@@ -1,3 +1,3 @@
 mod rtsp;
 
-pub use rtsp::RtspPipeline;
+pub use rtsp::FfmpegPipeline;

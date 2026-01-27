@@ -12,13 +12,17 @@ When object detection identifies a person or vehicle, the system reaches back in
 
 Access is abstracted behind a unified interface — consumers request video by time offset, and the system transparently serves from the appropriate tier.
 
+## Camera Pipeline
+
+Cameras stream H.264 via RTSP. The system uses FFmpeg to ingest RTSP streams, outputting MPEG-TS format to stdout. An MPEG-TS parser extracts H.264 frames and detects keyframes via the random_access_indicator in the adaptation field. PTS timestamps are extracted from PES headers for accurate timing.
+
 ## Camera Requirements
 
 Cameras must provide an RTSP stream with H.264 codec at 1080p 30fps. Keyframe interval should be 1-2 seconds (GOP 30-60 frames) with bitrate around 6 Mbps. CBR or capped VBR recommended.
 
 ## Concurrency
 
-Each camera has its own ring buffer using a single-producer, multi-consumer (SPMC) pattern. The ingestion thread writes while analytics and API read concurrently. Synchronization via `Arc<RwLock<RingBuffer>>` with minimal contention since there's only one writer per buffer.
+Each camera has its own hot buffer using a single-producer, multi-consumer (SPMC) pattern. The ingestion thread writes while analytics and API read concurrently. Synchronization via `Arc<RwLock<HotBuffer>>` with minimal contention since there's only one writer per buffer.
 
 ## Analytics Pipeline
 
@@ -34,15 +38,15 @@ Vanilla HTML/CSS/JS served from the Rust binary with video playback via Vidstack
 
 ## Error Handling
 
-Camera disconnections are handled with automatic reconnection using exponential backoff (1s to 30s cap). Cameras operate independently — one disconnecting doesn't affect others. Reconnected cameras resume immediately.
+Camera disconnections are handled with automatic reconnection after a 5-second delay. Cameras operate independently — one disconnecting doesn't affect others. Reconnected cameras resume immediately.
 
 ## System Dependencies
 
-Build requires GStreamer and OpenCV development headers. Runtime requires GStreamer plugins for H.264 decoding. On Ubuntu/Debian:
+Build requires OpenCV development headers. Runtime requires FFmpeg for RTSP ingestion and H.264 handling. On Ubuntu/Debian:
 
-**Build:** `libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libopencv-dev`
+**Build:** `libopencv-dev`
 
-**Runtime:** `gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-libav`
+**Runtime:** `ffmpeg`
 
 SQLite is bundled by rusqlite. ONNX Runtime is auto-downloaded by the ort crate.
 

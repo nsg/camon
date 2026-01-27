@@ -59,8 +59,4 @@ impl HotBuffer {
     pub fn current_duration_secs(&self) -> f64 {
         self.current_duration_ns as f64 / NANOS_PER_SEC as f64
     }
-
-    pub fn camera_id(&self) -> &str {
-        &self.camera_id
-    }
 }
