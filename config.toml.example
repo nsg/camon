@@ -1,0 +1,17 @@
+# Camon Configuration
+
+[buffer]
+# Hot buffer duration in seconds (default: 600 = 10 minutes)
+hot_duration_secs = 600
+
+# Camera configuration
+# Each camera needs an id and url
+
+[[cameras]]
+id = "front-door"
+url = "rtsp://admin:password@192.168.1.100:554/stream1"
+
+# Additional cameras
+# [[cameras]]
+# id = "backyard"
+# url = "rtsp://admin:password@192.168.1.101:554/stream1"

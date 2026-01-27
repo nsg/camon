@@ -1,0 +1,66 @@
+use std::collections::VecDeque;
+use std::sync::{Arc, RwLock};
+
+use super::GopSegment;
+
+const NANOS_PER_SEC: u64 = 1_000_000_000;
+
+pub struct HotBuffer {
+    segments: VecDeque<GopSegment>,
+    max_duration_ns: u64,
+    current_duration_ns: u64,
+    camera_id: String,
+}
+
+impl HotBuffer {
+    pub fn new(camera_id: String, max_duration_secs: u64) -> Arc<RwLock<Self>> {
+        Arc::new(RwLock::new(Self {
+            segments: VecDeque::new(),
+            max_duration_ns: max_duration_secs * NANOS_PER_SEC,
+            current_duration_ns: 0,
+            camera_id,
+        }))
+    }
+
+    pub fn push(&mut self, segment: GopSegment) {
+        tracing::debug!(
+            camera = %self.camera_id,
+            frames = segment.frame_count,
+            duration_ms = segment.duration_ns / 1_000_000,
+            data_size = segment.data.len(),
+            "pushing GOP segment"
+        );
+
+        self.current_duration_ns += segment.duration_ns;
+        self.segments.push_back(segment);
+
+        self.evict_old();
+    }
+
+    fn evict_old(&mut self) {
+        while self.current_duration_ns > self.max_duration_ns {
+            if let Some(old) = self.segments.pop_front() {
+                self.current_duration_ns = self.current_duration_ns.saturating_sub(old.duration_ns);
+                tracing::trace!(
+                    camera = %self.camera_id,
+                    evicted_duration_ms = old.duration_ns / 1_000_000,
+                    "evicted old segment"
+                );
+            } else {
+                break;
+            }
+        }
+    }
+
+    pub fn segment_count(&self) -> usize {
+        self.segments.len()
+    }
+
+    pub fn current_duration_secs(&self) -> f64 {
+        self.current_duration_ns as f64 / NANOS_PER_SEC as f64
+    }
+
+    pub fn camera_id(&self) -> &str {
+        &self.camera_id
+    }
+}
