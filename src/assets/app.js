@@ -31,6 +31,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     let motionPollInterval = null;
     let detectionPollInterval = null;
     let currentDetailCameraId = null;
+    let bufferDuration = 0;
 
     // View transition helper
     function withViewTransition(callback, isBack = false) {
@@ -76,20 +77,23 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     timelineScrubber.addEventListener('input', () => {
         isSeeking = true;
-        const time = (timelineScrubber.value / 100) * detailVideo.duration;
+        const duration = bufferDuration || detailVideo.duration;
+        const time = (timelineScrubber.value / 100) * duration;
         currentTimeDisplay.textContent = formatTime(time);
         updateLiveState();
     });
 
     timelineScrubber.addEventListener('change', () => {
-        const time = (timelineScrubber.value / 100) * detailVideo.duration;
+        const duration = bufferDuration || detailVideo.duration;
+        const time = (timelineScrubber.value / 100) * duration;
         detailVideo.currentTime = time;
         isSeeking = false;
     });
 
     liveBtn.addEventListener('click', () => {
-        if (detailVideo.duration && isFinite(detailVideo.duration)) {
-            detailVideo.currentTime = detailVideo.duration;
+        const duration = bufferDuration || detailVideo.duration;
+        if (duration && isFinite(duration)) {
+            detailVideo.currentTime = duration;
             updateLiveState();
         }
     });
@@ -97,11 +101,11 @@ document.addEventListener('DOMContentLoaded', async () => {
     // Tooltip event listeners (on wrapper since canvas has pointer-events: none)
     const timelineWrapper = document.querySelector('.timeline-wrapper');
     timelineWrapper.addEventListener('mousemove', (e) => {
-        if (!detailVideo.duration || !isFinite(detailVideo.duration)) return;
+        if (!bufferDuration) return;
 
         const rect = timelineWrapper.getBoundingClientRect();
         const x = e.clientX - rect.left;
-        const time = (x / rect.width) * detailVideo.duration;
+        const time = (x / rect.width) * bufferDuration;
 
         const detection = findDetectionNear(time, 1.0);
         if (detection && currentDetailCameraId) {
@@ -206,6 +210,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         currentMotionSegments = [];
         currentDetections = [];
         currentDetailCameraId = null;
+        bufferDuration = 0;
         hideTooltip();
         const rect = motionCanvas.getBoundingClientRect();
         motionCtx.clearRect(0, 0, rect.width, rect.height);
@@ -292,11 +297,6 @@ document.addEventListener('DOMContentLoaded', async () => {
                 startTimelineUpdate();
                 fetchMotionSegments(cameraId);
                 fetchDetections(cameraId);
-                detailVideo.addEventListener('durationchange', () => {
-                    if (detailVideo.duration && isFinite(detailVideo.duration)) {
-                        renderTimeline(detailVideo.duration);
-                    }
-                }, { once: true });
             });
 
             detailHls.on(Hls.Events.ERROR, (event, data) => {
@@ -333,11 +333,12 @@ document.addEventListener('DOMContentLoaded', async () => {
     // Timeline functions
     function startTimelineUpdate() {
         function update() {
-            if (!isSeeking && detailVideo.duration && isFinite(detailVideo.duration)) {
-                const progress = (detailVideo.currentTime / detailVideo.duration) * 100;
+            const duration = bufferDuration || detailVideo.duration;
+            if (!isSeeking && duration && isFinite(duration)) {
+                const progress = (detailVideo.currentTime / duration) * 100;
                 timelineScrubber.value = progress;
                 currentTimeDisplay.textContent = formatTime(detailVideo.currentTime);
-                durationDisplay.textContent = formatTime(detailVideo.duration);
+                durationDisplay.textContent = formatTime(duration);
                 updateLiveState();
             }
             timelineAnimationId = requestAnimationFrame(update);
@@ -346,8 +347,9 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
 
     function updateLiveState() {
-        if (detailVideo.duration && isFinite(detailVideo.duration)) {
-            const isAtLive = (detailVideo.duration - detailVideo.currentTime) < 3;
+        const duration = bufferDuration || detailVideo.duration;
+        if (duration && isFinite(duration)) {
+            const isAtLive = (duration - detailVideo.currentTime) < 3;
             liveBtn.classList.toggle('is-live', isAtLive);
         }
     }
@@ -372,8 +374,9 @@ document.addEventListener('DOMContentLoaded', async () => {
                 if (response.ok) {
                     const data = await response.json();
                     currentMotionSegments = data.segments || [];
-                    if (detailVideo.duration && isFinite(detailVideo.duration)) {
-                        renderTimeline(detailVideo.duration);
+                    if (data.total_duration > 0) {
+                        bufferDuration = data.total_duration;
+                        renderTimeline(bufferDuration);
                     }
                 }
             } catch (err) {
@@ -397,8 +400,9 @@ document.addEventListener('DOMContentLoaded', async () => {
                 if (response.ok) {
                     const data = await response.json();
                     currentDetections = data.detections || [];
-                    if (detailVideo.duration && isFinite(detailVideo.duration)) {
-                        renderTimeline(detailVideo.duration);
+                    if (data.total_duration > 0) {
+                        bufferDuration = data.total_duration;
+                        renderTimeline(bufferDuration);
                     }
                 }
             } catch (err) {
@@ -481,8 +485,8 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     // Handle canvas resize
     window.addEventListener('resize', () => {
-        if (detailVideo.duration && isFinite(detailVideo.duration)) {
-            renderTimeline(detailVideo.duration);
+        if (bufferDuration > 0) {
+            renderTimeline(bufferDuration);
         }
     });
 });

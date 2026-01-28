@@ -174,7 +174,7 @@ impl MotionAnalyzer {
                 );
 
                 if self.object_detector.is_some() && self.detection_store.is_some() {
-                    self.run_object_detection(&data, seq, start_pts, duration_ns);
+                    self.run_object_detection(&data, seq, duration_ns);
                 }
             }
 
@@ -221,7 +221,7 @@ impl MotionAnalyzer {
         Ok(total_score / frame_count as f32)
     }
 
-    fn run_object_detection(&mut self, data: &[u8], seq: u64, start_pts: u64, duration_ns: u64) {
+    fn run_object_detection(&mut self, data: &[u8], seq: u64, duration_ns: u64) {
         let detection_decoder = match &self.detection_decoder {
             Some(d) => d,
             None => return,
@@ -238,9 +238,8 @@ impl MotionAnalyzer {
 
         let height = detection_decoder.height() as i32;
         let _width = detection_decoder.width() as i32;
-        let frame_duration_ns = duration_ns / raw_frames.len().max(1) as u64;
 
-        for (i, frame_data) in raw_frames.iter().enumerate() {
+        for frame_data in raw_frames.iter() {
             let mat = match Mat::from_slice(frame_data) {
                 Ok(m) => m,
                 Err(_) => continue,
@@ -276,13 +275,10 @@ impl MotionAnalyzer {
                 None => continue,
             };
 
-            let frame_timestamp = start_pts + (i as u64 * frame_duration_ns);
-
             for det in detections {
                 detection_store.insert(
                     &self.camera_id,
                     seq,
-                    frame_timestamp,
                     det.class_name.clone(),
                     det.confidence,
                     frame_jpeg.clone(),

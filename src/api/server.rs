@@ -48,6 +48,7 @@ struct MotionSegmentResponse {
 
 #[derive(Serialize)]
 struct MotionResponse {
+    total_duration: f64,
     segments: Vec<MotionSegmentResponse>,
 }
 
@@ -61,6 +62,7 @@ struct DetectionItem {
 
 #[derive(Serialize)]
 struct DetectionResponse {
+    total_duration: f64,
     detections: Vec<DetectionItem>,
 }
 
@@ -154,22 +156,30 @@ async fn motion_handler(State(state): State<AppState>, Path(id): Path<String>) -
         None => return (StatusCode::NOT_FOUND, "camera not found").into_response(),
     };
 
-    let base_time = buffer
-        .read()
-        .ok()
-        .and_then(|b| b.first_pts())
-        .unwrap_or(0);
+    let buf = match buffer.read() {
+        Ok(b) => b,
+        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "buffer lock error").into_response(),
+    };
+
+    let first_sequence = buf.first_sequence();
+    let total_duration = buf.total_duration_ns() as f64 / 1_000_000_000.0;
 
     let segments = state.motion_store.get_motion(&id);
 
     let response = MotionResponse {
+        total_duration,
         segments: segments
             .iter()
-            .filter(|s| s.start_time_ns >= base_time)
-            .map(|s| MotionSegmentResponse {
-                start: (s.start_time_ns - base_time) as f64 / 1_000_000_000.0,
-                end: (s.end_time_ns - base_time) as f64 / 1_000_000_000.0,
-                intensity: s.motion_score,
+            .filter(|s| s.segment_sequence >= first_sequence)
+            .filter_map(|s| {
+                let start_ns = buf.sequence_to_offset_ns(s.segment_sequence)?;
+                let start = start_ns as f64 / 1_000_000_000.0;
+                let end = start + s.duration_ns as f64 / 1_000_000_000.0;
+                Some(MotionSegmentResponse {
+                    start,
+                    end,
+                    intensity: s.motion_score,
+                })
             })
             .collect(),
     };
@@ -183,23 +193,29 @@ async fn detections_handler(State(state): State<AppState>, Path(id): Path<String
         None => return (StatusCode::NOT_FOUND, "camera not found").into_response(),
     };
 
-    let base_time = buffer
-        .read()
-        .ok()
-        .and_then(|b| b.first_pts())
-        .unwrap_or(0);
+    let buf = match buffer.read() {
+        Ok(b) => b,
+        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "buffer lock error").into_response(),
+    };
+
+    let first_sequence = buf.first_sequence();
+    let total_duration = buf.total_duration_ns() as f64 / 1_000_000_000.0;
 
     let detections = state.detection_store.get_detections(&id);
 
     let response = DetectionResponse {
+        total_duration,
         detections: detections
             .iter()
-            .filter(|d| d.timestamp_ns >= base_time)
-            .map(|d| DetectionItem {
-                id: d.id,
-                timestamp: (d.timestamp_ns - base_time) as f64 / 1_000_000_000.0,
-                object_class: d.object_class.clone(),
-                confidence: d.confidence,
+            .filter(|d| d.segment_sequence >= first_sequence)
+            .filter_map(|d| {
+                let offset_ns = buf.sequence_to_offset_ns(d.segment_sequence)?;
+                Some(DetectionItem {
+                    id: d.id,
+                    timestamp: offset_ns as f64 / 1_000_000_000.0,
+                    object_class: d.object_class.clone(),
+                    confidence: d.confidence,
+                })
             })
             .collect(),
     };

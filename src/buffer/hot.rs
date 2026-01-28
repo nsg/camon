@@ -87,8 +87,27 @@ impl HotBuffer {
         self.first_sequence + self.segments.len() as u64
     }
 
-    /// Get the PTS of the first segment in the buffer
-    pub fn first_pts(&self) -> Option<u64> {
-        self.segments.front().map(|s| s.start_pts)
+    /// Get total duration of all segments in nanoseconds
+    pub fn total_duration_ns(&self) -> u64 {
+        self.segments.iter().map(|s| s.duration_ns).sum()
+    }
+
+    /// Convert a segment sequence number to timeline offset in nanoseconds
+    /// Returns the cumulative duration of all segments before the given sequence
+    pub fn sequence_to_offset_ns(&self, sequence: u64) -> Option<u64> {
+        if sequence < self.first_sequence {
+            return None;
+        }
+        let index = (sequence - self.first_sequence) as usize;
+        if index > self.segments.len() {
+            return None;
+        }
+        Some(
+            self.segments
+                .iter()
+                .take(index)
+                .map(|s| s.duration_ns)
+                .sum(),
+        )
     }
 }

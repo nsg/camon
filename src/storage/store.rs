@@ -36,8 +36,8 @@ impl MotionStore {
                 entries
                     .iter()
                     .map(|e| MotionSnapshot {
-                        start_time_ns: e.start_time_ns,
-                        end_time_ns: e.end_time_ns,
+                        segment_sequence: e.segment_sequence,
+                        duration_ns: e.end_time_ns - e.start_time_ns,
                         motion_score: e.motion_score,
                     })
                     .collect()
@@ -78,7 +78,7 @@ impl Clone for MotionStore {
 }
 
 pub struct MotionSnapshot {
-    pub start_time_ns: u64,
-    pub end_time_ns: u64,
+    pub segment_sequence: u64,
+    pub duration_ns: u64,
     pub motion_score: f32,
 }
