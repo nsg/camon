@@ -243,7 +243,7 @@ impl MotionAnalyzer {
             None => return,
         };
         let detection_store = match &self.detection_store {
-            Some(s) => s.clone(),
+            Some(s) => s,
             None => return,
         };
 

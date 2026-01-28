@@ -19,7 +19,7 @@ pub struct DetectionSnapshot {
 
 pub struct DetectionStore {
     cameras: Arc<HashMap<String, RwLock<VecDeque<DetectionEntry>>>>,
-    next_id: AtomicU64,
+    next_id: Arc<AtomicU64>,
 }
 
 impl DetectionStore {
@@ -30,7 +30,7 @@ impl DetectionStore {
         }
         Self {
             cameras: Arc::new(cameras),
-            next_id: AtomicU64::new(1),
+            next_id: Arc::new(AtomicU64::new(1)),
         }
     }
 
@@ -101,7 +101,7 @@ impl Clone for DetectionStore {
     fn clone(&self) -> Self {
         Self {
             cameras: Arc::clone(&self.cameras),
-            next_id: AtomicU64::new(self.next_id.load(Ordering::Relaxed)),
+            next_id: Arc::clone(&self.next_id),
         }
     }
 }
