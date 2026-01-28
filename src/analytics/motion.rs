@@ -1,5 +1,5 @@
 use opencv::{
-    core::Mat,
+    core::{Mat, Rect, Vector},
     prelude::*,
     video::{self, BackgroundSubtractorTrait},
     Result as CvResult,
@@ -103,5 +103,18 @@ impl MotionDetector {
         let foreground_ratio = fg_pixels / total_pixels as f32;
 
         Ok((foreground_ratio * 10.0).min(1.0))
+    }
+
+    pub fn motion_bbox(&self) -> Option<Rect> {
+        let mut points = Vector::<opencv::core::Point>::new();
+        opencv::core::find_non_zero(&self.fg_mask, &mut points).ok()?;
+        if points.is_empty() {
+            return None;
+        }
+        let rect = opencv::imgproc::bounding_rect(&points).ok()?;
+        if rect.width == 0 || rect.height == 0 {
+            return None;
+        }
+        Some(rect)
     }
 }

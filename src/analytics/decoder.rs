@@ -9,9 +9,9 @@ const ANALYSIS_HEIGHT: u32 = 240;
 const FRAME_SIZE: usize = (ANALYSIS_WIDTH * ANALYSIS_HEIGHT) as usize;
 const FRAME_READ_TIMEOUT: Duration = Duration::from_millis(500);
 
-const DETECTION_WIDTH: u32 = 640;
-const DETECTION_HEIGHT: u32 = 480;
-const DETECTION_FRAME_SIZE: usize = (DETECTION_WIDTH * DETECTION_HEIGHT * 3) as usize;
+const CROP_WIDTH: u32 = 1920;
+const CROP_HEIGHT: u32 = 1080;
+const CROP_FRAME_SIZE: usize = (CROP_WIDTH * CROP_HEIGHT * 3) as usize;
 
 pub struct FrameDecoder {
     segment_tx: Option<SyncSender<Vec<u8>>>,
@@ -130,7 +130,7 @@ impl Drop for FrameDecoder {
     }
 }
 
-pub struct DetectionDecoder {
+pub struct CropDecoder {
     segment_tx: Option<SyncSender<Vec<u8>>>,
     frame_rx: Receiver<Vec<u8>>,
     sample_fps: u32,
@@ -139,7 +139,7 @@ pub struct DetectionDecoder {
     _reader_handle: JoinHandle<()>,
 }
 
-impl DetectionDecoder {
+impl CropDecoder {
     pub fn new(sample_fps: u32) -> Result<Self, std::io::Error> {
         let mut child = Command::new("ffmpeg")
             .args([
@@ -151,7 +151,7 @@ impl DetectionDecoder {
                 "-i",
                 "pipe:0",
                 "-vf",
-                &format!("fps={sample_fps},scale={DETECTION_WIDTH}:{DETECTION_HEIGHT}"),
+                &format!("fps={sample_fps},scale={CROP_WIDTH}:{CROP_HEIGHT}"),
                 "-f",
                 "rawvideo",
                 "-pix_fmt",
@@ -167,7 +167,7 @@ impl DetectionDecoder {
         let stdout = child.stdout.take().expect("stdout piped");
 
         let (segment_tx, segment_rx) = mpsc::sync_channel::<Vec<u8>>(16);
-        let (frame_tx, frame_rx) = mpsc::sync_channel::<Vec<u8>>(64);
+        let (frame_tx, frame_rx) = mpsc::sync_channel::<Vec<u8>>(16);
 
         let writer_handle = thread::spawn(move || {
             let mut stdin = stdin;
@@ -183,7 +183,7 @@ impl DetectionDecoder {
 
         let reader_handle = thread::spawn(move || {
             let mut stdout = stdout;
-            let mut buf = vec![0u8; DETECTION_FRAME_SIZE];
+            let mut buf = vec![0u8; CROP_FRAME_SIZE];
             while stdout.read_exact(&mut buf).is_ok() {
                 if frame_tx.send(buf.clone()).is_err() {
                     break;
@@ -230,16 +230,12 @@ impl DetectionDecoder {
             .unwrap_or(false)
     }
 
-    pub fn width(&self) -> u32 {
-        DETECTION_WIDTH
-    }
-
     pub fn height(&self) -> u32 {
-        DETECTION_HEIGHT
+        CROP_HEIGHT
     }
 }
 
-impl Drop for DetectionDecoder {
+impl Drop for CropDecoder {
     fn drop(&mut self) {
         self.segment_tx.take();
         if let Some(mut child) = self.child.take() {

@@ -3,17 +3,25 @@ use std::sync::{Arc, RwLock};
 use std::thread;
 use std::time::Duration;
 
-use opencv::core::{Mat, Vector};
+use opencv::core::{Mat, Rect, Size, Vector};
 use opencv::imgcodecs;
+use opencv::imgproc;
 use opencv::prelude::*;
 
 use crate::buffer::HotBuffer;
 use crate::config::AnalyticsConfig;
 use crate::storage::{DetectionStore, MotionEntry, MotionStore};
 
-use super::decoder::{DetectionDecoder, FrameDecoder};
+use super::decoder::{CropDecoder, FrameDecoder};
 use super::motion::{MotionDetector, ScoreHistogram};
 use super::object::ObjectDetector;
+
+const DETECTION_WIDTH: i32 = 640;
+const DETECTION_HEIGHT: i32 = 480;
+const ANALYSIS_WIDTH: i32 = 320;
+const ANALYSIS_HEIGHT: i32 = 240;
+const CROP_DECODE_WIDTH: i32 = 1920;
+const CROP_DECODE_HEIGHT: i32 = 1080;
 
 const MOTION_PERCENTILE: f32 = 0.90;
 const DEFAULT_MOTION_THRESHOLD: f32 = 0.05;
@@ -28,9 +36,10 @@ pub struct MotionAnalyzer {
     config: AnalyticsConfig,
     detector: MotionDetector,
     decoder: FrameDecoder,
-    detection_decoder: Option<DetectionDecoder>,
+    crop_decoder: Option<CropDecoder>,
     object_detector: Option<ObjectDetector>,
     last_processed: u64,
+    last_motion_bbox: Option<Rect>,
     score_histogram: ScoreHistogram,
 }
 
@@ -46,8 +55,8 @@ impl MotionAnalyzer {
         let detector = MotionDetector::new()?;
         let decoder = FrameDecoder::new(config.sample_fps)?;
 
-        let detection_decoder = if object_detector.is_some() {
-            Some(DetectionDecoder::new(config.sample_fps)?)
+        let crop_decoder = if object_detector.is_some() {
+            Some(CropDecoder::new(config.sample_fps)?)
         } else {
             None
         };
@@ -67,9 +76,10 @@ impl MotionAnalyzer {
             config,
             detector,
             decoder,
-            detection_decoder,
+            crop_decoder,
             object_detector,
             last_processed,
+            last_motion_bbox: None,
             score_histogram,
         })
     }
@@ -90,13 +100,13 @@ impl MotionAnalyzer {
                 }
             }
 
-            if let Some(ref mut dd) = self.detection_decoder {
+            if let Some(ref mut dd) = self.crop_decoder {
                 if !dd.is_alive() {
-                    tracing::warn!(camera = %self.camera_id, "detection decoder died, restarting");
-                    match DetectionDecoder::new(self.config.sample_fps) {
-                        Ok(d) => self.detection_decoder = Some(d),
+                    tracing::warn!(camera = %self.camera_id, "crop decoder died, restarting");
+                    match CropDecoder::new(self.config.sample_fps) {
+                        Ok(d) => self.crop_decoder = Some(d),
                         Err(e) => {
-                            tracing::error!(camera = %self.camera_id, error = %e, "failed to restart detection decoder");
+                            tracing::error!(camera = %self.camera_id, error = %e, "failed to restart crop decoder");
                         }
                     }
                 }
@@ -198,6 +208,7 @@ impl MotionAnalyzer {
         let height = self.decoder.height() as i32;
         let mut total_score = 0.0f32;
         let mut frame_count = 0u32;
+        let mut last_bbox = None;
 
         for frame_data in &raw_frames {
             let mat = Mat::from_slice(frame_data)?;
@@ -207,12 +218,17 @@ impl MotionAnalyzer {
                 Ok(score) => {
                     total_score += score;
                     frame_count += 1;
+                    if let Some(bbox) = self.detector.motion_bbox() {
+                        last_bbox = Some(bbox);
+                    }
                 }
                 Err(e) => {
                     tracing::trace!(error = %e, "frame processing error");
                 }
             }
         }
+
+        self.last_motion_bbox = last_bbox;
 
         if frame_count == 0 {
             return Ok(0.0);
@@ -222,7 +238,7 @@ impl MotionAnalyzer {
     }
 
     fn run_object_detection(&mut self, data: &[u8], seq: u64, duration_ns: u64) {
-        let detection_decoder = match &self.detection_decoder {
+        let crop_decoder = match &self.crop_decoder {
             Some(d) => d,
             None => return,
         };
@@ -231,13 +247,13 @@ impl MotionAnalyzer {
             None => return,
         };
 
-        let raw_frames = detection_decoder.decode_segment(data, duration_ns);
+        let raw_frames = crop_decoder.decode_segment(data, duration_ns);
         if raw_frames.is_empty() {
             return;
         }
 
-        let height = detection_decoder.height() as i32;
-        let _width = detection_decoder.width() as i32;
+        let height = crop_decoder.height() as i32;
+        let crop_rect = self.crop_region();
 
         for frame_data in raw_frames.iter() {
             let mat = match Mat::from_slice(frame_data) {
@@ -248,9 +264,31 @@ impl MotionAnalyzer {
                 Ok(m) => m,
                 Err(_) => continue,
             };
-            let mat_owned = match reshaped.try_clone() {
-                Ok(m) => m,
-                Err(_) => continue,
+
+            let detection_input = match crop_rect {
+                Some(rect) => match Mat::roi(&reshaped, rect) {
+                    Ok(roi) => match roi.try_clone() {
+                        Ok(m) => m,
+                        Err(_) => continue,
+                    },
+                    Err(_) => continue,
+                },
+                None => {
+                    let mut resized = Mat::default();
+                    if imgproc::resize(
+                        &reshaped,
+                        &mut resized,
+                        Size::new(DETECTION_WIDTH, DETECTION_HEIGHT),
+                        0.0,
+                        0.0,
+                        imgproc::INTER_LINEAR,
+                    )
+                    .is_err()
+                    {
+                        continue;
+                    }
+                    resized
+                }
             };
 
             let object_detector = match &mut self.object_detector {
@@ -258,7 +296,7 @@ impl MotionAnalyzer {
                 None => return,
             };
 
-            let detections = match object_detector.detect(&mat_owned) {
+            let detections = match object_detector.detect(&detection_input) {
                 Ok(d) => d,
                 Err(e) => {
                     tracing::trace!(error = %e, "object detection error");
@@ -270,7 +308,7 @@ impl MotionAnalyzer {
                 continue;
             }
 
-            let frame_jpeg = match encode_jpeg(&mat_owned) {
+            let frame_jpeg = match encode_jpeg(&detection_input) {
                 Some(j) => j,
                 None => continue,
             };
@@ -293,6 +331,31 @@ impl MotionAnalyzer {
                 );
             }
         }
+    }
+
+    fn crop_region(&self) -> Option<Rect> {
+        let bbox = self.last_motion_bbox?;
+
+        // Scale motion bbox from analysis coords to crop decode coords
+        let scale_x = CROP_DECODE_WIDTH as f32 / ANALYSIS_WIDTH as f32;
+        let scale_y = CROP_DECODE_HEIGHT as f32 / ANALYSIS_HEIGHT as f32;
+
+        let center_x = ((bbox.x as f32 + bbox.width as f32 / 2.0) * scale_x) as i32;
+        let center_y = ((bbox.y as f32 + bbox.height as f32 / 2.0) * scale_y) as i32;
+
+        let scaled_w = (bbox.width as f32 * scale_x) as i32;
+        let scaled_h = (bbox.height as f32 * scale_y) as i32;
+
+        // If motion is larger than detection size, fall back to full-frame resize
+        if scaled_w > DETECTION_WIDTH || scaled_h > DETECTION_HEIGHT {
+            return None;
+        }
+
+        // Center a DETECTION_WIDTH x DETECTION_HEIGHT rect on the motion center, clamped to frame
+        let x = (center_x - DETECTION_WIDTH / 2).clamp(0, CROP_DECODE_WIDTH - DETECTION_WIDTH);
+        let y = (center_y - DETECTION_HEIGHT / 2).clamp(0, CROP_DECODE_HEIGHT - DETECTION_HEIGHT);
+
+        Some(Rect::new(x, y, DETECTION_WIDTH, DETECTION_HEIGHT))
     }
 }
 
