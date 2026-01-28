@@ -12,6 +12,8 @@ document.addEventListener('DOMContentLoaded', async () => {
     const currentTimeDisplay = document.getElementById('current-time');
     const durationDisplay = document.getElementById('duration');
     const liveBtn = document.getElementById('live-btn');
+    const motionCanvas = document.getElementById('motion-canvas');
+    const motionCtx = motionCanvas.getContext('2d');
 
     // State
     let cameras = [];
@@ -21,6 +23,8 @@ document.addEventListener('DOMContentLoaded', async () => {
     let isSeeking = false;
     let currentView = null;
     let isFirstLoad = true;
+    let currentMotionSegments = [];
+    let motionPollInterval = null;
 
     // View transition helper
     function withViewTransition(callback, isBack = false) {
@@ -158,11 +162,18 @@ document.addEventListener('DOMContentLoaded', async () => {
             cancelAnimationFrame(timelineAnimationId);
             timelineAnimationId = null;
         }
+        if (motionPollInterval) {
+            clearInterval(motionPollInterval);
+            motionPollInterval = null;
+        }
         if (detailHls) {
             detailHls.destroy();
             detailHls = null;
         }
         detailVideo.src = '';
+        currentMotionSegments = [];
+        const rect = motionCanvas.getBoundingClientRect();
+        motionCtx.clearRect(0, 0, rect.width, rect.height);
     }
 
     // Camera cell creation
@@ -244,6 +255,12 @@ document.addEventListener('DOMContentLoaded', async () => {
                 detailLoading.hidden = true;
                 detailVideo.play().catch(e => console.error(`Play failed for ${cameraId}:`, e));
                 startTimelineUpdate();
+                fetchMotionSegments(cameraId);
+                detailVideo.addEventListener('durationchange', () => {
+                    if (detailVideo.duration && isFinite(detailVideo.duration)) {
+                        renderMotionSegments(detailVideo.duration);
+                    }
+                }, { once: true });
             });
 
             detailHls.on(Hls.Events.ERROR, (event, data) => {
@@ -269,6 +286,7 @@ document.addEventListener('DOMContentLoaded', async () => {
                 detailLoading.hidden = true;
                 detailVideo.play().catch(e => console.error(`Play failed for ${cameraId}:`, e));
                 startTimelineUpdate();
+                fetchMotionSegments(cameraId);
             }, { once: true });
         } else {
             detailLoading.querySelector('p').textContent = 'HLS not supported';
@@ -304,4 +322,69 @@ document.addEventListener('DOMContentLoaded', async () => {
         const s = Math.floor(seconds % 60);
         return `${h.toString().padStart(2, '0')}:${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
     }
+
+    // Motion segment data fetching
+    async function fetchMotionSegments(cameraId) {
+        // Clear any existing poll interval
+        if (motionPollInterval) {
+            clearInterval(motionPollInterval);
+        }
+
+        async function poll() {
+            try {
+                const response = await fetch(`/api/cameras/${encodeURIComponent(cameraId)}/motion`);
+                if (response.ok) {
+                    const data = await response.json();
+                    currentMotionSegments = data.segments || [];
+                    if (detailVideo.duration && isFinite(detailVideo.duration)) {
+                        renderMotionSegments(detailVideo.duration);
+                    }
+                }
+            } catch (err) {
+                console.error('Failed to fetch motion data:', err);
+            }
+        }
+
+        // Fetch immediately, then poll every 5 seconds for updates
+        await poll();
+        motionPollInterval = setInterval(poll, 5000);
+    }
+
+    function renderMotionSegments(duration) {
+        if (!duration || !isFinite(duration)) return;
+
+        // Set canvas size to match actual pixel dimensions
+        const rect = motionCanvas.getBoundingClientRect();
+        const dpr = window.devicePixelRatio || 1;
+        motionCanvas.width = rect.width * dpr;
+        motionCanvas.height = rect.height * dpr;
+        motionCtx.scale(dpr, dpr);
+
+        // Clear canvas
+        motionCtx.clearRect(0, 0, rect.width, rect.height);
+
+        // Draw each motion segment
+        currentMotionSegments.forEach(segment => {
+            const startX = (segment.start / duration) * rect.width;
+            const endX = (segment.end / duration) * rect.width;
+            const width = endX - startX;
+
+            // Use rust color with intensity-based alpha
+            const alpha = segment.intensity * 0.8;
+            motionCtx.fillStyle = `rgba(170, 80, 66, ${alpha})`; // --color-rust
+
+            // Draw rounded rectangle
+            const radius = 4;
+            motionCtx.beginPath();
+            motionCtx.roundRect(startX, 0, width, rect.height, radius);
+            motionCtx.fill();
+        });
+    }
+
+    // Handle canvas resize
+    window.addEventListener('resize', () => {
+        if (detailVideo.duration && isFinite(detailVideo.duration)) {
+            renderMotionSegments(detailVideo.duration);
+        }
+    });
 });

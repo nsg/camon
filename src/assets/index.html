@@ -39,7 +39,10 @@
             </div>
             <div class="timeline-controls">
                 <span id="current-time" class="time-display">00:00:00</span>
-                <input type="range" id="timeline-scrubber" min="0" max="100" value="100" step="0.1">
+                <div class="timeline-wrapper">
+                    <canvas id="motion-canvas"></canvas>
+                    <input type="range" id="timeline-scrubber" min="0" max="100" value="100" step="0.1">
+                </div>
                 <span id="duration" class="time-display">00:00:00</span>
                 <button id="live-btn" class="live-btn">
                     <span class="live-indicator"></span>
