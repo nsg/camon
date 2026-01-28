@@ -10,11 +10,10 @@ port = 8080
 
 [analytics]
 # Enable MOG2 motion detection (default: false)
+# Motion threshold is automatically tuned using percentile-based adaptive thresholding
 enabled = true
 # Frame sample rate for analysis (default: 5)
 sample_fps = 5
-# Minimum score to record a motion segment (default: 0.05)
-motion_threshold = 0.05
 
 # Object detection using YOLO26 (requires motion detection enabled)
 [analytics.object_detection]

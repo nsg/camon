@@ -29,13 +29,12 @@ impl MotionStore {
         }
     }
 
-    pub fn get_motion(&self, camera_id: &str, min_score: f32) -> Vec<MotionSnapshot> {
+    pub fn get_motion(&self, camera_id: &str) -> Vec<MotionSnapshot> {
         match self.cameras.get(camera_id) {
             Some(lock) => {
                 let entries = lock.read().unwrap();
                 entries
                     .iter()
-                    .filter(|e| e.motion_score >= min_score)
                     .map(|e| MotionSnapshot {
                         start_time_ns: e.start_time_ns,
                         end_time_ns: e.end_time_ns,

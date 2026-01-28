@@ -60,8 +60,45 @@ fn default_sample_fps() -> u32 {
     5
 }
 
-fn default_motion_threshold() -> f32 {
-    0.05
+fn default_model_path() -> String {
+    "https://huggingface.co/onnx-community/yolo26n-ONNX/resolve/main/onnx/model.onnx".to_string()
+}
+
+fn default_confidence_threshold() -> f32 {
+    0.5
+}
+
+fn default_classes() -> Vec<String> {
+    vec![
+        "person".to_string(),
+        "car".to_string(),
+        "truck".to_string(),
+        "dog".to_string(),
+        "cat".to_string(),
+    ]
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ObjectDetectionConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_model_path")]
+    pub model_path: String,
+    #[serde(default = "default_confidence_threshold")]
+    pub confidence_threshold: f32,
+    #[serde(default = "default_classes")]
+    pub classes: Vec<String>,
+}
+
+impl Default for ObjectDetectionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            model_path: default_model_path(),
+            confidence_threshold: default_confidence_threshold(),
+            classes: default_classes(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -70,8 +107,8 @@ pub struct AnalyticsConfig {
     pub enabled: bool,
     #[serde(default = "default_sample_fps")]
     pub sample_fps: u32,
-    #[serde(default = "default_motion_threshold")]
-    pub motion_threshold: f32,
+    #[serde(default)]
+    pub object_detection: ObjectDetectionConfig,
 }
 
 impl Default for AnalyticsConfig {
@@ -79,7 +116,7 @@ impl Default for AnalyticsConfig {
         Self {
             enabled: false,
             sample_fps: default_sample_fps(),
-            motion_threshold: default_motion_threshold(),
+            object_detection: ObjectDetectionConfig::default(),
         }
     }
 }

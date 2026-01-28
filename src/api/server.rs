@@ -23,7 +23,6 @@ pub struct AppState {
     pub buffers: Arc<HashMap<String, Arc<RwLock<HotBuffer>>>>,
     pub motion_store: MotionStore,
     pub detection_store: DetectionStore,
-    pub motion_threshold: f32,
 }
 
 impl AppState {
@@ -31,13 +30,11 @@ impl AppState {
         buffers: HashMap<String, Arc<RwLock<HotBuffer>>>,
         motion_store: MotionStore,
         detection_store: DetectionStore,
-        motion_threshold: f32,
     ) -> Self {
         Self {
             buffers: Arc::new(buffers),
             motion_store,
             detection_store,
-            motion_threshold,
         }
     }
 }
@@ -163,7 +160,7 @@ async fn motion_handler(State(state): State<AppState>, Path(id): Path<String>) -
         .and_then(|b| b.first_pts())
         .unwrap_or(0);
 
-    let segments = state.motion_store.get_motion(&id, state.motion_threshold);
+    let segments = state.motion_store.get_motion(&id);
 
     let response = MotionResponse {
         segments: segments

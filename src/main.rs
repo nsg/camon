@@ -11,11 +11,12 @@ mod camera;
 mod config;
 mod storage;
 
+use analytics::ObjectDetector;
 use api::AppState;
 use buffer::HotBuffer;
 use camera::FfmpegPipeline;
 use config::Config;
-use storage::MotionStore;
+use storage::{DetectionStore, MotionStore};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -29,6 +30,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let http_port = config.http.port;
     let camera_ids: Vec<String> = config.cameras.iter().map(|c| c.id.clone()).collect();
     let motion_store = MotionStore::new(&camera_ids);
+    let detection_store = DetectionStore::new(&camera_ids);
+
+    let object_detector = if config.analytics.enabled && config.analytics.object_detection.enabled {
+        match ObjectDetector::new(
+            &config.analytics.object_detection.model_path,
+            config.analytics.object_detection.confidence_threshold,
+            config.analytics.object_detection.classes.clone(),
+        ) {
+            Ok(detector) => {
+                tracing::info!(
+                    model = %config.analytics.object_detection.model_path,
+                    "object detector loaded"
+                );
+                Some(Arc::new(detector))
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "failed to load object detector, continuing without it");
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     let shutdown = Arc::new(AtomicBool::new(false));
     let mut handles = Vec::new();
@@ -49,12 +73,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         handles.push((camera_id.clone(), handle, Arc::clone(&buffer)));
 
-        // Spawn motion analyzer if analytics is enabled
         if config.analytics.enabled {
+            let det_store = if object_detector.is_some() {
+                Some(detection_store.clone())
+            } else {
+                None
+            };
+
+            let obj_det = object_detector.as_ref().and_then(|_| {
+                ObjectDetector::new(
+                    &config.analytics.object_detection.model_path,
+                    config.analytics.object_detection.confidence_threshold,
+                    config.analytics.object_detection.classes.clone(),
+                )
+                .ok()
+            });
+
             let analyzer_handle = analytics::spawn_analyzer(
                 camera_id,
                 buffer,
                 motion_store.clone(),
+                det_store,
+                obj_det,
                 config.analytics.clone(),
                 Arc::clone(&shutdown),
             );
@@ -62,7 +102,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    let app_state = AppState::new(buffers_map, motion_store, config.analytics.motion_threshold);
+    let app_state = AppState::new(buffers_map, motion_store, detection_store);
     let server_handle = tokio::spawn(async move {
         if let Err(e) = api::start_server(app_state, http_port).await {
             tracing::error!("HTTP server error: {}", e);
@@ -83,7 +123,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     server_handle.abort();
 
-    // Wait for analyzer handles
     for handle in analyzer_handles {
         handle.abort();
     }
