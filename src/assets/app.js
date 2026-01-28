@@ -17,6 +17,9 @@ document.addEventListener('DOMContentLoaded', async () => {
     const detectionTooltip = document.getElementById('detection-tooltip');
     const tooltipImage = document.getElementById('tooltip-image');
     const tooltipLabel = document.getElementById('tooltip-label');
+    const maskOverlay = document.getElementById('mask-overlay');
+    const maskCtx = maskOverlay.getContext('2d');
+    const maskToggleBtn = document.getElementById('mask-toggle-btn');
 
     // State
     let cameras = [];
@@ -32,6 +35,10 @@ document.addEventListener('DOMContentLoaded', async () => {
     let detectionPollInterval = null;
     let currentDetailCameraId = null;
     let bufferDuration = 0;
+    let maskOverlayEnabled = false;
+    let currentMaskSeq = null;
+    let maskImage = null;
+    const failedMaskSeqs = new Set();
 
     // View transition helper
     function withViewTransition(callback, isBack = false) {
@@ -95,6 +102,18 @@ document.addEventListener('DOMContentLoaded', async () => {
         if (duration && isFinite(duration)) {
             detailVideo.currentTime = duration;
             updateLiveState();
+        }
+    });
+
+    maskToggleBtn.addEventListener('click', () => {
+        maskOverlayEnabled = !maskOverlayEnabled;
+        maskToggleBtn.classList.toggle('active', maskOverlayEnabled);
+        maskOverlay.hidden = !maskOverlayEnabled;
+        if (!maskOverlayEnabled) {
+            maskCtx.clearRect(0, 0, maskOverlay.width, maskOverlay.height);
+            currentMaskSeq = null;
+            maskImage = null;
+            failedMaskSeqs.clear();
         }
     });
 
@@ -184,6 +203,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         currentTimeDisplay.textContent = '00:00:00';
         durationDisplay.textContent = '00:00:00';
         liveBtn.classList.add('is-live');
+        maskOverlay.hidden = !maskOverlayEnabled;
 
         // Load camera stream
         loadDetailCamera(cameraId);
@@ -211,6 +231,13 @@ document.addEventListener('DOMContentLoaded', async () => {
         currentDetections = [];
         currentDetailCameraId = null;
         bufferDuration = 0;
+        currentMaskSeq = null;
+        maskImage = null;
+        failedMaskSeqs.clear();
+        maskOverlay.hidden = true;
+        maskOverlayEnabled = false;
+        maskToggleBtn.classList.remove('active');
+        maskCtx.clearRect(0, 0, maskOverlay.width, maskOverlay.height);
         hideTooltip();
         const rect = motionCanvas.getBoundingClientRect();
         motionCtx.clearRect(0, 0, rect.width, rect.height);
@@ -340,10 +367,71 @@ document.addEventListener('DOMContentLoaded', async () => {
                 currentTimeDisplay.textContent = formatTime(detailVideo.currentTime);
                 durationDisplay.textContent = formatTime(duration);
                 updateLiveState();
+                updateMaskOverlay();
             }
             timelineAnimationId = requestAnimationFrame(update);
         }
         update();
+    }
+
+    function updateMaskOverlay() {
+        if (!maskOverlayEnabled || !currentDetailCameraId) return;
+
+        const time = detailVideo.currentTime;
+        const seg = currentMotionSegments.find(s => time >= s.start && time <= s.end);
+
+        if (!seg) {
+            if (currentMaskSeq !== null) {
+                maskCtx.clearRect(0, 0, maskOverlay.width, maskOverlay.height);
+                currentMaskSeq = null;
+                maskImage = null;
+            }
+            return;
+        }
+
+        if (seg.sequence === currentMaskSeq || failedMaskSeqs.has(seg.sequence)) {
+            return;
+        }
+
+        currentMaskSeq = seg.sequence;
+        const seq = seg.sequence;
+        const img = new Image();
+        img.onload = () => {
+            if (currentMaskSeq === seq) {
+                maskImage = img;
+                drawMask();
+            }
+        };
+        img.onerror = () => {
+            failedMaskSeqs.add(seq);
+        };
+        img.src = `/api/cameras/${encodeURIComponent(currentDetailCameraId)}/motion/${seq}/mask`;
+    }
+
+    function drawMask() {
+        if (!maskImage) return;
+        const w = detailVideo.clientWidth;
+        const h = detailVideo.clientHeight;
+        if (w === 0 || h === 0) return;
+        if (maskOverlay.width !== w || maskOverlay.height !== h) {
+            maskOverlay.width = w;
+            maskOverlay.height = h;
+        }
+        maskCtx.clearRect(0, 0, w, h);
+        maskCtx.drawImage(maskImage, 0, 0, w, h);
+        // Convert grayscale JPEG to green-tinted alpha mask:
+        // white (foreground) -> green at 60% opacity
+        // black (background) -> fully transparent
+        const imageData = maskCtx.getImageData(0, 0, w, h);
+        const px = imageData.data;
+        for (let i = 0; i < px.length; i += 4) {
+            const brightness = px[i];
+            px[i]     = 0;
+            px[i + 1] = 255;
+            px[i + 2] = 80;
+            px[i + 3] = (brightness / 255) * 153; // 0.6 * 255 = 153
+        }
+        maskCtx.putImageData(imageData, 0, 0);
     }
 
     function updateLiveState() {
@@ -488,5 +576,6 @@ document.addEventListener('DOMContentLoaded', async () => {
         if (bufferDuration > 0) {
             renderTimeline(bufferDuration);
         }
+        drawMask();
     });
 });

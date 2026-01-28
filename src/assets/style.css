@@ -128,6 +128,19 @@ main {
     width: 100%;
 }
 
+#mask-overlay {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    pointer-events: none;
+}
+
+#mask-overlay[hidden] {
+    display: none;
+}
+
 .detail-video-wrapper .loading {
     position: absolute;
     inset: 0;
@@ -237,6 +250,31 @@ main {
     border-radius: 50%;
     border: none;
     cursor: pointer;
+}
+
+.mask-toggle-btn {
+    display: flex;
+    align-items: center;
+    background: transparent;
+    color: #999;
+    border: none;
+    padding: 0.5rem;
+    border-radius: 4px;
+    cursor: pointer;
+    transition: color 0.2s;
+}
+
+.mask-toggle-btn:hover {
+    color: #fff;
+}
+
+.mask-toggle-btn.active {
+    color: var(--color-cream);
+}
+
+.mask-toggle-btn svg {
+    width: 20px;
+    height: 20px;
 }
 
 .live-btn {

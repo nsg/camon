@@ -1,5 +1,6 @@
 use opencv::{
     core::{Mat, Rect, Vector},
+    imgcodecs,
     prelude::*,
     video::{self, BackgroundSubtractorTrait},
     Result as CvResult,
@@ -103,6 +104,16 @@ impl MotionDetector {
         let foreground_ratio = fg_pixels / total_pixels as f32;
 
         Ok((foreground_ratio * 10.0).min(1.0))
+    }
+
+    pub fn fg_mask_jpeg(&self) -> Option<Vec<u8>> {
+        if self.fg_mask.empty() {
+            return None;
+        }
+        let mut buf = Vector::<u8>::new();
+        let params = Vector::<i32>::new();
+        imgcodecs::imencode(".jpg", &self.fg_mask, &mut buf, &params).ok()?;
+        Some(buf.to_vec())
     }
 
     pub fn motion_bbox(&self) -> Option<Rect> {

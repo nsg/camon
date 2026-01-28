@@ -6,6 +6,7 @@ pub struct MotionEntry {
     pub start_time_ns: u64,
     pub end_time_ns: u64,
     pub motion_score: f32,
+    pub mask_jpeg: Option<Vec<u8>>,
 }
 
 pub struct MotionStore {
@@ -44,6 +45,15 @@ impl MotionStore {
             }
             None => Vec::new(),
         }
+    }
+
+    pub fn get_mask(&self, camera_id: &str, segment_sequence: u64) -> Option<Vec<u8>> {
+        let lock = self.cameras.get(camera_id)?;
+        let entries = lock.read().unwrap();
+        entries
+            .iter()
+            .find(|e| e.segment_sequence == segment_sequence)
+            .and_then(|e| e.mask_jpeg.clone())
     }
 
     pub fn cleanup(&self, camera_id: &str, min_sequence: u64) {

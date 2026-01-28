@@ -181,6 +181,7 @@ impl MotionAnalyzer {
             let threshold = self.score_histogram.threshold();
 
             if score >= threshold {
+                let mask_jpeg = self.detector.fg_mask_jpeg();
                 self.motion_store.insert(
                     &self.camera_id,
                     MotionEntry {
@@ -188,6 +189,7 @@ impl MotionAnalyzer {
                         start_time_ns: start_pts,
                         end_time_ns: start_pts + duration_ns,
                         motion_score: score,
+                        mask_jpeg,
                     },
                 );
 

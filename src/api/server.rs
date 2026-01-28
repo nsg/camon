@@ -41,6 +41,7 @@ impl AppState {
 
 #[derive(Serialize)]
 struct MotionSegmentResponse {
+    sequence: u64,
     start: f64,
     end: f64,
     intensity: f32,
@@ -72,6 +73,10 @@ pub async fn start_server(state: AppState, port: u16) -> Result<(), std::io::Err
         .route("/assets/{*path}", get(static_handler))
         .route("/api/cameras", get(cameras_handler))
         .route("/api/cameras/{id}/motion", get(motion_handler))
+        .route(
+            "/api/cameras/{id}/motion/{seq}/mask",
+            get(motion_mask_handler),
+        )
         .route("/api/cameras/{id}/detections", get(detections_handler))
         .route(
             "/api/cameras/{id}/detections/{detection_id}/frame",
@@ -176,6 +181,7 @@ async fn motion_handler(State(state): State<AppState>, Path(id): Path<String>) -
                 let start = start_ns as f64 / 1_000_000_000.0;
                 let end = start + s.duration_ns as f64 / 1_000_000_000.0;
                 Some(MotionSegmentResponse {
+                    sequence: s.segment_sequence,
                     start,
                     end,
                     intensity: s.motion_score,
@@ -221,6 +227,20 @@ async fn detections_handler(State(state): State<AppState>, Path(id): Path<String
     };
 
     axum::Json(response).into_response()
+}
+
+async fn motion_mask_handler(
+    State(state): State<AppState>,
+    Path((id, seq)): Path<(String, u64)>,
+) -> Response {
+    if !state.buffers.contains_key(&id) {
+        return (StatusCode::NOT_FOUND, "camera not found").into_response();
+    }
+
+    match state.motion_store.get_mask(&id, seq) {
+        Some(mask) => ([(header::CONTENT_TYPE, "image/jpeg")], mask).into_response(),
+        None => (StatusCode::NOT_FOUND, "mask not found").into_response(),
+    }
 }
 
 async fn detection_frame_handler(
