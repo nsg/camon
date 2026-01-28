@@ -1,12 +1,15 @@
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 
 use tracing_subscriber::EnvFilter;
 
+mod api;
 mod buffer;
 mod camera;
 mod config;
 
+use api::AppState;
 use buffer::HotBuffer;
 use camera::FfmpegPipeline;
 use config::Config;
@@ -20,14 +23,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::load()?;
     tracing::info!("loaded {} camera(s)", config.cameras.len());
 
+    let http_port = config.http.port;
+
     let shutdown = Arc::new(AtomicBool::new(false));
     let mut handles = Vec::new();
+    let mut buffers_map: HashMap<String, Arc<RwLock<HotBuffer>>> = HashMap::new();
 
     for cam_config in config.cameras {
         let buffer = HotBuffer::new(cam_config.id.clone(), config.buffer.hot_duration_secs);
         let buffer_clone = Arc::clone(&buffer);
         let camera_id = cam_config.id.clone();
         let shutdown_clone = Arc::clone(&shutdown);
+
+        buffers_map.insert(camera_id.clone(), Arc::clone(&buffer));
 
         let handle = tokio::spawn(async move {
             run_camera(cam_config, buffer_clone, shutdown_clone).await;
@@ -36,7 +44,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         handles.push((camera_id, handle, buffer));
     }
 
-    // Wait for Ctrl+C
+    let app_state = AppState::new(buffers_map);
+    let server_handle = tokio::spawn(async move {
+        if let Err(e) = api::start_server(app_state, http_port).await {
+            tracing::error!("HTTP server error: {}", e);
+        }
+    });
+
     tokio::select! {
         _ = async {
             loop {
@@ -49,7 +63,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // Wait for camera tasks to finish
+    server_handle.abort();
+
     for (camera_id, handle, buffer) in handles {
         let _ = handle.await;
         if let Ok(buf) = buffer.read() {
@@ -73,7 +88,6 @@ async fn run_camera(
 ) {
     let camera_id = config.id.clone();
 
-    // Stats logging task
     let buffer_ref = Arc::clone(&buffer);
     let camera_id_clone = camera_id.clone();
     let shutdown_clone = Arc::clone(&shutdown);
@@ -93,7 +107,6 @@ async fn run_camera(
         }
     });
 
-    // Main camera loop with reconnection
     while !shutdown.load(Ordering::Relaxed) {
         tracing::info!(camera = %camera_id, url = %config.url, "connecting to camera");
 
@@ -106,7 +119,6 @@ async fn run_camera(
             }
         };
 
-        // Run ffmpeg in a blocking task
         let shutdown_ref = Arc::clone(&shutdown);
         let camera_id_ref = camera_id.clone();
 

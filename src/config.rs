@@ -30,6 +30,10 @@ fn default_hot_duration() -> u64 {
     600
 }
 
+fn default_http_port() -> u16 {
+    8080
+}
+
 impl Default for BufferConfig {
     fn default() -> Self {
         Self {
@@ -39,9 +43,25 @@ impl Default for BufferConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+pub struct HttpConfig {
+    #[serde(default = "default_http_port")]
+    pub port: u16,
+}
+
+impl Default for HttpConfig {
+    fn default() -> Self {
+        Self {
+            port: default_http_port(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct Config {
     #[serde(default)]
     pub buffer: BufferConfig,
+    #[serde(default)]
+    pub http: HttpConfig,
     #[serde(default)]
     pub cameras: Vec<CameraConfig>,
 }

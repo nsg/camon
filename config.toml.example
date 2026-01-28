@@ -4,6 +4,10 @@
 # Hot buffer duration in seconds (default: 600 = 10 minutes)
 hot_duration_secs = 600
 
+[http]
+# HTTP server port for web UI (default: 8080)
+port = 8080
+
 # Camera configuration
 # Each camera needs an id and url
 

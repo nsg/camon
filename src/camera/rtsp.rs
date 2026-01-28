@@ -33,7 +33,6 @@ impl FfmpegPipeline {
         })
     }
 
-    /// Run the ffmpeg pipeline, blocking until error or shutdown
     pub fn run(&self, shutdown: &std::sync::atomic::AtomicBool) -> Result<(), RtspError> {
         let mut child = self.spawn_ffmpeg()?;
         let stdout = child.stdout.take().ok_or(RtspError::FfmpegFailed(
@@ -44,7 +43,6 @@ impl FfmpegPipeline {
 
         let result = self.process_stream(stdout, shutdown);
 
-        // Clean up child process
         let _ = child.kill();
         let _ = child.wait();
 
@@ -52,9 +50,6 @@ impl FfmpegPipeline {
     }
 
     fn spawn_ffmpeg(&self) -> Result<Child, RtspError> {
-        // Output MPEG-TS format which includes keyframe flags in adaptation field
-        // -fflags +genpts ensures proper timestamps
-        // -rtsp_transport tcp for reliable delivery
         Command::new("ffmpeg")
             .args([
                 "-hide_banner",
@@ -65,13 +60,13 @@ impl FfmpegPipeline {
                 "-i",
                 &self.url,
                 "-c:v",
-                "copy", // No re-encoding
-                "-an",  // No audio
+                "copy",
+                "-an",
                 "-f",
-                "mpegts", // MPEG-TS container with keyframe flags
+                "mpegts",
                 "-mpegts_copyts",
-                "1", // Preserve timestamps
-                "-", // Output to stdout
+                "1",
+                "-",
             ])
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -90,11 +85,8 @@ impl FfmpegPipeline {
         mut reader: R,
         shutdown: &std::sync::atomic::AtomicBool,
     ) -> Result<(), RtspError> {
-        let mut parser = MpegTsParser::new();
-        let mut accumulator = GopAccumulator::new(self.camera_id.clone(), Arc::clone(&self.buffer));
-        let mut buf = [0u8; 188 * 64]; // Read multiple TS packets at once
-
-        let start = Instant::now();
+        let mut segmenter = MpegTsSegmenter::new(self.camera_id.clone(), Arc::clone(&self.buffer));
+        let mut buf = [0u8; 188 * 64];
 
         while !shutdown.load(std::sync::atomic::Ordering::Relaxed) {
             let n = reader.read(&mut buf)?;
@@ -102,213 +94,159 @@ impl FfmpegPipeline {
                 tracing::warn!(camera = %self.camera_id, "ffmpeg stream ended");
                 return Ok(());
             }
-
-            // Parse MPEG-TS packets
-            for frame in parser.parse(&buf[..n]) {
-                let pts_ns = frame
-                    .pts
-                    .map(|p| p * 1_000_000_000 / 90_000)
-                    .unwrap_or_else(|| start.elapsed().as_nanos() as u64);
-                accumulator.handle_frame(&frame.data, pts_ns, frame.is_keyframe);
-            }
+            segmenter.process(&buf[..n]);
         }
 
         Ok(())
     }
 }
 
-/// Accumulates frames into GOP segments
-struct GopAccumulator {
+/// Segments raw MPEG-TS stream based on keyframe detection
+/// Stores raw MPEG-TS packets directly - no re-muxing needed
+struct MpegTsSegmenter {
     camera_id: String,
     buffer: Arc<RwLock<HotBuffer>>,
-    current_gop: Option<GopSegment>,
+    current_segment: Option<GopSegment>,
+    video_pid: Option<u16>,
+    pat_packet: Option<[u8; 188]>,
+    pmt_packet: Option<[u8; 188]>,
+    pmt_pid: Option<u16>,
+    start_time: Instant,
+    partial_packet: Vec<u8>,
 }
 
-impl GopAccumulator {
+impl MpegTsSegmenter {
     fn new(camera_id: String, buffer: Arc<RwLock<HotBuffer>>) -> Self {
         Self {
             camera_id,
             buffer,
-            current_gop: None,
-        }
-    }
-
-    fn handle_frame(&mut self, data: &[u8], pts_ns: u64, is_keyframe: bool) {
-        if is_keyframe {
-            // Finalize and push current GOP
-            if let Some(mut gop) = self.current_gop.take() {
-                gop.finalize(pts_ns);
-                if gop.frame_count > 0 {
-                    if let Ok(mut hot) = self.buffer.write() {
-                        hot.push(gop);
-                    }
-                }
-            }
-            self.current_gop = Some(GopSegment::new(pts_ns));
-            tracing::debug!(camera = %self.camera_id, "keyframe detected, starting new GOP");
-        }
-
-        // Initialize first GOP if needed
-        if self.current_gop.is_none() {
-            self.current_gop = Some(GopSegment::new(pts_ns));
-            tracing::debug!(camera = %self.camera_id, "initializing first GOP");
-        }
-
-        if let Some(ref mut gop) = self.current_gop {
-            gop.append_frame(data, pts_ns);
-        }
-    }
-}
-
-/// MPEG-TS parser that extracts H.264 frames and keyframe flags
-struct MpegTsParser {
-    video_pid: Option<u16>,
-    buffer: Vec<u8>,
-    current_pts: Option<u64>,
-    current_is_keyframe: bool,
-}
-
-struct ParsedFrame {
-    data: Vec<u8>,
-    pts: Option<u64>,
-    is_keyframe: bool,
-}
-
-impl MpegTsParser {
-    fn new() -> Self {
-        Self {
+            current_segment: None,
             video_pid: None,
-            buffer: Vec::new(),
-            current_pts: None,
-            current_is_keyframe: false,
+            pat_packet: None,
+            pmt_packet: None,
+            pmt_pid: None,
+            start_time: Instant::now(),
+            partial_packet: Vec::with_capacity(188),
         }
     }
 
-    fn parse(&mut self, data: &[u8]) -> Vec<ParsedFrame> {
-        let mut frames = Vec::new();
+    fn process(&mut self, data: &[u8]) {
+        // Handle partial packet from previous read
         let mut offset = 0;
+        if !self.partial_packet.is_empty() {
+            let needed = 188 - self.partial_packet.len();
+            if data.len() >= needed {
+                self.partial_packet.extend_from_slice(&data[..needed]);
+                let packet: [u8; 188] = self.partial_packet[..188].try_into().unwrap();
+                self.partial_packet.clear();
+                if packet[0] == 0x47 {
+                    self.process_packet(&packet);
+                }
+                offset = needed;
+            } else {
+                self.partial_packet.extend_from_slice(data);
+                return;
+            }
+        }
 
-        while offset + 188 <= data.len() {
+        // Find sync byte and process aligned packets
+        while offset < data.len() {
+            // Look for sync byte
             if data[offset] != 0x47 {
-                // Sync byte not found, try to resync
                 offset += 1;
                 continue;
             }
 
-            let packet = &data[offset..offset + 188];
-            if let Some(frame) = self.parse_packet(packet) {
-                frames.push(frame);
+            // Check if we have a complete packet
+            if offset + 188 <= data.len() {
+                let packet: &[u8; 188] = data[offset..offset + 188].try_into().unwrap();
+                self.process_packet(packet);
+                offset += 188;
+            } else {
+                // Save partial packet for next read
+                self.partial_packet.extend_from_slice(&data[offset..]);
+                break;
             }
-            offset += 188;
         }
-
-        frames
     }
 
-    fn parse_packet(&mut self, packet: &[u8]) -> Option<ParsedFrame> {
+    fn process_packet(&mut self, packet: &[u8]) {
         let pid = ((packet[1] as u16 & 0x1F) << 8) | packet[2] as u16;
-        let payload_start = (packet[1] & 0x40) != 0;
         let has_adaptation = (packet[3] & 0x20) != 0;
-        let has_payload = (packet[3] & 0x10) != 0;
 
-        // Handle PAT (Program Association Table)
+        // Capture PAT
         if pid == 0 {
+            let mut pat = [0u8; 188];
+            pat.copy_from_slice(packet);
+            self.pat_packet = Some(pat);
             self.parse_pat(packet);
-            return None;
         }
 
-        // Handle PMT (Program Map Table) - we detect video PID here
-        if pid == 0x1000 {
-            // Common PMT PID, but we should get it from PAT
+        // Capture PMT
+        if Some(pid) == self.pmt_pid {
+            let mut pmt = [0u8; 188];
+            pmt.copy_from_slice(packet);
+            self.pmt_packet = Some(pmt);
             self.parse_pmt(packet);
-            return None;
         }
 
-        // Only process video PID
-        let video_pid = self.video_pid.unwrap_or(0x100); // Default video PID
-        if pid != video_pid {
-            // Try common video PIDs if not yet detected
-            if self.video_pid.is_none() && (pid == 0x100 || pid == 0x101 || pid == 0x1011) {
-                self.video_pid = Some(pid);
-            } else {
-                return None;
-            }
-        }
-
-        let mut payload_offset = 4;
-
-        // Parse adaptation field
-        if has_adaptation {
+        // Detect keyframe from random_access_indicator
+        let is_keyframe = if has_adaptation && Some(pid) == self.video_pid {
             let adaptation_len = packet[4] as usize;
             if adaptation_len > 0 && adaptation_len < 184 {
-                let adaptation = &packet[5..5 + adaptation_len.min(183)];
-
-                // Check random_access_indicator (bit 6 of adaptation flags)
-                if !adaptation.is_empty() && (adaptation[0] & 0x40) != 0 {
-                    self.current_is_keyframe = true;
-                }
-
-                // Parse PCR/PTS if present
-                if adaptation.len() >= 6 && (adaptation[0] & 0x10) != 0 {
-                    // PCR present - could extract timing here
-                }
-            }
-            payload_offset = 5 + adaptation_len.min(183);
-        }
-
-        if !has_payload || payload_offset >= 188 {
-            return None;
-        }
-
-        let payload = &packet[payload_offset..188];
-
-        // If payload starts new PES packet
-        if payload_start && payload.len() >= 9 {
-            // Emit previous frame if we have data
-            let result = if !self.buffer.is_empty() {
-                Some(ParsedFrame {
-                    data: std::mem::take(&mut self.buffer),
-                    pts: self.current_pts.take(),
-                    is_keyframe: std::mem::replace(&mut self.current_is_keyframe, false),
-                })
+                (packet[5] & 0x40) != 0
             } else {
-                None
-            };
-
-            // Parse PES header
-            if payload[0] == 0x00 && payload[1] == 0x00 && payload[2] == 0x01 {
-                let stream_id = payload[3];
-
-                // Video stream IDs: 0xE0-0xEF
-                if (0xE0..=0xEF).contains(&stream_id) {
-                    let pes_header_len = payload[8] as usize;
-                    let pts_dts_flags = (payload[7] >> 6) & 0x03;
-
-                    // Extract PTS if present
-                    if pts_dts_flags >= 2 && payload.len() >= 14 {
-                        let pts = self.parse_pts(&payload[9..14]);
-                        self.current_pts = Some(pts);
-                    }
-
-                    // Skip PES header to get to H.264 data
-                    let h264_start = 9 + pes_header_len;
-                    if h264_start < payload.len() {
-                        self.buffer.extend_from_slice(&payload[h264_start..]);
-                    }
-                }
+                false
             }
+        } else {
+            false
+        };
 
-            return result;
+        // Start new segment on keyframe
+        if is_keyframe {
+            let pts_ns = self.start_time.elapsed().as_nanos() as u64;
+            self.finalize_segment(pts_ns);
+            self.start_segment(pts_ns);
         }
 
-        // Continuation of PES packet
-        self.buffer.extend_from_slice(payload);
+        // Append packet to current segment
+        if let Some(ref mut segment) = self.current_segment {
+            segment.data.extend_from_slice(packet);
+            if Some(pid) == self.video_pid {
+                segment.frame_count += 1;
+            }
+        }
+    }
 
-        None
+    fn start_segment(&mut self, pts_ns: u64) {
+        let mut segment = GopSegment::new(pts_ns);
+
+        // Prepend PAT and PMT for segment independence
+        // Reset continuity counters to 0 for clean segment start
+        if let Some(mut pat) = self.pat_packet {
+            pat[3] &= 0xF0; // Reset continuity counter to 0
+            segment.data.extend_from_slice(&pat);
+        }
+        if let Some(mut pmt) = self.pmt_packet {
+            pmt[3] &= 0xF0; // Reset continuity counter to 0
+            segment.data.extend_from_slice(&pmt);
+        }
+
+        self.current_segment = Some(segment);
+    }
+
+    fn finalize_segment(&mut self, end_pts_ns: u64) {
+        if let Some(mut segment) = self.current_segment.take() {
+            segment.finalize(end_pts_ns);
+            if segment.frame_count > 0 {
+                if let Ok(mut hot) = self.buffer.write() {
+                    hot.push(segment);
+                }
+            }
+        }
     }
 
     fn parse_pat(&mut self, packet: &[u8]) {
-        // Simplified PAT parsing - just look for PMT PID
         let payload_offset = if (packet[3] & 0x20) != 0 {
             5 + packet[4] as usize
         } else {
@@ -319,7 +257,6 @@ impl MpegTsParser {
             return;
         }
 
-        // PAT starts with pointer field when payload_unit_start is set
         let start = if (packet[1] & 0x40) != 0 {
             payload_offset + 1 + packet[payload_offset] as usize
         } else {
@@ -330,17 +267,16 @@ impl MpegTsParser {
             return;
         }
 
-        // Skip table header and find first program
         if start + 8 + 4 <= 188 {
             let pmt_pid = ((packet[start + 10] as u16 & 0x1F) << 8) | packet[start + 11] as u16;
-            if pmt_pid != 0 && pmt_pid != 0x1FFF {
-                tracing::trace!(pmt_pid, "found PMT PID in PAT");
+            if pmt_pid != 0 && pmt_pid != 0x1FFF && self.pmt_pid.is_none() {
+                self.pmt_pid = Some(pmt_pid);
+                tracing::debug!(camera = %self.camera_id, pmt_pid, "detected PMT PID");
             }
         }
     }
 
     fn parse_pmt(&mut self, packet: &[u8]) {
-        // Simplified PMT parsing to find video PID
         let payload_offset = if (packet[3] & 0x20) != 0 {
             5 + packet[4] as usize
         } else {
@@ -361,7 +297,6 @@ impl MpegTsParser {
             return;
         }
 
-        // Look for H.264 stream type (0x1B) in program loop
         let program_info_len = ((packet.get(start + 10).copied().unwrap_or(0) as usize & 0x0F)
             << 8)
             | packet.get(start + 11).copied().unwrap_or(0) as usize;
@@ -372,22 +307,14 @@ impl MpegTsParser {
             let elem_pid = ((packet[pos + 1] as u16 & 0x1F) << 8) | packet[pos + 2] as u16;
             let es_info_len = ((packet[pos + 3] as usize & 0x0F) << 8) | packet[pos + 4] as usize;
 
-            // H.264 stream type
+            // H.264 stream type = 0x1B
             if stream_type == 0x1B && self.video_pid.is_none() {
                 self.video_pid = Some(elem_pid);
-                tracing::debug!(video_pid = elem_pid, "detected H.264 video PID");
+                tracing::debug!(camera = %self.camera_id, video_pid = elem_pid, "detected H.264 video PID");
                 break;
             }
 
             pos += 5 + es_info_len;
         }
-    }
-
-    fn parse_pts(&self, data: &[u8]) -> u64 {
-        ((data[0] as u64 >> 1) & 0x07) << 30
-            | (data[1] as u64) << 22
-            | ((data[2] as u64 >> 1) & 0x7F) << 15
-            | (data[3] as u64) << 7
-            | ((data[4] as u64 >> 1) & 0x7F)
     }
 }
