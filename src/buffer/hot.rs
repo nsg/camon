@@ -86,4 +86,9 @@ impl HotBuffer {
     pub fn last_sequence(&self) -> u64 {
         self.first_sequence + self.segments.len() as u64
     }
+
+    /// Get the PTS of the first segment in the buffer
+    pub fn first_pts(&self) -> Option<u64> {
+        self.segments.front().map(|s| s.start_pts)
+    }
 }
