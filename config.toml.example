@@ -16,6 +16,19 @@ sample_fps = 5
 # Minimum score to record a motion segment (default: 0.05)
 motion_threshold = 0.05
 
+# Object detection using YOLO26 (requires motion detection enabled)
+[analytics.object_detection]
+# Enable YOLO26 object detection on motion segments (default: false)
+enabled = true
+# Path or URL to YOLO26 ONNX model file
+# Remote: "https://huggingface.co/onnx-community/yolo26n-ONNX/resolve/main/onnx/model.onnx"
+# Local: "models/yolo26n.onnx"
+model_path = "https://huggingface.co/onnx-community/yolo26n-ONNX/resolve/main/onnx/model.onnx"
+# Minimum confidence threshold (default: 0.5)
+confidence_threshold = 0.5
+# Object classes to detect (default: person, car, truck, dog, cat)
+classes = ["person", "car", "truck", "dog", "cat"]
+
 # Camera configuration
 # Each camera needs an id and url
 
