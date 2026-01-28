@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Camon - Live View</title>
+    <link rel="stylesheet" href="/assets/style.css">
+</head>
+<body>
+    <header>
+        <svg class="logo" viewBox="0 0 24 24" fill="currentColor">
+            <path d="M3 21h18v-2H3v2zm3-4h2V7H6v10zm4 0h4V4h-4v13zm6 0h2v-7h-2v7z"/>
+        </svg>
+        <h1>Camon</h1>
+    </header>
+    <main>
+        <div id="camera-grid"></div>
+        <div id="no-cameras" class="placeholder" hidden>
+            <p>No cameras configured</p>
+        </div>
+    </main>
+    <script src="https://cdn.jsdelivr.net/npm/hls.js@1"></script>
+    <script src="/assets/app.js"></script>
+</body>
+</html>
