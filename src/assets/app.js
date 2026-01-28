@@ -14,6 +14,9 @@ document.addEventListener('DOMContentLoaded', async () => {
     const liveBtn = document.getElementById('live-btn');
     const motionCanvas = document.getElementById('motion-canvas');
     const motionCtx = motionCanvas.getContext('2d');
+    const detectionTooltip = document.getElementById('detection-tooltip');
+    const tooltipImage = document.getElementById('tooltip-image');
+    const tooltipLabel = document.getElementById('tooltip-label');
 
     // State
     let cameras = [];
@@ -24,7 +27,10 @@ document.addEventListener('DOMContentLoaded', async () => {
     let currentView = null;
     let isFirstLoad = true;
     let currentMotionSegments = [];
+    let currentDetections = [];
     let motionPollInterval = null;
+    let detectionPollInterval = null;
+    let currentDetailCameraId = null;
 
     // View transition helper
     function withViewTransition(callback, isBack = false) {
@@ -88,6 +94,27 @@ document.addEventListener('DOMContentLoaded', async () => {
         }
     });
 
+    // Tooltip event listeners (on wrapper since canvas has pointer-events: none)
+    const timelineWrapper = document.querySelector('.timeline-wrapper');
+    timelineWrapper.addEventListener('mousemove', (e) => {
+        if (!detailVideo.duration || !isFinite(detailVideo.duration)) return;
+
+        const rect = timelineWrapper.getBoundingClientRect();
+        const x = e.clientX - rect.left;
+        const time = (x / rect.width) * detailVideo.duration;
+
+        const detection = findDetectionNear(time, 1.0);
+        if (detection && currentDetailCameraId) {
+            showTooltip(e.clientX, e.clientY, detection);
+        } else {
+            hideTooltip();
+        }
+    });
+
+    timelineWrapper.addEventListener('mouseleave', () => {
+        hideTooltip();
+    });
+
     // Router
     function router() {
         const hash = window.location.hash || '#/';
@@ -146,6 +173,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         detailView.hidden = false;
         detailCameraName.textContent = cameraId;
         detailLoading.hidden = false;
+        currentDetailCameraId = cameraId;
 
         // Reset timeline
         timelineScrubber.value = 100;
@@ -166,12 +194,19 @@ document.addEventListener('DOMContentLoaded', async () => {
             clearInterval(motionPollInterval);
             motionPollInterval = null;
         }
+        if (detectionPollInterval) {
+            clearInterval(detectionPollInterval);
+            detectionPollInterval = null;
+        }
         if (detailHls) {
             detailHls.destroy();
             detailHls = null;
         }
         detailVideo.src = '';
         currentMotionSegments = [];
+        currentDetections = [];
+        currentDetailCameraId = null;
+        hideTooltip();
         const rect = motionCanvas.getBoundingClientRect();
         motionCtx.clearRect(0, 0, rect.width, rect.height);
     }
@@ -256,9 +291,10 @@ document.addEventListener('DOMContentLoaded', async () => {
                 detailVideo.play().catch(e => console.error(`Play failed for ${cameraId}:`, e));
                 startTimelineUpdate();
                 fetchMotionSegments(cameraId);
+                fetchDetections(cameraId);
                 detailVideo.addEventListener('durationchange', () => {
                     if (detailVideo.duration && isFinite(detailVideo.duration)) {
-                        renderMotionSegments(detailVideo.duration);
+                        renderTimeline(detailVideo.duration);
                     }
                 }, { once: true });
             });
@@ -287,6 +323,7 @@ document.addEventListener('DOMContentLoaded', async () => {
                 detailVideo.play().catch(e => console.error(`Play failed for ${cameraId}:`, e));
                 startTimelineUpdate();
                 fetchMotionSegments(cameraId);
+                fetchDetections(cameraId);
             }, { once: true });
         } else {
             detailLoading.querySelector('p').textContent = 'HLS not supported';
@@ -325,7 +362,6 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     // Motion segment data fetching
     async function fetchMotionSegments(cameraId) {
-        // Clear any existing poll interval
         if (motionPollInterval) {
             clearInterval(motionPollInterval);
         }
@@ -337,7 +373,7 @@ document.addEventListener('DOMContentLoaded', async () => {
                     const data = await response.json();
                     currentMotionSegments = data.segments || [];
                     if (detailVideo.duration && isFinite(detailVideo.duration)) {
-                        renderMotionSegments(detailVideo.duration);
+                        renderTimeline(detailVideo.duration);
                     }
                 }
             } catch (err) {
@@ -345,46 +381,108 @@ document.addEventListener('DOMContentLoaded', async () => {
             }
         }
 
-        // Fetch immediately, then poll every 5 seconds for updates
         await poll();
         motionPollInterval = setInterval(poll, 5000);
     }
 
-    function renderMotionSegments(duration) {
+    // Detection data fetching
+    async function fetchDetections(cameraId) {
+        if (detectionPollInterval) {
+            clearInterval(detectionPollInterval);
+        }
+
+        async function poll() {
+            try {
+                const response = await fetch(`/api/cameras/${encodeURIComponent(cameraId)}/detections`);
+                if (response.ok) {
+                    const data = await response.json();
+                    currentDetections = data.detections || [];
+                    if (detailVideo.duration && isFinite(detailVideo.duration)) {
+                        renderTimeline(detailVideo.duration);
+                    }
+                }
+            } catch (err) {
+                console.error('Failed to fetch detection data:', err);
+            }
+        }
+
+        await poll();
+        detectionPollInterval = setInterval(poll, 5000);
+    }
+
+    function renderTimeline(duration) {
         if (!duration || !isFinite(duration)) return;
 
-        // Set canvas size to match actual pixel dimensions
         const rect = motionCanvas.getBoundingClientRect();
         const dpr = window.devicePixelRatio || 1;
         motionCanvas.width = rect.width * dpr;
         motionCanvas.height = rect.height * dpr;
         motionCtx.scale(dpr, dpr);
 
-        // Clear canvas
         motionCtx.clearRect(0, 0, rect.width, rect.height);
 
-        // Draw each motion segment
+        // Build set of detection timestamps for overlap checking
+        const detectionTimes = currentDetections.map(d => d.timestamp);
+
+        // Draw motion segments (yellow), skipping areas with object detections
         currentMotionSegments.forEach(segment => {
             const startX = (segment.start / duration) * rect.width;
             const endX = (segment.end / duration) * rect.width;
             const width = endX - startX;
 
-            // Use rust color with intensity-based alpha
-            const alpha = segment.intensity * 0.8;
-            motionCtx.fillStyle = `rgba(170, 80, 66, ${alpha})`; // --color-rust
+            // Check if any detection falls within this segment
+            const hasDetection = detectionTimes.some(t => t >= segment.start && t <= segment.end);
+            if (hasDetection) return;
 
-            // Draw rounded rectangle
+            const alpha = 0.5 + segment.intensity * 0.5;
+            motionCtx.fillStyle = `rgba(255, 200, 50, ${alpha})`;
+
             const radius = 4;
             motionCtx.beginPath();
             motionCtx.roundRect(startX, 0, width, rect.height, radius);
             motionCtx.fill();
         });
+
+        // Draw detection markers (red)
+        currentDetections.forEach(det => {
+            const x = (det.timestamp / duration) * rect.width;
+            const alpha = 0.6 + det.confidence * 0.4;
+            motionCtx.fillStyle = `rgba(220, 50, 50, ${alpha})`;
+            motionCtx.fillRect(x - 2, 0, 4, rect.height);
+        });
+    }
+
+    function findDetectionNear(time, threshold) {
+        let closest = null;
+        let minDist = threshold;
+
+        for (const det of currentDetections) {
+            const dist = Math.abs(det.timestamp - time);
+            if (dist < minDist) {
+                minDist = dist;
+                closest = det;
+            }
+        }
+
+        return closest;
+    }
+
+    function showTooltip(x, y, detection) {
+        tooltipImage.src = `/api/cameras/${encodeURIComponent(currentDetailCameraId)}/detections/${detection.id}/frame`;
+        tooltipLabel.textContent = `${detection.object_class} (${Math.round(detection.confidence * 100)}%)`;
+        detectionTooltip.style.left = `${x + 10}px`;
+        detectionTooltip.style.top = `${y - 170}px`;
+        detectionTooltip.hidden = false;
+    }
+
+    function hideTooltip() {
+        detectionTooltip.hidden = true;
     }
 
     // Handle canvas resize
     window.addEventListener('resize', () => {
         if (detailVideo.duration && isFinite(detailVideo.duration)) {
-            renderMotionSegments(detailVideo.duration);
+            renderTimeline(detailVideo.duration);
         }
     });
 });
