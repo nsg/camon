@@ -14,9 +14,38 @@
         <h1>Camon</h1>
     </header>
     <main>
-        <div id="camera-grid"></div>
-        <div id="no-cameras" class="placeholder" hidden>
-            <p>No cameras configured</p>
+        <!-- Grid View -->
+        <div id="grid-view">
+            <div id="camera-grid"></div>
+            <div id="no-cameras" class="placeholder" hidden>
+                <p>No cameras configured</p>
+            </div>
+        </div>
+
+        <!-- Detail View (hidden by default) -->
+        <div id="detail-view" hidden>
+            <div class="detail-header">
+                <button id="back-btn" class="back-btn">
+                    <svg viewBox="0 0 24 24" fill="currentColor">
+                        <path d="M20 11H7.83l5.59-5.59L12 4l-8 8 8 8 1.41-1.41L7.83 13H20v-2z"/>
+                    </svg>
+                    Back
+                </button>
+                <span id="detail-camera-name" class="detail-camera-name"></span>
+            </div>
+            <div class="detail-video-wrapper">
+                <video id="detail-video" playsinline muted></video>
+                <div id="detail-loading" class="loading"><p>Loading...</p></div>
+            </div>
+            <div class="timeline-controls">
+                <span id="current-time" class="time-display">00:00:00</span>
+                <input type="range" id="timeline-scrubber" min="0" max="100" value="100" step="0.1">
+                <span id="duration" class="time-display">00:00:00</span>
+                <button id="live-btn" class="live-btn">
+                    <span class="live-indicator"></span>
+                    Live
+                </button>
+            </div>
         </div>
     </main>
     <script src="https://cdn.jsdelivr.net/npm/hls.js@1"></script>

@@ -99,3 +99,219 @@ main {
 #no-cameras[hidden] {
     display: none;
 }
+
+/* Grid View */
+#grid-view[hidden] {
+    display: none;
+}
+
+/* Detail View */
+#detail-view[hidden] {
+    display: none;
+}
+
+.detail-header {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    padding: 0.5rem 1rem;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+.detail-video-wrapper {
+    position: relative;
+    background: #000;
+}
+
+.detail-video-wrapper video {
+    display: block;
+    width: 100%;
+}
+
+.detail-video-wrapper .loading {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: #666;
+}
+
+.detail-video-wrapper .loading[hidden] {
+    display: none;
+}
+
+.back-btn {
+    display: flex;
+    align-items: center;
+    gap: 0.25rem;
+    background: none;
+    color: rgba(255, 255, 255, 0.6);
+    border: none;
+    padding: 0.5rem 0;
+    cursor: pointer;
+    font-size: 0.875rem;
+    transition: color 0.2s;
+}
+
+.back-btn:hover {
+    color: #fff;
+}
+
+.back-btn svg {
+    width: 18px;
+    height: 18px;
+}
+
+.detail-camera-name {
+    flex: 1;
+    font-size: 1.25rem;
+    font-weight: 600;
+    color: #fff;
+    text-align: center;
+    padding-right: 3rem;
+}
+
+/* Timeline Controls */
+.timeline-controls {
+    display: flex;
+    align-items: center;
+    gap: 1rem;
+    padding: 0.75rem 1rem;
+}
+
+.time-display {
+    font-family: monospace;
+    font-size: 0.875rem;
+    color: #999;
+    min-width: 70px;
+}
+
+#timeline-scrubber {
+    flex: 1;
+    height: 8px;
+    -webkit-appearance: none;
+    appearance: none;
+    background: rgba(255, 255, 255, 0.2);
+    border-radius: 4px;
+    cursor: pointer;
+}
+
+#timeline-scrubber::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    appearance: none;
+    width: 16px;
+    height: 16px;
+    background: var(--color-cream);
+    border-radius: 50%;
+    cursor: pointer;
+    transition: transform 0.1s;
+}
+
+#timeline-scrubber::-webkit-slider-thumb:hover {
+    transform: scale(1.2);
+}
+
+#timeline-scrubber::-moz-range-thumb {
+    width: 16px;
+    height: 16px;
+    background: var(--color-cream);
+    border-radius: 50%;
+    border: none;
+    cursor: pointer;
+}
+
+.live-btn {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    background: transparent;
+    color: #999;
+    border: none;
+    padding: 0.5rem;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 0.875rem;
+    font-weight: 500;
+    transition: color 0.2s;
+}
+
+.live-btn:hover {
+    color: #fff;
+}
+
+.live-btn.is-live {
+    color: #e74c3c;
+}
+
+.live-indicator {
+    width: 8px;
+    height: 8px;
+    background: currentColor;
+    border-radius: 50%;
+}
+
+.live-btn.is-live .live-indicator {
+    animation: pulse 1.5s ease-in-out infinite;
+}
+
+@keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.5; }
+}
+
+/* Make camera cells clickable */
+.camera-cell {
+    cursor: pointer;
+    transition: transform 0.2s, box-shadow 0.2s;
+}
+
+.camera-cell:hover {
+    transform: scale(1.02);
+    box-shadow: 0 4px 20px rgba(0, 0, 0, 0.5);
+}
+
+/* View Transitions - page swipe */
+::view-transition-old(root),
+::view-transition-new(root) {
+    animation-duration: 300ms;
+    animation-timing-function: cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+/* Forward navigation (grid -> detail): swipe left */
+::view-transition-old(root) {
+    animation-name: swipe-out-left;
+}
+
+::view-transition-new(root) {
+    animation-name: swipe-in-right;
+}
+
+/* Back navigation (detail -> grid): swipe right */
+.swipe-back::view-transition-old(root) {
+    animation-name: swipe-out-right;
+}
+
+.swipe-back::view-transition-new(root) {
+    animation-name: swipe-in-left;
+}
+
+@keyframes swipe-out-left {
+    from { transform: translateX(0); }
+    to { transform: translateX(-100%); }
+}
+
+@keyframes swipe-in-right {
+    from { transform: translateX(100%); }
+    to { transform: translateX(0); }
+}
+
+@keyframes swipe-out-right {
+    from { transform: translateX(0); }
+    to { transform: translateX(100%); }
+}
+
+@keyframes swipe-in-left {
+    from { transform: translateX(-100%); }
+    to { transform: translateX(0); }
+}
