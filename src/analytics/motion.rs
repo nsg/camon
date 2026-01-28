@@ -1,15 +1,9 @@
 use opencv::{
-    core::{Mat, Rect, Vector},
-    imgproc,
+    core::Mat,
     prelude::*,
     video::{self, BackgroundSubtractorTrait},
     Result as CvResult,
 };
-
-pub struct MotionScore {
-    pub score: f32,
-    pub regions: Vec<Rect>,
-}
 
 const HISTOGRAM_BUCKETS: usize = 100;
 const MIN_SAMPLES_FOR_THRESHOLD: u64 = 1000;
@@ -85,10 +79,7 @@ impl MotionDetector {
         })
     }
 
-    pub fn process_frame(
-        &mut self,
-        frame: &impl opencv::core::ToInputArray,
-    ) -> CvResult<MotionScore> {
+    pub fn process_frame(&mut self, frame: &impl opencv::core::ToInputArray) -> CvResult<f32> {
         BackgroundSubtractorTrait::apply(
             &mut self.mog2,
             frame,
@@ -100,52 +91,17 @@ impl MotionDetector {
 
         // During warmup, return zero score to let background model stabilize
         if self.frames_processed < WARMUP_FRAMES {
-            return Ok(MotionScore {
-                score: 0.0,
-                regions: Vec::new(),
-            });
+            return Ok(0.0);
         }
 
         let total_pixels = self.fg_mask.rows() * self.fg_mask.cols();
         if total_pixels == 0 {
-            return Ok(MotionScore {
-                score: 0.0,
-                regions: Vec::new(),
-            });
+            return Ok(0.0);
         }
 
         let fg_pixels = opencv::core::count_non_zero(&self.fg_mask)? as f32;
         let foreground_ratio = fg_pixels / total_pixels as f32;
 
-        let score = (foreground_ratio * 10.0).min(1.0);
-
-        let regions = self.find_motion_regions()?;
-
-        Ok(MotionScore { score, regions })
-    }
-
-    fn find_motion_regions(&self) -> CvResult<Vec<Rect>> {
-        let mut contours: Vector<Vector<opencv::core::Point>> = Vector::new();
-        imgproc::find_contours(
-            &self.fg_mask,
-            &mut contours,
-            imgproc::RETR_EXTERNAL,
-            imgproc::CHAIN_APPROX_SIMPLE,
-            opencv::core::Point::new(0, 0),
-        )?;
-
-        let mut regions = Vec::new();
-        let min_area = 500.0;
-
-        for i in 0..contours.len() {
-            let contour = contours.get(i)?;
-            let area = imgproc::contour_area(&contour, false)?;
-            if area >= min_area {
-                let rect = imgproc::bounding_rect(&contour)?;
-                regions.push(rect);
-            }
-        }
-
-        Ok(regions)
+        Ok((foreground_ratio * 10.0).min(1.0))
     }
 }

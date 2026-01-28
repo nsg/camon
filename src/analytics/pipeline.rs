@@ -205,7 +205,7 @@ impl MotionAnalyzer {
 
             match self.detector.process_frame(&mat) {
                 Ok(score) => {
-                    total_score += score.score;
+                    total_score += score;
                     frame_count += 1;
                 }
                 Err(e) => {

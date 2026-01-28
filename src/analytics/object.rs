@@ -89,12 +89,7 @@ const COCO_CLASSES: [&str; 80] = [
 #[derive(Debug, Clone)]
 pub struct Detection {
     pub class_name: String,
-    pub class_id: usize,
     pub confidence: f32,
-    pub x: f32,
-    pub y: f32,
-    pub width: f32,
-    pub height: f32,
 }
 
 pub struct ObjectDetector {
@@ -138,37 +133,24 @@ impl ObjectDetector {
             return Ok(Vec::new());
         }
 
-        let (input_tensor, scale, pad_x, pad_y) = self.preprocess(frame)?;
+        let input_tensor = self.preprocess(frame)?;
 
         let tensor_ref = TensorRef::from_array_view(input_tensor.view())?.into_dyn();
         let outputs = self.session.run(ort::inputs![tensor_ref])?;
 
         // YOLO26 format: separate "logits" and "pred_boxes" outputs
-        let (Some(logits_val), Some(boxes_val)) =
-            (outputs.get("logits"), outputs.get("pred_boxes"))
-        else {
-            return Err(
-                "Unsupported model format: expected YOLO26 with 'logits' and 'pred_boxes' outputs"
-                    .into(),
-            );
+        let Some(logits_val) = outputs.get("logits") else {
+            return Err("Unsupported model format: expected YOLO26 with 'logits' output".into());
         };
 
         let logits = logits_val.try_extract_array::<f32>()?;
-        let boxes = boxes_val.try_extract_array::<f32>()?;
         let logits_owned = logits.to_owned();
-        let boxes_owned = boxes.to_owned();
         drop(outputs);
 
         let detections = Self::postprocess_yolo26(
             &logits_owned.view(),
-            &boxes_owned.view(),
             self.confidence_threshold,
             &self.allowed_classes,
-            scale,
-            pad_x,
-            pad_y,
-            cols as f32,
-            rows as f32,
         )?;
 
         Ok(detections)
@@ -177,7 +159,7 @@ impl ObjectDetector {
     fn preprocess(
         &self,
         frame: &opencv::core::Mat,
-    ) -> Result<(Array4<f32>, f32, f32, f32), Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<Array4<f32>, Box<dyn std::error::Error + Send + Sync>> {
         use opencv::core::{Mat, Size, BORDER_CONSTANT};
         use opencv::imgproc;
         use opencv::prelude::*;
@@ -200,17 +182,17 @@ impl ObjectDetector {
             imgproc::INTER_LINEAR,
         )?;
 
-        let pad_x = ((input_size as i32 - new_w) / 2) as f32;
-        let pad_y = ((input_size as i32 - new_h) / 2) as f32;
+        let pad_x = (input_size as i32 - new_w) / 2;
+        let pad_y = (input_size as i32 - new_h) / 2;
 
         let mut padded = Mat::default();
         opencv::core::copy_make_border(
             &resized,
             &mut padded,
-            pad_y as i32,
-            input_size as i32 - new_h - pad_y as i32,
-            pad_x as i32,
-            input_size as i32 - new_w - pad_x as i32,
+            pad_y,
+            input_size as i32 - new_h - pad_y,
+            pad_x,
+            input_size as i32 - new_w - pad_x,
             BORDER_CONSTANT,
             opencv::core::Scalar::new(114.0, 114.0, 114.0, 0.0),
         )?;
@@ -235,25 +217,18 @@ impl ObjectDetector {
             }
         }
 
-        Ok((tensor, scale, pad_x, pad_y))
+        Ok(tensor)
     }
 
     fn postprocess_yolo26(
         logits: &ArrayViewD<f32>,
-        boxes: &ArrayViewD<f32>,
         confidence_threshold: f32,
         allowed_classes: &[String],
-        scale: f32,
-        pad_x: f32,
-        pad_y: f32,
-        orig_w: f32,
-        orig_h: f32,
     ) -> Result<Vec<Detection>, Box<dyn std::error::Error + Send + Sync>> {
         let logits_shape = logits.shape();
-        let boxes_shape = boxes.shape();
 
-        // Expected shapes: logits [1, 300, 80], boxes [1, 300, 4]
-        if logits_shape.len() < 2 || boxes_shape.len() < 2 {
+        // Expected shape: logits [1, 300, 80]
+        if logits_shape.len() < 2 {
             return Ok(Vec::new());
         }
 
@@ -269,9 +244,6 @@ impl ObjectDetector {
         };
 
         let logits_flat = logits.as_slice().ok_or("Cannot get logits slice")?;
-        let boxes_flat = boxes.as_slice().ok_or("Cannot get boxes slice")?;
-
-        let input_size = YOLO_INPUT_SIZE as f32;
         let mut detections = Vec::new();
 
         for i in 0..num_detections {
@@ -302,32 +274,9 @@ impl ObjectDetector {
                 continue;
             }
 
-            // Box format: (cx, cy, w, h) normalized to [0, 1]
-            let cx = boxes_flat[i * 4] * input_size;
-            let cy = boxes_flat[i * 4 + 1] * input_size;
-            let w = boxes_flat[i * 4 + 2] * input_size;
-            let h = boxes_flat[i * 4 + 3] * input_size;
-
-            // Convert to original image coordinates
-            let x = ((cx - w / 2.0) - pad_x) / scale;
-            let y = ((cy - h / 2.0) - pad_y) / scale;
-            let det_w = w / scale;
-            let det_h = h / scale;
-
-            // Clamp to image bounds
-            let x = x.max(0.0).min(orig_w);
-            let y = y.max(0.0).min(orig_h);
-            let det_w = det_w.min(orig_w - x);
-            let det_h = det_h.min(orig_h - y);
-
             detections.push(Detection {
                 class_name,
-                class_id: max_class,
                 confidence: max_score,
-                x,
-                y,
-                width: det_w,
-                height: det_h,
             });
         }
 
