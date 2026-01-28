@@ -81,4 +81,9 @@ impl HotBuffer {
     pub fn first_sequence(&self) -> u64 {
         self.first_sequence
     }
+
+    /// Get the sequence number of the last segment in the buffer (exclusive)
+    pub fn last_sequence(&self) -> u64 {
+        self.first_sequence + self.segments.len() as u64
+    }
 }

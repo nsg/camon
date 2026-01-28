@@ -56,12 +56,42 @@ impl Default for HttpConfig {
     }
 }
 
+fn default_sample_fps() -> u32 {
+    5
+}
+
+fn default_motion_threshold() -> f32 {
+    0.05
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AnalyticsConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_sample_fps")]
+    pub sample_fps: u32,
+    #[serde(default = "default_motion_threshold")]
+    pub motion_threshold: f32,
+}
+
+impl Default for AnalyticsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            sample_fps: default_sample_fps(),
+            motion_threshold: default_motion_threshold(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
     #[serde(default)]
     pub buffer: BufferConfig,
     #[serde(default)]
     pub http: HttpConfig,
+    #[serde(default)]
+    pub analytics: AnalyticsConfig,
     #[serde(default)]
     pub cameras: Vec<CameraConfig>,
 }

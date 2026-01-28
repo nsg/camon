@@ -8,6 +8,14 @@ hot_duration_secs = 600
 # HTTP server port for web UI (default: 8080)
 port = 8080
 
+[analytics]
+# Enable MOG2 motion detection (default: false)
+enabled = true
+# Frame sample rate for analysis (default: 5)
+sample_fps = 5
+# Minimum score to record a motion segment (default: 0.05)
+motion_threshold = 0.05
+
 # Camera configuration
 # Each camera needs an id and url
 

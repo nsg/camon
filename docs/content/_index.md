@@ -42,9 +42,9 @@ Camera disconnections are handled with automatic reconnection after a 5-second d
 
 ## System Dependencies
 
-Build requires OpenCV development headers. Runtime requires FFmpeg for RTSP ingestion and H.264 handling. On Ubuntu/Debian:
+Build requires OpenCV and Clang development headers. Runtime requires FFmpeg for RTSP ingestion, H.264 handling, and motion analysis frame decoding. On Ubuntu/Debian:
 
-**Build:** `libopencv-dev`
+**Build:** `libopencv-dev`, `clang`, `libclang-dev`, `cmake`
 
 **Runtime:** `ffmpeg`
 

@@ -4,15 +4,18 @@ use std::sync::{Arc, RwLock};
 
 use tracing_subscriber::EnvFilter;
 
+mod analytics;
 mod api;
 mod buffer;
 mod camera;
 mod config;
+mod storage;
 
 use api::AppState;
 use buffer::HotBuffer;
 use camera::FfmpegPipeline;
 use config::Config;
+use storage::MotionStore;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -24,9 +27,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("loaded {} camera(s)", config.cameras.len());
 
     let http_port = config.http.port;
+    let camera_ids: Vec<String> = config.cameras.iter().map(|c| c.id.clone()).collect();
+    let motion_store = MotionStore::new(&camera_ids);
 
     let shutdown = Arc::new(AtomicBool::new(false));
     let mut handles = Vec::new();
+    let mut analyzer_handles = Vec::new();
     let mut buffers_map: HashMap<String, Arc<RwLock<HotBuffer>>> = HashMap::new();
 
     for cam_config in config.cameras {
@@ -41,10 +47,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             run_camera(cam_config, buffer_clone, shutdown_clone).await;
         });
 
-        handles.push((camera_id, handle, buffer));
+        handles.push((camera_id.clone(), handle, Arc::clone(&buffer)));
+
+        // Spawn motion analyzer if analytics is enabled
+        if config.analytics.enabled {
+            let analyzer_handle = analytics::spawn_analyzer(
+                camera_id,
+                buffer,
+                motion_store.clone(),
+                config.analytics.clone(),
+                Arc::clone(&shutdown),
+            );
+            analyzer_handles.push(analyzer_handle);
+        }
     }
 
-    let app_state = AppState::new(buffers_map);
+    let app_state = AppState::new(buffers_map, motion_store, config.analytics.motion_threshold);
     let server_handle = tokio::spawn(async move {
         if let Err(e) = api::start_server(app_state, http_port).await {
             tracing::error!("HTTP server error: {}", e);
@@ -64,6 +82,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     server_handle.abort();
+
+    // Wait for analyzer handles
+    for handle in analyzer_handles {
+        handle.abort();
+    }
 
     for (camera_id, handle, buffer) in handles {
         let _ = handle.await;

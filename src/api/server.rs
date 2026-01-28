@@ -7,8 +7,10 @@ use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
 use rust_embed::Embed;
+use serde::Serialize;
 
 use crate::buffer::HotBuffer;
+use crate::storage::MotionStore;
 
 use super::hls;
 
@@ -19,14 +21,34 @@ struct Assets;
 #[derive(Clone)]
 pub struct AppState {
     pub buffers: Arc<HashMap<String, Arc<RwLock<HotBuffer>>>>,
+    pub motion_store: MotionStore,
+    pub motion_threshold: f32,
 }
 
 impl AppState {
-    pub fn new(buffers: HashMap<String, Arc<RwLock<HotBuffer>>>) -> Self {
+    pub fn new(
+        buffers: HashMap<String, Arc<RwLock<HotBuffer>>>,
+        motion_store: MotionStore,
+        motion_threshold: f32,
+    ) -> Self {
         Self {
             buffers: Arc::new(buffers),
+            motion_store,
+            motion_threshold,
         }
     }
+}
+
+#[derive(Serialize)]
+struct MotionSegmentResponse {
+    start: f64,
+    end: f64,
+    intensity: f32,
+}
+
+#[derive(Serialize)]
+struct MotionResponse {
+    segments: Vec<MotionSegmentResponse>,
 }
 
 pub async fn start_server(state: AppState, port: u16) -> Result<(), std::io::Error> {
@@ -34,6 +56,7 @@ pub async fn start_server(state: AppState, port: u16) -> Result<(), std::io::Err
         .route("/", get(index_handler))
         .route("/assets/{*path}", get(static_handler))
         .route("/api/cameras", get(cameras_handler))
+        .route("/api/cameras/{id}/motion", get(motion_handler))
         .route("/api/stream/{id}/playlist.m3u8", get(playlist_handler))
         .route("/api/stream/{id}/segment/{n}", get(segment_handler))
         .with_state(state);
@@ -105,4 +128,26 @@ async fn segment_handler(
         },
         None => (StatusCode::NOT_FOUND, "camera not found").into_response(),
     }
+}
+
+async fn motion_handler(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+    if !state.buffers.contains_key(&id) {
+        return (StatusCode::NOT_FOUND, "camera not found").into_response();
+    }
+
+    let segments = state.motion_store.get_motion(&id, state.motion_threshold);
+    let base_time = segments.first().map(|s| s.start_time_ns).unwrap_or(0);
+
+    let response = MotionResponse {
+        segments: segments
+            .iter()
+            .map(|s| MotionSegmentResponse {
+                start: (s.start_time_ns - base_time) as f64 / 1_000_000_000.0,
+                end: (s.end_time_ns - base_time) as f64 / 1_000_000_000.0,
+                intensity: s.motion_score,
+            })
+            .collect(),
+    };
+
+    axum::Json(response).into_response()
 }
