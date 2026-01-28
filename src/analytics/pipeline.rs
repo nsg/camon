@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::thread;
@@ -27,6 +28,18 @@ const MOTION_PERCENTILE: f32 = 0.90;
 const DEFAULT_MOTION_THRESHOLD: f32 = 0.05;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
+
+struct MotionSegment {
+    seq: u64,
+    data: Vec<u8>,
+    duration_ns: u64,
+}
+
+struct SegmentDetectionResult {
+    classes: Vec<String>,
+    confidences: Vec<f32>,
+    frame_jpeg: Vec<u8>,
+}
 
 pub struct MotionAnalyzer {
     camera_id: String,
@@ -157,6 +170,10 @@ impl MotionAnalyzer {
             segments
         };
 
+        let has_detection = self.object_detector.is_some() && self.detection_store.is_some();
+        let mut motion_segments = Vec::new();
+
+        // Phase 1: Motion analysis
         for (seq, data, start_pts, duration_ns) in segments_to_process {
             let score = self.analyze_segment(&data, duration_ns)?;
 
@@ -183,12 +200,21 @@ impl MotionAnalyzer {
                     "motion detected"
                 );
 
-                if self.object_detector.is_some() && self.detection_store.is_some() {
-                    self.run_object_detection(&data, seq, duration_ns);
+                if has_detection {
+                    motion_segments.push(MotionSegment {
+                        seq,
+                        data,
+                        duration_ns,
+                    });
                 }
             }
 
             self.last_processed = seq + 1;
+        }
+
+        // Phase 2: Sampled object detection
+        if !motion_segments.is_empty() {
+            self.run_sampled_detections(motion_segments);
         }
 
         Ok(())
@@ -237,19 +263,12 @@ impl MotionAnalyzer {
         Ok(total_score / frame_count as f32)
     }
 
-    fn run_object_detection(&mut self, data: &[u8], seq: u64, duration_ns: u64) {
-        let crop_decoder = match &self.crop_decoder {
-            Some(d) => d,
-            None => return,
-        };
-        let detection_store = match &self.detection_store {
-            Some(s) => s,
-            None => return,
-        };
+    fn detect_segment(&mut self, data: &[u8], duration_ns: u64) -> Option<SegmentDetectionResult> {
+        let crop_decoder = self.crop_decoder.as_ref()?;
 
         let raw_frames = crop_decoder.decode_segment(data, duration_ns);
         if raw_frames.is_empty() {
-            return;
+            return None;
         }
 
         let height = crop_decoder.height() as i32;
@@ -293,7 +312,7 @@ impl MotionAnalyzer {
 
             let object_detector = match &mut self.object_detector {
                 Some(d) => d,
-                None => return,
+                None => return None,
             };
 
             let detections = match object_detector.detect(&detection_input) {
@@ -313,22 +332,133 @@ impl MotionAnalyzer {
                 None => continue,
             };
 
+            let mut classes = Vec::with_capacity(detections.len());
+            let mut confidences = Vec::with_capacity(detections.len());
             for det in detections {
-                detection_store.insert(
-                    &self.camera_id,
-                    seq,
-                    det.class_name.clone(),
-                    det.confidence,
-                    frame_jpeg.clone(),
-                );
+                classes.push(det.class_name);
+                confidences.push(det.confidence);
+            }
+
+            return Some(SegmentDetectionResult {
+                classes,
+                confidences,
+                frame_jpeg,
+            });
+        }
+
+        None
+    }
+
+    fn store_detection_result(&self, seq: u64, result: &SegmentDetectionResult) {
+        let detection_store = match &self.detection_store {
+            Some(s) => s,
+            None => return,
+        };
+
+        for (class, &confidence) in result.classes.iter().zip(&result.confidences) {
+            detection_store.insert(
+                &self.camera_id,
+                seq,
+                class.clone(),
+                confidence,
+                result.frame_jpeg.clone(),
+            );
+
+            tracing::debug!(
+                camera = %self.camera_id,
+                sequence = seq,
+                class = %class,
+                confidence = format!("{:.2}", confidence),
+                "object detected"
+            );
+        }
+    }
+
+    fn run_sampled_detections(&mut self, segments: Vec<MotionSegment>) {
+        let runs = group_contiguous_runs(segments);
+        for run in runs {
+            self.detect_run(run);
+        }
+    }
+
+    fn detect_run(&mut self, run: Vec<MotionSegment>) {
+        let len = run.len();
+        if len <= 2 {
+            for seg in &run {
+                if let Some(result) = self.detect_segment(&seg.data, seg.duration_ns) {
+                    self.store_detection_result(seg.seq, &result);
+                }
+            }
+            return;
+        }
+
+        let first_result = self.detect_segment(&run[0].data, run[0].duration_ns);
+        let last_result = self.detect_segment(&run[len - 1].data, run[len - 1].duration_ns);
+
+        let boundaries_agree = match (&first_result, &last_result) {
+            (Some(first), Some(last)) => {
+                let first_classes: BTreeSet<&str> =
+                    first.classes.iter().map(|s| s.as_str()).collect();
+                let last_classes: BTreeSet<&str> =
+                    last.classes.iter().map(|s| s.as_str()).collect();
+                first_classes == last_classes
+            }
+            _ => false,
+        };
+
+        if boundaries_agree {
+            let first_result = first_result.unwrap();
+            let last_result = last_result.unwrap();
+
+            self.store_detection_result(run[0].seq, &first_result);
+            self.store_detection_result(run[len - 1].seq, &last_result);
+
+            let min_confidences: Vec<f32> = first_result
+                .confidences
+                .iter()
+                .zip(&last_result.confidences)
+                .map(|(&a, &b)| a.min(b))
+                .collect();
+
+            let mid = len / 2;
+            for (i, seg) in run.iter().enumerate().take(len - 1).skip(1) {
+                let nearest = if i <= mid {
+                    &first_result
+                } else {
+                    &last_result
+                };
+
+                let propagated = SegmentDetectionResult {
+                    classes: first_result.classes.clone(),
+                    confidences: min_confidences.clone(),
+                    frame_jpeg: nearest.frame_jpeg.clone(),
+                };
+
+                self.store_detection_result(seg.seq, &propagated);
 
                 tracing::debug!(
                     camera = %self.camera_id,
-                    sequence = seq,
-                    class = %det.class_name,
-                    confidence = format!("{:.2}", det.confidence),
-                    "object detected"
+                    sequence = seg.seq,
+                    "detection propagated from boundary"
                 );
+            }
+        } else {
+            // Boundaries disagree or empty — split in half and recurse
+            if let Some(result) = first_result {
+                self.store_detection_result(run[0].seq, &result);
+            }
+            if let Some(result) = last_result {
+                self.store_detection_result(run[len - 1].seq, &result);
+            }
+
+            let mut inner: Vec<MotionSegment> = run.into_iter().skip(1).collect();
+            inner.pop(); // remove last (already stored)
+
+            if !inner.is_empty() {
+                let mid = inner.len() / 2;
+                let right = inner.split_off(mid);
+                self.detect_run(inner);
+                self.detect_run(right);
             }
         }
     }
@@ -336,7 +466,6 @@ impl MotionAnalyzer {
     fn crop_region(&self) -> Option<Rect> {
         let bbox = self.last_motion_bbox?;
 
-        // Scale motion bbox from analysis coords to crop decode coords
         let scale_x = CROP_DECODE_WIDTH as f32 / ANALYSIS_WIDTH as f32;
         let scale_y = CROP_DECODE_HEIGHT as f32 / ANALYSIS_HEIGHT as f32;
 
@@ -346,17 +475,37 @@ impl MotionAnalyzer {
         let scaled_w = (bbox.width as f32 * scale_x) as i32;
         let scaled_h = (bbox.height as f32 * scale_y) as i32;
 
-        // If motion is larger than detection size, fall back to full-frame resize
         if scaled_w > DETECTION_WIDTH || scaled_h > DETECTION_HEIGHT {
             return None;
         }
 
-        // Center a DETECTION_WIDTH x DETECTION_HEIGHT rect on the motion center, clamped to frame
         let x = (center_x - DETECTION_WIDTH / 2).clamp(0, CROP_DECODE_WIDTH - DETECTION_WIDTH);
         let y = (center_y - DETECTION_HEIGHT / 2).clamp(0, CROP_DECODE_HEIGHT - DETECTION_HEIGHT);
 
         Some(Rect::new(x, y, DETECTION_WIDTH, DETECTION_HEIGHT))
     }
+}
+
+fn group_contiguous_runs(segments: Vec<MotionSegment>) -> Vec<Vec<MotionSegment>> {
+    let mut runs: Vec<Vec<MotionSegment>> = Vec::new();
+
+    for seg in segments {
+        let start_new = match runs.last() {
+            Some(run) => {
+                let last_seq = run.last().unwrap().seq;
+                seg.seq != last_seq + 1
+            }
+            None => true,
+        };
+
+        if start_new {
+            runs.push(vec![seg]);
+        } else {
+            runs.last_mut().unwrap().push(seg);
+        }
+    }
+
+    runs
 }
 
 fn encode_jpeg(mat: &Mat) -> Option<Vec<u8>> {
