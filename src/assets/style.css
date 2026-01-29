@@ -252,6 +252,31 @@ main {
     cursor: pointer;
 }
 
+.mute-toggle-btn {
+    display: flex;
+    align-items: center;
+    background: transparent;
+    color: #999;
+    border: none;
+    padding: 0.5rem;
+    border-radius: 4px;
+    cursor: pointer;
+    transition: color 0.2s;
+}
+
+.mute-toggle-btn:hover {
+    color: #fff;
+}
+
+.mute-toggle-btn.muted {
+    color: var(--color-rust);
+}
+
+.mute-toggle-btn svg {
+    width: 20px;
+    height: 20px;
+}
+
 .mask-toggle-btn {
     display: flex;
     align-items: center;
@@ -370,6 +395,72 @@ main {
 @keyframes swipe-in-left {
     from { transform: translateX(-100%); }
     to { transform: translateX(0); }
+}
+
+/* Detection Gallery */
+#detection-gallery {
+    display: flex;
+    overflow-x: auto;
+    gap: 0.75rem;
+    padding: 0.75rem 1rem;
+}
+
+#detection-gallery:empty {
+    display: none;
+}
+
+#detection-gallery::-webkit-scrollbar {
+    height: 6px;
+}
+
+#detection-gallery::-webkit-scrollbar-track {
+    background: transparent;
+}
+
+#detection-gallery::-webkit-scrollbar-thumb {
+    background: rgba(255, 255, 255, 0.2);
+    border-radius: 3px;
+}
+
+.detection-card {
+    flex-shrink: 0;
+    background: var(--color-dark);
+    border: 1px solid var(--color-burgundy);
+    border-radius: 8px;
+    padding: 6px;
+    cursor: pointer;
+    transition: border-color 0.2s, transform 0.2s;
+    width: 140px;
+}
+
+.detection-card:hover {
+    border-color: var(--color-cream);
+    transform: scale(1.05);
+}
+
+.detection-card img {
+    width: 100%;
+    aspect-ratio: 4 / 3;
+    object-fit: cover;
+    border-radius: 4px;
+    display: block;
+    background: #000;
+}
+
+.detection-card .det-label {
+    color: var(--color-cream);
+    font-size: 0.75rem;
+    margin-top: 4px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.detection-card .det-time {
+    color: #999;
+    font-family: monospace;
+    font-size: 0.6875rem;
+    margin-top: 2px;
 }
 
 /* Detection Tooltip */

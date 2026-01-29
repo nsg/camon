@@ -61,7 +61,8 @@ impl FfmpegPipeline {
                 &self.url,
                 "-c:v",
                 "copy",
-                "-an",
+                "-c:a",
+                "copy",
                 "-f",
                 "mpegts",
                 "-mpegts_copyts",
@@ -108,6 +109,7 @@ struct MpegTsSegmenter {
     buffer: Arc<RwLock<HotBuffer>>,
     current_segment: Option<GopSegment>,
     video_pid: Option<u16>,
+    audio_pid: Option<u16>,
     pat_packet: Option<[u8; 188]>,
     pmt_packet: Option<[u8; 188]>,
     pmt_pid: Option<u16>,
@@ -122,6 +124,7 @@ impl MpegTsSegmenter {
             buffer,
             current_segment: None,
             video_pid: None,
+            audio_pid: None,
             pat_packet: None,
             pmt_packet: None,
             pmt_pid: None,
@@ -311,7 +314,14 @@ impl MpegTsSegmenter {
             if stream_type == 0x1B && self.video_pid.is_none() {
                 self.video_pid = Some(elem_pid);
                 tracing::debug!(camera = %self.camera_id, video_pid = elem_pid, "detected H.264 video PID");
-                break;
+            }
+
+            // AAC audio stream types: 0x0F (MPEG-2 AAC), 0x11 (MPEG-4 AAC), 0x81 (AC-3)
+            if (stream_type == 0x0F || stream_type == 0x11 || stream_type == 0x81)
+                && self.audio_pid.is_none()
+            {
+                self.audio_pid = Some(elem_pid);
+                tracing::debug!(camera = %self.camera_id, audio_pid = elem_pid, stream_type, "detected audio PID");
             }
 
             pos += 5 + es_info_len;
