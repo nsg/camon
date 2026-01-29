@@ -1,7 +1,7 @@
 use std::io::Read;
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, RwLock};
-use std::time::Instant;
+use std::time::SystemTime;
 
 use thiserror::Error;
 
@@ -113,7 +113,6 @@ struct MpegTsSegmenter {
     pat_packet: Option<[u8; 188]>,
     pmt_packet: Option<[u8; 188]>,
     pmt_pid: Option<u16>,
-    start_time: Instant,
     partial_packet: Vec<u8>,
 }
 
@@ -128,7 +127,6 @@ impl MpegTsSegmenter {
             pat_packet: None,
             pmt_packet: None,
             pmt_pid: None,
-            start_time: Instant::now(),
             partial_packet: Vec::with_capacity(188),
         }
     }
@@ -207,7 +205,10 @@ impl MpegTsSegmenter {
 
         // Start new segment on keyframe
         if is_keyframe {
-            let pts_ns = self.start_time.elapsed().as_nanos() as u64;
+            let pts_ns = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos() as u64;
             self.finalize_segment(pts_ns);
             self.start_segment(pts_ns);
         }
