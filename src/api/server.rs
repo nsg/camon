@@ -1,16 +1,16 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{header, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
 use rust_embed::Embed;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::buffer::HotBuffer;
-use crate::storage::{DetectionStore, MotionStore};
+use crate::storage::{DetectionStore, MotionStore, WarmEventIndex};
 
 use super::hls;
 
@@ -23,6 +23,7 @@ pub struct AppState {
     pub buffers: Arc<HashMap<String, Arc<RwLock<HotBuffer>>>>,
     pub motion_store: MotionStore,
     pub detection_store: DetectionStore,
+    pub warm_index: Option<WarmEventIndex>,
 }
 
 impl AppState {
@@ -30,11 +31,13 @@ impl AppState {
         buffers: HashMap<String, Arc<RwLock<HotBuffer>>>,
         motion_store: MotionStore,
         detection_store: DetectionStore,
+        warm_index: Option<WarmEventIndex>,
     ) -> Self {
         Self {
             buffers: Arc::new(buffers),
             motion_store,
             detection_store,
+            warm_index,
         }
     }
 }
@@ -81,6 +84,15 @@ pub async fn start_server(state: AppState, port: u16) -> Result<(), std::io::Err
         .route(
             "/api/cameras/{id}/detections/{detection_id}/frame",
             get(detection_frame_handler),
+        )
+        .route("/api/cameras/{id}/events", get(warm_events_handler))
+        .route(
+            "/api/cameras/{id}/events/{start_pts}/playlist.m3u8",
+            get(warm_playlist_handler),
+        )
+        .route(
+            "/api/cameras/{id}/events/{start_pts}/segment",
+            get(warm_segment_handler),
         )
         .route("/api/stream/{id}/playlist.m3u8", get(playlist_handler))
         .route("/api/stream/{id}/segment/{n}", get(segment_handler))
@@ -254,5 +266,120 @@ async fn detection_frame_handler(
     match state.detection_store.get_frame(&id, detection_id) {
         Some(frame) => ([(header::CONTENT_TYPE, "image/jpeg")], frame).into_response(),
         None => (StatusCode::NOT_FOUND, "detection not found").into_response(),
+    }
+}
+
+// Warm event types and handlers
+
+#[derive(Deserialize)]
+struct EventsQuery {
+    from: Option<u64>,
+    to: Option<u64>,
+}
+
+#[derive(Serialize)]
+struct WarmEventResponse {
+    start_pts_ns: String,
+    duration_ms: u32,
+    event_type: String,
+}
+
+async fn warm_events_handler(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(query): Query<EventsQuery>,
+) -> Response {
+    let index = match &state.warm_index {
+        Some(idx) => idx,
+        None => return (StatusCode::NOT_FOUND, "warm storage not enabled").into_response(),
+    };
+
+    if !state.buffers.contains_key(&id) {
+        return (StatusCode::NOT_FOUND, "camera not found").into_response();
+    }
+
+    let from = query.from.unwrap_or(0);
+    let to = query.to.unwrap_or(u64::MAX);
+    let events = index.query(&id, from, to);
+
+    let response: Vec<WarmEventResponse> = events
+        .iter()
+        .map(|e| WarmEventResponse {
+            start_pts_ns: e.start_pts_ns.to_string(),
+            duration_ms: e.duration_ms,
+            event_type: match e.event_type {
+                crate::storage::EventType::Movement => "movement".to_string(),
+                crate::storage::EventType::Object => "object".to_string(),
+            },
+        })
+        .collect();
+
+    axum::Json(response).into_response()
+}
+
+async fn warm_playlist_handler(
+    State(state): State<AppState>,
+    Path((id, start_pts_str)): Path<(String, String)>,
+) -> Response {
+    let index = match &state.warm_index {
+        Some(idx) => idx,
+        None => return (StatusCode::NOT_FOUND, "warm storage not enabled").into_response(),
+    };
+
+    let start_pts: u64 = match start_pts_str.parse() {
+        Ok(v) => v,
+        Err(_) => return (StatusCode::BAD_REQUEST, "invalid start_pts").into_response(),
+    };
+
+    let entry = match index.find_event(&id, start_pts) {
+        Some(e) => e,
+        None => return (StatusCode::NOT_FOUND, "event not found").into_response(),
+    };
+
+    let duration_secs = entry.duration_ms as f64 / 1000.0;
+    let target_duration = duration_secs.ceil() as u64;
+
+    let playlist = format!(
+        "#EXTM3U\n\
+         #EXT-X-VERSION:3\n\
+         #EXT-X-TARGETDURATION:{target_duration}\n\
+         #EXT-X-MEDIA-SEQUENCE:0\n\
+         #EXT-X-PLAYLIST-TYPE:VOD\n\
+         #EXTINF:{duration_secs:.3},\n\
+         segment\n\
+         #EXT-X-ENDLIST\n"
+    );
+
+    (
+        [(header::CONTENT_TYPE, "application/vnd.apple.mpegurl")],
+        playlist,
+    )
+        .into_response()
+}
+
+async fn warm_segment_handler(
+    State(state): State<AppState>,
+    Path((id, start_pts_str)): Path<(String, String)>,
+) -> Response {
+    let index = match &state.warm_index {
+        Some(idx) => idx,
+        None => return (StatusCode::NOT_FOUND, "warm storage not enabled").into_response(),
+    };
+
+    let start_pts: u64 = match start_pts_str.parse() {
+        Ok(v) => v,
+        Err(_) => return (StatusCode::BAD_REQUEST, "invalid start_pts").into_response(),
+    };
+
+    let entry = match index.find_event(&id, start_pts) {
+        Some(e) => e,
+        None => return (StatusCode::NOT_FOUND, "event not found").into_response(),
+    };
+
+    let file_path = index.resolve_file_path(&id, &entry);
+
+    match tokio::fs::read(&file_path).await {
+        Ok(data) => ([(header::CONTENT_TYPE, "video/mp2t")], data).into_response(),
+        Err(_) => (StatusCode::NOT_FOUND, "event file not found").into_response(),
     }
 }

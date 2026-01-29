@@ -17,7 +17,7 @@ use buffer::warm::WarmWriter;
 use buffer::HotBuffer;
 use camera::FfmpegPipeline;
 use config::Config;
-use storage::{DetectionStore, MotionStore};
+use storage::{DetectionStore, MotionStore, WarmEventIndex};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -55,6 +55,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
+    let warm_index = if config.storage.enabled {
+        let index = WarmEventIndex::new(
+            &camera_ids,
+            std::path::PathBuf::from(&config.storage.data_dir),
+        );
+        index.scan();
+        Some(index)
+    } else {
+        None
+    };
+
     let shutdown = Arc::new(AtomicBool::new(false));
     let mut handles = Vec::new();
     let mut analyzer_handles = Vec::new();
@@ -78,6 +89,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 camera_id.clone(),
                 config.storage.pre_padding_secs,
                 config.storage.post_padding_secs,
+                warm_index.clone(),
             );
             let warm_handle = tokio::spawn(writer.run());
             warm_handles.push(warm_handle);
@@ -120,7 +132,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    let app_state = AppState::new(buffers_map, motion_store, detection_store);
+    let app_state = AppState::new(buffers_map, motion_store, detection_store, warm_index);
     let server_handle = tokio::spawn(async move {
         if let Err(e) = api::start_server(app_state, http_port).await {
             tracing::error!("HTTP server error: {}", e);

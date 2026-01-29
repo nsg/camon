@@ -22,6 +22,11 @@ document.addEventListener('DOMContentLoaded', async () => {
     const maskToggleBtn = document.getElementById('mask-toggle-btn');
     const muteToggleBtn = document.getElementById('mute-toggle-btn');
     const detectionGallery = document.getElementById('detection-gallery');
+    const eventStripCanvas = document.getElementById('event-strip-canvas');
+    const eventStripCtx = eventStripCanvas.getContext('2d');
+    const eventStripTime = document.getElementById('event-strip-time');
+    const eventStripWrapper = document.querySelector('.event-strip-wrapper');
+    const zoomButtons = document.querySelectorAll('.zoom-btn');
 
     // State
     let cameras = [];
@@ -35,12 +40,19 @@ document.addEventListener('DOMContentLoaded', async () => {
     let currentDetections = [];
     let motionPollInterval = null;
     let detectionPollInterval = null;
+    let warmEventPollInterval = null;
     let currentDetailCameraId = null;
     let bufferDuration = 0;
     let maskOverlayEnabled = false;
     let currentMaskSeq = null;
     let maskImage = null;
     const failedMaskSeqs = new Set();
+
+    // Warm event state
+    let warmEvents = [];
+    let eventStripZoomHours = 24;
+    let isPlayingWarmEvent = false;
+    let currentWarmEventPts = null;
 
     // View transition helper
     function withViewTransition(callback, isBack = false) {
@@ -86,20 +98,24 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     timelineScrubber.addEventListener('input', () => {
         isSeeking = true;
-        const duration = bufferDuration || detailVideo.duration;
+        const duration = isPlayingWarmEvent ? detailVideo.duration : (bufferDuration || detailVideo.duration);
         const time = (timelineScrubber.value / 100) * duration;
         currentTimeDisplay.textContent = formatTime(time);
-        updateLiveState();
+        if (!isPlayingWarmEvent) updateLiveState();
     });
 
     timelineScrubber.addEventListener('change', () => {
-        const duration = bufferDuration || detailVideo.duration;
+        const duration = isPlayingWarmEvent ? detailVideo.duration : (bufferDuration || detailVideo.duration);
         const time = (timelineScrubber.value / 100) * duration;
         detailVideo.currentTime = time;
         isSeeking = false;
     });
 
     liveBtn.addEventListener('click', () => {
+        if (isPlayingWarmEvent) {
+            returnToLive();
+            return;
+        }
         const duration = bufferDuration || detailVideo.duration;
         if (duration && isFinite(duration)) {
             detailVideo.currentTime = duration;
@@ -132,10 +148,82 @@ document.addEventListener('DOMContentLoaded', async () => {
         }
     });
 
+    // Zoom button listeners
+    zoomButtons.forEach(btn => {
+        btn.addEventListener('click', () => {
+            zoomButtons.forEach(b => b.classList.remove('active'));
+            btn.classList.add('active');
+            eventStripZoomHours = parseInt(btn.dataset.hours, 10);
+            renderEventStrip();
+        });
+    });
+
+    // Event strip click handler
+    eventStripWrapper.addEventListener('click', (e) => {
+        if (!currentDetailCameraId || warmEvents.length === 0) return;
+
+        const rect = eventStripWrapper.getBoundingClientRect();
+        const x = e.clientX - rect.left;
+        const ratio = x / rect.width;
+
+        const now = Date.now() * 1_000_000; // approximate current time in ns
+        const windowNs = eventStripZoomHours * 3600 * 1_000_000_000;
+        const windowStart = now - windowNs;
+        const clickedNs = windowStart + ratio * windowNs;
+
+        // Find the closest event to the click
+        let closest = null;
+        let closestDist = Infinity;
+        for (const ev of warmEvents) {
+            const evEnd = ev.start_ns + ev.duration_ms * 1_000_000;
+            // Check if click is within event bounds
+            if (clickedNs >= ev.start_ns && clickedNs <= evEnd) {
+                closest = ev;
+                break;
+            }
+            // Otherwise find nearest
+            const dist = Math.min(
+                Math.abs(clickedNs - ev.start_ns),
+                Math.abs(clickedNs - evEnd)
+            );
+            if (dist < closestDist) {
+                closestDist = dist;
+                closest = ev;
+            }
+        }
+
+        // Only play if click was reasonably close to an event (within 2% of window)
+        if (closest) {
+            const evEnd = closest.start_ns + closest.duration_ms * 1_000_000;
+            const threshold = windowNs * 0.02;
+            if (clickedNs >= closest.start_ns - threshold && clickedNs <= evEnd + threshold) {
+                loadWarmEvent(currentDetailCameraId, closest.start_pts_ns);
+            }
+        }
+    });
+
+    // Event strip hover for time display
+    eventStripWrapper.addEventListener('mousemove', (e) => {
+        const rect = eventStripWrapper.getBoundingClientRect();
+        const x = e.clientX - rect.left;
+        const ratio = x / rect.width;
+
+        const now = Date.now() * 1_000_000;
+        const windowNs = eventStripZoomHours * 3600 * 1_000_000_000;
+        const windowStart = now - windowNs;
+        const hoveredNs = windowStart + ratio * windowNs;
+        const hoveredDate = new Date(hoveredNs / 1_000_000);
+        eventStripTime.textContent = hoveredDate.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    });
+
+    eventStripWrapper.addEventListener('mouseleave', () => {
+        eventStripTime.textContent = '';
+    });
+
     // Tooltip event listeners (on wrapper since canvas has pointer-events: none)
     const timelineWrapper = document.querySelector('.timeline-wrapper');
     timelineWrapper.addEventListener('mousemove', (e) => {
-        if (!bufferDuration) return;
+        if (!bufferDuration || isPlayingWarmEvent) return;
 
         const rect = timelineWrapper.getBoundingClientRect();
         const x = e.clientX - rect.left;
@@ -218,10 +306,28 @@ document.addEventListener('DOMContentLoaded', async () => {
         currentTimeDisplay.textContent = '00:00:00';
         durationDisplay.textContent = '00:00:00';
         liveBtn.classList.add('is-live');
+        liveBtn.classList.remove('is-warm');
+        liveBtn.querySelector('span:last-child') || updateLiveBtnText('Live');
         maskOverlay.hidden = !maskOverlayEnabled;
+
+        // Reset warm state
+        isPlayingWarmEvent = false;
+        currentWarmEventPts = null;
+        warmEvents = [];
 
         // Load camera stream
         loadDetailCamera(cameraId);
+
+        // Fetch warm events
+        fetchWarmEvents(cameraId);
+    }
+
+    function updateLiveBtnText(text) {
+        // The button has: <span class="live-indicator"></span> + text node
+        const indicator = liveBtn.querySelector('.live-indicator');
+        liveBtn.textContent = '';
+        liveBtn.appendChild(indicator);
+        liveBtn.appendChild(document.createTextNode(' ' + text));
     }
 
     function cleanupDetailView() {
@@ -236,6 +342,10 @@ document.addEventListener('DOMContentLoaded', async () => {
         if (detectionPollInterval) {
             clearInterval(detectionPollInterval);
             detectionPollInterval = null;
+        }
+        if (warmEventPollInterval) {
+            clearInterval(warmEventPollInterval);
+            warmEventPollInterval = null;
         }
         if (detailHls) {
             detailHls.destroy();
@@ -257,6 +367,9 @@ document.addEventListener('DOMContentLoaded', async () => {
         detectionGallery.innerHTML = '';
         const rect = motionCanvas.getBoundingClientRect();
         motionCtx.clearRect(0, 0, rect.width, rect.height);
+        warmEvents = [];
+        isPlayingWarmEvent = false;
+        currentWarmEventPts = null;
     }
 
     // Camera cell creation
@@ -322,7 +435,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         }
     }
 
-    // Detail camera loading
+    // Detail camera loading (live stream)
     function loadDetailCamera(cameraId) {
         const src = `/api/stream/${cameraId}/playlist.m3u8`;
 
@@ -373,17 +486,98 @@ document.addEventListener('DOMContentLoaded', async () => {
         }
     }
 
+    // Warm event playback
+    function loadWarmEvent(cameraId, startPtsNs) {
+        const src = `/api/cameras/${encodeURIComponent(cameraId)}/events/${startPtsNs}/playlist.m3u8`;
+
+        // Destroy current HLS instance
+        if (detailHls) {
+            detailHls.destroy();
+            detailHls = null;
+        }
+
+        isPlayingWarmEvent = true;
+        currentWarmEventPts = startPtsNs;
+
+        // Update UI state
+        liveBtn.classList.remove('is-live');
+        liveBtn.classList.add('is-warm');
+        updateLiveBtnText('Return to Live');
+
+        detailLoading.hidden = false;
+
+        if (typeof Hls !== 'undefined' && Hls.isSupported()) {
+            detailHls = new Hls({
+                enableWorker: false,
+            });
+
+            detailHls.loadSource(src);
+            detailHls.attachMedia(detailVideo);
+
+            detailHls.on(Hls.Events.MANIFEST_PARSED, () => {
+                detailLoading.hidden = true;
+                detailVideo.play().catch(e => console.error(`Warm play failed:`, e));
+            });
+
+            detailHls.on(Hls.Events.ERROR, (event, data) => {
+                console.error(`Warm HLS error:`, data.type, data.details);
+                if (data.fatal) {
+                    detailLoading.querySelector('p').textContent = 'Playback error';
+                    detailLoading.hidden = false;
+                }
+            });
+        } else if (detailVideo.canPlayType('application/vnd.apple.mpegurl')) {
+            detailVideo.src = src;
+            detailVideo.addEventListener('loadedmetadata', () => {
+                detailLoading.hidden = true;
+                detailVideo.play().catch(e => console.error(`Warm play failed:`, e));
+            }, { once: true });
+        }
+
+        // Highlight the event in the strip
+        renderEventStrip();
+    }
+
+    function returnToLive() {
+        if (!currentDetailCameraId) return;
+
+        isPlayingWarmEvent = false;
+        currentWarmEventPts = null;
+
+        liveBtn.classList.remove('is-warm');
+        updateLiveBtnText('Live');
+
+        // Reload live stream
+        if (detailHls) {
+            detailHls.destroy();
+            detailHls = null;
+        }
+
+        loadDetailCamera(currentDetailCameraId);
+        renderEventStrip();
+    }
+
     // Timeline functions
     function startTimelineUpdate() {
         function update() {
-            const duration = bufferDuration || detailVideo.duration;
-            if (!isSeeking && duration && isFinite(duration)) {
-                const progress = (detailVideo.currentTime / duration) * 100;
-                timelineScrubber.value = progress;
-                currentTimeDisplay.textContent = formatTime(detailVideo.currentTime);
-                durationDisplay.textContent = formatTime(duration);
-                updateLiveState();
-                updateMaskOverlay();
+            if (isPlayingWarmEvent) {
+                const duration = detailVideo.duration;
+                if (!isSeeking && duration && isFinite(duration)) {
+                    const progress = (detailVideo.currentTime / duration) * 100;
+                    timelineScrubber.value = progress;
+                    currentTimeDisplay.textContent = formatTime(detailVideo.currentTime);
+                    durationDisplay.textContent = formatTime(duration);
+                }
+            } else {
+                const duration = bufferDuration || detailVideo.duration;
+                if (!isSeeking && duration && isFinite(duration)) {
+                    const progress = (detailVideo.currentTime / duration) * 100;
+                    timelineScrubber.value = progress;
+                    currentTimeDisplay.textContent = formatTime(detailVideo.currentTime);
+                    durationDisplay.textContent = formatTime(duration);
+                    updateLiveState();
+                    updateMaskOverlay();
+                }
             }
             timelineAnimationId = requestAnimationFrame(update);
         }
@@ -391,7 +585,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
 
     function updateMaskOverlay() {
-        if (!maskOverlayEnabled || !currentDetailCameraId) return;
+        if (!maskOverlayEnabled || !currentDetailCameraId || isPlayingWarmEvent) return;
 
         const time = detailVideo.currentTime;
         const seg = currentMotionSegments.find(s => time >= s.start && time <= s.end);
@@ -480,7 +674,9 @@ document.addEventListener('DOMContentLoaded', async () => {
                     currentMotionSegments = data.segments || [];
                     if (data.total_duration > 0) {
                         bufferDuration = data.total_duration;
-                        renderTimeline(bufferDuration);
+                        if (!isPlayingWarmEvent) {
+                            renderTimeline(bufferDuration);
+                        }
                     }
                 }
             } catch (err) {
@@ -506,7 +702,9 @@ document.addEventListener('DOMContentLoaded', async () => {
                     currentDetections = data.detections || [];
                     if (data.total_duration > 0) {
                         bufferDuration = data.total_duration;
-                        renderTimeline(bufferDuration);
+                        if (!isPlayingWarmEvent) {
+                            renderTimeline(bufferDuration);
+                        }
                     }
                     renderDetectionGallery();
                 }
@@ -517,6 +715,106 @@ document.addEventListener('DOMContentLoaded', async () => {
 
         await poll();
         detectionPollInterval = setInterval(poll, 5000);
+    }
+
+    // Warm event fetching
+    async function fetchWarmEvents(cameraId) {
+        if (warmEventPollInterval) {
+            clearInterval(warmEventPollInterval);
+        }
+
+        async function poll() {
+            try {
+                const response = await fetch(`/api/cameras/${encodeURIComponent(cameraId)}/events`);
+                if (response.ok) {
+                    const raw = await response.json();
+                    warmEvents = raw.map(ev => ({
+                        ...ev,
+                        start_ns: Number(ev.start_pts_ns),
+                    }));
+                    renderEventStrip();
+                }
+            } catch (err) {
+                console.error('Failed to fetch warm events:', err);
+            }
+        }
+
+        await poll();
+        warmEventPollInterval = setInterval(poll, 15000);
+    }
+
+    // Event strip rendering
+    function renderEventStrip() {
+        const rect = eventStripWrapper.getBoundingClientRect();
+        if (rect.width === 0) return;
+
+        const dpr = window.devicePixelRatio || 1;
+        eventStripCanvas.width = rect.width * dpr;
+        eventStripCanvas.height = rect.height * dpr;
+        eventStripCtx.scale(dpr, dpr);
+
+        eventStripCtx.clearRect(0, 0, rect.width, rect.height);
+
+        if (warmEvents.length === 0) return;
+
+        const now = Date.now() * 1_000_000; // approximate ns
+        const windowNs = eventStripZoomHours * 3600 * 1_000_000_000;
+        const windowStart = now - windowNs;
+        const windowEnd = now;
+
+        // Draw time axis ticks
+        eventStripCtx.strokeStyle = 'rgba(255, 255, 255, 0.1)';
+        eventStripCtx.lineWidth = 1;
+        const tickIntervalHours = eventStripZoomHours <= 1 ? 0.25 :
+                                   eventStripZoomHours <= 6 ? 1 :
+                                   eventStripZoomHours <= 24 ? 4 : 8;
+        const tickIntervalNs = tickIntervalHours * 3600 * 1_000_000_000;
+        const firstTick = Math.ceil(windowStart / tickIntervalNs) * tickIntervalNs;
+        for (let t = firstTick; t < windowEnd; t += tickIntervalNs) {
+            const x = ((t - windowStart) / windowNs) * rect.width;
+            eventStripCtx.beginPath();
+            eventStripCtx.moveTo(x, 0);
+            eventStripCtx.lineTo(x, rect.height);
+            eventStripCtx.stroke();
+        }
+
+        // Draw "now" marker (live edge) at right
+        eventStripCtx.fillStyle = 'rgba(231, 76, 60, 0.3)';
+        const liveWidth = Math.max(2, rect.width * 0.005);
+        eventStripCtx.fillRect(rect.width - liveWidth, 0, liveWidth, rect.height);
+
+        // Draw events
+        warmEvents.forEach(ev => {
+            const evStart = ev.start_ns;
+            const evEndNs = evStart + ev.duration_ms * 1_000_000;
+
+            // Skip events outside window
+            if (evEndNs < windowStart || evStart > windowEnd) return;
+
+            const startX = Math.max(0, ((evStart - windowStart) / windowNs) * rect.width);
+            const endX = Math.min(rect.width, ((evEndNs - windowStart) / windowNs) * rect.width);
+            const width = Math.max(2, endX - startX); // minimum 2px visibility
+
+            const isPlaying = isPlayingWarmEvent && currentWarmEventPts === ev.start_pts_ns;
+            if (ev.event_type === 'object') {
+                eventStripCtx.fillStyle = isPlaying ? 'rgba(220, 50, 50, 1)' : 'rgba(220, 50, 50, 0.8)';
+            } else {
+                eventStripCtx.fillStyle = isPlaying ? 'rgba(255, 200, 50, 1)' : 'rgba(255, 200, 50, 0.7)';
+            }
+
+            eventStripCtx.beginPath();
+            eventStripCtx.roundRect(startX, 2, width, rect.height - 4, 2);
+            eventStripCtx.fill();
+
+            // Highlight border for currently playing event
+            if (isPlaying) {
+                eventStripCtx.strokeStyle = '#fff';
+                eventStripCtx.lineWidth = 2;
+                eventStripCtx.beginPath();
+                eventStripCtx.roundRect(startX, 2, width, rect.height - 4, 2);
+                eventStripCtx.stroke();
+            }
+        });
     }
 
     function renderTimeline(duration) {
@@ -608,9 +906,10 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     // Handle canvas resize
     window.addEventListener('resize', () => {
-        if (bufferDuration > 0) {
+        if (bufferDuration > 0 && !isPlayingWarmEvent) {
             renderTimeline(bufferDuration);
         }
+        renderEventStrip();
         drawMask();
     });
 });

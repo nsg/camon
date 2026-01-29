@@ -5,7 +5,7 @@ use tokio::sync::mpsc;
 
 use super::GopSegment;
 use crate::buffer::EvictedSegment;
-use crate::storage::{DetectionStore, MotionStore};
+use crate::storage::{DetectionStore, EventType, MotionStore, WarmEventEntry, WarmEventIndex};
 
 const NANOS_PER_SEC: u64 = 1_000_000_000;
 const NANOS_PER_MS: u64 = 1_000_000;
@@ -35,9 +35,11 @@ pub struct WarmWriter {
     pre_buffer: VecDeque<GopSegment>,
     pre_buffer_duration_ns: u64,
     current_event: Option<WarmEvent>,
+    warm_index: Option<WarmEventIndex>,
 }
 
 impl WarmWriter {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         receiver: mpsc::UnboundedReceiver<EvictedSegment>,
         motion_store: MotionStore,
@@ -46,6 +48,7 @@ impl WarmWriter {
         camera_id: String,
         pre_padding_secs: u64,
         post_padding_secs: u64,
+        warm_index: Option<WarmEventIndex>,
     ) -> Self {
         Self {
             receiver,
@@ -58,6 +61,7 @@ impl WarmWriter {
             pre_buffer: VecDeque::new(),
             pre_buffer_duration_ns: 0,
             current_event: None,
+            warm_index,
         }
     }
 
@@ -117,13 +121,21 @@ impl WarmWriter {
                 event.total_bytes += segment.data.len();
                 event.segments.push(segment);
             } else {
-                // Post-padding expired — finalize synchronously via spawn
+                // Post-padding expired — finalize via spawn
                 let mut event = self.current_event.take().unwrap();
                 let data_dir = self.data_dir.clone();
                 let camera_id = self.camera_id.clone();
                 let has_objects = event.has_objects;
+                let warm_index = self.warm_index.clone();
                 tokio::spawn(async move {
-                    write_event(&data_dir, &camera_id, &mut event, has_objects).await;
+                    write_event(
+                        &data_dir,
+                        &camera_id,
+                        &mut event,
+                        has_objects,
+                        warm_index.as_ref(),
+                    )
+                    .await;
                 });
                 // This non-motion segment goes into pre-buffer for next event
                 self.push_pre_buffer(segment);
@@ -149,7 +161,14 @@ impl WarmWriter {
     async fn finalize_event(&mut self) {
         if let Some(ref mut event) = self.current_event.take() {
             let has_objects = event.has_objects;
-            write_event(&self.data_dir, &self.camera_id, event, has_objects).await;
+            write_event(
+                &self.data_dir,
+                &self.camera_id,
+                event,
+                has_objects,
+                self.warm_index.as_ref(),
+            )
+            .await;
         }
     }
 }
@@ -159,6 +178,7 @@ async fn write_event(
     camera_id: &str,
     event: &mut WarmEvent,
     has_objects: bool,
+    warm_index: Option<&WarmEventIndex>,
 ) {
     let duration_ns = event.duration_ns();
     let duration_ms = duration_ns / NANOS_PER_MS;
@@ -176,7 +196,7 @@ async fn write_event(
         return;
     }
 
-    let filename = format!("{}_{}.h264", event.first_pts, duration_ms);
+    let filename = format!("{}_{}.ts", event.first_pts, duration_ms);
     let file_path = camera_dir.join(&filename);
 
     let mut data = Vec::with_capacity(total_bytes);
@@ -184,6 +204,7 @@ async fn write_event(
         data.extend_from_slice(&seg.data);
     }
 
+    let file_size = data.len() as u64;
     match tokio::fs::write(&file_path, &data).await {
         Ok(()) => {
             tracing::info!(
@@ -194,6 +215,21 @@ async fn write_event(
                 duration_ms = duration_ms,
                 "wrote warm event file"
             );
+            if let Some(index) = warm_index {
+                index.insert(
+                    camera_id,
+                    WarmEventEntry {
+                        start_pts_ns: event.first_pts,
+                        duration_ms: duration_ms as u32,
+                        event_type: if has_objects {
+                            EventType::Object
+                        } else {
+                            EventType::Movement
+                        },
+                        file_size,
+                    },
+                );
+            }
         }
         Err(e) => {
             tracing::error!(

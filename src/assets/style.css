@@ -185,6 +185,69 @@ main {
     padding-right: 3rem;
 }
 
+/* Event Strip */
+.event-strip-controls {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    padding: 0.5rem 1rem 0;
+}
+
+.zoom-buttons {
+    display: flex;
+    gap: 2px;
+}
+
+.zoom-btn {
+    background: rgba(255, 255, 255, 0.1);
+    color: #999;
+    border: none;
+    padding: 4px 10px;
+    font-size: 0.75rem;
+    cursor: pointer;
+    transition: background 0.2s, color 0.2s;
+}
+
+.zoom-btn:first-child {
+    border-radius: 4px 0 0 4px;
+}
+
+.zoom-btn:last-child {
+    border-radius: 0 4px 4px 0;
+}
+
+.zoom-btn.active {
+    background: var(--color-burgundy);
+    color: #fff;
+}
+
+.zoom-btn:hover:not(.active) {
+    background: rgba(255, 255, 255, 0.2);
+    color: #fff;
+}
+
+.event-strip-wrapper {
+    flex: 1;
+    position: relative;
+    height: 24px;
+    background: rgba(255, 255, 255, 0.05);
+    border-radius: 4px;
+    cursor: pointer;
+    overflow: hidden;
+}
+
+#event-strip-canvas {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+}
+
+#event-strip-time {
+    min-width: 50px;
+    text-align: right;
+}
+
 /* Timeline Controls */
 .timeline-controls {
     display: flex;
@@ -334,6 +397,13 @@ main {
 
 .live-btn.is-live .live-indicator {
     animation: pulse 1.5s ease-in-out infinite;
+}
+
+.live-btn.is-warm {
+    color: var(--color-tan);
+    background: rgba(216, 189, 138, 0.15);
+    border-radius: 4px;
+    padding: 0.5rem 0.75rem;
 }
 
 @keyframes pulse {

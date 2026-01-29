@@ -38,6 +38,18 @@
                 <canvas id="mask-overlay"></canvas>
                 <div id="detail-loading" class="loading"><p>Loading...</p></div>
             </div>
+            <div class="event-strip-controls">
+                <div class="zoom-buttons">
+                    <button class="zoom-btn" data-hours="1">1h</button>
+                    <button class="zoom-btn" data-hours="6">6h</button>
+                    <button class="zoom-btn active" data-hours="24">24h</button>
+                    <button class="zoom-btn" data-hours="48">48h</button>
+                </div>
+                <div class="event-strip-wrapper">
+                    <canvas id="event-strip-canvas"></canvas>
+                </div>
+                <span id="event-strip-time" class="time-display"></span>
+            </div>
             <div class="timeline-controls">
                 <span id="current-time" class="time-display">00:00:00</span>
                 <div class="timeline-wrapper">
