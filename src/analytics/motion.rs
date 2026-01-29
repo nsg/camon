@@ -72,12 +72,13 @@ impl ScoreHistogram {
 }
 
 const WARMUP_FRAMES: u32 = 100;
+const SCENE_CHANGE_RATIO: f32 = 0.8;
 
 pub struct MotionDetector {
     mog2: opencv::core::Ptr<video::BackgroundSubtractorMOG2>,
     fg_mask: Mat,
     learning_rate: f64,
-    frames_processed: u32,
+    frames_since_stable: u32,
 }
 
 impl MotionDetector {
@@ -89,7 +90,7 @@ impl MotionDetector {
             mog2,
             fg_mask,
             learning_rate: -1.0,
-            frames_processed: 0,
+            frames_since_stable: 0,
         })
     }
 
@@ -101,13 +102,6 @@ impl MotionDetector {
             self.learning_rate,
         )?;
 
-        self.frames_processed += 1;
-
-        // During warmup, return zero score to let background model stabilize
-        if self.frames_processed < WARMUP_FRAMES {
-            return Ok(0.0);
-        }
-
         let total_pixels = self.fg_mask.rows() * self.fg_mask.cols();
         if total_pixels == 0 {
             return Ok(0.0);
@@ -115,6 +109,17 @@ impl MotionDetector {
 
         let fg_pixels = opencv::core::count_non_zero(&self.fg_mask)? as f32;
         let foreground_ratio = fg_pixels / total_pixels as f32;
+
+        if foreground_ratio >= SCENE_CHANGE_RATIO {
+            self.frames_since_stable = 0;
+            return Ok(0.0);
+        }
+
+        self.frames_since_stable += 1;
+
+        if self.frames_since_stable < WARMUP_FRAMES {
+            return Ok(0.0);
+        }
 
         Ok((foreground_ratio * 10.0).min(1.0))
     }
