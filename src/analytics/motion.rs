@@ -1,3 +1,5 @@
+use std::collections::VecDeque;
+
 use opencv::{
     core::{Mat, Rect, Vector},
     imgcodecs,
@@ -8,19 +10,23 @@ use opencv::{
 
 const HISTOGRAM_BUCKETS: usize = 100;
 const MIN_SAMPLES_FOR_THRESHOLD: u64 = 1000;
+const WINDOW_HOURS: usize = 3;
 
 pub struct ScoreHistogram {
     buckets: [u64; HISTOGRAM_BUCKETS],
-    total_samples: u64,
+    window: VecDeque<u8>,
+    window_size: usize,
     target_percentile: f32,
     default_threshold: f32,
 }
 
 impl ScoreHistogram {
-    pub fn new(target_percentile: f32, default_threshold: f32) -> Self {
+    pub fn new(target_percentile: f32, default_threshold: f32, sample_fps: u32) -> Self {
+        let window_size = WINDOW_HOURS * 60 * 60 * sample_fps as usize;
         Self {
             buckets: [0; HISTOGRAM_BUCKETS],
-            total_samples: 0,
+            window: VecDeque::with_capacity(window_size),
+            window_size,
             target_percentile,
             default_threshold,
         }
@@ -31,16 +37,23 @@ impl ScoreHistogram {
             return;
         }
         let bucket = ((score * HISTOGRAM_BUCKETS as f32) as usize).min(HISTOGRAM_BUCKETS - 1);
+
+        if self.window.len() == self.window_size {
+            let old = self.window.pop_front().unwrap() as usize;
+            self.buckets[old] -= 1;
+        }
+
+        self.window.push_back(bucket as u8);
         self.buckets[bucket] += 1;
-        self.total_samples += 1;
     }
 
     pub fn threshold(&self) -> f32 {
-        if self.total_samples < MIN_SAMPLES_FOR_THRESHOLD {
+        let total = self.window.len() as u64;
+        if total < MIN_SAMPLES_FOR_THRESHOLD {
             return self.default_threshold;
         }
 
-        let target_count = (self.total_samples as f32 * self.target_percentile) as u64;
+        let target_count = (total as f32 * self.target_percentile) as u64;
         let mut cumulative = 0u64;
 
         for (i, &count) in self.buckets.iter().enumerate() {
@@ -54,7 +67,7 @@ impl ScoreHistogram {
     }
 
     pub fn samples(&self) -> u64 {
-        self.total_samples
+        self.window.len() as u64
     }
 }
 

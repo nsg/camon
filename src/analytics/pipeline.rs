@@ -79,7 +79,11 @@ impl MotionAnalyzer {
             .map(|s| s + 1)
             .unwrap_or(0);
 
-        let score_histogram = ScoreHistogram::new(MOTION_PERCENTILE, DEFAULT_MOTION_THRESHOLD);
+        let score_histogram = ScoreHistogram::new(
+            MOTION_PERCENTILE,
+            DEFAULT_MOTION_THRESHOLD,
+            config.sample_fps,
+        );
 
         Ok(Self {
             camera_id,
