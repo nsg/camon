@@ -1,5 +1,6 @@
 mod hot;
 mod segment;
+pub mod warm;
 
-pub use hot::HotBuffer;
+pub use hot::{EvictedSegment, HotBuffer};
 pub use segment::GopSegment;

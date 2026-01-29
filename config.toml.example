@@ -28,6 +28,16 @@ confidence_threshold = 0.5
 # Object classes to detect (default: person, car, truck, dog, cat)
 classes = ["person", "car", "truck", "dog", "cat"]
 
+[storage]
+# Enable storage — flush motion events to disk (default: true)
+enabled = true
+# Directory for event files (default: /var/camon/storage)
+data_dir = "/var/camon/storage"
+# Seconds of context before first motion in an event (default: 5)
+pre_padding_secs = 5
+# Seconds of context after last motion in an event (default: 10)
+post_padding_secs = 10
+
 # Camera configuration
 # Each camera needs an id and url
 

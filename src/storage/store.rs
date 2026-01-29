@@ -69,6 +69,18 @@ impl MotionStore {
         }
     }
 
+    pub fn has_motion(&self, camera_id: &str, segment_sequence: u64) -> bool {
+        match self.cameras.get(camera_id) {
+            Some(lock) => {
+                let entries = lock.read().unwrap();
+                entries
+                    .iter()
+                    .any(|e| e.segment_sequence == segment_sequence && e.motion_score > 0.0)
+            }
+            None => false,
+        }
+    }
+
     pub fn last_sequence(&self, camera_id: &str) -> Option<u64> {
         self.cameras
             .get(camera_id)?

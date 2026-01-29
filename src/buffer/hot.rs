@@ -1,9 +1,17 @@
 use std::collections::VecDeque;
 use std::sync::{Arc, RwLock};
 
+use tokio::sync::mpsc;
+
 use super::GopSegment;
 
 const NANOS_PER_SEC: u64 = 1_000_000_000;
+
+pub struct EvictedSegment {
+    pub segment: GopSegment,
+    pub camera_id: String,
+    pub sequence: u64,
+}
 
 pub struct HotBuffer {
     segments: VecDeque<GopSegment>,
@@ -11,6 +19,7 @@ pub struct HotBuffer {
     current_duration_ns: u64,
     camera_id: String,
     first_sequence: u64,
+    eviction_tx: Option<mpsc::UnboundedSender<EvictedSegment>>,
 }
 
 impl HotBuffer {
@@ -21,6 +30,7 @@ impl HotBuffer {
             current_duration_ns: 0,
             camera_id,
             first_sequence: 0,
+            eviction_tx: None,
         }))
     }
 
@@ -42,6 +52,7 @@ impl HotBuffer {
     fn evict_old(&mut self) {
         while self.current_duration_ns > self.max_duration_ns {
             if let Some(old) = self.segments.pop_front() {
+                let evicted_sequence = self.first_sequence;
                 self.current_duration_ns = self.current_duration_ns.saturating_sub(old.duration_ns);
                 self.first_sequence += 1;
                 tracing::trace!(
@@ -50,10 +61,21 @@ impl HotBuffer {
                     first_sequence = self.first_sequence,
                     "evicted old segment"
                 );
+                if let Some(tx) = &self.eviction_tx {
+                    let _ = tx.send(EvictedSegment {
+                        segment: old,
+                        camera_id: self.camera_id.clone(),
+                        sequence: evicted_sequence,
+                    });
+                }
             } else {
                 break;
             }
         }
+    }
+
+    pub fn set_eviction_sender(&mut self, tx: mpsc::UnboundedSender<EvictedSegment>) {
+        self.eviction_tx = Some(tx);
     }
 
     pub fn segment_count(&self) -> usize {

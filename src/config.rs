@@ -121,6 +121,45 @@ impl Default for AnalyticsConfig {
     }
 }
 
+fn default_warm_enabled() -> bool {
+    true
+}
+
+fn default_warm_data_dir() -> String {
+    "/var/camon/storage".to_string()
+}
+
+fn default_warm_pre_padding_secs() -> u64 {
+    5
+}
+
+fn default_warm_post_padding_secs() -> u64 {
+    10
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct WarmConfig {
+    #[serde(default = "default_warm_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_warm_data_dir")]
+    pub data_dir: String,
+    #[serde(default = "default_warm_pre_padding_secs")]
+    pub pre_padding_secs: u64,
+    #[serde(default = "default_warm_post_padding_secs")]
+    pub post_padding_secs: u64,
+}
+
+impl Default for WarmConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_warm_enabled(),
+            data_dir: default_warm_data_dir(),
+            pre_padding_secs: default_warm_pre_padding_secs(),
+            post_padding_secs: default_warm_post_padding_secs(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
     #[serde(default)]
@@ -129,6 +168,8 @@ pub struct Config {
     pub http: HttpConfig,
     #[serde(default)]
     pub analytics: AnalyticsConfig,
+    #[serde(default)]
+    pub storage: WarmConfig,
     #[serde(default)]
     pub cameras: Vec<CameraConfig>,
 }
