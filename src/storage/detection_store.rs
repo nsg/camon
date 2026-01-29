@@ -83,6 +83,18 @@ impl DetectionStore {
         })
     }
 
+    pub fn has_detections(&self, camera_id: &str, segment_sequence: u64) -> bool {
+        match self.cameras.get(camera_id) {
+            Some(lock) => {
+                let entries = lock.read().unwrap();
+                entries
+                    .iter()
+                    .any(|e| e.segment_sequence == segment_sequence)
+            }
+            None => false,
+        }
+    }
+
     pub fn cleanup(&self, camera_id: &str, min_sequence: u64) {
         if let Some(lock) = self.cameras.get(camera_id) {
             let mut entries = lock.write().unwrap();

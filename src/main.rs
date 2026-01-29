@@ -13,6 +13,7 @@ mod storage;
 
 use analytics::ObjectDetector;
 use api::AppState;
+use buffer::warm::WarmWriter;
 use buffer::HotBuffer;
 use camera::FfmpegPipeline;
 use config::Config;
@@ -57,6 +58,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let shutdown = Arc::new(AtomicBool::new(false));
     let mut handles = Vec::new();
     let mut analyzer_handles = Vec::new();
+    let mut warm_handles = Vec::new();
     let mut buffers_map: HashMap<String, Arc<RwLock<HotBuffer>>> = HashMap::new();
 
     for cam_config in config.cameras {
@@ -64,6 +66,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let buffer_clone = Arc::clone(&buffer);
         let camera_id = cam_config.id.clone();
         let shutdown_clone = Arc::clone(&shutdown);
+
+        if config.storage.enabled {
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            buffer.write().unwrap().set_eviction_sender(tx);
+            let writer = WarmWriter::new(
+                rx,
+                motion_store.clone(),
+                detection_store.clone(),
+                std::path::PathBuf::from(&config.storage.data_dir),
+                camera_id.clone(),
+                config.storage.pre_padding_secs,
+                config.storage.post_padding_secs,
+            );
+            let warm_handle = tokio::spawn(writer.run());
+            warm_handles.push(warm_handle);
+        }
 
         buffers_map.insert(camera_id.clone(), Arc::clone(&buffer));
 
@@ -125,6 +143,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     for handle in analyzer_handles {
         handle.abort();
+    }
+
+    // Warm writers drain remaining segments and exit when senders are dropped
+    for handle in warm_handles {
+        let _ = handle.await;
     }
 
     for (camera_id, handle, buffer) in handles {
