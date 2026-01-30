@@ -56,7 +56,7 @@ impl WarmEventIndex {
                 for entry in read_dir.flatten() {
                     let path = entry.path();
                     let ext = path.extension().and_then(|e| e.to_str());
-                    if ext != Some("h264") && ext != Some("ts") {
+                    if ext != Some("ts") {
                         continue;
                     }
                     let stem = match path.file_stem().and_then(|s| s.to_str()) {
@@ -131,10 +131,6 @@ impl WarmEventIndex {
             .data_dir
             .join(camera_id)
             .join(entry.event_type.dir_name());
-        let ts_path = dir.join(format!("{}_{}.ts", entry.start_pts_ns, entry.duration_ms));
-        if ts_path.exists() {
-            return ts_path;
-        }
-        dir.join(format!("{}_{}.h264", entry.start_pts_ns, entry.duration_ms))
+        dir.join(format!("{}_{}.ts", entry.start_pts_ns, entry.duration_ms))
     }
 }
