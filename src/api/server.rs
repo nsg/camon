@@ -107,7 +107,11 @@ pub async fn start_server(state: AppState, port: u16) -> Result<(), std::io::Err
 
 async fn index_handler() -> impl IntoResponse {
     match Assets::get("index.html") {
-        Some(content) => Html(content.data.to_vec()).into_response(),
+        Some(content) => {
+            let html = String::from_utf8_lossy(&content.data)
+                .replace("__VERSION__", env!("CAMON_VERSION"));
+            Html(html).into_response()
+        }
         None => (StatusCode::NOT_FOUND, "index.html not found").into_response(),
     }
 }

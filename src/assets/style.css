@@ -563,6 +563,14 @@ main {
     text-align: center;
 }
 
+/* Footer */
+footer {
+    text-align: center;
+    padding: 1rem;
+    font-size: 0.75rem;
+    color: #555;
+}
+
 /* Mobile Responsive */
 @media (max-width: 600px) {
     header {
