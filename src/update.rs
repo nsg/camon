@@ -15,14 +15,6 @@ struct Asset {
     browser_download_url: String,
 }
 
-fn asset_name() -> &'static str {
-    if cfg!(target_env = "musl") {
-        "camon-linux-musl"
-    } else {
-        "camon-linux-glibc"
-    }
-}
-
 pub async fn check_and_update() -> Result<bool, Box<dyn std::error::Error>> {
     let current_version = env!("CARGO_PKG_VERSION");
     tracing::info!(version = %current_version, "checking for updates");
@@ -66,9 +58,9 @@ pub async fn check_and_update() -> Result<bool, Box<dyn std::error::Error>> {
     let asset = release
         .assets
         .iter()
-        .find(|a| a.name == asset_name())
+        .find(|a| a.name == "camon-linux-glibc")
         .or_else(|| release.assets.iter().find(|a| a.name == "camon"))
-        .ok_or("no compatible binary asset found in release")?;
+        .ok_or("no 'camon-linux-glibc' binary asset found in release")?;
 
     let bytes = client
         .get(&asset.browser_download_url)
@@ -106,16 +98,6 @@ fn is_newer(latest: &str, current: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_asset_name() {
-        let name = asset_name();
-        if cfg!(target_env = "musl") {
-            assert_eq!(name, "camon-linux-musl");
-        } else {
-            assert_eq!(name, "camon-linux-glibc");
-        }
-    }
 
     #[test]
     fn test_is_newer() {
