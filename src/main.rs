@@ -10,6 +10,7 @@ mod buffer;
 mod camera;
 mod config;
 mod storage;
+mod update;
 
 use analytics::ObjectDetector;
 use api::AppState;
@@ -26,6 +27,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let config = Config::load()?;
+
+    if config.update.enabled {
+        match update::check_and_update().await {
+            Ok(true) => {
+                tracing::info!("update applied, exiting for restart");
+                std::process::exit(0);
+            }
+            Ok(false) => {}
+            Err(e) => {
+                tracing::warn!(error = %e, "update check failed, continuing startup");
+            }
+        }
+    }
+
     tracing::info!("loaded {} camera(s)", config.cameras.len());
 
     let http_port = config.http.port;

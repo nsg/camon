@@ -161,7 +161,27 @@ impl Default for WarmConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+pub struct UpdateConfig {
+    #[serde(default = "default_update_enabled")]
+    pub enabled: bool,
+}
+
+fn default_update_enabled() -> bool {
+    true
+}
+
+impl Default for UpdateConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_update_enabled(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct Config {
+    #[serde(default)]
+    pub update: UpdateConfig,
     #[serde(default)]
     pub buffer: BufferConfig,
     #[serde(default)]

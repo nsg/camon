@@ -1,5 +1,9 @@
 # Camon Configuration
 
+[update]
+# Auto-update from GitHub Releases on startup (default: true)
+enabled = true
+
 [buffer]
 # Hot buffer duration in seconds (default: 600 = 10 minutes)
 hot_duration_secs = 600
