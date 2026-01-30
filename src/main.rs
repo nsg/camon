@@ -9,6 +9,7 @@ mod api;
 mod buffer;
 mod camera;
 mod config;
+mod install;
 mod storage;
 mod update;
 
@@ -20,8 +21,36 @@ use camera::FfmpegPipeline;
 use config::Config;
 use storage::{DetectionStore, MotionStore, WarmEventIndex};
 
+fn dispatch_subcommand() -> bool {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.is_empty() {
+        return false;
+    }
+
+    match args[0].as_str() {
+        "install" => {
+            if args.get(1).map(|s| s.as_str()) == Some("service") {
+                if let Err(e) = install::install_service() {
+                    eprintln!("error: {e}");
+                    std::process::exit(1);
+                }
+                std::process::exit(0);
+            }
+            eprintln!("usage: camon install service");
+            std::process::exit(1);
+        }
+        other => {
+            eprintln!("unknown command: {other}");
+            eprintln!("usage: camon [install service]");
+            std::process::exit(1);
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    dispatch_subcommand();
+
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env().add_directive("camon=debug".parse()?))
         .init();
