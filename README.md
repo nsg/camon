@@ -58,7 +58,12 @@ IP Camera ──RTSP──▶ Camon
 Install FFmpeg and download the latest binary from [GitHub Releases](https://github.com/nsg/camon/releases):
 
 ```bash
-sudo apt install ffmpeg
+# Ubuntu 24.10+
+sudo apt install ffmpeg libopencv-contrib406t64
+
+# Other Ubuntu/Debian (pulls in extra -dev files)
+sudo apt install ffmpeg libopencv-dev
+
 curl -fLO https://github.com/nsg/camon/releases/latest/download/camon-linux-glibc
 chmod +x camon-linux-glibc
 ./camon-linux-glibc
