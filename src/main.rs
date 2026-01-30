@@ -68,6 +68,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 tracing::warn!(error = %e, "update check failed, continuing startup");
             }
         }
+
+        tokio::spawn(async {
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(12 * 60 * 60));
+            interval.tick().await; // skip immediate tick
+            loop {
+                interval.tick().await;
+                match update::check_and_update().await {
+                    Ok(true) => {
+                        tracing::info!("update applied, exiting for restart");
+                        std::process::exit(0);
+                    }
+                    Ok(false) => {}
+                    Err(e) => {
+                        tracing::warn!(error = %e, "periodic update check failed");
+                    }
+                }
+            }
+        });
     }
 
     tracing::info!("loaded {} camera(s)", config.cameras.len());
