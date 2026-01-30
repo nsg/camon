@@ -57,19 +57,40 @@ IP Camera ──RTSP──▶ Camon
 
 Install FFmpeg and download the latest binary from [GitHub Releases](https://github.com/nsg/camon/releases):
 
+**Ubuntu/Debian:**
+
 ```bash
 sudo apt install ffmpeg
-./camon
+curl -fLO https://github.com/nsg/camon/releases/latest/download/camon-linux-glibc
+chmod +x camon-linux-glibc
+./camon-linux-glibc
+```
+
+**Alpine:**
+
+```bash
+apk add ffmpeg
+curl -fLO https://github.com/nsg/camon/releases/latest/download/camon-linux-musl
+chmod +x camon-linux-musl
+./camon-linux-musl
 ```
 
 Camon loads `config.toml` from the current working directory.
 
 ### Building from Source
 
-Install system dependencies (Ubuntu/Debian):
+Install system dependencies:
+
+Ubuntu/Debian:
 
 ```bash
 sudo apt install libopencv-dev clang libclang-dev cmake ffmpeg
+```
+
+Alpine:
+
+```bash
+apk add opencv-dev clang-dev cmake ffmpeg
 ```
 
 ```bash

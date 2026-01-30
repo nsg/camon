@@ -5,21 +5,36 @@ on:
     tags: ['v*']
 
 jobs:
-  release:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
+  build:
+    strategy:
+      matrix:
+        include:
+          - variant: glibc
+            runner: ubuntu-latest
+            container: ""
+          - variant: musl
+            runner: ubuntu-latest
+            container: alpine:latest
+
+    runs-on: ${{ matrix.runner }}
+    container: ${{ matrix.container || null }}
 
     steps:
+      - name: Install Alpine dependencies
+        if: matrix.variant == 'musl'
+        run: apk add --no-cache opencv-dev clang-dev cmake build-base rust cargo git
+
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install system dependencies
+      - name: Install Ubuntu dependencies
+        if: matrix.variant == 'glibc'
         run: |
           sudo apt-get update
           sudo apt-get install -y libopencv-dev clang libclang-dev cmake
 
       - name: Setup Rust toolchain
+        if: matrix.variant == 'glibc'
         run: rustup default stable
 
       - name: Cache cargo registry and build
@@ -29,18 +44,50 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          key: ${{ matrix.variant }}-cargo-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-
+            ${{ matrix.variant }}-cargo-
 
       - name: Build camon binary
         run: cargo build --release
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: camon-linux-${{ matrix.variant }}
+          path: target/release/camon
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download glibc artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: camon-linux-glibc
+          path: artifacts/glibc
+
+      - name: Download musl artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: camon-linux-musl
+          path: artifacts/musl
+
+      - name: Rename binaries
+        run: |
+          mv artifacts/glibc/camon camon-linux-glibc
+          mv artifacts/musl/camon camon-linux-musl
 
       - name: Create release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           gh release create ${{ github.ref_name }} \
+            --repo ${{ github.repository }} \
             --title "${{ github.ref_name }}" \
             --generate-notes \
-            target/release/camon
+            camon-linux-glibc \
+            camon-linux-musl
