@@ -19,7 +19,7 @@ pub struct HotBuffer {
     current_duration_ns: u64,
     camera_id: String,
     first_sequence: u64,
-    eviction_tx: Option<mpsc::UnboundedSender<EvictedSegment>>,
+    eviction_tx: Option<mpsc::Sender<EvictedSegment>>,
 }
 
 impl HotBuffer {
@@ -62,11 +62,19 @@ impl HotBuffer {
                     "evicted old segment"
                 );
                 if let Some(tx) = &self.eviction_tx {
-                    let _ = tx.send(EvictedSegment {
+                    match tx.try_send(EvictedSegment {
                         segment: old,
                         camera_id: self.camera_id.clone(),
                         sequence: evicted_sequence,
-                    });
+                    }) {
+                        Err(mpsc::error::TrySendError::Full(_)) => {
+                            tracing::warn!(
+                                camera = %self.camera_id,
+                                "warm writer behind, dropping evicted segment"
+                            );
+                        }
+                        _ => {}
+                    }
                 }
             } else {
                 break;
@@ -74,7 +82,7 @@ impl HotBuffer {
         }
     }
 
-    pub fn set_eviction_sender(&mut self, tx: mpsc::UnboundedSender<EvictedSegment>) {
+    pub fn set_eviction_sender(&mut self, tx: mpsc::Sender<EvictedSegment>) {
         self.eviction_tx = Some(tx);
     }
 

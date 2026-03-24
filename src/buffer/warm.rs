@@ -25,7 +25,7 @@ impl WarmEvent {
 }
 
 pub struct WarmWriter {
-    receiver: mpsc::UnboundedReceiver<EvictedSegment>,
+    receiver: mpsc::Receiver<EvictedSegment>,
     motion_store: MotionStore,
     detection_store: DetectionStore,
     data_dir: PathBuf,
@@ -41,7 +41,7 @@ pub struct WarmWriter {
 impl WarmWriter {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        receiver: mpsc::UnboundedReceiver<EvictedSegment>,
+        receiver: mpsc::Receiver<EvictedSegment>,
         motion_store: MotionStore,
         detection_store: DetectionStore,
         data_dir: PathBuf,

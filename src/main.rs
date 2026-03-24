@@ -70,7 +70,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         tokio::spawn(async {
-            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(12 * 60 * 60));
+            let mut interval =
+                tokio::time::interval(tokio::time::Duration::from_secs(12 * 60 * 60));
             interval.tick().await; // skip immediate tick
             loop {
                 interval.tick().await;
@@ -141,7 +142,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let shutdown_clone = Arc::clone(&shutdown);
 
         if config.storage.enabled {
-            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            let (tx, rx) = tokio::sync::mpsc::channel(64);
             buffer.write().unwrap().set_eviction_sender(tx);
             let writer = WarmWriter::new(
                 rx,
