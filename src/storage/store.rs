@@ -1,6 +1,9 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, RwLock};
 
+/// Number of recent motion entries to retain mask JPEGs for
+const MASK_RETAIN_COUNT: usize = 60;
+
 pub struct MotionEntry {
     pub segment_sequence: u64,
     pub start_time_ns: u64,
@@ -64,6 +67,13 @@ impl MotionStore {
                     entries.pop_front();
                 } else {
                     break;
+                }
+            }
+            // Keep mask JPEGs only for the most recent entries
+            let len = entries.len();
+            if len > MASK_RETAIN_COUNT {
+                for entry in entries.iter_mut().take(len - MASK_RETAIN_COUNT) {
+                    entry.mask_jpeg = None;
                 }
             }
         }
