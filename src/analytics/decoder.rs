@@ -16,25 +16,28 @@ const CROP_FRAME_SIZE: usize = (CROP_WIDTH * CROP_HEIGHT * 3) as usize;
 pub struct FrameDecoder {
     segment_tx: Option<SyncSender<Vec<u8>>>,
     frame_rx: Receiver<Vec<u8>>,
-    sample_fps: u32,
     child: Option<Child>,
     _writer_handle: JoinHandle<()>,
     _reader_handle: JoinHandle<()>,
 }
 
 impl FrameDecoder {
-    pub fn new(sample_fps: u32) -> Result<Self, std::io::Error> {
+    pub fn new() -> Result<Self, std::io::Error> {
         let mut child = Command::new("ffmpeg")
             .args([
                 "-hide_banner",
                 "-loglevel",
                 "quiet",
+                "-skip_frame",
+                "nokey",
                 "-f",
                 "mpegts",
                 "-i",
                 "pipe:0",
                 "-vf",
-                &format!("fps={sample_fps},scale={ANALYSIS_WIDTH}:{ANALYSIS_HEIGHT}"),
+                &format!("select=eq(pict_type\\,I),scale={ANALYSIS_WIDTH}:{ANALYSIS_HEIGHT}"),
+                "-vsync",
+                "vfr",
                 "-f",
                 "rawvideo",
                 "-pix_fmt",
@@ -77,26 +80,22 @@ impl FrameDecoder {
         Ok(Self {
             segment_tx: Some(segment_tx),
             frame_rx,
-            sample_fps,
             child: Some(child),
             _writer_handle: writer_handle,
             _reader_handle: reader_handle,
         })
     }
 
-    pub fn decode_segment(&self, data: &[u8], duration_ns: u64) -> Vec<Vec<u8>> {
+    pub fn decode_segment(&self, data: &[u8]) -> Vec<Vec<u8>> {
         if let Some(tx) = &self.segment_tx {
             if tx.send(data.to_vec()).is_err() {
                 return Vec::new();
             }
         }
 
-        let duration_secs = duration_ns as f64 / 1_000_000_000.0;
-        let expected_frames = (duration_secs * self.sample_fps as f64).ceil() as usize;
-        let expected_frames = expected_frames.max(1);
-
-        let mut frames = Vec::with_capacity(expected_frames);
-        for _ in 0..expected_frames {
+        // Each segment typically has 1 keyframe; drain whatever is available
+        let mut frames = Vec::with_capacity(2);
+        loop {
             match self.frame_rx.recv_timeout(FRAME_READ_TIMEOUT) {
                 Ok(frame) => frames.push(frame),
                 Err(_) => break,

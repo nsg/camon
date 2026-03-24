@@ -66,7 +66,7 @@ impl MotionAnalyzer {
         config: AnalyticsConfig,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let detector = MotionDetector::new()?;
-        let decoder = FrameDecoder::new(config.sample_fps)?;
+        let decoder = FrameDecoder::new()?;
 
         let has_object_detection = object_detector.is_some();
 
@@ -75,10 +75,11 @@ impl MotionAnalyzer {
             .map(|s| s + 1)
             .unwrap_or(0);
 
+        // One score per GOP segment (~1 per second with typical 1-2s keyframe interval)
         let score_histogram = ScoreHistogram::new(
             MOTION_PERCENTILE,
             DEFAULT_MOTION_THRESHOLD,
-            config.sample_fps,
+            1,
         );
 
         Ok(Self {
@@ -103,7 +104,7 @@ impl MotionAnalyzer {
         while !shutdown.load(Ordering::Relaxed) {
             if !self.decoder.is_alive() {
                 tracing::warn!(camera = %self.camera_id, "decoder process died, restarting");
-                match FrameDecoder::new(self.config.sample_fps) {
+                match FrameDecoder::new() {
                     Ok(d) => self.decoder = d,
                     Err(e) => {
                         tracing::error!(camera = %self.camera_id, error = %e, "failed to restart decoder");
@@ -163,7 +164,7 @@ impl MotionAnalyzer {
 
         // Phase 1: Motion analysis
         for (seq, data, start_pts, duration_ns) in segments_to_process {
-            let score = self.analyze_segment(&data, duration_ns)?;
+            let score = self.analyze_segment(&data)?;
 
             self.score_histogram.record(score);
             let threshold = self.score_histogram.threshold();
@@ -213,9 +214,8 @@ impl MotionAnalyzer {
     fn analyze_segment(
         &mut self,
         data: &[u8],
-        duration_ns: u64,
     ) -> Result<f32, Box<dyn std::error::Error + Send + Sync>> {
-        let raw_frames = self.decoder.decode_segment(data, duration_ns);
+        let raw_frames = self.decoder.decode_segment(data);
 
         if raw_frames.is_empty() {
             return Ok(0.0);
