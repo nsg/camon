@@ -86,6 +86,10 @@ impl HotBuffer {
         self.eviction_tx = Some(tx);
     }
 
+    pub fn close_eviction_channel(&mut self) {
+        self.eviction_tx = None;
+    }
+
     pub fn segment_count(&self) -> usize {
         self.segments.len()
     }

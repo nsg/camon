@@ -1,4 +1,5 @@
 use std::io::Read;
+use std::os::unix::io::{AsRawFd, RawFd};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, RwLock};
 use std::time::SystemTime;
@@ -81,15 +82,20 @@ impl FfmpegPipeline {
             })
     }
 
-    fn process_stream<R: Read>(
+    fn process_stream<R: Read + AsRawFd>(
         &self,
         mut reader: R,
         shutdown: &std::sync::atomic::AtomicBool,
     ) -> Result<(), RtspError> {
         let mut segmenter = MpegTsSegmenter::new(self.camera_id.clone(), Arc::clone(&self.buffer));
         let mut buf = [0u8; 188 * 64];
+        let fd = reader.as_raw_fd();
 
         while !shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+            // Poll with timeout so we can check the shutdown flag
+            if !poll_readable(fd, 500) {
+                continue;
+            }
             let n = reader.read(&mut buf)?;
             if n == 0 {
                 tracing::warn!(camera = %self.camera_id, "ffmpeg stream ended");
@@ -328,4 +334,16 @@ impl MpegTsSegmenter {
             pos += 5 + es_info_len;
         }
     }
+}
+
+/// Poll a file descriptor for readability with a timeout in milliseconds.
+/// Returns true if the fd is readable, false on timeout.
+fn poll_readable(fd: RawFd, timeout_ms: i32) -> bool {
+    let mut pollfd = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let ret = unsafe { libc::poll(&mut pollfd, 1, timeout_ms) };
+    ret > 0
 }

@@ -202,16 +202,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    tokio::select! {
-        _ = async {
-            loop {
-                tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut sigterm =
+            signal(SignalKind::terminate()).expect("failed to register SIGTERM handler");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                tracing::info!("SIGINT received, shutting down");
             }
-        } => {}
-        _ = tokio::signal::ctrl_c() => {
-            tracing::info!("shutdown signal received");
-            shutdown.store(true, Ordering::Relaxed);
+            _ = sigterm.recv() => {
+                tracing::info!("SIGTERM received, shutting down");
+            }
         }
+        shutdown.store(true, Ordering::Relaxed);
     }
 
     server_handle.abort();
@@ -220,13 +223,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         handle.abort();
     }
 
-    // Warm writers drain remaining segments and exit when senders are dropped
+    // Wait for camera pipelines to stop (ffmpeg processes exit)
+    let mut buffers_with_ids = Vec::new();
+    for (camera_id, handle, buffer) in handles {
+        let _ = handle.await;
+        tracing::info!(camera = %camera_id, "camera pipeline stopped");
+        buffers_with_ids.push((camera_id, buffer));
+    }
+
+    // Close eviction channels so warm writers can drain and exit
+    for (_, buffer) in &buffers_with_ids {
+        if let Ok(mut buf) = buffer.write() {
+            buf.close_eviction_channel();
+        }
+    }
+
     for handle in warm_handles {
         let _ = handle.await;
     }
 
-    for (camera_id, handle, buffer) in handles {
-        let _ = handle.await;
+    for (camera_id, buffer) in buffers_with_ids {
         if let Ok(buf) = buffer.read() {
             tracing::info!(
                 camera = %camera_id,
