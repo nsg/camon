@@ -17,8 +17,6 @@ document.addEventListener('DOMContentLoaded', async () => {
     const detectionTooltip = document.getElementById('detection-tooltip');
     const tooltipImage = document.getElementById('tooltip-image');
     const tooltipLabel = document.getElementById('tooltip-label');
-    const maskOverlay = document.getElementById('mask-overlay');
-    const maskCtx = maskOverlay.getContext('2d');
     const stabilityOverlay = document.getElementById('stability-overlay');
     const stabilityCtx = stabilityOverlay.getContext('2d');
     const maskToggleBtn = document.getElementById('mask-toggle-btn');
@@ -43,15 +41,11 @@ document.addEventListener('DOMContentLoaded', async () => {
     let warmEventPollInterval = null;
     let currentDetailCameraId = null;
     let bufferDuration = 0;
-    // Overlay modes: 'off' -> 'both' -> 'off'
+    // Overlay: 'off' -> 'stability' -> 'off'
     let overlayMode = 'off';
-    let maskOverlayEnabled = false;
     let stabilityOverlayEnabled = false;
-    let currentMaskSeq = null;
-    let maskImage = null;
     let stabilityImage = null;
     let stabilityPollInterval = null;
-    const failedMaskSeqs = new Set();
 
     // Warm event state
     let warmEvents = [];
@@ -143,26 +137,15 @@ document.addEventListener('DOMContentLoaded', async () => {
         updateMuteIcon();
     });
 
-    const overlayModes = ['off', 'both'];
     maskToggleBtn.addEventListener('click', () => {
-        const idx = overlayModes.indexOf(overlayMode);
-        overlayMode = overlayModes[(idx + 1) % overlayModes.length];
-        maskOverlayEnabled = overlayMode === 'both';
-        stabilityOverlayEnabled = overlayMode === 'both';
-        maskToggleBtn.classList.toggle('active', overlayMode !== 'off');
-        maskOverlay.hidden = !maskOverlayEnabled;
+        overlayMode = overlayMode === 'off' ? 'stability' : 'off';
+        stabilityOverlayEnabled = overlayMode === 'stability';
+        maskToggleBtn.classList.toggle('active', stabilityOverlayEnabled);
         stabilityOverlay.hidden = !stabilityOverlayEnabled;
-        if (!maskOverlayEnabled) {
-            maskCtx.clearRect(0, 0, maskOverlay.width, maskOverlay.height);
-            currentMaskSeq = null;
-            maskImage = null;
-            failedMaskSeqs.clear();
-        }
         if (!stabilityOverlayEnabled) {
             stabilityCtx.clearRect(0, 0, stabilityOverlay.width, stabilityOverlay.height);
             stabilityImage = null;
-        }
-        if (stabilityOverlayEnabled) {
+        } else {
             fetchStabilityMap();
         }
         maskToggleBtn.title = `Overlay: ${overlayMode}`;
@@ -445,7 +428,6 @@ document.addEventListener('DOMContentLoaded', async () => {
         liveBtn.classList.add('is-live');
         liveBtn.classList.remove('is-warm');
         liveBtn.querySelector('span:last-child') || updateLiveBtnText('Live');
-        maskOverlay.hidden = !maskOverlayEnabled;
         stabilityOverlay.hidden = !stabilityOverlayEnabled;
         if (stabilityOverlayEnabled) {
             fetchStabilityMap();
@@ -497,17 +479,11 @@ document.addEventListener('DOMContentLoaded', async () => {
         currentDetections = [];
         currentDetailCameraId = null;
         bufferDuration = 0;
-        currentMaskSeq = null;
-        maskImage = null;
         stabilityImage = null;
-        failedMaskSeqs.clear();
-        maskOverlay.hidden = true;
         stabilityOverlay.hidden = true;
         overlayMode = 'off';
-        maskOverlayEnabled = false;
         stabilityOverlayEnabled = false;
         maskToggleBtn.classList.remove('active');
-        maskCtx.clearRect(0, 0, maskOverlay.width, maskOverlay.height);
         stabilityCtx.clearRect(0, 0, stabilityOverlay.width, stabilityOverlay.height);
         if (stabilityPollInterval) {
             clearInterval(stabilityPollInterval);
@@ -728,7 +704,6 @@ document.addEventListener('DOMContentLoaded', async () => {
                     const progress = (detailVideo.currentTime / duration) * 100;
                     timelineScrubber.value = progress;
                     updateLiveState();
-                    updateMaskOverlay();
                     drawStability();
                 }
             }
@@ -750,66 +725,6 @@ document.addEventListener('DOMContentLoaded', async () => {
             timelineAnimationId = requestAnimationFrame(update);
         }
         update();
-    }
-
-    function updateMaskOverlay() {
-        if (!maskOverlayEnabled || !currentDetailCameraId || isPlayingWarmEvent) return;
-
-        const time = detailVideo.currentTime;
-        const seg = currentMotionSegments.find(s => time >= s.start && time <= s.end);
-
-        if (!seg) {
-            if (currentMaskSeq !== null) {
-                maskCtx.clearRect(0, 0, maskOverlay.width, maskOverlay.height);
-                currentMaskSeq = null;
-                maskImage = null;
-            }
-            return;
-        }
-
-        if (seg.sequence === currentMaskSeq || failedMaskSeqs.has(seg.sequence)) {
-            return;
-        }
-
-        currentMaskSeq = seg.sequence;
-        const seq = seg.sequence;
-        const img = new Image();
-        img.onload = () => {
-            if (currentMaskSeq === seq) {
-                maskImage = img;
-                drawMask();
-            }
-        };
-        img.onerror = () => {
-            failedMaskSeqs.add(seq);
-        };
-        img.src = `/api/cameras/${encodeURIComponent(currentDetailCameraId)}/motion/${seq}/mask`;
-    }
-
-    function drawMask() {
-        if (!maskImage) return;
-        const w = detailVideo.clientWidth;
-        const h = detailVideo.clientHeight;
-        if (w === 0 || h === 0) return;
-        if (maskOverlay.width !== w || maskOverlay.height !== h) {
-            maskOverlay.width = w;
-            maskOverlay.height = h;
-        }
-        maskCtx.clearRect(0, 0, w, h);
-        maskCtx.drawImage(maskImage, 0, 0, w, h);
-        // Convert grayscale JPEG to green-tinted alpha mask:
-        // white (foreground) -> green at 60% opacity
-        // black (background) -> fully transparent
-        const imageData = maskCtx.getImageData(0, 0, w, h);
-        const px = imageData.data;
-        for (let i = 0; i < px.length; i += 4) {
-            const brightness = px[i];
-            px[i]     = 0;
-            px[i + 1] = 255;
-            px[i + 2] = 80;
-            px[i + 3] = (brightness / 255) * 153; // 0.6 * 255 = 153
-        }
-        maskCtx.putImageData(imageData, 0, 0);
     }
 
     function fetchStabilityMap() {
@@ -1127,7 +1042,6 @@ document.addEventListener('DOMContentLoaded', async () => {
     // Handle canvas resize
     window.addEventListener('resize', () => {
         renderTimeline();
-        drawMask();
         drawStability();
     });
 });
