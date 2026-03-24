@@ -74,9 +74,13 @@ impl ScoreHistogram {
 const WARMUP_FRAMES: u32 = 100;
 const SCENE_CHANGE_RATIO: f32 = 0.8;
 
+const ACCUMULATOR_DECAY: f64 = 0.85;
+const ACCUMULATOR_BLEND: f64 = 1.0 - ACCUMULATOR_DECAY;
+
 pub struct MotionDetector {
     mog2: opencv::core::Ptr<video::BackgroundSubtractorMOG2>,
     fg_mask: Mat,
+    accumulator: Option<Mat>,
     learning_rate: f64,
     frames_since_stable: u32,
 }
@@ -89,6 +93,7 @@ impl MotionDetector {
         Ok(Self {
             mog2,
             fg_mask,
+            accumulator: None,
             learning_rate: -1.0,
             frames_since_stable: 0,
         })
@@ -117,11 +122,62 @@ impl MotionDetector {
 
         self.frames_since_stable += 1;
 
+        // Update the motion accumulator
+        self.update_accumulator()?;
+
         if self.frames_since_stable < WARMUP_FRAMES {
             return Ok(0.0);
         }
 
         Ok((foreground_ratio * 10.0).min(1.0))
+    }
+
+    fn update_accumulator(&mut self) -> CvResult<()> {
+        if self.fg_mask.empty() {
+            return Ok(());
+        }
+
+        let mut fg_float = Mat::default();
+        self.fg_mask
+            .convert_to(&mut fg_float, opencv::core::CV_64F, 1.0 / 255.0, 0.0)?;
+
+        match &self.accumulator {
+            Some(acc) => {
+                let mut new_acc = Mat::default();
+                opencv::core::add_weighted(
+                    acc,
+                    ACCUMULATOR_DECAY,
+                    &fg_float,
+                    ACCUMULATOR_BLEND,
+                    0.0,
+                    &mut new_acc,
+                    -1,
+                )?;
+                self.accumulator = Some(new_acc);
+            }
+            None => {
+                self.accumulator = Some(fg_float);
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn stability_map_jpeg(&self) -> Option<Vec<u8>> {
+        let acc = self.accumulator.as_ref()?;
+        if acc.empty() {
+            return None;
+        }
+        // Scale accumulator values to 0-255 with a fixed gain.
+        // Accumulator values typically range 0.0-0.3 for active areas,
+        // so a gain of 800 maps 0.3 -> 240.
+        let mut scaled = Mat::default();
+        acc.convert_to(&mut scaled, opencv::core::CV_8U, 1000.0, 0.0)
+            .ok()?;
+        let mut buf = Vector::<u8>::new();
+        let params = Vector::<i32>::new();
+        imgcodecs::imencode(".jpg", &scaled, &mut buf, &params).ok()?;
+        Some(buf.to_vec())
     }
 
     pub fn fg_mask_jpeg(&self) -> Option<Vec<u8>> {

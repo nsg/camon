@@ -80,6 +80,10 @@ pub async fn start_server(state: AppState, port: u16) -> Result<(), std::io::Err
             "/api/cameras/{id}/motion/{seq}/mask",
             get(motion_mask_handler),
         )
+        .route(
+            "/api/cameras/{id}/motion/stability",
+            get(stability_map_handler),
+        )
         .route("/api/cameras/{id}/detections", get(detections_handler))
         .route(
             "/api/cameras/{id}/detections/{detection_id}/frame",
@@ -256,6 +260,17 @@ async fn motion_mask_handler(
     match state.motion_store.get_mask(&id, seq) {
         Some(mask) => ([(header::CONTENT_TYPE, "image/jpeg")], mask).into_response(),
         None => (StatusCode::NOT_FOUND, "mask not found").into_response(),
+    }
+}
+
+async fn stability_map_handler(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+    if !state.buffers.contains_key(&id) {
+        return (StatusCode::NOT_FOUND, "camera not found").into_response();
+    }
+
+    match state.motion_store.get_stability_map(&id) {
+        Some(jpeg) => ([(header::CONTENT_TYPE, "image/jpeg")], jpeg).into_response(),
+        None => (StatusCode::NOT_FOUND, "stability map not available yet").into_response(),
     }
 }
 

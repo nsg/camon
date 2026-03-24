@@ -14,16 +14,20 @@ pub struct MotionEntry {
 
 pub struct MotionStore {
     cameras: Arc<HashMap<String, RwLock<VecDeque<MotionEntry>>>>,
+    stability_maps: Arc<HashMap<String, RwLock<Option<Vec<u8>>>>>,
 }
 
 impl MotionStore {
     pub fn new(camera_ids: &[String]) -> Self {
         let mut cameras = HashMap::new();
+        let mut stability_maps = HashMap::new();
         for id in camera_ids {
             cameras.insert(id.clone(), RwLock::new(VecDeque::new()));
+            stability_maps.insert(id.clone(), RwLock::new(None));
         }
         Self {
             cameras: Arc::new(cameras),
+            stability_maps: Arc::new(stability_maps),
         }
     }
 
@@ -91,6 +95,17 @@ impl MotionStore {
         }
     }
 
+    pub fn set_stability_map(&self, camera_id: &str, jpeg: Vec<u8>) {
+        if let Some(lock) = self.stability_maps.get(camera_id) {
+            *lock.write().unwrap() = Some(jpeg);
+        }
+    }
+
+    pub fn get_stability_map(&self, camera_id: &str) -> Option<Vec<u8>> {
+        let lock = self.stability_maps.get(camera_id)?;
+        lock.read().unwrap().clone()
+    }
+
     pub fn last_sequence(&self, camera_id: &str) -> Option<u64> {
         self.cameras
             .get(camera_id)?
@@ -105,6 +120,7 @@ impl Clone for MotionStore {
     fn clone(&self) -> Self {
         Self {
             cameras: Arc::clone(&self.cameras),
+            stability_maps: Arc::clone(&self.stability_maps),
         }
     }
 }

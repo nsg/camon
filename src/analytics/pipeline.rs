@@ -163,6 +163,10 @@ impl MotionAnalyzer {
         for (seq, data, start_pts, duration_ns) in segments_to_process {
             let score = self.analyze_segment(&data)?;
 
+            if let Some(jpeg) = self.detector.stability_map_jpeg() {
+                self.motion_store.set_stability_map(&self.camera_id, jpeg);
+            }
+
             self.score_histogram.record(score);
             let threshold = self.score_histogram.threshold();
 

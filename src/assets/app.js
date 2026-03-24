@@ -12,20 +12,20 @@ document.addEventListener('DOMContentLoaded', async () => {
     const currentTimeDisplay = document.getElementById('current-time');
     const durationDisplay = document.getElementById('duration');
     const liveBtn = document.getElementById('live-btn');
-    const motionCanvas = document.getElementById('motion-canvas');
-    const motionCtx = motionCanvas.getContext('2d');
+    const timelineCanvas = document.getElementById('timeline-canvas');
+    const timelineCtx = timelineCanvas.getContext('2d');
     const detectionTooltip = document.getElementById('detection-tooltip');
     const tooltipImage = document.getElementById('tooltip-image');
     const tooltipLabel = document.getElementById('tooltip-label');
     const maskOverlay = document.getElementById('mask-overlay');
     const maskCtx = maskOverlay.getContext('2d');
+    const stabilityOverlay = document.getElementById('stability-overlay');
+    const stabilityCtx = stabilityOverlay.getContext('2d');
     const maskToggleBtn = document.getElementById('mask-toggle-btn');
     const muteToggleBtn = document.getElementById('mute-toggle-btn');
     const detectionGallery = document.getElementById('detection-gallery');
-    const eventStripCanvas = document.getElementById('event-strip-canvas');
-    const eventStripCtx = eventStripCanvas.getContext('2d');
-    const eventStripTime = document.getElementById('event-strip-time');
-    const eventStripWrapper = document.querySelector('.event-strip-wrapper');
+    const hoverTime = document.getElementById('hover-time');
+    const timelineWrapper = document.querySelector('.timeline-wrapper');
     const zoomButtons = document.querySelectorAll('.zoom-btn');
 
     // State
@@ -43,9 +43,14 @@ document.addEventListener('DOMContentLoaded', async () => {
     let warmEventPollInterval = null;
     let currentDetailCameraId = null;
     let bufferDuration = 0;
+    // Overlay modes: 'off' -> 'motion' -> 'stability' -> 'both' -> 'off'
+    let overlayMode = 'off';
     let maskOverlayEnabled = false;
+    let stabilityOverlayEnabled = false;
     let currentMaskSeq = null;
     let maskImage = null;
+    let stabilityImage = null;
+    let stabilityPollInterval = null;
     const failedMaskSeqs = new Set();
 
     // Warm event state
@@ -53,6 +58,10 @@ document.addEventListener('DOMContentLoaded', async () => {
     let eventStripZoomHours = 24;
     let isPlayingWarmEvent = false;
     let currentWarmEventPts = null;
+
+    // Timeline drag state
+    let isDraggingTimeline = false;
+    let dragTarget = null; // 'buffer' or 'warm'
 
     // View transition helper
     function withViewTransition(callback, isBack = false) {
@@ -99,8 +108,6 @@ document.addEventListener('DOMContentLoaded', async () => {
     timelineScrubber.addEventListener('input', () => {
         isSeeking = true;
         const duration = isPlayingWarmEvent ? detailVideo.duration : (bufferDuration || detailVideo.duration);
-        const time = (timelineScrubber.value / 100) * duration;
-        currentTimeDisplay.textContent = formatTime(time);
         if (!isPlayingWarmEvent) updateLiveState();
     });
 
@@ -136,16 +143,29 @@ document.addEventListener('DOMContentLoaded', async () => {
         updateMuteIcon();
     });
 
+    const overlayModes = ['off', 'motion', 'stability', 'both'];
     maskToggleBtn.addEventListener('click', () => {
-        maskOverlayEnabled = !maskOverlayEnabled;
-        maskToggleBtn.classList.toggle('active', maskOverlayEnabled);
+        const idx = overlayModes.indexOf(overlayMode);
+        overlayMode = overlayModes[(idx + 1) % overlayModes.length];
+        maskOverlayEnabled = overlayMode === 'motion' || overlayMode === 'both';
+        stabilityOverlayEnabled = overlayMode === 'stability' || overlayMode === 'both';
+        maskToggleBtn.classList.toggle('active', overlayMode !== 'off');
         maskOverlay.hidden = !maskOverlayEnabled;
+        stabilityOverlay.hidden = !stabilityOverlayEnabled;
         if (!maskOverlayEnabled) {
             maskCtx.clearRect(0, 0, maskOverlay.width, maskOverlay.height);
             currentMaskSeq = null;
             maskImage = null;
             failedMaskSeqs.clear();
         }
+        if (!stabilityOverlayEnabled) {
+            stabilityCtx.clearRect(0, 0, stabilityOverlay.width, stabilityOverlay.height);
+            stabilityImage = null;
+        }
+        if (stabilityOverlayEnabled) {
+            fetchStabilityMap();
+        }
+        maskToggleBtn.title = `Overlay: ${overlayMode}`;
     });
 
     // Zoom button listeners
@@ -154,37 +174,156 @@ document.addEventListener('DOMContentLoaded', async () => {
             zoomButtons.forEach(b => b.classList.remove('active'));
             btn.classList.add('active');
             eventStripZoomHours = parseInt(btn.dataset.hours, 10);
-            renderEventStrip();
+            renderTimeline();
         });
     });
 
-    // Event strip click handler
-    eventStripWrapper.addEventListener('click', (e) => {
-        if (!currentDetailCameraId || warmEvents.length === 0) return;
+    // Timeline seek helpers
+    function getTimelineRatio(clientX) {
+        const rect = timelineWrapper.getBoundingClientRect();
+        return Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
+    }
 
-        const rect = eventStripWrapper.getBoundingClientRect();
-        const x = e.clientX - rect.left;
-        const ratio = x / rect.width;
+    function getBufferBounds() {
+        const windowMs = eventStripZoomHours * 3600_000;
+        const bufferMs = (bufferDuration || 0) * 1000;
+        const bufferRatio = bufferMs / windowMs;
+        return { startRatio: 1.0 - bufferRatio, bufferRatio };
+    }
 
-        const now = Date.now() * 1_000_000; // approximate current time in ns
-        const windowNs = eventStripZoomHours * 3600 * 1_000_000_000;
-        const windowStart = now - windowNs;
-        const clickedNs = windowStart + ratio * windowNs;
+    function seekBufferAtRatio(ratio) {
+        const { startRatio, bufferRatio } = getBufferBounds();
+        if (bufferRatio <= 0) return;
+        const clamped = Math.max(startRatio, Math.min(1, ratio));
+        const seekTime = ((clamped - startRatio) / bufferRatio) * bufferDuration;
+        detailVideo.currentTime = seekTime;
+        updateLiveState();
+    }
 
-        // Find the closest event to the click
+    function seekWarmEventAtRatio(ratio) {
+        if (!currentWarmEventPts) return;
+        const ev = warmEvents.find(e => e.start_pts_ns === currentWarmEventPts);
+        if (!ev) return;
+        const windowMs = eventStripZoomHours * 3600_000;
+        const windowStart = Date.now() - windowMs;
+        const evStartRatio = (ev.start_ms - windowStart) / windowMs;
+        const evEndRatio = (ev.start_ms + ev.duration_ms - windowStart) / windowMs;
+        const evSpan = evEndRatio - evStartRatio;
+        if (evSpan <= 0) return;
+        const clamped = Math.max(evStartRatio, Math.min(evEndRatio, ratio));
+        const progress = (clamped - evStartRatio) / evSpan;
+        const duration = detailVideo.duration;
+        if (duration && isFinite(duration)) {
+            detailVideo.currentTime = progress * duration;
+        }
+    }
+
+    // Timeline drag handlers
+    function timelineDragStart(clientX) {
+        if (!currentDetailCameraId) return;
+        const ratio = getTimelineRatio(clientX);
+        const { startRatio } = getBufferBounds();
+
+        if (isPlayingWarmEvent) {
+            dragTarget = 'warm';
+            isDraggingTimeline = true;
+            isSeeking = true;
+            timelineWrapper.classList.add('dragging');
+            seekWarmEventAtRatio(ratio);
+        } else if (ratio >= startRatio && bufferDuration > 0) {
+            dragTarget = 'buffer';
+            isDraggingTimeline = true;
+            isSeeking = true;
+            timelineWrapper.classList.add('dragging');
+            seekBufferAtRatio(ratio);
+        }
+    }
+
+    function timelineDragMove(clientX) {
+        if (!isDraggingTimeline) return;
+        const ratio = getTimelineRatio(clientX);
+        if (dragTarget === 'buffer') {
+            seekBufferAtRatio(ratio);
+        } else if (dragTarget === 'warm') {
+            seekWarmEventAtRatio(ratio);
+        }
+    }
+
+    function timelineDragEnd() {
+        if (!isDraggingTimeline) return;
+        isDraggingTimeline = false;
+        isSeeking = false;
+        dragTarget = null;
+        timelineWrapper.classList.remove('dragging');
+    }
+
+    // Mouse drag
+    timelineWrapper.addEventListener('mousedown', (e) => {
+        if (e.target === timelineScrubber) return;
+        e.preventDefault();
+        timelineDragStart(e.clientX);
+    });
+
+    document.addEventListener('mousemove', (e) => {
+        if (isDraggingTimeline) {
+            e.preventDefault();
+            timelineDragMove(e.clientX);
+        }
+    });
+
+    document.addEventListener('mouseup', () => {
+        timelineDragEnd();
+    });
+
+    // Touch drag
+    timelineWrapper.addEventListener('touchstart', (e) => {
+        if (e.target === timelineScrubber) return;
+        timelineDragStart(e.touches[0].clientX);
+    }, { passive: true });
+
+    document.addEventListener('touchmove', (e) => {
+        if (isDraggingTimeline) {
+            e.preventDefault();
+            timelineDragMove(e.touches[0].clientX);
+        }
+    }, { passive: false });
+
+    document.addEventListener('touchend', () => {
+        timelineDragEnd();
+    });
+
+    // Unified timeline click handler (for warm event selection)
+    timelineWrapper.addEventListener('click', (e) => {
+        if (!currentDetailCameraId) return;
+        if (e.target === timelineScrubber) return;
+
+        const ratio = getTimelineRatio(e.clientX);
+        const { startRatio } = getBufferBounds();
+
+        // Clicks in the buffer region are handled by drag handlers
+        if (ratio >= startRatio && bufferDuration > 0) return;
+        // Warm event scrubbing is handled by drag handlers
+        if (isPlayingWarmEvent) return;
+
+        // Check if click is on a warm event
+        if (warmEvents.length === 0) return;
+
+        const now = Date.now();
+        const windowMs = eventStripZoomHours * 3600_000;
+        const windowStart = now - windowMs;
+        const clickedMs = windowStart + ratio * windowMs;
+
         let closest = null;
         let closestDist = Infinity;
         for (const ev of warmEvents) {
-            const evEnd = ev.start_ns + ev.duration_ms * 1_000_000;
-            // Check if click is within event bounds
-            if (clickedNs >= ev.start_ns && clickedNs <= evEnd) {
+            const evEnd = ev.start_ms + ev.duration_ms;
+            if (clickedMs >= ev.start_ms && clickedMs <= evEnd) {
                 closest = ev;
                 break;
             }
-            // Otherwise find nearest
             const dist = Math.min(
-                Math.abs(clickedNs - ev.start_ns),
-                Math.abs(clickedNs - evEnd)
+                Math.abs(clickedMs - ev.start_ms),
+                Math.abs(clickedMs - evEnd)
             );
             if (dist < closestDist) {
                 closestDist = dist;
@@ -192,52 +331,50 @@ document.addEventListener('DOMContentLoaded', async () => {
             }
         }
 
-        // Only play if click was reasonably close to an event (within 2% of window)
         if (closest) {
-            const evEnd = closest.start_ns + closest.duration_ms * 1_000_000;
-            const threshold = windowNs * 0.02;
-            if (clickedNs >= closest.start_ns - threshold && clickedNs <= evEnd + threshold) {
+            const evEnd = closest.start_ms + closest.duration_ms;
+            const threshold = windowMs * 0.02;
+            if (clickedMs >= closest.start_ms - threshold && clickedMs <= evEnd + threshold) {
                 loadWarmEvent(currentDetailCameraId, closest.start_pts_ns);
             }
         }
     });
 
-    // Event strip hover for time display
-    eventStripWrapper.addEventListener('mousemove', (e) => {
-        const rect = eventStripWrapper.getBoundingClientRect();
+    // Unified timeline hover handler
+    timelineWrapper.addEventListener('mousemove', (e) => {
+        const rect = timelineWrapper.getBoundingClientRect();
         const x = e.clientX - rect.left;
         const ratio = x / rect.width;
 
-        const now = Date.now() * 1_000_000;
-        const windowNs = eventStripZoomHours * 3600 * 1_000_000_000;
-        const windowStart = now - windowNs;
-        const hoveredNs = windowStart + ratio * windowNs;
-        const hoveredDate = new Date(hoveredNs / 1_000_000);
-        eventStripTime.textContent = hoveredDate.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-    });
+        const now = Date.now();
+        const windowMs = eventStripZoomHours * 3600_000;
+        const windowStart = now - windowMs;
+        const hoveredMs = windowStart + ratio * windowMs;
+        const hoveredDate = new Date(hoveredMs);
+        hoverTime.textContent = hoveredDate.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+        hoverTime.style.left = (x - hoverTime.offsetWidth / 2) + 'px';
+        hoverTime.classList.add('visible');
 
-    eventStripWrapper.addEventListener('mouseleave', () => {
-        eventStripTime.textContent = '';
-    });
-
-    // Tooltip event listeners (on wrapper since canvas has pointer-events: none)
-    const timelineWrapper = document.querySelector('.timeline-wrapper');
-    timelineWrapper.addEventListener('mousemove', (e) => {
-        if (!bufferDuration || isPlayingWarmEvent) return;
-
-        const rect = timelineWrapper.getBoundingClientRect();
-        const x = e.clientX - rect.left;
-        const time = (x / rect.width) * bufferDuration;
-
-        const detection = findDetectionNear(time, 1.0);
-        if (detection && currentDetailCameraId) {
-            showTooltip(e.clientX, e.clientY, detection);
-        } else {
-            hideTooltip();
+        // Tooltip for detections in buffer region
+        if (bufferDuration > 0 && !isPlayingWarmEvent) {
+            const bufferMs = bufferDuration * 1000;
+            const bufferRatio = bufferMs / windowMs;
+            const bufferStartX = 1.0 - bufferRatio;
+            if (ratio >= bufferStartX) {
+                const bufferClickRatio = (ratio - bufferStartX) / bufferRatio;
+                const time = bufferClickRatio * bufferDuration;
+                const detection = findDetectionNear(time, 1.0);
+                if (detection && currentDetailCameraId) {
+                    showTooltip(e.clientX, e.clientY, detection);
+                    return;
+                }
+            }
         }
+        hideTooltip();
     });
 
     timelineWrapper.addEventListener('mouseleave', () => {
+        hoverTime.classList.remove('visible');
         hideTooltip();
     });
 
@@ -309,6 +446,10 @@ document.addEventListener('DOMContentLoaded', async () => {
         liveBtn.classList.remove('is-warm');
         liveBtn.querySelector('span:last-child') || updateLiveBtnText('Live');
         maskOverlay.hidden = !maskOverlayEnabled;
+        stabilityOverlay.hidden = !stabilityOverlayEnabled;
+        if (stabilityOverlayEnabled) {
+            fetchStabilityMap();
+        }
 
         // Reset warm state
         isPlayingWarmEvent = false;
@@ -358,15 +499,24 @@ document.addEventListener('DOMContentLoaded', async () => {
         bufferDuration = 0;
         currentMaskSeq = null;
         maskImage = null;
+        stabilityImage = null;
         failedMaskSeqs.clear();
         maskOverlay.hidden = true;
+        stabilityOverlay.hidden = true;
+        overlayMode = 'off';
         maskOverlayEnabled = false;
+        stabilityOverlayEnabled = false;
         maskToggleBtn.classList.remove('active');
         maskCtx.clearRect(0, 0, maskOverlay.width, maskOverlay.height);
+        stabilityCtx.clearRect(0, 0, stabilityOverlay.width, stabilityOverlay.height);
+        if (stabilityPollInterval) {
+            clearInterval(stabilityPollInterval);
+            stabilityPollInterval = null;
+        }
         hideTooltip();
         detectionGallery.innerHTML = '';
-        const rect = motionCanvas.getBoundingClientRect();
-        motionCtx.clearRect(0, 0, rect.width, rect.height);
+        const rect = timelineCanvas.getBoundingClientRect();
+        timelineCtx.clearRect(0, 0, rect.width, rect.height);
         warmEvents = [];
         isPlayingWarmEvent = false;
         currentWarmEventPts = null;
@@ -502,6 +652,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         // Update UI state
         liveBtn.classList.remove('is-live');
         liveBtn.classList.add('is-warm');
+        timelineScrubber.classList.add('active');
         updateLiveBtnText('Return to Live');
 
         detailLoading.hidden = false;
@@ -535,7 +686,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         }
 
         // Highlight the event in the strip
-        renderEventStrip();
+        renderTimeline();
     }
 
     function returnToLive() {
@@ -545,6 +696,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         currentWarmEventPts = null;
 
         liveBtn.classList.remove('is-warm');
+        timelineScrubber.classList.remove('active');
         updateLiveBtnText('Live');
 
         // Reload live stream
@@ -554,10 +706,14 @@ document.addEventListener('DOMContentLoaded', async () => {
         }
 
         loadDetailCamera(currentDetailCameraId);
-        renderEventStrip();
+        renderTimeline();
     }
 
     // Timeline functions
+    function formatWindowTime(date) {
+        return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    }
+
     function startTimelineUpdate() {
         function update() {
             if (isPlayingWarmEvent) {
@@ -565,20 +721,32 @@ document.addEventListener('DOMContentLoaded', async () => {
                 if (!isSeeking && duration && isFinite(duration)) {
                     const progress = (detailVideo.currentTime / duration) * 100;
                     timelineScrubber.value = progress;
-                    currentTimeDisplay.textContent = formatTime(detailVideo.currentTime);
-                    durationDisplay.textContent = formatTime(duration);
                 }
             } else {
                 const duration = bufferDuration || detailVideo.duration;
                 if (!isSeeking && duration && isFinite(duration)) {
                     const progress = (detailVideo.currentTime / duration) * 100;
                     timelineScrubber.value = progress;
-                    currentTimeDisplay.textContent = formatTime(detailVideo.currentTime);
-                    durationDisplay.textContent = formatTime(duration);
                     updateLiveState();
                     updateMaskOverlay();
+                    drawStability();
                 }
             }
+            // Update window time labels
+            const now = Date.now();
+            const windowMs = eventStripZoomHours * 3600_000;
+            if (isPlayingWarmEvent && currentWarmEventPts) {
+                const evStartMs = Number(BigInt(currentWarmEventPts) / 1_000_000n);
+                const ev = warmEvents.find(e => e.start_pts_ns === currentWarmEventPts);
+                const evDurationMs = ev ? ev.duration_ms : (detailVideo.duration * 1000);
+                currentTimeDisplay.textContent = formatWindowTime(new Date(evStartMs));
+                durationDisplay.textContent = formatWindowTime(new Date(evStartMs + evDurationMs));
+            } else {
+                currentTimeDisplay.textContent = formatWindowTime(new Date(now - windowMs));
+                durationDisplay.textContent = 'Now';
+            }
+
+            renderTimeline();
             timelineAnimationId = requestAnimationFrame(update);
         }
         update();
@@ -644,6 +812,43 @@ document.addEventListener('DOMContentLoaded', async () => {
         maskCtx.putImageData(imageData, 0, 0);
     }
 
+    function fetchStabilityMap() {
+        if (!stabilityOverlayEnabled || !currentDetailCameraId || isPlayingWarmEvent) return;
+        const img = new Image();
+        img.onload = () => {
+            stabilityImage = img;
+            drawStability();
+        };
+        img.onerror = () => {};
+        img.src = `/api/cameras/${encodeURIComponent(currentDetailCameraId)}/motion/stability?t=${Date.now()}`;
+    }
+
+    function drawStability() {
+        if (!stabilityImage) return;
+        const w = detailVideo.clientWidth;
+        const h = detailVideo.clientHeight;
+        if (w === 0 || h === 0) return;
+        if (stabilityOverlay.width !== w || stabilityOverlay.height !== h) {
+            stabilityOverlay.width = w;
+            stabilityOverlay.height = h;
+        }
+        stabilityCtx.clearRect(0, 0, w, h);
+        stabilityCtx.drawImage(stabilityImage, 0, 0, w, h);
+        // Convert grayscale JPEG to blue/purple-tinted alpha mask:
+        // bright (volatile) -> blue at 50% opacity
+        // dark (stable) -> fully transparent
+        const imageData = stabilityCtx.getImageData(0, 0, w, h);
+        const px = imageData.data;
+        for (let i = 0; i < px.length; i += 4) {
+            const brightness = px[i];
+            px[i]     = 100;
+            px[i + 1] = 60;
+            px[i + 2] = 255;
+            px[i + 3] = (brightness / 255) * 128; // 0.5 * 255 = 128
+        }
+        stabilityCtx.putImageData(imageData, 0, 0);
+    }
+
     function updateLiveState() {
         const duration = bufferDuration || detailVideo.duration;
         if (duration && isFinite(duration)) {
@@ -674,10 +879,8 @@ document.addEventListener('DOMContentLoaded', async () => {
                     currentMotionSegments = data.segments || [];
                     if (data.total_duration > 0) {
                         bufferDuration = data.total_duration;
-                        if (!isPlayingWarmEvent) {
-                            renderTimeline(bufferDuration);
-                        }
                     }
+                    renderTimeline();
                 }
             } catch (err) {
                 console.error('Failed to fetch motion data:', err);
@@ -686,6 +889,9 @@ document.addEventListener('DOMContentLoaded', async () => {
 
         await poll();
         motionPollInterval = setInterval(poll, 5000);
+        // Poll stability map every 5 seconds when overlay is enabled
+        if (stabilityPollInterval) clearInterval(stabilityPollInterval);
+        stabilityPollInterval = setInterval(fetchStabilityMap, 5000);
     }
 
     // Detection data fetching
@@ -702,10 +908,8 @@ document.addEventListener('DOMContentLoaded', async () => {
                     currentDetections = data.detections || [];
                     if (data.total_duration > 0) {
                         bufferDuration = data.total_duration;
-                        if (!isPlayingWarmEvent) {
-                            renderTimeline(bufferDuration);
-                        }
                     }
+                    renderTimeline();
                     renderDetectionGallery();
                 }
             } catch (err) {
@@ -730,9 +934,9 @@ document.addEventListener('DOMContentLoaded', async () => {
                     const raw = await response.json();
                     warmEvents = raw.map(ev => ({
                         ...ev,
-                        start_ns: Number(ev.start_pts_ns),
+                        start_ms: Number(BigInt(ev.start_pts_ns) / 1_000_000n),
                     }));
-                    renderEventStrip();
+                    renderTimeline();
                 }
             } catch (err) {
                 console.error('Failed to fetch warm events:', err);
@@ -743,120 +947,136 @@ document.addEventListener('DOMContentLoaded', async () => {
         warmEventPollInterval = setInterval(poll, 15000);
     }
 
-    // Event strip rendering
-    function renderEventStrip() {
-        const rect = eventStripWrapper.getBoundingClientRect();
+    // Unified timeline rendering
+    function renderTimeline() {
+        const rect = timelineWrapper.getBoundingClientRect();
         if (rect.width === 0) return;
 
         const dpr = window.devicePixelRatio || 1;
-        eventStripCanvas.width = rect.width * dpr;
-        eventStripCanvas.height = rect.height * dpr;
-        eventStripCtx.scale(dpr, dpr);
+        timelineCanvas.width = rect.width * dpr;
+        timelineCanvas.height = rect.height * dpr;
+        timelineCtx.scale(dpr, dpr);
+        timelineCtx.clearRect(0, 0, rect.width, rect.height);
 
-        eventStripCtx.clearRect(0, 0, rect.width, rect.height);
+        const w = rect.width;
+        const h = rect.height;
 
-        if (warmEvents.length === 0) return;
-
-        const now = Date.now() * 1_000_000; // approximate ns
-        const windowNs = eventStripZoomHours * 3600 * 1_000_000_000;
-        const windowStart = now - windowNs;
+        const now = Date.now();
+        const windowMs = eventStripZoomHours * 3600_000;
+        const windowStart = now - windowMs;
         const windowEnd = now;
 
-        // Draw time axis ticks
-        eventStripCtx.strokeStyle = 'rgba(255, 255, 255, 0.1)';
-        eventStripCtx.lineWidth = 1;
+        // 1. Time axis ticks
+        timelineCtx.strokeStyle = 'rgba(255, 255, 255, 0.1)';
+        timelineCtx.lineWidth = 1;
         const tickIntervalHours = eventStripZoomHours <= 1 ? 0.25 :
                                    eventStripZoomHours <= 6 ? 1 :
                                    eventStripZoomHours <= 24 ? 4 : 8;
-        const tickIntervalNs = tickIntervalHours * 3600 * 1_000_000_000;
-        const firstTick = Math.ceil(windowStart / tickIntervalNs) * tickIntervalNs;
-        for (let t = firstTick; t < windowEnd; t += tickIntervalNs) {
-            const x = ((t - windowStart) / windowNs) * rect.width;
-            eventStripCtx.beginPath();
-            eventStripCtx.moveTo(x, 0);
-            eventStripCtx.lineTo(x, rect.height);
-            eventStripCtx.stroke();
+        const tickIntervalMs = tickIntervalHours * 3600_000;
+        const firstTick = Math.ceil(windowStart / tickIntervalMs) * tickIntervalMs;
+        for (let t = firstTick; t < windowEnd; t += tickIntervalMs) {
+            const x = ((t - windowStart) / windowMs) * w;
+            timelineCtx.beginPath();
+            timelineCtx.moveTo(x, 0);
+            timelineCtx.lineTo(x, h);
+            timelineCtx.stroke();
         }
 
-        // Draw "now" marker (live edge) at right
-        eventStripCtx.fillStyle = 'rgba(231, 76, 60, 0.3)';
-        const liveWidth = Math.max(2, rect.width * 0.005);
-        eventStripCtx.fillRect(rect.width - liveWidth, 0, liveWidth, rect.height);
-
-        // Draw events
+        // 2. Warm event blocks
         warmEvents.forEach(ev => {
-            const evStart = ev.start_ns;
-            const evEndNs = evStart + ev.duration_ms * 1_000_000;
+            const evStart = ev.start_ms;
+            const evEnd = evStart + ev.duration_ms;
 
-            // Skip events outside window
-            if (evEndNs < windowStart || evStart > windowEnd) return;
+            if (evEnd < windowStart || evStart > windowEnd) return;
 
-            const startX = Math.max(0, ((evStart - windowStart) / windowNs) * rect.width);
-            const endX = Math.min(rect.width, ((evEndNs - windowStart) / windowNs) * rect.width);
-            const width = Math.max(2, endX - startX); // minimum 2px visibility
+            const startX = Math.max(0, ((evStart - windowStart) / windowMs) * w);
+            const endX = Math.min(w, ((evEnd - windowStart) / windowMs) * w);
+            const evW = Math.max(2, endX - startX);
 
             const isPlaying = isPlayingWarmEvent && currentWarmEventPts === ev.start_pts_ns;
             if (ev.event_type === 'object') {
-                eventStripCtx.fillStyle = isPlaying ? 'rgba(220, 50, 50, 1)' : 'rgba(220, 50, 50, 0.8)';
+                timelineCtx.fillStyle = isPlaying ? 'rgba(220, 50, 50, 1)' : 'rgba(220, 50, 50, 0.8)';
             } else {
-                eventStripCtx.fillStyle = isPlaying ? 'rgba(255, 200, 50, 1)' : 'rgba(255, 200, 50, 0.7)';
+                timelineCtx.fillStyle = isPlaying ? 'rgba(255, 200, 50, 1)' : 'rgba(255, 200, 50, 0.7)';
             }
 
-            eventStripCtx.beginPath();
-            eventStripCtx.roundRect(startX, 2, width, rect.height - 4, 2);
-            eventStripCtx.fill();
+            timelineCtx.beginPath();
+            timelineCtx.roundRect(startX, 2, evW, h - 4, 2);
+            timelineCtx.fill();
 
-            // Highlight border for currently playing event
             if (isPlaying) {
-                eventStripCtx.strokeStyle = '#fff';
-                eventStripCtx.lineWidth = 2;
-                eventStripCtx.beginPath();
-                eventStripCtx.roundRect(startX, 2, width, rect.height - 4, 2);
-                eventStripCtx.stroke();
+                timelineCtx.strokeStyle = '#fff';
+                timelineCtx.lineWidth = 2;
+                timelineCtx.beginPath();
+                timelineCtx.roundRect(startX, 2, evW, h - 4, 2);
+                timelineCtx.stroke();
+
+                // Playhead within event: show progress through event
+                const duration = detailVideo.duration;
+                if (duration && isFinite(duration) && duration > 0) {
+                    const progress = detailVideo.currentTime / duration;
+                    const playheadX = startX + progress * evW;
+                    timelineCtx.strokeStyle = 'rgba(255, 255, 255, 0.9)';
+                    timelineCtx.lineWidth = 2;
+                    timelineCtx.beginPath();
+                    timelineCtx.moveTo(playheadX, 0);
+                    timelineCtx.lineTo(playheadX, h);
+                    timelineCtx.stroke();
+                }
             }
         });
-    }
 
-    function renderTimeline(duration) {
-        if (!duration || !isFinite(duration)) return;
+        // 3. Live buffer region (right edge)
+        const bufferMs = (bufferDuration || 0) * 1000;
+        if (bufferMs > 0) {
+            const bufferRatio = Math.min(1, bufferMs / windowMs);
+            const bufferStartX = w * (1.0 - bufferRatio);
+            const bufferW = w * bufferRatio;
 
-        const rect = motionCanvas.getBoundingClientRect();
-        const dpr = window.devicePixelRatio || 1;
-        motionCanvas.width = rect.width * dpr;
-        motionCanvas.height = rect.height * dpr;
-        motionCtx.scale(dpr, dpr);
+            // Subtle background tint for buffer region
+            timelineCtx.fillStyle = 'rgba(255, 255, 255, 0.08)';
+            timelineCtx.fillRect(bufferStartX, 0, bufferW, h);
 
-        motionCtx.clearRect(0, 0, rect.width, rect.height);
+            // 4. Motion segments within buffer region
+            const detectionTimes = currentDetections.map(d => d.timestamp);
+            currentMotionSegments.forEach(segment => {
+                const segStartX = bufferStartX + (segment.start / bufferDuration) * bufferW;
+                const segEndX = bufferStartX + (segment.end / bufferDuration) * bufferW;
+                const segW = segEndX - segStartX;
 
-        // Build set of detection timestamps for overlap checking
-        const detectionTimes = currentDetections.map(d => d.timestamp);
+                const hasDetection = detectionTimes.some(t => t >= segment.start && t <= segment.end);
+                if (hasDetection) return;
 
-        // Draw motion segments (yellow), skipping areas with object detections
-        currentMotionSegments.forEach(segment => {
-            const startX = (segment.start / duration) * rect.width;
-            const endX = (segment.end / duration) * rect.width;
-            const width = endX - startX;
+                const alpha = 0.5 + segment.intensity * 0.5;
+                timelineCtx.fillStyle = `rgba(255, 200, 50, ${alpha})`;
+                timelineCtx.beginPath();
+                timelineCtx.roundRect(segStartX, 2, segW, h - 4, 2);
+                timelineCtx.fill();
+            });
 
-            // Check if any detection falls within this segment
-            const hasDetection = detectionTimes.some(t => t >= segment.start && t <= segment.end);
-            if (hasDetection) return;
+            // 5. Detection markers within buffer region
+            currentDetections.forEach(det => {
+                const x = bufferStartX + (det.timestamp / bufferDuration) * bufferW;
+                const alpha = 0.6 + det.confidence * 0.4;
+                timelineCtx.fillStyle = `rgba(220, 50, 50, ${alpha})`;
+                timelineCtx.fillRect(x - 2, 2, 4, h - 4);
+            });
 
-            const alpha = 0.5 + segment.intensity * 0.5;
-            motionCtx.fillStyle = `rgba(255, 200, 50, ${alpha})`;
-
-            const radius = 4;
-            motionCtx.beginPath();
-            motionCtx.roundRect(startX, 0, width, rect.height, radius);
-            motionCtx.fill();
-        });
-
-        // Draw detection markers (red)
-        currentDetections.forEach(det => {
-            const x = (det.timestamp / duration) * rect.width;
-            const alpha = 0.6 + det.confidence * 0.4;
-            motionCtx.fillStyle = `rgba(220, 50, 50, ${alpha})`;
-            motionCtx.fillRect(x - 2, 0, 4, rect.height);
-        });
+            // 6. Playhead in live mode
+            if (!isPlayingWarmEvent) {
+                const currentTime = detailVideo.currentTime;
+                const duration = bufferDuration || detailVideo.duration;
+                if (duration && isFinite(duration) && duration > 0) {
+                    const playheadX = bufferStartX + (currentTime / duration) * bufferW;
+                    timelineCtx.strokeStyle = 'rgba(255, 255, 255, 0.9)';
+                    timelineCtx.lineWidth = 2;
+                    timelineCtx.beginPath();
+                    timelineCtx.moveTo(playheadX, 0);
+                    timelineCtx.lineTo(playheadX, h);
+                    timelineCtx.stroke();
+                }
+            }
+        }
     }
 
     function findDetectionNear(time, threshold) {
@@ -906,10 +1126,8 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     // Handle canvas resize
     window.addEventListener('resize', () => {
-        if (bufferDuration > 0 && !isPlayingWarmEvent) {
-            renderTimeline(bufferDuration);
-        }
-        renderEventStrip();
+        renderTimeline();
         drawMask();
+        drawStability();
     });
 });

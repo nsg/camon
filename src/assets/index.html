@@ -36,25 +36,21 @@
             <div class="detail-video-wrapper">
                 <video id="detail-video" playsinline muted></video>
                 <canvas id="mask-overlay"></canvas>
+                <canvas id="stability-overlay"></canvas>
                 <div id="detail-loading" class="loading"><p>Loading...</p></div>
             </div>
-            <div class="event-strip-controls">
+            <div class="timeline-controls">
                 <div class="zoom-buttons">
                     <button class="zoom-btn" data-hours="1">1h</button>
                     <button class="zoom-btn" data-hours="6">6h</button>
                     <button class="zoom-btn active" data-hours="24">24h</button>
                     <button class="zoom-btn" data-hours="48">48h</button>
                 </div>
-                <div class="event-strip-wrapper">
-                    <canvas id="event-strip-canvas"></canvas>
-                </div>
-                <span id="event-strip-time" class="time-display"></span>
-            </div>
-            <div class="timeline-controls">
                 <span id="current-time" class="time-display">00:00:00</span>
                 <div class="timeline-wrapper">
-                    <canvas id="motion-canvas"></canvas>
+                    <canvas id="timeline-canvas"></canvas>
                     <input type="range" id="timeline-scrubber" min="0" max="100" value="100" step="0.1">
+                    <span id="hover-time"></span>
                 </div>
                 <span id="duration" class="time-display">00:00:00</span>
                 <button id="mute-toggle-btn" class="mute-toggle-btn muted" title="Toggle audio">
