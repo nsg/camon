@@ -40,11 +40,44 @@ pub fn generate_playlist(buffer: &HotBuffer) -> String {
                 playlist.push_str("#EXT-X-DISCONTINUITY\n");
             }
         }
+        let secs = (segment.start_pts / 1_000_000_000) as i64;
+        let millis = ((segment.start_pts % 1_000_000_000) / 1_000_000) as u32;
+        let dt = format_datetime(secs, millis);
+        playlist.push_str(&format!("#EXT-X-PROGRAM-DATE-TIME:{}\n", dt));
         playlist.push_str(&format!("#EXTINF:{:.3},\n", duration));
         playlist.push_str(&format!("segment/{}\n", sequence));
     }
 
     playlist
+}
+
+/// Format unix timestamp as ISO 8601 for EXT-X-PROGRAM-DATE-TIME
+fn format_datetime(secs: i64, millis: u32) -> String {
+    const SECS_PER_DAY: i64 = 86400;
+    const DAYS_FROM_UNIX_TO_0000: i64 = 719_468;
+
+    let days = secs.div_euclid(SECS_PER_DAY) + DAYS_FROM_UNIX_TO_0000;
+    let time_of_day = secs.rem_euclid(SECS_PER_DAY) as u32;
+
+    // Civil date from day count (Euclidean affine algorithm)
+    let era = days.div_euclid(146097);
+    let doe = days.rem_euclid(146097) as u32;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+
+    let h = time_of_day / 3600;
+    let min = (time_of_day % 3600) / 60;
+    let s = time_of_day % 60;
+
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
+        y, m, d, h, min, s, millis
+    )
 }
 
 pub fn generate_segment(buffer: &HotBuffer, sequence: u64) -> Option<Vec<u8>> {
