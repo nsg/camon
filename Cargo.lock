@@ -147,6 +147,7 @@ name = "camon"
 version = "0.1.3"
 dependencies = [
  "axum",
+ "libc",
  "mime_guess",
  "ndarray",
  "opencv",
