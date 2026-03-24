@@ -223,13 +223,6 @@ impl CropDecoder {
         frames
     }
 
-    pub fn is_alive(&mut self) -> bool {
-        self.child
-            .as_mut()
-            .map(|c| c.try_wait().ok().flatten().is_none())
-            .unwrap_or(false)
-    }
-
     pub fn height(&self) -> u32 {
         CROP_HEIGHT
     }

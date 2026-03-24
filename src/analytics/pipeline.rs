@@ -49,7 +49,7 @@ pub struct MotionAnalyzer {
     config: AnalyticsConfig,
     detector: MotionDetector,
     decoder: FrameDecoder,
-    crop_decoder: Option<CropDecoder>,
+    has_object_detection: bool,
     object_detector: Option<ObjectDetector>,
     last_processed: u64,
     last_motion_bbox: Option<Rect>,
@@ -68,11 +68,7 @@ impl MotionAnalyzer {
         let detector = MotionDetector::new()?;
         let decoder = FrameDecoder::new(config.sample_fps)?;
 
-        let crop_decoder = if object_detector.is_some() {
-            Some(CropDecoder::new(config.sample_fps)?)
-        } else {
-            None
-        };
+        let has_object_detection = object_detector.is_some();
 
         let last_processed = motion_store
             .last_sequence(&camera_id)
@@ -93,7 +89,7 @@ impl MotionAnalyzer {
             config,
             detector,
             decoder,
-            crop_decoder,
+            has_object_detection,
             object_detector,
             last_processed,
             last_motion_bbox: None,
@@ -113,18 +109,6 @@ impl MotionAnalyzer {
                         tracing::error!(camera = %self.camera_id, error = %e, "failed to restart decoder");
                         thread::sleep(Duration::from_secs(5));
                         continue;
-                    }
-                }
-            }
-
-            if let Some(ref mut dd) = self.crop_decoder {
-                if !dd.is_alive() {
-                    tracing::warn!(camera = %self.camera_id, "crop decoder died, restarting");
-                    match CropDecoder::new(self.config.sample_fps) {
-                        Ok(d) => self.crop_decoder = Some(d),
-                        Err(e) => {
-                            tracing::error!(camera = %self.camera_id, error = %e, "failed to restart crop decoder");
-                        }
                     }
                 }
             }
@@ -174,7 +158,7 @@ impl MotionAnalyzer {
             segments
         };
 
-        let has_detection = self.object_detector.is_some() && self.detection_store.is_some();
+        let has_detection = self.has_object_detection && self.detection_store.is_some();
         let mut motion_segments = Vec::new();
 
         // Phase 1: Motion analysis
@@ -269,9 +253,7 @@ impl MotionAnalyzer {
         Ok(total_score / frame_count as f32)
     }
 
-    fn detect_segment(&mut self, data: &[u8], duration_ns: u64) -> Option<SegmentDetectionResult> {
-        let crop_decoder = self.crop_decoder.as_ref()?;
-
+    fn detect_segment(&mut self, data: &[u8], duration_ns: u64, crop_decoder: &CropDecoder) -> Option<SegmentDetectionResult> {
         let raw_frames = crop_decoder.decode_segment(data, duration_ns);
         if raw_frames.is_empty() {
             return None;
@@ -381,25 +363,34 @@ impl MotionAnalyzer {
     }
 
     fn run_sampled_detections(&mut self, segments: Vec<MotionSegment>) {
+        let crop_decoder = match CropDecoder::new(self.config.sample_fps) {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::error!(camera = %self.camera_id, error = %e, "failed to create crop decoder");
+                return;
+            }
+        };
+
         let runs = group_contiguous_runs(segments);
         for run in runs {
-            self.detect_run(run);
+            self.detect_run(run, &crop_decoder);
         }
+        // crop_decoder is dropped here, killing the ffmpeg process
     }
 
-    fn detect_run(&mut self, run: Vec<MotionSegment>) {
+    fn detect_run(&mut self, run: Vec<MotionSegment>, crop_decoder: &CropDecoder) {
         let len = run.len();
         if len <= 2 {
             for seg in &run {
-                if let Some(result) = self.detect_segment(&seg.data, seg.duration_ns) {
+                if let Some(result) = self.detect_segment(&seg.data, seg.duration_ns, crop_decoder) {
                     self.store_detection_result(seg.seq, &result);
                 }
             }
             return;
         }
 
-        let first_result = self.detect_segment(&run[0].data, run[0].duration_ns);
-        let last_result = self.detect_segment(&run[len - 1].data, run[len - 1].duration_ns);
+        let first_result = self.detect_segment(&run[0].data, run[0].duration_ns, crop_decoder);
+        let last_result = self.detect_segment(&run[len - 1].data, run[len - 1].duration_ns, crop_decoder);
 
         let boundaries_agree = match (&first_result, &last_result) {
             (Some(first), Some(last)) => {
@@ -463,8 +454,8 @@ impl MotionAnalyzer {
             if !inner.is_empty() {
                 let mid = inner.len() / 2;
                 let right = inner.split_off(mid);
-                self.detect_run(inner);
-                self.detect_run(right);
+                self.detect_run(inner, crop_decoder);
+                self.detect_run(right, crop_decoder);
             }
         }
     }
