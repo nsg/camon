@@ -76,11 +76,7 @@ impl MotionAnalyzer {
             .unwrap_or(0);
 
         // One score per GOP segment (~1 per second with typical 1-2s keyframe interval)
-        let score_histogram = ScoreHistogram::new(
-            MOTION_PERCENTILE,
-            DEFAULT_MOTION_THRESHOLD,
-            1,
-        );
+        let score_histogram = ScoreHistogram::new(MOTION_PERCENTILE, DEFAULT_MOTION_THRESHOLD, 1);
 
         Ok(Self {
             camera_id,
@@ -129,35 +125,36 @@ impl MotionAnalyzer {
     }
 
     fn process_new_segments(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let segments_to_process = {
+        // Grab only the sequence range under the lock, release immediately
+        let (first_seq, last_seq) = {
             let buffer = self.buffer.read().map_err(|_| "buffer lock poisoned")?;
-            let first_seq = buffer.first_sequence();
-            let last_seq = buffer.last_sequence();
-
-            if first_seq > 0 {
-                self.motion_store.cleanup(&self.camera_id, first_seq);
-                if let Some(ref ds) = self.detection_store {
-                    ds.cleanup(&self.camera_id, first_seq);
-                }
-            }
-
-            if self.last_processed < first_seq {
-                self.last_processed = first_seq;
-            }
-
-            let mut segments = Vec::new();
-            for seq in self.last_processed..last_seq {
-                if let Some(segment) = buffer.get_segment_by_sequence(seq) {
-                    segments.push((
-                        seq,
-                        segment.data.clone(),
-                        segment.start_pts,
-                        segment.duration_ns,
-                    ));
-                }
-            }
-            segments
+            (buffer.first_sequence(), buffer.last_sequence())
         };
+
+        if first_seq > 0 {
+            self.motion_store.cleanup(&self.camera_id, first_seq);
+            if let Some(ref ds) = self.detection_store {
+                ds.cleanup(&self.camera_id, first_seq);
+            }
+        }
+
+        if self.last_processed < first_seq {
+            self.last_processed = first_seq;
+        }
+
+        // Fetch and clone each segment with a short-lived lock
+        let mut segments_to_process = Vec::new();
+        for seq in self.last_processed..last_seq {
+            let segment = {
+                let buffer = self.buffer.read().map_err(|_| "buffer lock poisoned")?;
+                buffer
+                    .get_segment_by_sequence(seq)
+                    .map(|s| (seq, s.data.clone(), s.start_pts, s.duration_ns))
+            };
+            if let Some(seg) = segment {
+                segments_to_process.push(seg);
+            }
+        }
 
         let has_detection = self.has_object_detection && self.detection_store.is_some();
         let mut motion_segments = Vec::new();
@@ -253,7 +250,12 @@ impl MotionAnalyzer {
         Ok(total_score / frame_count as f32)
     }
 
-    fn detect_segment(&mut self, data: &[u8], duration_ns: u64, crop_decoder: &CropDecoder) -> Option<SegmentDetectionResult> {
+    fn detect_segment(
+        &mut self,
+        data: &[u8],
+        duration_ns: u64,
+        crop_decoder: &CropDecoder,
+    ) -> Option<SegmentDetectionResult> {
         let raw_frames = crop_decoder.decode_segment(data, duration_ns);
         if raw_frames.is_empty() {
             return None;
@@ -382,7 +384,8 @@ impl MotionAnalyzer {
         let len = run.len();
         if len <= 2 {
             for seg in &run {
-                if let Some(result) = self.detect_segment(&seg.data, seg.duration_ns, crop_decoder) {
+                if let Some(result) = self.detect_segment(&seg.data, seg.duration_ns, crop_decoder)
+                {
                     self.store_detection_result(seg.seq, &result);
                 }
             }
@@ -390,7 +393,8 @@ impl MotionAnalyzer {
         }
 
         let first_result = self.detect_segment(&run[0].data, run[0].duration_ns, crop_decoder);
-        let last_result = self.detect_segment(&run[len - 1].data, run[len - 1].duration_ns, crop_decoder);
+        let last_result =
+            self.detect_segment(&run[len - 1].data, run[len - 1].duration_ns, crop_decoder);
 
         let boundaries_agree = match (&first_result, &last_result) {
             (Some(first), Some(last)) => {
