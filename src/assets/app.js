@@ -43,7 +43,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     let warmEventPollInterval = null;
     let currentDetailCameraId = null;
     let bufferDuration = 0;
-    // Overlay modes: 'off' -> 'motion' -> 'stability' -> 'both' -> 'off'
+    // Overlay modes: 'off' -> 'both' -> 'off'
     let overlayMode = 'off';
     let maskOverlayEnabled = false;
     let stabilityOverlayEnabled = false;
@@ -143,12 +143,12 @@ document.addEventListener('DOMContentLoaded', async () => {
         updateMuteIcon();
     });
 
-    const overlayModes = ['off', 'motion', 'stability', 'both'];
+    const overlayModes = ['off', 'both'];
     maskToggleBtn.addEventListener('click', () => {
         const idx = overlayModes.indexOf(overlayMode);
         overlayMode = overlayModes[(idx + 1) % overlayModes.length];
-        maskOverlayEnabled = overlayMode === 'motion' || overlayMode === 'both';
-        stabilityOverlayEnabled = overlayMode === 'stability' || overlayMode === 'both';
+        maskOverlayEnabled = overlayMode === 'both';
+        stabilityOverlayEnabled = overlayMode === 'both';
         maskToggleBtn.classList.toggle('active', overlayMode !== 'off');
         maskOverlay.hidden = !maskOverlayEnabled;
         stabilityOverlay.hidden = !stabilityOverlayEnabled;
