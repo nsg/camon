@@ -45,6 +45,8 @@ impl WarmEventIndex {
     }
 
     pub fn scan(&self) {
+        let start = std::time::Instant::now();
+        let mut total_events = 0;
         for (camera_id, lock) in self.cameras.iter() {
             let mut entries = Vec::new();
             for event_type in &[EventType::Movement, EventType::Object] {
@@ -87,10 +89,16 @@ impl WarmEventIndex {
             entries.sort_by_key(|e| e.start_pts_ns);
             let count = entries.len();
             *lock.write().unwrap() = entries;
+            total_events += count;
             if count > 0 {
                 tracing::info!(camera = %camera_id, events = count, "scanned warm events");
             }
         }
+        tracing::info!(
+            total_events,
+            elapsed_ms = start.elapsed().as_millis() as u64,
+            "warm index scan complete"
+        );
     }
 
     pub fn insert(&self, camera_id: &str, entry: WarmEventEntry) {
