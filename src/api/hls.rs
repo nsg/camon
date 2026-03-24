@@ -26,9 +26,19 @@ pub fn generate_playlist(buffer: &HotBuffer) -> String {
     for (i, segment) in segments.iter().enumerate() {
         let sequence = first_sequence + i as u64;
         let duration = segment.duration_ns as f64 / NANOS_PER_SEC;
-        // Mark discontinuity for each segment since they have independent timestamps
+        // Only mark discontinuity when there's an actual PTS gap between segments
         if i > 0 {
-            playlist.push_str("#EXT-X-DISCONTINUITY\n");
+            let prev = &segments[i - 1];
+            let expected_pts = prev.start_pts + prev.duration_ns;
+            let gap = if segment.start_pts > expected_pts {
+                segment.start_pts - expected_pts
+            } else {
+                expected_pts - segment.start_pts
+            };
+            // Allow 100ms tolerance for timestamp jitter
+            if gap > 100_000_000 {
+                playlist.push_str("#EXT-X-DISCONTINUITY\n");
+            }
         }
         playlist.push_str(&format!("#EXTINF:{:.3},\n", duration));
         playlist.push_str(&format!("segment/{}\n", sequence));
