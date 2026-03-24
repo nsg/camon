@@ -98,6 +98,10 @@ pub async fn start_server(state: AppState, port: u16) -> Result<(), std::io::Err
             "/api/cameras/{id}/events/{start_pts}/segment",
             get(warm_segment_handler),
         )
+        .route(
+            "/api/cameras/{id}/events/{start_pts}/thumbnail",
+            get(warm_thumbnail_handler),
+        )
         .route("/api/stream/{id}/playlist.m3u8", get(playlist_handler))
         .route("/api/stream/{id}/segment/{n}", get(segment_handler))
         .with_state(state);
@@ -400,5 +404,72 @@ async fn warm_segment_handler(
     match tokio::fs::read(&file_path).await {
         Ok(data) => ([(header::CONTENT_TYPE, "video/mp2t")], data).into_response(),
         Err(_) => (StatusCode::NOT_FOUND, "event file not found").into_response(),
+    }
+}
+
+async fn warm_thumbnail_handler(
+    State(state): State<AppState>,
+    Path((id, start_pts_str)): Path<(String, String)>,
+) -> Response {
+    let index = match &state.warm_index {
+        Some(idx) => idx,
+        None => return (StatusCode::NOT_FOUND, "warm storage not enabled").into_response(),
+    };
+
+    let start_pts: u64 = match start_pts_str.parse() {
+        Ok(v) => v,
+        Err(_) => return (StatusCode::BAD_REQUEST, "invalid start_pts").into_response(),
+    };
+
+    let entry = match index.find_event(&id, start_pts) {
+        Some(e) => e,
+        None => return (StatusCode::NOT_FOUND, "event not found").into_response(),
+    };
+
+    let ts_path = index.resolve_file_path(&id, &entry);
+    let thumb_path = ts_path.with_extension("jpg");
+
+    // Serve cached thumbnail if it exists
+    if let Ok(data) = tokio::fs::read(&thumb_path).await {
+        return (
+            [
+                (header::CONTENT_TYPE, "image/jpeg"),
+                (header::CACHE_CONTROL, "public, max-age=86400"),
+            ],
+            data,
+        )
+            .into_response();
+    }
+
+    // Generate thumbnail via ffmpeg
+    let output = tokio::process::Command::new("ffmpeg")
+        .args(["-hide_banner", "-loglevel", "error", "-i"])
+        .arg(&ts_path)
+        .args(["-frames:v", "1", "-vf", "scale=320:-1", "-q:v", "5", "-y"])
+        .arg(&thumb_path)
+        .output()
+        .await;
+
+    match output {
+        Ok(result) if result.status.success() => match tokio::fs::read(&thumb_path).await {
+            Ok(data) => (
+                [
+                    (header::CONTENT_TYPE, "image/jpeg"),
+                    (header::CACHE_CONTROL, "public, max-age=86400"),
+                ],
+                data,
+            )
+                .into_response(),
+            Err(_) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to read thumbnail",
+            )
+                .into_response(),
+        },
+        _ => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "thumbnail generation failed",
+        )
+            .into_response(),
     }
 }

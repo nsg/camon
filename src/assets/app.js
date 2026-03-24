@@ -25,6 +25,11 @@ document.addEventListener('DOMContentLoaded', async () => {
     const hoverTime = document.getElementById('hover-time');
     const timelineWrapper = document.querySelector('.timeline-wrapper');
     const zoomButtons = document.querySelectorAll('.zoom-btn');
+    const recordingsSection = document.getElementById('recordings-section');
+    const recordingsGroups = document.getElementById('recordings-groups');
+    const RECORDINGS_PER_PAGE = 12;
+    const collapsedGroups = new Map();
+    const groupPageLimits = new Map();
 
     // State
     let cameras = [];
@@ -437,6 +442,8 @@ document.addEventListener('DOMContentLoaded', async () => {
         isPlayingWarmEvent = false;
         currentWarmEventPts = null;
         warmEvents = [];
+        collapsedGroups.clear();
+        groupPageLimits.clear();
 
         // Load camera stream
         loadDetailCamera(cameraId);
@@ -491,6 +498,8 @@ document.addEventListener('DOMContentLoaded', async () => {
         }
         hideTooltip();
         detectionGallery.innerHTML = '';
+        recordingsGroups.innerHTML = '';
+        recordingsSection.hidden = true;
         const rect = timelineCanvas.getBoundingClientRect();
         timelineCtx.clearRect(0, 0, rect.width, rect.height);
         warmEvents = [];
@@ -661,8 +670,8 @@ document.addEventListener('DOMContentLoaded', async () => {
             }, { once: true });
         }
 
-        // Highlight the event in the strip
         renderTimeline();
+        renderRecordingsGallery();
     }
 
     function returnToLive() {
@@ -683,6 +692,7 @@ document.addEventListener('DOMContentLoaded', async () => {
 
         loadDetailCamera(currentDetailCameraId);
         renderTimeline();
+        renderRecordingsGallery();
     }
 
     // Timeline functions
@@ -845,6 +855,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         async function poll() {
             try {
                 const response = await fetch(`/api/cameras/${encodeURIComponent(cameraId)}/events`);
+                if (currentDetailCameraId !== cameraId) return;
                 if (response.ok) {
                     const raw = await response.json();
                     warmEvents = raw.map(ev => ({
@@ -852,6 +863,7 @@ document.addEventListener('DOMContentLoaded', async () => {
                         start_ms: Number(BigInt(ev.start_pts_ns) / 1_000_000n),
                     }));
                     renderTimeline();
+                    renderRecordingsGallery();
                 }
             } catch (err) {
                 console.error('Failed to fetch warm events:', err);
@@ -1036,6 +1048,125 @@ document.addEventListener('DOMContentLoaded', async () => {
                 detailVideo.currentTime = det.timestamp;
             });
             detectionGallery.appendChild(card);
+        });
+    }
+
+    function formatDateLabel(date) {
+        const now = new Date();
+        const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+        const yesterday = new Date(today); yesterday.setDate(today.getDate() - 1);
+        const eventDay = new Date(date.getFullYear(), date.getMonth(), date.getDate());
+
+        if (eventDay.getTime() === today.getTime()) return 'Today';
+        if (eventDay.getTime() === yesterday.getTime()) return 'Yesterday';
+        return date.toLocaleDateString([], { weekday: 'short', month: 'short', day: 'numeric' });
+    }
+
+    function renderRecordingsGallery() {
+        recordingsGroups.innerHTML = '';
+        if (warmEvents.length === 0) {
+            recordingsSection.hidden = true;
+            return;
+        }
+        recordingsSection.hidden = false;
+
+        // Group all events by date
+        const groups = new Map();
+        warmEvents.forEach(ev => {
+            const label = formatDateLabel(new Date(ev.start_ms));
+            if (!groups.has(label)) groups.set(label, []);
+            groups.get(label).push(ev);
+        });
+
+        // Sort groups by most recent event (descending)
+        const sortedGroups = [...groups.entries()].sort((a, b) => {
+            const aMax = Math.max(...a[1].map(e => e.start_ms));
+            const bMax = Math.max(...b[1].map(e => e.start_ms));
+            return bMax - aMax;
+        });
+
+        let isFirst = true;
+        sortedGroups.forEach(([label, events]) => {
+            // Sort within group: objects first, then by recency
+            events.sort((a, b) => {
+                if (a.event_type !== b.event_type) return a.event_type === 'object' ? -1 : 1;
+                return b.start_pts_ns - a.start_pts_ns;
+            });
+
+            const objectCount = events.filter(e => e.event_type === 'object').length;
+            const defaultCollapsed = !isFirst;
+            const collapsed = collapsedGroups.has(label) ? collapsedGroups.get(label) : defaultCollapsed;
+
+            const group = document.createElement('div');
+            group.className = 'rec-group';
+            if (collapsed) group.classList.add('collapsed');
+
+            const heading = document.createElement('button');
+            heading.className = 'rec-group-label';
+            const countParts = [];
+            if (objectCount > 0) countParts.push(`${objectCount} object${objectCount !== 1 ? 's' : ''}`);
+            const motionCount = events.length - objectCount;
+            if (motionCount > 0) countParts.push(`${motionCount} motion`);
+            heading.innerHTML = `<span class="rec-group-arrow"></span>${label} <span class="rec-group-count">${countParts.join(', ')}</span>`;
+
+            heading.addEventListener('click', () => {
+                const nowCollapsed = !group.classList.contains('collapsed');
+                group.classList.toggle('collapsed', nowCollapsed);
+                collapsedGroups.set(label, nowCollapsed);
+            });
+
+            group.appendChild(heading);
+
+            const grid = document.createElement('div');
+            grid.className = 'rec-group-grid';
+
+            const limit = groupPageLimits.get(label) || RECORDINGS_PER_PAGE;
+            const visible = events.slice(0, limit);
+
+            visible.forEach(ev => {
+                const card = document.createElement('div');
+                card.className = 'recording-card';
+                if (isPlayingWarmEvent && currentWarmEventPts === ev.start_pts_ns) {
+                    card.classList.add('active');
+                }
+
+                const thumbSrc = `/api/cameras/${encodeURIComponent(currentDetailCameraId)}/events/${ev.start_pts_ns}/thumbnail`;
+                const evDate = new Date(ev.start_ms);
+                const timeStr = evDate.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+                const durSec = (ev.duration_ms / 1000).toFixed(0);
+                const typeLabel = ev.event_type === 'object' ? 'Object' : 'Motion';
+                const typeClass = ev.event_type === 'object' ? 'object' : 'movement';
+
+                card.innerHTML = `
+                    <img class="rec-thumb" src="${thumbSrc}" loading="lazy" alt="Recording">
+                    <div class="rec-type ${typeClass}">${typeLabel}</div>
+                    <div class="rec-time">${timeStr}</div>
+                    <div class="rec-duration">${durSec}s</div>
+                `;
+
+                card.addEventListener('click', () => {
+                    loadWarmEvent(currentDetailCameraId, ev.start_pts_ns);
+                    renderRecordingsGallery();
+                });
+
+                grid.appendChild(card);
+            });
+
+            group.appendChild(grid);
+
+            if (events.length > limit) {
+                const moreBtn = document.createElement('button');
+                moreBtn.className = 'recordings-more-btn';
+                moreBtn.textContent = `Show more (${events.length - limit} remaining)`;
+                moreBtn.addEventListener('click', () => {
+                    groupPageLimits.set(label, limit + RECORDINGS_PER_PAGE);
+                    renderRecordingsGallery();
+                });
+                group.appendChild(moreBtn);
+            }
+
+            recordingsGroups.appendChild(group);
+            isFirst = false;
         });
     }
 
