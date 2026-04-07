@@ -16,9 +16,24 @@ impl GopSegment {
         }
     }
 
-    pub fn finalize(&mut self, end_pts: u64) {
-        if end_pts > self.start_pts {
-            self.duration_ns = end_pts - self.start_pts;
+    pub fn finalize_with_media_pts(
+        &mut self,
+        wall_clock_end: u64,
+        media_pts_ticks: Option<u64>,
+        prev_media_pts_ticks: Option<u64>,
+    ) {
+        // Prefer media PTS for duration (aligns with browser currentTime),
+        // fall back to wall-clock if PTS is unavailable.
+        if let (Some(cur), Some(prev)) = (media_pts_ticks, prev_media_pts_ticks) {
+            if cur > prev {
+                // PTS is in 90kHz ticks; convert to nanoseconds
+                let delta_ticks = cur - prev;
+                self.duration_ns = delta_ticks * 1_000_000_000 / 90_000;
+                return;
+            }
+        }
+        if wall_clock_end > self.start_pts {
+            self.duration_ns = wall_clock_end - self.start_pts;
         }
     }
 }

@@ -118,6 +118,8 @@ struct MpegTsSegmenter {
     pmt_packet: Option<[u8; 188]>,
     pmt_pid: Option<u16>,
     partial_packet: Vec<u8>,
+    current_media_pts: Option<u64>,
+    prev_media_pts: Option<u64>,
 }
 
 impl MpegTsSegmenter {
@@ -132,6 +134,8 @@ impl MpegTsSegmenter {
             pmt_packet: None,
             pmt_pid: None,
             partial_packet: Vec::with_capacity(188),
+            current_media_pts: None,
+            prev_media_pts: None,
         }
     }
 
@@ -207,6 +211,16 @@ impl MpegTsSegmenter {
             false
         };
 
+        // Extract media PTS from video packets with PES header
+        if Some(pid) == self.video_pid {
+            let pusi = (packet[1] & 0x40) != 0;
+            if pusi {
+                if let Some(pts) = Self::extract_pes_pts(packet) {
+                    self.current_media_pts = Some(pts);
+                }
+            }
+        }
+
         // Start new segment on keyframe
         if is_keyframe {
             let pts_ns = SystemTime::now()
@@ -245,13 +259,59 @@ impl MpegTsSegmenter {
 
     fn finalize_segment(&mut self, end_pts_ns: u64) {
         if let Some(mut segment) = self.current_segment.take() {
-            segment.finalize(end_pts_ns);
+            segment.finalize_with_media_pts(
+                end_pts_ns,
+                self.current_media_pts,
+                self.prev_media_pts,
+            );
+            self.prev_media_pts = self.current_media_pts;
             if segment.frame_count > 0 {
                 if let Ok(mut hot) = self.buffer.write() {
                     hot.push(segment);
                 }
             }
         }
+    }
+
+    fn extract_pes_pts(packet: &[u8]) -> Option<u64> {
+        let has_adaptation = (packet[3] & 0x20) != 0;
+        let has_payload = (packet[3] & 0x10) != 0;
+        if !has_payload {
+            return None;
+        }
+
+        let payload_start = if has_adaptation {
+            5 + packet[4] as usize
+        } else {
+            4
+        };
+
+        // PES header: 0x00 0x00 0x01 stream_id
+        if payload_start + 14 > 188 {
+            return None;
+        }
+        let p = &packet[payload_start..];
+        if p[0] != 0x00 || p[1] != 0x00 || p[2] != 0x01 {
+            return None;
+        }
+
+        // Check PTS_DTS_flags (bits 7-6 of byte 7)
+        let pts_dts_flags = (p[7] >> 6) & 0x03;
+        if pts_dts_flags < 2 {
+            return None; // No PTS present
+        }
+
+        // Parse 33-bit PTS from 5 bytes (bytes 9-13)
+        if payload_start + 14 > 188 {
+            return None;
+        }
+        let pts = ((p[9] as u64 & 0x0E) << 29)
+            | ((p[10] as u64) << 22)
+            | ((p[11] as u64 & 0xFE) << 14)
+            | ((p[12] as u64) << 7)
+            | ((p[13] as u64) >> 1);
+
+        Some(pts)
     }
 
     fn parse_pat(&mut self, packet: &[u8]) {
