@@ -173,7 +173,6 @@ impl DetectionGrid {
         }
     }
 
-
     fn load_grid(data_dir: &std::path::Path, camera_id: &str) -> Option<CameraGrid> {
         let path = data_dir.join(camera_id).join("detection_grid.json");
         let data = std::fs::read_to_string(&path).ok()?;
