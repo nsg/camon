@@ -166,6 +166,9 @@ impl MotionAnalyzer {
             if let Some(jpeg) = self.detector.stability_map_jpeg() {
                 self.motion_store.set_stability_map(&self.camera_id, jpeg);
             }
+            if let Some(jpeg) = self.detector.background_jpeg() {
+                self.motion_store.set_background_map(&self.camera_id, jpeg);
+            }
 
             self.score_histogram.record(score);
             let threshold = self.score_histogram.threshold();

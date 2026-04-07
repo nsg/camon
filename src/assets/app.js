@@ -19,7 +19,10 @@ document.addEventListener('DOMContentLoaded', async () => {
     const tooltipLabel = document.getElementById('tooltip-label');
     const stabilityOverlay = document.getElementById('stability-overlay');
     const stabilityCtx = stabilityOverlay.getContext('2d');
+    const bgOverlay = document.getElementById('bg-overlay');
+    const bgCtx = bgOverlay.getContext('2d');
     const maskToggleBtn = document.getElementById('mask-toggle-btn');
+    const bgToggleBtn = document.getElementById('bg-toggle-btn');
     const muteToggleBtn = document.getElementById('mute-toggle-btn');
     const detectionGallery = document.getElementById('detection-gallery');
     const hoverTime = document.getElementById('hover-time');
@@ -46,10 +49,10 @@ document.addEventListener('DOMContentLoaded', async () => {
     let warmEventPollInterval = null;
     let currentDetailCameraId = null;
     let bufferDuration = 0;
-    // Overlay: 'off' -> 'stability' -> 'off'
-    let overlayMode = 'off';
     let stabilityOverlayEnabled = false;
     let stabilityImage = null;
+    let bgOverlayEnabled = false;
+    let bgImage = null;
     let stabilityPollInterval = null;
 
     // Warm event state
@@ -143,8 +146,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     });
 
     maskToggleBtn.addEventListener('click', () => {
-        overlayMode = overlayMode === 'off' ? 'stability' : 'off';
-        stabilityOverlayEnabled = overlayMode === 'stability';
+        stabilityOverlayEnabled = !stabilityOverlayEnabled;
         maskToggleBtn.classList.toggle('active', stabilityOverlayEnabled);
         stabilityOverlay.hidden = !stabilityOverlayEnabled;
         if (!stabilityOverlayEnabled) {
@@ -153,7 +155,18 @@ document.addEventListener('DOMContentLoaded', async () => {
         } else {
             fetchStabilityMap();
         }
-        maskToggleBtn.title = `Overlay: ${overlayMode}`;
+    });
+
+    bgToggleBtn.addEventListener('click', () => {
+        bgOverlayEnabled = !bgOverlayEnabled;
+        bgToggleBtn.classList.toggle('active', bgOverlayEnabled);
+        bgOverlay.hidden = !bgOverlayEnabled;
+        if (!bgOverlayEnabled) {
+            bgCtx.clearRect(0, 0, bgOverlay.width, bgOverlay.height);
+            bgImage = null;
+        } else {
+            fetchBackgroundMap();
+        }
     });
 
     // Zoom button listeners
@@ -434,8 +447,12 @@ document.addEventListener('DOMContentLoaded', async () => {
         liveBtn.classList.remove('is-warm');
         liveBtn.querySelector('span:last-child') || updateLiveBtnText('Live');
         stabilityOverlay.hidden = !stabilityOverlayEnabled;
+        bgOverlay.hidden = !bgOverlayEnabled;
         if (stabilityOverlayEnabled) {
             fetchStabilityMap();
+        }
+        if (bgOverlayEnabled) {
+            fetchBackgroundMap();
         }
 
         // Reset warm state
@@ -488,10 +505,14 @@ document.addEventListener('DOMContentLoaded', async () => {
         bufferDuration = 0;
         stabilityImage = null;
         stabilityOverlay.hidden = true;
-        overlayMode = 'off';
         stabilityOverlayEnabled = false;
         maskToggleBtn.classList.remove('active');
         stabilityCtx.clearRect(0, 0, stabilityOverlay.width, stabilityOverlay.height);
+        bgImage = null;
+        bgOverlay.hidden = true;
+        bgOverlayEnabled = false;
+        bgToggleBtn.classList.remove('active');
+        bgCtx.clearRect(0, 0, bgOverlay.width, bgOverlay.height);
         if (stabilityPollInterval) {
             clearInterval(stabilityPollInterval);
             stabilityPollInterval = null;
@@ -714,6 +735,7 @@ document.addEventListener('DOMContentLoaded', async () => {
                     const progress = (detailVideo.currentTime / duration) * 100;
                     timelineScrubber.value = progress;
                     updateLiveState();
+                    drawBackground();
                     drawStability();
                 }
             }
@@ -759,19 +781,44 @@ document.addEventListener('DOMContentLoaded', async () => {
         }
         stabilityCtx.clearRect(0, 0, w, h);
         stabilityCtx.drawImage(stabilityImage, 0, 0, w, h);
-        // Convert grayscale JPEG to blue/purple-tinted alpha mask:
-        // bright (volatile) -> blue at 50% opacity
-        // dark (stable) -> fully transparent
         const imageData = stabilityCtx.getImageData(0, 0, w, h);
         const px = imageData.data;
         for (let i = 0; i < px.length; i += 4) {
             const brightness = px[i];
-            px[i]     = 100;
-            px[i + 1] = 60;
-            px[i + 2] = 255;
-            px[i + 3] = (brightness / 255) * 128; // 0.5 * 255 = 128
+            if (brightness > 128) {
+                px[i]     = 0;
+                px[i + 1] = 255;
+                px[i + 2] = 0;
+                px[i + 3] = 180;
+            } else {
+                px[i + 3] = 0;
+            }
         }
         stabilityCtx.putImageData(imageData, 0, 0);
+    }
+
+    function fetchBackgroundMap() {
+        if (!bgOverlayEnabled || !currentDetailCameraId || isPlayingWarmEvent) return;
+        const img = new Image();
+        img.onload = () => {
+            bgImage = img;
+            drawBackground();
+        };
+        img.onerror = () => {};
+        img.src = `/api/cameras/${encodeURIComponent(currentDetailCameraId)}/motion/background?t=${Date.now()}`;
+    }
+
+    function drawBackground() {
+        if (!bgImage) return;
+        const w = detailVideo.clientWidth;
+        const h = detailVideo.clientHeight;
+        if (w === 0 || h === 0) return;
+        if (bgOverlay.width !== w || bgOverlay.height !== h) {
+            bgOverlay.width = w;
+            bgOverlay.height = h;
+        }
+        bgCtx.clearRect(0, 0, w, h);
+        bgCtx.drawImage(bgImage, 0, 0, w, h);
     }
 
     function updateLiveState() {
@@ -816,7 +863,10 @@ document.addEventListener('DOMContentLoaded', async () => {
         motionPollInterval = setInterval(poll, 5000);
         // Poll stability map every 5 seconds when overlay is enabled
         if (stabilityPollInterval) clearInterval(stabilityPollInterval);
-        stabilityPollInterval = setInterval(fetchStabilityMap, 5000);
+        stabilityPollInterval = setInterval(() => {
+            fetchStabilityMap();
+            fetchBackgroundMap();
+        }, 5000);
     }
 
     // Detection data fetching
@@ -1173,6 +1223,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     // Handle canvas resize
     window.addEventListener('resize', () => {
         renderTimeline();
+        drawBackground();
         drawStability();
     });
 });

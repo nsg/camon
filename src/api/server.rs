@@ -84,6 +84,10 @@ pub async fn start_server(state: AppState, port: u16) -> Result<(), std::io::Err
             "/api/cameras/{id}/motion/stability",
             get(stability_map_handler),
         )
+        .route(
+            "/api/cameras/{id}/motion/background",
+            get(background_map_handler),
+        )
         .route("/api/cameras/{id}/detections", get(detections_handler))
         .route(
             "/api/cameras/{id}/detections/{detection_id}/frame",
@@ -278,6 +282,17 @@ async fn stability_map_handler(State(state): State<AppState>, Path(id): Path<Str
     }
 }
 
+async fn background_map_handler(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+    if !state.buffers.contains_key(&id) {
+        return (StatusCode::NOT_FOUND, "camera not found").into_response();
+    }
+
+    match state.motion_store.get_background_map(&id) {
+        Some(jpeg) => ([(header::CONTENT_TYPE, "image/jpeg")], jpeg).into_response(),
+        None => (StatusCode::NOT_FOUND, "background not available yet").into_response(),
+    }
+}
+
 async fn detection_frame_handler(
     State(state): State<AppState>,
     Path((id, detection_id)): Path<(String, u64)>,
@@ -441,34 +456,51 @@ async fn warm_thumbnail_handler(
             .into_response();
     }
 
-    // Generate thumbnail via ffmpeg
-    let output = tokio::process::Command::new("ffmpeg")
+    // Generate thumbnail via ffmpeg.
+    // Use kill_on_drop so cancelled requests don't leave zombie processes.
+    let mut child = match tokio::process::Command::new("ffmpeg")
         .args(["-hide_banner", "-loglevel", "error", "-i"])
         .arg(&ts_path)
         .args(["-frames:v", "1", "-vf", "scale=320:-1", "-q:v", "5", "-y"])
         .arg(&thumb_path)
-        .output()
-        .await;
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(_) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, "failed to spawn ffmpeg").into_response()
+        }
+    };
 
-    match output {
-        Ok(result) if result.status.success() => match tokio::fs::read(&thumb_path).await {
-            Ok(data) => (
-                [
-                    (header::CONTENT_TYPE, "image/jpeg"),
-                    (header::CACHE_CONTROL, "public, max-age=86400"),
-                ],
-                data,
-            )
-                .into_response(),
-            Err(_) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "failed to read thumbnail",
-            )
-                .into_response(),
-        },
-        _ => (
+    let status = match child.wait().await {
+        Ok(s) => s,
+        Err(_) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, "ffmpeg process error").into_response()
+        }
+    };
+
+    if !status.success() {
+        return (
             StatusCode::INTERNAL_SERVER_ERROR,
             "thumbnail generation failed",
+        )
+            .into_response();
+    }
+
+    match tokio::fs::read(&thumb_path).await {
+        Ok(data) => (
+            [
+                (header::CONTENT_TYPE, "image/jpeg"),
+                (header::CACHE_CONTROL, "public, max-age=86400"),
+            ],
+            data,
+        )
+            .into_response(),
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "failed to read thumbnail",
         )
             .into_response(),
     }
