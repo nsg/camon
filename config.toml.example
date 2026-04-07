@@ -9,7 +9,7 @@ enabled = true
 hot_duration_secs = 600
 
 [http]
-# HTTP server port for web UI (default: 8080)
+# HTTP server port for web UI and API (default: 8080)
 port = 8080
 
 [analytics]
@@ -19,7 +19,7 @@ enabled = true
 # Frame sample rate for analysis (default: 5)
 sample_fps = 5
 
-# Object detection using YOLO26 (requires motion detection enabled)
+# Object detection using YOLO26 (requires analytics enabled)
 [analytics.object_detection]
 # Enable YOLO26 object detection on motion segments (default: false)
 enabled = true
@@ -33,7 +33,7 @@ confidence_threshold = 0.5
 classes = ["person", "car", "truck", "dog", "cat"]
 
 [storage]
-# Enable storage — flush motion events to disk (default: true)
+# Enable warm storage — flush motion events to disk (default: true)
 enabled = true
 # Directory for event files (default: /var/camon/storage)
 data_dir = "/var/camon/storage"
@@ -41,15 +41,17 @@ data_dir = "/var/camon/storage"
 pre_padding_secs = 5
 # Seconds of context after last motion in an event (default: 10)
 post_padding_secs = 10
+# Retention for movement-only events in days (default: 2)
+movement_retention_days = 2
+# Retention for object detection events in days (default: 14)
+object_retention_days = 14
 
-# Camera configuration
-# Each camera needs an id and url
+# Camera definitions — add one [[cameras]] block per camera
 
 [[cameras]]
 id = "front-door"
 url = "rtsp://admin:password@192.168.1.100:554/stream1"
 
-# Additional cameras
 # [[cameras]]
 # id = "backyard"
 # url = "rtsp://admin:password@192.168.1.101:554/stream1"
