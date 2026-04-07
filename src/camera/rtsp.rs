@@ -66,8 +66,6 @@ impl FfmpegPipeline {
                 "copy",
                 "-f",
                 "mpegts",
-                "-mpegts_copyts",
-                "1",
                 "-",
             ])
             .stdout(Stdio::piped())
