@@ -1,4 +1,3 @@
-use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -9,69 +8,6 @@ use opencv::{
     video::{self, BackgroundSubtractorTrait},
     Result as CvResult,
 };
-
-const HISTOGRAM_BUCKETS: usize = 100;
-const MIN_SAMPLES_FOR_THRESHOLD: u64 = 1000;
-const WINDOW_HOURS: usize = 3;
-
-pub struct ScoreHistogram {
-    buckets: [u64; HISTOGRAM_BUCKETS],
-    window: VecDeque<u8>,
-    window_size: usize,
-    target_percentile: f32,
-    default_threshold: f32,
-}
-
-impl ScoreHistogram {
-    pub fn new(target_percentile: f32, default_threshold: f32, sample_fps: u32) -> Self {
-        let window_size = WINDOW_HOURS * 60 * 60 * sample_fps as usize;
-        Self {
-            buckets: [0; HISTOGRAM_BUCKETS],
-            window: VecDeque::with_capacity(window_size),
-            window_size,
-            target_percentile,
-            default_threshold,
-        }
-    }
-
-    pub fn record(&mut self, score: f32) {
-        if score <= 0.0 {
-            return;
-        }
-        let bucket = ((score * HISTOGRAM_BUCKETS as f32) as usize).min(HISTOGRAM_BUCKETS - 1);
-
-        if self.window.len() == self.window_size {
-            let old = self.window.pop_front().unwrap() as usize;
-            self.buckets[old] -= 1;
-        }
-
-        self.window.push_back(bucket as u8);
-        self.buckets[bucket] += 1;
-    }
-
-    pub fn threshold(&self) -> f32 {
-        let total = self.window.len() as u64;
-        if total < MIN_SAMPLES_FOR_THRESHOLD {
-            return self.default_threshold;
-        }
-
-        let target_count = (total as f32 * self.target_percentile) as u64;
-        let mut cumulative = 0u64;
-
-        for (i, &count) in self.buckets.iter().enumerate() {
-            cumulative += count;
-            if cumulative >= target_count {
-                return (i as f32 + 0.5) / HISTOGRAM_BUCKETS as f32;
-            }
-        }
-
-        self.default_threshold
-    }
-
-    pub fn samples(&self) -> u64 {
-        self.window.len() as u64
-    }
-}
 
 const WARMUP_FRAMES: u32 = 100;
 const SCENE_CHANGE_RATIO: f32 = 0.8;

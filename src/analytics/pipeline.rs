@@ -16,7 +16,7 @@ use crate::config::AnalyticsConfig;
 use crate::storage::{DetectionStore, MotionEntry, MotionStore};
 
 use super::decoder::{CropDecoder, FrameDecoder};
-use super::motion::{MotionDetector, ScoreHistogram};
+use super::motion::MotionDetector;
 use super::object::ObjectDetector;
 
 const DETECTION_WIDTH: i32 = 640;
@@ -26,8 +26,10 @@ const ANALYSIS_HEIGHT: i32 = 240;
 const CROP_DECODE_WIDTH: i32 = 1920;
 const CROP_DECODE_HEIGHT: i32 = 1080;
 
-const MOTION_PERCENTILE: f32 = 0.90;
-const DEFAULT_MOTION_THRESHOLD: f32 = 0.05;
+// Fixed motion threshold — a score of 0.05 means 0.5% of pixels survived
+// morphological opening and contour area filtering. Below this is too small
+// to be meaningful motion.
+const MOTION_THRESHOLD: f32 = 0.05;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
 
@@ -56,7 +58,6 @@ pub struct MotionAnalyzer {
     object_detector: Option<ObjectDetector>,
     last_processed: u64,
     last_motion_bbox: Option<Rect>,
-    score_histogram: ScoreHistogram,
     detection_grid: Option<DetectionGrid>,
     grid_save_counter: u32,
 }
@@ -83,9 +84,6 @@ impl MotionAnalyzer {
             .map(|s| s + 1)
             .unwrap_or(0);
 
-        // One score per GOP segment (~1 per second with typical 1-2s keyframe interval)
-        let score_histogram = ScoreHistogram::new(MOTION_PERCENTILE, DEFAULT_MOTION_THRESHOLD, 1);
-
         Ok(Self {
             camera_id,
             buffer,
@@ -98,7 +96,6 @@ impl MotionAnalyzer {
             object_detector,
             last_processed,
             last_motion_bbox: None,
-            score_histogram,
             detection_grid,
             grid_save_counter: 0,
         })
@@ -193,19 +190,11 @@ impl MotionAnalyzer {
                 self.motion_store.set_background_map(&self.camera_id, jpeg);
             }
 
-            self.score_histogram.record(score);
-            let threshold = self.score_histogram.threshold();
-            let triggered = score >= threshold;
-
-            // Report to the adaptive tuner. Uses score > 0 (pre-threshold)
-            // rather than the trigger decision, because the adaptive threshold
-            // normalizes trigger rate to ~10% regardless of noise level —
-            // the tuner needs to see the raw noise floor to react correctly.
             if let Err(e) = self.detector.report_segment(score > 0.0) {
                 tracing::warn!(camera = %self.camera_id, error = %e, "tuner update failed");
             }
 
-            if triggered {
+            if score >= MOTION_THRESHOLD {
                 let mask_jpeg = self.detector.fg_mask_jpeg();
                 self.motion_store.insert(
                     &self.camera_id,
@@ -222,8 +211,6 @@ impl MotionAnalyzer {
                     camera = %self.camera_id,
                     sequence = seq,
                     score = format!("{:.3}", score),
-                    threshold = format!("{:.3}", threshold),
-                    samples = self.score_histogram.samples(),
                     "motion detected"
                 );
 
