@@ -1,19 +1,24 @@
 document.addEventListener('DOMContentLoaded', async () => {
-    // DOM elements
+    // === DOM Elements ===
+
+    // Grid view
     const gridView = document.getElementById('grid-view');
     const grid = document.getElementById('camera-grid');
     const noCameras = document.getElementById('no-cameras');
-    const detailView = document.getElementById('detail-view');
+
+    // View 1: Live Monitor
+    const liveView = document.getElementById('live-view');
     const detailVideo = document.getElementById('detail-video');
     const detailLoading = document.getElementById('detail-loading');
     const detailCameraName = document.getElementById('detail-camera-name');
     const backBtn = document.getElementById('back-btn');
-    const timelineScrubber = document.getElementById('timeline-scrubber');
-    const currentTimeDisplay = document.getElementById('current-time');
-    const durationDisplay = document.getElementById('duration');
-    const liveBtn = document.getElementById('live-btn');
-    const timelineCanvas = document.getElementById('timeline-canvas');
-    const timelineCtx = timelineCanvas.getContext('2d');
+    const muteToggleBtn = document.getElementById('mute-toggle-btn');
+    const maskToggleBtn = document.getElementById('mask-toggle-btn');
+    const bgToggleBtn = document.getElementById('bg-toggle-btn');
+    const gridToggleBtn = document.getElementById('grid-toggle-btn');
+    const detectionGallery = document.getElementById('detection-gallery');
+    const eventsSummaryBtn = document.getElementById('events-summary-btn');
+    const eventsSummaryText = document.getElementById('events-summary-text');
     const detectionTooltip = document.getElementById('detection-tooltip');
     const tooltipImage = document.getElementById('tooltip-image');
     const tooltipLabel = document.getElementById('tooltip-label');
@@ -23,41 +28,64 @@ document.addEventListener('DOMContentLoaded', async () => {
     const bgCtx = bgOverlay.getContext('2d');
     const gridOverlay = document.getElementById('detection-grid-overlay');
     const gridCtx = gridOverlay.getContext('2d');
-    const maskToggleBtn = document.getElementById('mask-toggle-btn');
-    const bgToggleBtn = document.getElementById('bg-toggle-btn');
-    const gridToggleBtn = document.getElementById('grid-toggle-btn');
-    const muteToggleBtn = document.getElementById('mute-toggle-btn');
-    const detectionGallery = document.getElementById('detection-gallery');
-    const hoverTime = document.getElementById('hover-time');
-    const timelineWrapper = document.querySelector('.timeline-wrapper');
-    const zoomButtons = document.querySelectorAll('.zoom-btn');
-    const recordingsSection = document.getElementById('recordings-section');
-    const recordingsGroups = document.getElementById('recordings-groups');
-    const RECORDINGS_PER_PAGE = 12;
-    const collapsedGroups = new Map();
-    const groupPageLimits = new Map();
 
-    // State
+    // View 2: Event Browser
+    const eventsView = document.getElementById('events-view');
+    const eventsBackBtn = document.getElementById('events-back-btn');
+    const eventsCameraName = document.getElementById('events-camera-name');
+    const eventList = document.getElementById('event-list');
+    const filterBtns = document.querySelectorAll('.filter-btn');
+
+    // View 3: Event Playback
+    const playbackView = document.getElementById('playback-view');
+    const playbackBackBtn = document.getElementById('playback-back-btn');
+    const playbackEventInfo = document.getElementById('playback-event-info');
+    const playbackVideo = document.getElementById('playback-video');
+    const playbackLoading = document.getElementById('playback-loading');
+    const playbackScrubber = document.getElementById('playback-scrubber');
+    const playbackProgressFill = document.getElementById('playback-progress-fill');
+    const playbackCurrentTime = document.getElementById('playback-current-time');
+    const playbackDuration = document.getElementById('playback-duration');
+    const playbackMuteBtn = document.getElementById('playback-mute-btn');
+    const prevEventBtn = document.getElementById('prev-event-btn');
+    const nextEventBtn = document.getElementById('next-event-btn');
+    const prevEventThumb = document.getElementById('prev-event-thumb');
+    const nextEventThumb = document.getElementById('next-event-thumb');
+    const prevEventText = document.getElementById('prev-event-text');
+    const nextEventText = document.getElementById('next-event-text');
+
+    // === State ===
     let cameras = [];
     const gridHlsInstances = new Map();
     let detailHls = null;
-    let timelineAnimationId = null;
-    let isSeeking = false;
+    let playbackHls = null;
     let currentView = null;
     let isFirstLoad = true;
-    let currentMotionSegments = [];
+    let currentDetailCameraId = null;
+
+    // Live monitor state
     let currentDetections = [];
+    let bufferDuration = 0;
     let motionPollInterval = null;
     let detectionPollInterval = null;
     let warmEventPollInterval = null;
-    let currentDetailCameraId = null;
-    let bufferDuration = 0;
+    let stabilityPollInterval = null;
     let stabilityOverlayEnabled = false;
     let stabilityImage = null;
     let bgOverlayEnabled = false;
     let bgImage = null;
     let gridOverlayEnabled = false;
     let gridData = null;
+    let overlayAnimationId = null;
+
+    // Warm events (shared between views 2 & 3)
+    let warmEvents = [];
+    let eventFilter = 'all';
+
+    // Playback state
+    let currentPlaybackPts = null;
+    let playbackAnimationId = null;
+    let isScrubbing = false;
 
     const GRID_CLASS_COLORS = {
         person: 'rgba(50, 100, 255, 0.5)',
@@ -71,19 +99,8 @@ document.addEventListener('DOMContentLoaded', async () => {
         'rgba(200, 200, 0, 0.5)',
         'rgba(200, 0, 200, 0.5)',
     ];
-    let stabilityPollInterval = null;
 
-    // Warm event state
-    let warmEvents = [];
-    let eventStripZoomHours = 24;
-    let isPlayingWarmEvent = false;
-    let currentWarmEventPts = null;
-
-    // Timeline drag state
-    let isDraggingTimeline = false;
-    let dragTarget = null; // 'buffer' or 'warm'
-
-    // View transition helper
+    // === View Transition Helper ===
     function withViewTransition(callback, isBack = false) {
         if (!isFirstLoad && document.startViewTransition) {
             document.documentElement.classList.toggle('swipe-back', isBack);
@@ -97,7 +114,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         }
     }
 
-    // Initialize
+    // === Initialize ===
     try {
         const response = await fetch('/api/cameras');
         cameras = await response.json();
@@ -116,51 +133,86 @@ document.addEventListener('DOMContentLoaded', async () => {
         noCameras.hidden = false;
     }
 
-    // Start router
+    // === Router ===
     window.addEventListener('hashchange', router);
     router();
 
-    // Event listeners
+    function router() {
+        const hash = window.location.hash || '#/';
+
+        // #/camera/{id}/events/{pts}
+        const playbackMatch = hash.match(/^#\/camera\/(.+)\/events\/(\d+)$/);
+        if (playbackMatch) {
+            const cameraId = decodeURIComponent(playbackMatch[1]);
+            const pts = playbackMatch[2];
+            if (cameras.includes(cameraId)) {
+                const targetView = `playback:${cameraId}:${pts}`;
+                if (currentView !== targetView) {
+                    const isBack = currentView && currentView.startsWith('playback:');
+                    withViewTransition(() => showPlaybackView(cameraId, pts), isBack);
+                    currentView = targetView;
+                }
+                return;
+            }
+        }
+
+        // #/camera/{id}/events
+        const eventsMatch = hash.match(/^#\/camera\/(.+)\/events$/);
+        if (eventsMatch) {
+            const cameraId = decodeURIComponent(eventsMatch[1]);
+            if (cameras.includes(cameraId)) {
+                const targetView = `events:${cameraId}`;
+                if (currentView !== targetView) {
+                    const isBack = currentView && currentView.startsWith('playback:');
+                    withViewTransition(() => showEventsView(cameraId), isBack);
+                    currentView = targetView;
+                }
+                return;
+            }
+        }
+
+        // #/camera/{id}
+        const cameraMatch = hash.match(/^#\/camera\/([^/]+)$/);
+        if (cameraMatch) {
+            const cameraId = decodeURIComponent(cameraMatch[1]);
+            if (cameras.includes(cameraId)) {
+                const targetView = `live:${cameraId}`;
+                if (currentView !== targetView) {
+                    const isBack = currentView !== null && !currentView.startsWith('live:') ||
+                                   (currentView && currentView.startsWith('events:'));
+                    withViewTransition(() => showLiveView(cameraId), isBack);
+                    currentView = targetView;
+                }
+                return;
+            }
+        }
+
+        // Default: grid
+        if (currentView !== 'grid') {
+            const isBack = currentView !== null;
+            withViewTransition(() => showGridView(), isBack);
+            currentView = 'grid';
+        }
+    }
+
+    // === Event Listeners ===
+
+    // View 1: Live Monitor
     backBtn.addEventListener('click', () => {
         window.location.hash = '/';
-    });
-
-    timelineScrubber.addEventListener('input', () => {
-        isSeeking = true;
-        const duration = isPlayingWarmEvent ? detailVideo.duration : (bufferDuration || detailVideo.duration);
-        if (!isPlayingWarmEvent) updateLiveState();
-    });
-
-    timelineScrubber.addEventListener('change', () => {
-        const duration = isPlayingWarmEvent ? detailVideo.duration : (bufferDuration || detailVideo.duration);
-        const time = (timelineScrubber.value / 100) * duration;
-        detailVideo.currentTime = time;
-        isSeeking = false;
-    });
-
-    liveBtn.addEventListener('click', () => {
-        if (isPlayingWarmEvent) {
-            returnToLive();
-            return;
-        }
-        const duration = bufferDuration || detailVideo.duration;
-        if (duration && isFinite(duration)) {
-            detailVideo.currentTime = duration;
-            updateLiveState();
-        }
     });
 
     const volumeOnPath = 'M3 9v6h4l5 5V4L7 9H3zm13.5 3c0-1.77-1.02-3.29-2.5-4.03v8.05c1.48-.73 2.5-2.25 2.5-4.02zM14 3.23v2.06c2.89.86 5 3.54 5 6.71s-2.11 5.85-5 6.71v2.06c4.01-.91 7-4.49 7-8.77s-2.99-7.86-7-8.77z';
     const volumeOffPath = 'M16.5 12c0-1.77-1.02-3.29-2.5-4.03v2.21l2.45 2.45c.03-.2.05-.41.05-.63zm2.5 0c0 .94-.2 1.82-.54 2.64l1.51 1.51C20.63 14.91 21 13.5 21 12c0-4.28-2.99-7.86-7-8.77v2.06c2.89.86 5 3.54 5 6.71zM4.27 3L3 4.27 7.73 9H3v6h4l5 5v-6.73l4.25 4.25c-.67.52-1.42.93-2.25 1.18v2.06c1.38-.31 2.63-.95 3.69-1.81L19.73 21 21 19.73l-9-9L4.27 3zM12 4L9.91 6.09 12 8.18V4z';
 
-    function updateMuteIcon() {
-        muteToggleBtn.querySelector('path').setAttribute('d', detailVideo.muted ? volumeOffPath : volumeOnPath);
-        muteToggleBtn.classList.toggle('muted', detailVideo.muted);
+    function updateMuteIcon(btn, video) {
+        btn.querySelector('path').setAttribute('d', video.muted ? volumeOffPath : volumeOnPath);
+        btn.classList.toggle('muted', video.muted);
     }
 
     muteToggleBtn.addEventListener('click', () => {
         detailVideo.muted = !detailVideo.muted;
-        updateMuteIcon();
+        updateMuteIcon(muteToggleBtn, detailVideo);
     });
 
     maskToggleBtn.addEventListener('click', () => {
@@ -199,252 +251,94 @@ document.addEventListener('DOMContentLoaded', async () => {
         }
     });
 
-    // Zoom button listeners
-    zoomButtons.forEach(btn => {
+    eventsSummaryBtn.addEventListener('click', () => {
+        if (currentDetailCameraId) {
+            window.location.hash = `/camera/${encodeURIComponent(currentDetailCameraId)}/events`;
+        }
+    });
+
+    // View 2: Event Browser
+    eventsBackBtn.addEventListener('click', () => {
+        if (currentDetailCameraId) {
+            window.location.hash = `/camera/${encodeURIComponent(currentDetailCameraId)}`;
+        }
+    });
+
+    filterBtns.forEach(btn => {
         btn.addEventListener('click', () => {
-            zoomButtons.forEach(b => b.classList.remove('active'));
+            filterBtns.forEach(b => b.classList.remove('active'));
             btn.classList.add('active');
-            eventStripZoomHours = parseInt(btn.dataset.hours, 10);
-            renderTimeline();
+            eventFilter = btn.dataset.filter;
+            renderEventList();
         });
     });
 
-    // Timeline seek helpers
-    function getTimelineRatio(clientX) {
-        const rect = timelineWrapper.getBoundingClientRect();
-        return Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
-    }
+    // View 3: Event Playback
+    playbackBackBtn.addEventListener('click', () => {
+        if (currentDetailCameraId) {
+            window.location.hash = `/camera/${encodeURIComponent(currentDetailCameraId)}/events`;
+        }
+    });
 
-    function getBufferBounds() {
-        const windowMs = eventStripZoomHours * 3600_000;
-        const bufferMs = (bufferDuration || 0) * 1000;
-        const bufferRatio = bufferMs / windowMs;
-        return { startRatio: 1.0 - bufferRatio, bufferRatio };
-    }
-
-    function seekBufferAtRatio(ratio) {
-        const { startRatio, bufferRatio } = getBufferBounds();
-        if (bufferRatio <= 0) return;
-        const clamped = Math.max(startRatio, Math.min(1, ratio));
-        const seekTime = ((clamped - startRatio) / bufferRatio) * bufferDuration;
-        detailVideo.currentTime = seekTime;
-        updateLiveState();
-    }
-
-    function seekWarmEventAtRatio(ratio) {
-        if (!currentWarmEventPts) return;
-        const ev = warmEvents.find(e => e.start_pts_ns === currentWarmEventPts);
-        if (!ev) return;
-        const windowMs = eventStripZoomHours * 3600_000;
-        const windowStart = Date.now() - windowMs;
-        const evStartRatio = (ev.start_ms - windowStart) / windowMs;
-        const evEndRatio = (ev.start_ms + ev.duration_ms - windowStart) / windowMs;
-        const evSpan = evEndRatio - evStartRatio;
-        if (evSpan <= 0) return;
-        const clamped = Math.max(evStartRatio, Math.min(evEndRatio, ratio));
-        const progress = (clamped - evStartRatio) / evSpan;
-        const duration = detailVideo.duration;
+    playbackScrubber.addEventListener('input', () => {
+        isScrubbing = true;
+        const duration = playbackVideo.duration;
         if (duration && isFinite(duration)) {
-            detailVideo.currentTime = progress * duration;
+            const progress = playbackScrubber.value / 1000;
+            playbackProgressFill.style.width = (progress * 100) + '%';
+            playbackCurrentTime.textContent = formatTimeShort(progress * duration);
         }
+    });
+
+    playbackScrubber.addEventListener('change', () => {
+        const duration = playbackVideo.duration;
+        if (duration && isFinite(duration)) {
+            playbackVideo.currentTime = (playbackScrubber.value / 1000) * duration;
+        }
+        isScrubbing = false;
+    });
+
+    playbackMuteBtn.addEventListener('click', () => {
+        playbackVideo.muted = !playbackVideo.muted;
+        updateMuteIcon(playbackMuteBtn, playbackVideo);
+    });
+
+    prevEventBtn.addEventListener('click', () => {
+        const nav = getAdjacentEvents(currentPlaybackPts);
+        if (nav.prev) {
+            window.location.hash = `/camera/${encodeURIComponent(currentDetailCameraId)}/events/${nav.prev.start_pts_ns}`;
+        }
+    });
+
+    nextEventBtn.addEventListener('click', () => {
+        const nav = getAdjacentEvents(currentPlaybackPts);
+        if (nav.next) {
+            window.location.hash = `/camera/${encodeURIComponent(currentDetailCameraId)}/events/${nav.next.start_pts_ns}`;
+        }
+    });
+
+    // Resize handler for overlays
+    window.addEventListener('resize', () => {
+        drawBackground();
+        drawDetectionGrid();
+        drawStability();
+    });
+
+    // === View Functions ===
+
+    function hideAllViews() {
+        gridView.hidden = true;
+        liveView.hidden = true;
+        eventsView.hidden = true;
+        playbackView.hidden = true;
     }
 
-    // Timeline drag handlers
-    function timelineDragStart(clientX) {
-        if (!currentDetailCameraId) return;
-        const ratio = getTimelineRatio(clientX);
-        const { startRatio } = getBufferBounds();
-
-        if (isPlayingWarmEvent) {
-            dragTarget = 'warm';
-            isDraggingTimeline = true;
-            isSeeking = true;
-            timelineWrapper.classList.add('dragging');
-            seekWarmEventAtRatio(ratio);
-        } else if (ratio >= startRatio && bufferDuration > 0) {
-            dragTarget = 'buffer';
-            isDraggingTimeline = true;
-            isSeeking = true;
-            timelineWrapper.classList.add('dragging');
-            seekBufferAtRatio(ratio);
-        }
-    }
-
-    function timelineDragMove(clientX) {
-        if (!isDraggingTimeline) return;
-        const ratio = getTimelineRatio(clientX);
-        if (dragTarget === 'buffer') {
-            seekBufferAtRatio(ratio);
-        } else if (dragTarget === 'warm') {
-            seekWarmEventAtRatio(ratio);
-        }
-    }
-
-    function timelineDragEnd() {
-        if (!isDraggingTimeline) return;
-        isDraggingTimeline = false;
-        isSeeking = false;
-        dragTarget = null;
-        timelineWrapper.classList.remove('dragging');
-    }
-
-    // Mouse drag
-    timelineWrapper.addEventListener('mousedown', (e) => {
-        if (e.target === timelineScrubber) return;
-        e.preventDefault();
-        timelineDragStart(e.clientX);
-    });
-
-    document.addEventListener('mousemove', (e) => {
-        if (isDraggingTimeline) {
-            e.preventDefault();
-            timelineDragMove(e.clientX);
-        }
-    });
-
-    document.addEventListener('mouseup', () => {
-        timelineDragEnd();
-    });
-
-    // Touch drag
-    timelineWrapper.addEventListener('touchstart', (e) => {
-        if (e.target === timelineScrubber) return;
-        timelineDragStart(e.touches[0].clientX);
-    }, { passive: true });
-
-    document.addEventListener('touchmove', (e) => {
-        if (isDraggingTimeline) {
-            e.preventDefault();
-            timelineDragMove(e.touches[0].clientX);
-        }
-    }, { passive: false });
-
-    document.addEventListener('touchend', () => {
-        timelineDragEnd();
-    });
-
-    // Unified timeline click handler (for warm event selection)
-    timelineWrapper.addEventListener('click', (e) => {
-        if (!currentDetailCameraId) return;
-        if (e.target === timelineScrubber) return;
-
-        const ratio = getTimelineRatio(e.clientX);
-        const { startRatio } = getBufferBounds();
-
-        // Clicks in the buffer region are handled by drag handlers
-        if (ratio >= startRatio && bufferDuration > 0) return;
-        // Warm event scrubbing is handled by drag handlers
-        if (isPlayingWarmEvent) return;
-
-        // Check if click is on a warm event
-        if (warmEvents.length === 0) return;
-
-        const now = Date.now();
-        const windowMs = eventStripZoomHours * 3600_000;
-        const windowStart = now - windowMs;
-        const clickedMs = windowStart + ratio * windowMs;
-
-        let closest = null;
-        let closestDist = Infinity;
-        for (const ev of warmEvents) {
-            const evEnd = ev.start_ms + ev.duration_ms;
-            if (clickedMs >= ev.start_ms && clickedMs <= evEnd) {
-                closest = ev;
-                break;
-            }
-            const dist = Math.min(
-                Math.abs(clickedMs - ev.start_ms),
-                Math.abs(clickedMs - evEnd)
-            );
-            if (dist < closestDist) {
-                closestDist = dist;
-                closest = ev;
-            }
-        }
-
-        if (closest) {
-            const evEnd = closest.start_ms + closest.duration_ms;
-            const threshold = windowMs * 0.02;
-            if (clickedMs >= closest.start_ms - threshold && clickedMs <= evEnd + threshold) {
-                loadWarmEvent(currentDetailCameraId, closest.start_pts_ns);
-            }
-        }
-    });
-
-    // Unified timeline hover handler
-    timelineWrapper.addEventListener('mousemove', (e) => {
-        const rect = timelineWrapper.getBoundingClientRect();
-        const x = e.clientX - rect.left;
-        const ratio = x / rect.width;
-
-        const now = Date.now();
-        const windowMs = eventStripZoomHours * 3600_000;
-        const windowStart = now - windowMs;
-        const hoveredMs = windowStart + ratio * windowMs;
-        const hoveredDate = new Date(hoveredMs);
-        hoverTime.textContent = hoveredDate.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-        hoverTime.style.left = (x - hoverTime.offsetWidth / 2) + 'px';
-        hoverTime.classList.add('visible');
-
-        // Tooltip for detections in buffer region
-        if (bufferDuration > 0 && !isPlayingWarmEvent) {
-            const bufferMs = bufferDuration * 1000;
-            const bufferRatio = bufferMs / windowMs;
-            const bufferStartX = 1.0 - bufferRatio;
-            if (ratio >= bufferStartX) {
-                const bufferClickRatio = (ratio - bufferStartX) / bufferRatio;
-                const time = bufferClickRatio * bufferDuration;
-                const detection = findDetectionNear(time, 1.0);
-                if (detection && currentDetailCameraId) {
-                    showTooltip(e.clientX, e.clientY, detection);
-                    return;
-                }
-            }
-        }
-        hideTooltip();
-    });
-
-    timelineWrapper.addEventListener('mouseleave', () => {
-        hoverTime.classList.remove('visible');
-        hideTooltip();
-    });
-
-    // Router
-    function router() {
-        const hash = window.location.hash || '#/';
-        const cameraMatch = hash.match(/^#\/camera\/(.+)$/);
-
-        if (cameraMatch) {
-            const cameraId = decodeURIComponent(cameraMatch[1]);
-            if (cameras.includes(cameraId)) {
-                const targetView = `detail:${cameraId}`;
-                if (currentView !== targetView) {
-                    const isBack = currentView && currentView.startsWith('detail:');
-                    withViewTransition(() => showDetailView(cameraId), isBack);
-                    currentView = targetView;
-                }
-            } else {
-                window.location.hash = '/';
-            }
-        } else {
-            if (currentView !== 'grid') {
-                const isBack = currentView !== null;
-                withViewTransition(() => showGridView(), isBack);
-                currentView = 'grid';
-            }
-        }
-    }
-
-    // View functions
     function showGridView() {
-        // Cleanup detail view
-        cleanupDetailView();
-
-        // Show grid view
-        detailView.hidden = true;
+        cleanupLiveView();
+        cleanupPlaybackView();
+        hideAllViews();
         gridView.hidden = false;
 
-        // Load grid cameras if not already loaded
         cameras.forEach(cameraId => {
             if (!gridHlsInstances.has(cameraId)) {
                 const cell = grid.querySelector(`[data-camera-id="${cameraId}"]`);
@@ -455,119 +349,147 @@ document.addEventListener('DOMContentLoaded', async () => {
         });
     }
 
-    function showDetailView(cameraId) {
-        // Cleanup grid HLS instances to save resources
-        gridHlsInstances.forEach((hls, id) => {
-            hls.destroy();
-        });
+    function showLiveView(cameraId) {
+        cleanupPlaybackView();
+
+        // Only reload if switching cameras
+        if (currentDetailCameraId !== cameraId) {
+            cleanupLiveView();
+        }
+
+        // Cleanup grid
+        gridHlsInstances.forEach((hls) => hls.destroy());
         gridHlsInstances.clear();
 
-        // Update UI
-        gridView.hidden = true;
-        detailView.hidden = false;
+        hideAllViews();
+        liveView.hidden = false;
         detailCameraName.textContent = cameraId;
-        detailLoading.hidden = false;
         currentDetailCameraId = cameraId;
 
-        // Reset timeline
-        timelineScrubber.value = 100;
-        currentTimeDisplay.textContent = '00:00:00';
-        durationDisplay.textContent = '00:00:00';
-        liveBtn.classList.add('is-live');
-        liveBtn.classList.remove('is-warm');
-        liveBtn.querySelector('span:last-child') || updateLiveBtnText('Live');
-        stabilityOverlay.hidden = !stabilityOverlayEnabled;
-        bgOverlay.hidden = !bgOverlayEnabled;
-        gridOverlay.hidden = !gridOverlayEnabled;
-        if (stabilityOverlayEnabled) {
-            fetchStabilityMap();
-        }
-        if (bgOverlayEnabled) {
-            fetchBackgroundMap();
-        }
-        if (gridOverlayEnabled) {
-            fetchDetectionGrid();
-        }
+        // Only start stream if not already running
+        if (!detailHls) {
+            detailLoading.hidden = false;
+            stabilityOverlay.hidden = !stabilityOverlayEnabled;
+            bgOverlay.hidden = !bgOverlayEnabled;
+            gridOverlay.hidden = !gridOverlayEnabled;
 
-        // Reset warm state
-        isPlayingWarmEvent = false;
-        currentWarmEventPts = null;
-        warmEvents = [];
-        collapsedGroups.clear();
-        groupPageLimits.clear();
+            if (stabilityOverlayEnabled) fetchStabilityMap();
+            if (bgOverlayEnabled) fetchBackgroundMap();
+            if (gridOverlayEnabled) fetchDetectionGrid();
 
-        // Load camera stream
-        loadDetailCamera(cameraId);
-
-        // Fetch warm events
-        fetchWarmEvents(cameraId);
+            loadDetailCamera(cameraId);
+            fetchWarmEvents(cameraId);
+        } else {
+            // Returning from events/playback — just show the view
+            updateEventsSummary();
+        }
     }
 
-    function updateLiveBtnText(text) {
-        // The button has: <span class="live-indicator"></span> + text node
-        const indicator = liveBtn.querySelector('.live-indicator');
-        liveBtn.textContent = '';
-        liveBtn.appendChild(indicator);
-        liveBtn.appendChild(document.createTextNode(' ' + text));
+    function showEventsView(cameraId) {
+        cleanupPlaybackView();
+
+        // Ensure we have warm events loaded
+        if (currentDetailCameraId !== cameraId) {
+            currentDetailCameraId = cameraId;
+            fetchWarmEvents(cameraId);
+        }
+
+        hideAllViews();
+        eventsView.hidden = false;
+        eventsCameraName.textContent = cameraId;
+
+        // Reset filter
+        eventFilter = 'all';
+        filterBtns.forEach(b => b.classList.toggle('active', b.dataset.filter === 'all'));
+
+        renderEventList();
     }
 
-    function cleanupDetailView() {
-        if (timelineAnimationId) {
-            cancelAnimationFrame(timelineAnimationId);
-            timelineAnimationId = null;
+    function showPlaybackView(cameraId, pts) {
+        // Ensure warm events are available
+        if (currentDetailCameraId !== cameraId) {
+            currentDetailCameraId = cameraId;
+            // Need to fetch warm events before we can show prev/next
+            fetchWarmEvents(cameraId).then(() => {
+                updatePlaybackNav();
+            });
         }
-        if (motionPollInterval) {
-            clearInterval(motionPollInterval);
-            motionPollInterval = null;
+
+        hideAllViews();
+        playbackView.hidden = false;
+        currentPlaybackPts = pts;
+
+        // Find the event
+        const ev = warmEvents.find(e => e.start_pts_ns === pts);
+        if (ev) {
+            const evDate = new Date(ev.start_ms);
+            const typeLabel = ev.event_type === 'object' ? 'Object' : 'Motion';
+            const timeStr = evDate.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+            playbackEventInfo.textContent = `${typeLabel} \u00b7 ${timeStr}`;
+        } else {
+            playbackEventInfo.textContent = 'Event';
         }
-        if (detectionPollInterval) {
-            clearInterval(detectionPollInterval);
-            detectionPollInterval = null;
+
+        loadPlaybackVideo(cameraId, pts);
+        updatePlaybackNav();
+    }
+
+    // === Cleanup ===
+
+    function cleanupLiveView() {
+        if (overlayAnimationId) {
+            cancelAnimationFrame(overlayAnimationId);
+            overlayAnimationId = null;
         }
-        if (warmEventPollInterval) {
-            clearInterval(warmEventPollInterval);
-            warmEventPollInterval = null;
-        }
-        if (detailHls) {
-            detailHls.destroy();
-            detailHls = null;
-        }
+        if (motionPollInterval) { clearInterval(motionPollInterval); motionPollInterval = null; }
+        if (detectionPollInterval) { clearInterval(detectionPollInterval); detectionPollInterval = null; }
+        if (warmEventPollInterval) { clearInterval(warmEventPollInterval); warmEventPollInterval = null; }
+        if (stabilityPollInterval) { clearInterval(stabilityPollInterval); stabilityPollInterval = null; }
+        if (detailHls) { detailHls.destroy(); detailHls = null; }
         detailVideo.src = '';
-        currentMotionSegments = [];
         currentDetections = [];
         currentDetailCameraId = null;
         bufferDuration = 0;
+        warmEvents = [];
+
         stabilityImage = null;
         stabilityOverlay.hidden = true;
         stabilityOverlayEnabled = false;
         maskToggleBtn.classList.remove('active');
         stabilityCtx.clearRect(0, 0, stabilityOverlay.width, stabilityOverlay.height);
+
         bgImage = null;
         bgOverlay.hidden = true;
         bgOverlayEnabled = false;
         bgToggleBtn.classList.remove('active');
         bgCtx.clearRect(0, 0, bgOverlay.width, bgOverlay.height);
+
         gridData = null;
         gridOverlay.hidden = true;
         gridOverlayEnabled = false;
         gridToggleBtn.classList.remove('active');
         gridCtx.clearRect(0, 0, gridOverlay.width, gridOverlay.height);
-        if (stabilityPollInterval) {
-            clearInterval(stabilityPollInterval);
-            stabilityPollInterval = null;
-        }
+
         hideTooltip();
         detectionGallery.innerHTML = '';
-        recordingsGroups.innerHTML = '';
-        recordingsSection.hidden = true;
-        const rect = timelineCanvas.getBoundingClientRect();
-        timelineCtx.clearRect(0, 0, rect.width, rect.height);
-        warmEvents = [];
-        isPlayingWarmEvent = false;
-        currentWarmEventPts = null;
+        eventsSummaryBtn.hidden = true;
     }
 
-    // Camera cell creation
+    function cleanupPlaybackView() {
+        if (playbackAnimationId) {
+            cancelAnimationFrame(playbackAnimationId);
+            playbackAnimationId = null;
+        }
+        if (playbackHls) { playbackHls.destroy(); playbackHls = null; }
+        playbackVideo.src = '';
+        currentPlaybackPts = null;
+        isScrubbing = false;
+        playbackScrubber.value = 0;
+        playbackProgressFill.style.width = '0%';
+    }
+
+    // === Camera Cell ===
+
     function createCameraCell(cameraId) {
         const cell = document.createElement('div');
         cell.className = 'camera-cell';
@@ -583,17 +505,15 @@ document.addEventListener('DOMContentLoaded', async () => {
         return cell;
     }
 
-    // Grid camera loading
+    // === HLS Loading ===
+
     function loadGridCamera(cameraId, video) {
         const src = `/api/stream/${cameraId}/playlist.m3u8?live=true`;
         const loading = video.parentElement.querySelector('.loading');
 
         if (typeof Hls !== 'undefined' && Hls.isSupported()) {
-            const hls = new Hls({
-                enableWorker: false,
-            });
+            const hls = new Hls({ enableWorker: false });
             gridHlsInstances.set(cameraId, hls);
-
             hls.loadSource(src);
             hls.attachMedia(video);
 
@@ -606,16 +526,11 @@ document.addEventListener('DOMContentLoaded', async () => {
                 console.error(`HLS error for ${cameraId}:`, data.type, data.details);
                 if (data.fatal) {
                     switch (data.type) {
-                        case Hls.ErrorTypes.NETWORK_ERROR:
-                            hls.startLoad();
-                            break;
-                        case Hls.ErrorTypes.MEDIA_ERROR:
-                            hls.recoverMediaError();
-                            break;
+                        case Hls.ErrorTypes.NETWORK_ERROR: hls.startLoad(); break;
+                        case Hls.ErrorTypes.MEDIA_ERROR: hls.recoverMediaError(); break;
                         default:
                             loading.querySelector('p').textContent = 'Stream error';
                             loading.hidden = false;
-                            break;
                     }
                 }
             });
@@ -630,22 +545,18 @@ document.addEventListener('DOMContentLoaded', async () => {
         }
     }
 
-    // Detail camera loading (live stream)
     function loadDetailCamera(cameraId) {
         const src = `/api/stream/${cameraId}/playlist.m3u8`;
 
         if (typeof Hls !== 'undefined' && Hls.isSupported()) {
-            detailHls = new Hls({
-                enableWorker: false,
-            });
-
+            detailHls = new Hls({ enableWorker: false });
             detailHls.loadSource(src);
             detailHls.attachMedia(detailVideo);
 
             detailHls.on(Hls.Events.MANIFEST_PARSED, () => {
                 detailLoading.hidden = true;
                 detailVideo.play().catch(e => console.error(`Play failed for ${cameraId}:`, e));
-                startTimelineUpdate();
+                startOverlayUpdates();
                 fetchMotionSegments(cameraId);
                 fetchDetections(cameraId);
             });
@@ -654,16 +565,11 @@ document.addEventListener('DOMContentLoaded', async () => {
                 console.error(`HLS error for ${cameraId}:`, data.type, data.details);
                 if (data.fatal) {
                     switch (data.type) {
-                        case Hls.ErrorTypes.NETWORK_ERROR:
-                            detailHls.startLoad();
-                            break;
-                        case Hls.ErrorTypes.MEDIA_ERROR:
-                            detailHls.recoverMediaError();
-                            break;
+                        case Hls.ErrorTypes.NETWORK_ERROR: detailHls.startLoad(); break;
+                        case Hls.ErrorTypes.MEDIA_ERROR: detailHls.recoverMediaError(); break;
                         default:
                             detailLoading.querySelector('p').textContent = 'Stream error';
                             detailLoading.hidden = false;
-                            break;
                     }
                 }
             });
@@ -672,7 +578,7 @@ document.addEventListener('DOMContentLoaded', async () => {
             detailVideo.addEventListener('loadedmetadata', () => {
                 detailLoading.hidden = true;
                 detailVideo.play().catch(e => console.error(`Play failed for ${cameraId}:`, e));
-                startTimelineUpdate();
+                startOverlayUpdates();
                 fetchMotionSegments(cameraId);
                 fetchDetections(cameraId);
             }, { once: true });
@@ -681,130 +587,55 @@ document.addEventListener('DOMContentLoaded', async () => {
         }
     }
 
-    // Warm event playback
-    function loadWarmEvent(cameraId, startPtsNs) {
-        const src = `/api/cameras/${encodeURIComponent(cameraId)}/events/${startPtsNs}/playlist.m3u8`;
+    function loadPlaybackVideo(cameraId, pts) {
+        const src = `/api/cameras/${encodeURIComponent(cameraId)}/events/${pts}/playlist.m3u8`;
 
-        // Destroy current HLS instance
-        if (detailHls) {
-            detailHls.destroy();
-            detailHls = null;
-        }
-
-        isPlayingWarmEvent = true;
-        currentWarmEventPts = startPtsNs;
-
-        // Update UI state
-        liveBtn.classList.remove('is-live');
-        liveBtn.classList.add('is-warm');
-        timelineScrubber.classList.add('active');
-        updateLiveBtnText('Return to Live');
-
-        detailLoading.hidden = false;
+        if (playbackHls) { playbackHls.destroy(); playbackHls = null; }
+        playbackLoading.hidden = false;
 
         if (typeof Hls !== 'undefined' && Hls.isSupported()) {
-            detailHls = new Hls({
-                enableWorker: false,
+            playbackHls = new Hls({ enableWorker: false });
+            playbackHls.loadSource(src);
+            playbackHls.attachMedia(playbackVideo);
+
+            playbackHls.on(Hls.Events.MANIFEST_PARSED, () => {
+                playbackLoading.hidden = true;
+                playbackVideo.play().catch(e => console.error('Playback failed:', e));
+                startPlaybackUpdate();
             });
 
-            detailHls.loadSource(src);
-            detailHls.attachMedia(detailVideo);
-
-            detailHls.on(Hls.Events.MANIFEST_PARSED, () => {
-                detailLoading.hidden = true;
-                detailVideo.play().catch(e => console.error(`Warm play failed:`, e));
-            });
-
-            detailHls.on(Hls.Events.ERROR, (event, data) => {
-                console.error(`Warm HLS error:`, data.type, data.details);
+            playbackHls.on(Hls.Events.ERROR, (event, data) => {
+                console.error('Playback HLS error:', data.type, data.details);
                 if (data.fatal) {
-                    detailLoading.querySelector('p').textContent = 'Playback error';
-                    detailLoading.hidden = false;
+                    playbackLoading.querySelector('p').textContent = 'Playback error';
+                    playbackLoading.hidden = false;
                 }
             });
-        } else if (detailVideo.canPlayType('application/vnd.apple.mpegurl')) {
-            detailVideo.src = src;
-            detailVideo.addEventListener('loadedmetadata', () => {
-                detailLoading.hidden = true;
-                detailVideo.play().catch(e => console.error(`Warm play failed:`, e));
+        } else if (playbackVideo.canPlayType('application/vnd.apple.mpegurl')) {
+            playbackVideo.src = src;
+            playbackVideo.addEventListener('loadedmetadata', () => {
+                playbackLoading.hidden = true;
+                playbackVideo.play().catch(e => console.error('Playback failed:', e));
+                startPlaybackUpdate();
             }, { once: true });
         }
-
-        renderTimeline();
-        renderRecordingsGallery();
     }
 
-    function returnToLive() {
-        if (!currentDetailCameraId) return;
+    // === Live Monitor: Overlay Updates ===
 
-        isPlayingWarmEvent = false;
-        currentWarmEventPts = null;
-
-        liveBtn.classList.remove('is-warm');
-        timelineScrubber.classList.remove('active');
-        updateLiveBtnText('Live');
-
-        // Reload live stream
-        if (detailHls) {
-            detailHls.destroy();
-            detailHls = null;
-        }
-
-        loadDetailCamera(currentDetailCameraId);
-        renderTimeline();
-        renderRecordingsGallery();
-    }
-
-    // Timeline functions
-    function formatWindowTime(date) {
-        return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-    }
-
-    function startTimelineUpdate() {
+    function startOverlayUpdates() {
         function update() {
-            if (isPlayingWarmEvent) {
-                const duration = detailVideo.duration;
-                if (!isSeeking && duration && isFinite(duration)) {
-                    const progress = (detailVideo.currentTime / duration) * 100;
-                    timelineScrubber.value = progress;
-                }
-            } else {
-                const duration = bufferDuration || detailVideo.duration;
-                if (!isSeeking && duration && isFinite(duration)) {
-                    const progress = (detailVideo.currentTime / duration) * 100;
-                    timelineScrubber.value = progress;
-                    updateLiveState();
-                    drawBackground();
-                    drawStability();
-                }
-            }
-            // Update window time labels
-            const now = Date.now();
-            const windowMs = eventStripZoomHours * 3600_000;
-            if (isPlayingWarmEvent && currentWarmEventPts) {
-                const evStartMs = Number(BigInt(currentWarmEventPts) / 1_000_000n);
-                const ev = warmEvents.find(e => e.start_pts_ns === currentWarmEventPts);
-                const evDurationMs = ev ? ev.duration_ms : (detailVideo.duration * 1000);
-                currentTimeDisplay.textContent = formatWindowTime(new Date(evStartMs));
-                durationDisplay.textContent = formatWindowTime(new Date(evStartMs + evDurationMs));
-            } else {
-                currentTimeDisplay.textContent = formatWindowTime(new Date(now - windowMs));
-                durationDisplay.textContent = 'Now';
-            }
-
-            renderTimeline();
-            timelineAnimationId = requestAnimationFrame(update);
+            drawBackground();
+            drawStability();
+            overlayAnimationId = requestAnimationFrame(update);
         }
         update();
     }
 
     function fetchStabilityMap() {
-        if (!stabilityOverlayEnabled || !currentDetailCameraId || isPlayingWarmEvent) return;
+        if (!stabilityOverlayEnabled || !currentDetailCameraId) return;
         const img = new Image();
-        img.onload = () => {
-            stabilityImage = img;
-            drawStability();
-        };
+        img.onload = () => { stabilityImage = img; drawStability(); };
         img.onerror = () => {};
         img.src = `/api/cameras/${encodeURIComponent(currentDetailCameraId)}/motion/stability?t=${Date.now()}`;
     }
@@ -837,12 +668,9 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
 
     function fetchBackgroundMap() {
-        if (!bgOverlayEnabled || !currentDetailCameraId || isPlayingWarmEvent) return;
+        if (!bgOverlayEnabled || !currentDetailCameraId) return;
         const img = new Image();
-        img.onload = () => {
-            bgImage = img;
-            drawBackground();
-        };
+        img.onload = () => { bgImage = img; drawBackground(); };
         img.onerror = () => {};
         img.src = `/api/cameras/${encodeURIComponent(currentDetailCameraId)}/motion/background?t=${Date.now()}`;
     }
@@ -861,14 +689,11 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
 
     function fetchDetectionGrid() {
-        if (!gridOverlayEnabled || !currentDetailCameraId || isPlayingWarmEvent) return;
+        if (!gridOverlayEnabled || !currentDetailCameraId) return;
         fetch(`/api/cameras/${encodeURIComponent(currentDetailCameraId)}/detection/grid`)
             .then(r => r.ok ? r.json() : null)
             .then(data => {
-                if (data) {
-                    gridData = data;
-                    drawDetectionGrid();
-                }
+                if (data) { gridData = data; drawDetectionGrid(); }
             })
             .catch(() => {});
     }
@@ -916,12 +741,9 @@ document.addEventListener('DOMContentLoaded', async () => {
                 hasVisible = true;
             }
 
-            if (hasVisible) {
-                legendEntries.push({ className, color });
-            }
+            if (hasVisible) legendEntries.push({ className, color });
         }
 
-        // Draw legend
         if (legendEntries.length > 0) {
             const fontSize = 12;
             const padding = 6;
@@ -945,38 +767,19 @@ document.addEventListener('DOMContentLoaded', async () => {
         }
     }
 
-    function updateLiveState() {
-        const duration = bufferDuration || detailVideo.duration;
-        if (duration && isFinite(duration)) {
-            const isAtLive = (duration - detailVideo.currentTime) < 3;
-            liveBtn.classList.toggle('is-live', isAtLive);
-        }
-    }
+    // === Live Monitor: Data Fetching ===
 
-    function formatTime(seconds) {
-        if (!isFinite(seconds)) return '00:00:00';
-        const h = Math.floor(seconds / 3600);
-        const m = Math.floor((seconds % 3600) / 60);
-        const s = Math.floor(seconds % 60);
-        return `${h.toString().padStart(2, '0')}:${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
-    }
-
-    // Motion segment data fetching
     async function fetchMotionSegments(cameraId) {
-        if (motionPollInterval) {
-            clearInterval(motionPollInterval);
-        }
+        if (motionPollInterval) clearInterval(motionPollInterval);
 
         async function poll() {
             try {
                 const response = await fetch(`/api/cameras/${encodeURIComponent(cameraId)}/motion`);
                 if (response.ok) {
                     const data = await response.json();
-                    currentMotionSegments = data.segments || [];
                     if (data.total_duration > 0) {
                         bufferDuration = data.total_duration;
                     }
-                    renderTimeline();
                 }
             } catch (err) {
                 console.error('Failed to fetch motion data:', err);
@@ -985,7 +788,7 @@ document.addEventListener('DOMContentLoaded', async () => {
 
         await poll();
         motionPollInterval = setInterval(poll, 5000);
-        // Poll stability map every 5 seconds when overlay is enabled
+
         if (stabilityPollInterval) clearInterval(stabilityPollInterval);
         stabilityPollInterval = setInterval(() => {
             fetchStabilityMap();
@@ -994,11 +797,8 @@ document.addEventListener('DOMContentLoaded', async () => {
         }, 5000);
     }
 
-    // Detection data fetching
     async function fetchDetections(cameraId) {
-        if (detectionPollInterval) {
-            clearInterval(detectionPollInterval);
-        }
+        if (detectionPollInterval) clearInterval(detectionPollInterval);
 
         async function poll() {
             try {
@@ -1009,7 +809,6 @@ document.addEventListener('DOMContentLoaded', async () => {
                     if (data.total_duration > 0) {
                         bufferDuration = data.total_duration;
                     }
-                    renderTimeline();
                     renderDetectionGallery();
                 }
             } catch (err) {
@@ -1021,11 +820,8 @@ document.addEventListener('DOMContentLoaded', async () => {
         detectionPollInterval = setInterval(poll, 5000);
     }
 
-    // Warm event fetching
     async function fetchWarmEvents(cameraId) {
-        if (warmEventPollInterval) {
-            clearInterval(warmEventPollInterval);
-        }
+        if (warmEventPollInterval) clearInterval(warmEventPollInterval);
 
         async function poll() {
             try {
@@ -1037,8 +833,11 @@ document.addEventListener('DOMContentLoaded', async () => {
                         ...ev,
                         start_ms: Number(BigInt(ev.start_pts_ns) / 1_000_000n),
                     }));
-                    renderTimeline();
-                    renderRecordingsGallery();
+                    updateEventsSummary();
+                    // Re-render event list if visible
+                    if (!eventsView.hidden) renderEventList();
+                    // Update nav if in playback
+                    if (!playbackView.hidden) updatePlaybackNav();
                 }
             } catch (err) {
                 console.error('Failed to fetch warm events:', err);
@@ -1049,164 +848,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         warmEventPollInterval = setInterval(poll, 15000);
     }
 
-    // Unified timeline rendering
-    function renderTimeline() {
-        const rect = timelineWrapper.getBoundingClientRect();
-        if (rect.width === 0) return;
-
-        const dpr = window.devicePixelRatio || 1;
-        timelineCanvas.width = rect.width * dpr;
-        timelineCanvas.height = rect.height * dpr;
-        timelineCtx.scale(dpr, dpr);
-        timelineCtx.clearRect(0, 0, rect.width, rect.height);
-
-        const w = rect.width;
-        const h = rect.height;
-
-        const now = Date.now();
-        const windowMs = eventStripZoomHours * 3600_000;
-        const windowStart = now - windowMs;
-        const windowEnd = now;
-
-        // 1. Time axis ticks
-        timelineCtx.strokeStyle = 'rgba(255, 255, 255, 0.1)';
-        timelineCtx.lineWidth = 1;
-        const tickIntervalHours = eventStripZoomHours <= 1 ? 0.25 :
-                                   eventStripZoomHours <= 6 ? 1 :
-                                   eventStripZoomHours <= 24 ? 4 : 8;
-        const tickIntervalMs = tickIntervalHours * 3600_000;
-        const firstTick = Math.ceil(windowStart / tickIntervalMs) * tickIntervalMs;
-        for (let t = firstTick; t < windowEnd; t += tickIntervalMs) {
-            const x = ((t - windowStart) / windowMs) * w;
-            timelineCtx.beginPath();
-            timelineCtx.moveTo(x, 0);
-            timelineCtx.lineTo(x, h);
-            timelineCtx.stroke();
-        }
-
-        // 2. Warm event blocks
-        warmEvents.forEach(ev => {
-            const evStart = ev.start_ms;
-            const evEnd = evStart + ev.duration_ms;
-
-            if (evEnd < windowStart || evStart > windowEnd) return;
-
-            const startX = Math.max(0, ((evStart - windowStart) / windowMs) * w);
-            const endX = Math.min(w, ((evEnd - windowStart) / windowMs) * w);
-            const evW = Math.max(2, endX - startX);
-
-            const isPlaying = isPlayingWarmEvent && currentWarmEventPts === ev.start_pts_ns;
-            if (ev.event_type === 'object') {
-                timelineCtx.fillStyle = isPlaying ? 'rgba(220, 50, 50, 1)' : 'rgba(220, 50, 50, 0.8)';
-            } else {
-                timelineCtx.fillStyle = isPlaying ? 'rgba(255, 200, 50, 1)' : 'rgba(255, 200, 50, 0.7)';
-            }
-
-            timelineCtx.beginPath();
-            timelineCtx.roundRect(startX, 2, evW, h - 4, 2);
-            timelineCtx.fill();
-
-            if (isPlaying) {
-                timelineCtx.strokeStyle = '#fff';
-                timelineCtx.lineWidth = 2;
-                timelineCtx.beginPath();
-                timelineCtx.roundRect(startX, 2, evW, h - 4, 2);
-                timelineCtx.stroke();
-
-                // Playhead within event: show progress through event
-                const duration = detailVideo.duration;
-                if (duration && isFinite(duration) && duration > 0) {
-                    const progress = detailVideo.currentTime / duration;
-                    const playheadX = startX + progress * evW;
-                    timelineCtx.strokeStyle = 'rgba(255, 255, 255, 0.9)';
-                    timelineCtx.lineWidth = 2;
-                    timelineCtx.beginPath();
-                    timelineCtx.moveTo(playheadX, 0);
-                    timelineCtx.lineTo(playheadX, h);
-                    timelineCtx.stroke();
-                }
-            }
-        });
-
-        // 3. Live buffer region (right edge)
-        const bufferMs = (bufferDuration || 0) * 1000;
-        if (bufferMs > 0) {
-            const bufferRatio = Math.min(1, bufferMs / windowMs);
-            const bufferStartX = w * (1.0 - bufferRatio);
-            const bufferW = w * bufferRatio;
-
-            // Subtle background tint for buffer region
-            timelineCtx.fillStyle = 'rgba(255, 255, 255, 0.08)';
-            timelineCtx.fillRect(bufferStartX, 0, bufferW, h);
-
-            // 4. Motion segments within buffer region
-            const detectionTimes = currentDetections.map(d => d.timestamp);
-            currentMotionSegments.forEach(segment => {
-                const segStartX = bufferStartX + (segment.start / bufferDuration) * bufferW;
-                const segEndX = bufferStartX + (segment.end / bufferDuration) * bufferW;
-                const segW = segEndX - segStartX;
-
-                const hasDetection = detectionTimes.some(t => t >= segment.start && t <= segment.end);
-                if (hasDetection) return;
-
-                const alpha = 0.5 + segment.intensity * 0.5;
-                timelineCtx.fillStyle = `rgba(255, 200, 50, ${alpha})`;
-                timelineCtx.beginPath();
-                timelineCtx.roundRect(segStartX, 2, segW, h - 4, 2);
-                timelineCtx.fill();
-            });
-
-            // 5. Detection markers within buffer region
-            currentDetections.forEach(det => {
-                const x = bufferStartX + (det.timestamp / bufferDuration) * bufferW;
-                const alpha = 0.6 + det.confidence * 0.4;
-                timelineCtx.fillStyle = `rgba(220, 50, 50, ${alpha})`;
-                timelineCtx.fillRect(x - 2, 2, 4, h - 4);
-            });
-
-            // 6. Playhead in live mode
-            if (!isPlayingWarmEvent) {
-                const currentTime = detailVideo.currentTime;
-                const duration = bufferDuration || detailVideo.duration;
-                if (duration && isFinite(duration) && duration > 0) {
-                    const playheadX = bufferStartX + (currentTime / duration) * bufferW;
-                    timelineCtx.strokeStyle = 'rgba(255, 255, 255, 0.9)';
-                    timelineCtx.lineWidth = 2;
-                    timelineCtx.beginPath();
-                    timelineCtx.moveTo(playheadX, 0);
-                    timelineCtx.lineTo(playheadX, h);
-                    timelineCtx.stroke();
-                }
-            }
-        }
-    }
-
-    function findDetectionNear(time, threshold) {
-        let closest = null;
-        let minDist = threshold;
-
-        for (const det of currentDetections) {
-            const dist = Math.abs(det.timestamp - time);
-            if (dist < minDist) {
-                minDist = dist;
-                closest = det;
-            }
-        }
-
-        return closest;
-    }
-
-    function showTooltip(x, y, detection) {
-        tooltipImage.src = `/api/cameras/${encodeURIComponent(currentDetailCameraId)}/detections/${detection.id}/frame`;
-        tooltipLabel.textContent = `${detection.object_class} (${Math.round(detection.confidence * 100)}%)`;
-        detectionTooltip.style.left = `${x + 10}px`;
-        detectionTooltip.style.top = `${y - 170}px`;
-        detectionTooltip.hidden = false;
-    }
-
-    function hideTooltip() {
-        detectionTooltip.hidden = true;
-    }
+    // === Live Monitor: Detection Gallery ===
 
     function renderDetectionGallery() {
         detectionGallery.innerHTML = '';
@@ -1226,6 +868,44 @@ document.addEventListener('DOMContentLoaded', async () => {
         });
     }
 
+    function updateEventsSummary() {
+        if (warmEvents.length === 0) {
+            eventsSummaryBtn.hidden = true;
+            return;
+        }
+
+        eventsSummaryBtn.hidden = false;
+
+        const now = Date.now();
+        const oneHourAgo = now - 3600_000;
+        const todayStart = new Date();
+        todayStart.setHours(0, 0, 0, 0);
+
+        const todayCount = warmEvents.filter(e => e.start_ms >= todayStart.getTime()).length;
+        const recentCount = warmEvents.filter(e => e.start_ms >= oneHourAgo).length;
+
+        const parts = [];
+        parts.push(`${todayCount} event${todayCount !== 1 ? 's' : ''} today`);
+        if (recentCount > 0) {
+            parts.push(`${recentCount} in last hour`);
+        }
+        eventsSummaryText.textContent = parts.join('  \u00b7  ');
+    }
+
+    function showTooltip(x, y, detection) {
+        tooltipImage.src = `/api/cameras/${encodeURIComponent(currentDetailCameraId)}/detections/${detection.id}/frame`;
+        tooltipLabel.textContent = `${detection.object_class} (${Math.round(detection.confidence * 100)}%)`;
+        detectionTooltip.style.left = `${x + 10}px`;
+        detectionTooltip.style.top = `${y - 170}px`;
+        detectionTooltip.hidden = false;
+    }
+
+    function hideTooltip() {
+        detectionTooltip.hidden = true;
+    }
+
+    // === View 2: Event List Rendering ===
+
     function formatDateLabel(date) {
         const now = new Date();
         const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
@@ -1237,119 +917,145 @@ document.addEventListener('DOMContentLoaded', async () => {
         return date.toLocaleDateString([], { weekday: 'short', month: 'short', day: 'numeric' });
     }
 
-    function renderRecordingsGallery() {
-        recordingsGroups.innerHTML = '';
-        if (warmEvents.length === 0) {
-            recordingsSection.hidden = true;
+    function renderEventList() {
+        eventList.innerHTML = '';
+
+        let filtered = warmEvents;
+        if (eventFilter === 'object') {
+            filtered = warmEvents.filter(e => e.event_type === 'object');
+        } else if (eventFilter === 'movement') {
+            filtered = warmEvents.filter(e => e.event_type === 'movement');
+        }
+
+        if (filtered.length === 0) {
+            eventList.innerHTML = '<div class="event-list-empty">No events found</div>';
             return;
         }
-        recordingsSection.hidden = false;
 
-        // Group all events by date
+        // Sort by time descending
+        const sorted = [...filtered].sort((a, b) => b.start_ms - a.start_ms);
+
+        // Group by date
         const groups = new Map();
-        warmEvents.forEach(ev => {
+        sorted.forEach(ev => {
             const label = formatDateLabel(new Date(ev.start_ms));
             if (!groups.has(label)) groups.set(label, []);
             groups.get(label).push(ev);
         });
 
-        // Sort groups by most recent event (descending)
-        const sortedGroups = [...groups.entries()].sort((a, b) => {
-            const aMax = Math.max(...a[1].map(e => e.start_ms));
-            const bMax = Math.max(...b[1].map(e => e.start_ms));
-            return bMax - aMax;
-        });
+        groups.forEach((events, label) => {
+            const groupEl = document.createElement('div');
+            groupEl.className = 'event-day-group';
 
-        let isFirst = true;
-        sortedGroups.forEach(([label, events]) => {
-            // Sort within group: objects first, then by recency
-            events.sort((a, b) => {
-                if (a.event_type !== b.event_type) return a.event_type === 'object' ? -1 : 1;
-                return b.start_pts_ns - a.start_pts_ns;
-            });
+            const dayLabel = document.createElement('div');
+            dayLabel.className = 'event-day-label';
+            dayLabel.textContent = label;
+            groupEl.appendChild(dayLabel);
 
-            const objectCount = events.filter(e => e.event_type === 'object').length;
-            const defaultCollapsed = !isFirst;
-            const collapsed = collapsedGroups.has(label) ? collapsedGroups.get(label) : defaultCollapsed;
-
-            const group = document.createElement('div');
-            group.className = 'rec-group';
-            if (collapsed) group.classList.add('collapsed');
-
-            const heading = document.createElement('button');
-            heading.className = 'rec-group-label';
-            const countParts = [];
-            if (objectCount > 0) countParts.push(`${objectCount} object${objectCount !== 1 ? 's' : ''}`);
-            const motionCount = events.length - objectCount;
-            if (motionCount > 0) countParts.push(`${motionCount} motion`);
-            heading.innerHTML = `<span class="rec-group-arrow"></span>${label} <span class="rec-group-count">${countParts.join(', ')}</span>`;
-
-            heading.addEventListener('click', () => {
-                const nowCollapsed = !group.classList.contains('collapsed');
-                group.classList.toggle('collapsed', nowCollapsed);
-                collapsedGroups.set(label, nowCollapsed);
-            });
-
-            group.appendChild(heading);
-
-            const grid = document.createElement('div');
-            grid.className = 'rec-group-grid';
-
-            const limit = groupPageLimits.get(label) || RECORDINGS_PER_PAGE;
-            const visible = events.slice(0, limit);
-
-            visible.forEach(ev => {
-                const card = document.createElement('div');
-                card.className = 'recording-card';
-                if (isPlayingWarmEvent && currentWarmEventPts === ev.start_pts_ns) {
-                    card.classList.add('active');
-                }
+            events.forEach(ev => {
+                const item = document.createElement('div');
+                item.className = 'event-list-item';
 
                 const thumbSrc = `/api/cameras/${encodeURIComponent(currentDetailCameraId)}/events/${ev.start_pts_ns}/thumbnail`;
                 const evDate = new Date(ev.start_ms);
                 const timeStr = evDate.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
-                const durSec = (ev.duration_ms / 1000).toFixed(0);
-                const typeLabel = ev.event_type === 'object' ? 'Object' : 'Motion';
+                const durSec = (ev.duration_ms / 1000).toFixed(1);
+                const typeLabel = ev.event_type === 'object' ? 'Object detected' : 'Movement';
                 const typeClass = ev.event_type === 'object' ? 'object' : 'movement';
 
-                card.innerHTML = `
-                    <img class="rec-thumb" src="${thumbSrc}" loading="lazy" alt="Recording">
-                    <div class="rec-type ${typeClass}">${typeLabel}</div>
-                    <div class="rec-time">${timeStr}</div>
-                    <div class="rec-duration">${durSec}s</div>
+                item.innerHTML = `
+                    <img class="event-list-thumb" src="${thumbSrc}" loading="lazy" alt="">
+                    <div class="event-list-info">
+                        <div class="event-list-type ${typeClass}">${typeLabel}</div>
+                        <div class="event-list-detail">${ev.event_type === 'object' && ev.object_classes ? ev.object_classes : ''}</div>
+                    </div>
+                    <div class="event-list-meta">
+                        <div class="event-list-time">${timeStr}</div>
+                        <div class="event-list-duration">${durSec}s</div>
+                    </div>
+                    <div class="event-list-chevron">
+                        <svg viewBox="0 0 24 24" fill="currentColor"><path d="M8.59 16.59L13.17 12 8.59 7.41 10 6l6 6-6 6z"/></svg>
+                    </div>
                 `;
 
-                card.addEventListener('click', () => {
-                    loadWarmEvent(currentDetailCameraId, ev.start_pts_ns);
-                    renderRecordingsGallery();
+                item.addEventListener('click', () => {
+                    window.location.hash = `/camera/${encodeURIComponent(currentDetailCameraId)}/events/${ev.start_pts_ns}`;
                 });
 
-                grid.appendChild(card);
+                groupEl.appendChild(item);
             });
 
-            group.appendChild(grid);
-
-            if (events.length > limit) {
-                const moreBtn = document.createElement('button');
-                moreBtn.className = 'recordings-more-btn';
-                moreBtn.textContent = `Show more (${events.length - limit} remaining)`;
-                moreBtn.addEventListener('click', () => {
-                    groupPageLimits.set(label, limit + RECORDINGS_PER_PAGE);
-                    renderRecordingsGallery();
-                });
-                group.appendChild(moreBtn);
-            }
-
-            recordingsGroups.appendChild(group);
-            isFirst = false;
+            eventList.appendChild(groupEl);
         });
     }
 
-    // Handle canvas resize
-    window.addEventListener('resize', () => {
-        renderTimeline();
-        drawBackground();
-        drawDetectionGrid();
-        drawStability();
-    });
+    // === View 3: Playback Controls ===
+
+    function startPlaybackUpdate() {
+        if (playbackAnimationId) cancelAnimationFrame(playbackAnimationId);
+
+        function update() {
+            const duration = playbackVideo.duration;
+            if (duration && isFinite(duration)) {
+                if (!isScrubbing) {
+                    const progress = playbackVideo.currentTime / duration;
+                    playbackScrubber.value = Math.round(progress * 1000);
+                    playbackProgressFill.style.width = (progress * 100) + '%';
+                    playbackCurrentTime.textContent = formatTimeShort(playbackVideo.currentTime);
+                }
+                playbackDuration.textContent = formatTimeShort(duration);
+            }
+            playbackAnimationId = requestAnimationFrame(update);
+        }
+        update();
+    }
+
+    function getAdjacentEvents(pts) {
+        // Sort events by time descending (newest first) to match event list order
+        const sorted = [...warmEvents].sort((a, b) => b.start_ms - a.start_ms);
+        const idx = sorted.findIndex(e => e.start_pts_ns === pts);
+        return {
+            prev: idx > 0 ? sorted[idx - 1] : null,
+            next: idx >= 0 && idx < sorted.length - 1 ? sorted[idx + 1] : null,
+        };
+    }
+
+    function updatePlaybackNav() {
+        const nav = getAdjacentEvents(currentPlaybackPts);
+
+        if (nav.prev) {
+            prevEventBtn.hidden = false;
+            const prevDate = new Date(nav.prev.start_ms);
+            prevEventText.textContent = prevDate.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+            prevEventThumb.src = `/api/cameras/${encodeURIComponent(currentDetailCameraId)}/events/${nav.prev.start_pts_ns}/thumbnail`;
+        } else {
+            prevEventBtn.hidden = true;
+        }
+
+        if (nav.next) {
+            nextEventBtn.hidden = false;
+            const nextDate = new Date(nav.next.start_ms);
+            nextEventText.textContent = nextDate.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+            nextEventThumb.src = `/api/cameras/${encodeURIComponent(currentDetailCameraId)}/events/${nav.next.start_pts_ns}/thumbnail`;
+        } else {
+            nextEventBtn.hidden = true;
+        }
+    }
+
+    // === Utility ===
+
+    function formatTime(seconds) {
+        if (!isFinite(seconds)) return '00:00:00';
+        const h = Math.floor(seconds / 3600);
+        const m = Math.floor((seconds % 3600) / 60);
+        const s = Math.floor(seconds % 60);
+        return `${h.toString().padStart(2, '0')}:${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
+    }
+
+    function formatTimeShort(seconds) {
+        if (!isFinite(seconds)) return '0:00';
+        const m = Math.floor(seconds / 60);
+        const s = Math.floor(seconds % 60);
+        return `${m}:${s.toString().padStart(2, '0')}`;
+    }
 });
