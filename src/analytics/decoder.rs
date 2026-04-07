@@ -95,11 +95,8 @@ impl FrameDecoder {
 
         // Each segment typically has 1 keyframe; drain whatever is available
         let mut frames = Vec::with_capacity(2);
-        loop {
-            match self.frame_rx.recv_timeout(FRAME_READ_TIMEOUT) {
-                Ok(frame) => frames.push(frame),
-                Err(_) => break,
-            }
+        while let Ok(frame) = self.frame_rx.recv_timeout(FRAME_READ_TIMEOUT) {
+            frames.push(frame);
         }
 
         frames

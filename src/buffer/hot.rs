@@ -62,18 +62,15 @@ impl HotBuffer {
                     "evicted old segment"
                 );
                 if let Some(tx) = &self.eviction_tx {
-                    match tx.try_send(EvictedSegment {
+                    if let Err(mpsc::error::TrySendError::Full(_)) = tx.try_send(EvictedSegment {
                         segment: old,
                         camera_id: self.camera_id.clone(),
                         sequence: evicted_sequence,
                     }) {
-                        Err(mpsc::error::TrySendError::Full(_)) => {
-                            tracing::warn!(
-                                camera = %self.camera_id,
-                                "warm writer behind, dropping evicted segment"
-                            );
-                        }
-                        _ => {}
+                        tracing::warn!(
+                            camera = %self.camera_id,
+                            "warm writer behind, dropping evicted segment"
+                        );
                     }
                 }
             } else {
