@@ -129,6 +129,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
+    let detection_grid = if config.analytics.enabled && config.analytics.object_detection.enabled {
+        Some(analytics::detection_grid::DetectionGrid::new(
+            &camera_ids,
+            std::path::PathBuf::from(&config.storage.data_dir),
+        ))
+    } else {
+        None
+    };
+
     let shutdown = Arc::new(AtomicBool::new(false));
     let mut handles = Vec::new();
     let mut analyzer_handles = Vec::new();
@@ -192,12 +201,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 obj_det,
                 config.analytics.clone(),
                 Arc::clone(&shutdown),
+                detection_grid.clone(),
             );
             analyzer_handles.push(analyzer_handle);
         }
     }
 
-    let app_state = AppState::new(buffers_map, motion_store, detection_store, warm_index);
+    let app_state = AppState::new(
+        buffers_map,
+        motion_store,
+        detection_store,
+        warm_index,
+        detection_grid,
+    );
     let server_handle = tokio::spawn(async move {
         if let Err(e) = api::start_server(app_state, http_port).await {
             tracing::error!("HTTP server error: {}", e);

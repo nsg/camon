@@ -21,8 +21,11 @@ document.addEventListener('DOMContentLoaded', async () => {
     const stabilityCtx = stabilityOverlay.getContext('2d');
     const bgOverlay = document.getElementById('bg-overlay');
     const bgCtx = bgOverlay.getContext('2d');
+    const gridOverlay = document.getElementById('detection-grid-overlay');
+    const gridCtx = gridOverlay.getContext('2d');
     const maskToggleBtn = document.getElementById('mask-toggle-btn');
     const bgToggleBtn = document.getElementById('bg-toggle-btn');
+    const gridToggleBtn = document.getElementById('grid-toggle-btn');
     const muteToggleBtn = document.getElementById('mute-toggle-btn');
     const detectionGallery = document.getElementById('detection-gallery');
     const hoverTime = document.getElementById('hover-time');
@@ -53,6 +56,21 @@ document.addEventListener('DOMContentLoaded', async () => {
     let stabilityImage = null;
     let bgOverlayEnabled = false;
     let bgImage = null;
+    let gridOverlayEnabled = false;
+    let gridData = null;
+
+    const GRID_CLASS_COLORS = {
+        person: 'rgba(50, 100, 255, 0.5)',
+        car: 'rgba(220, 50, 50, 0.5)',
+        truck: 'rgba(255, 140, 0, 0.5)',
+        dog: 'rgba(50, 180, 50, 0.5)',
+        cat: 'rgba(160, 50, 200, 0.5)',
+    };
+    const GRID_FALLBACK_COLORS = [
+        'rgba(0, 200, 200, 0.5)',
+        'rgba(200, 200, 0, 0.5)',
+        'rgba(200, 0, 200, 0.5)',
+    ];
     let stabilityPollInterval = null;
 
     // Warm event state
@@ -166,6 +184,18 @@ document.addEventListener('DOMContentLoaded', async () => {
             bgImage = null;
         } else {
             fetchBackgroundMap();
+        }
+    });
+
+    gridToggleBtn.addEventListener('click', () => {
+        gridOverlayEnabled = !gridOverlayEnabled;
+        gridToggleBtn.classList.toggle('active', gridOverlayEnabled);
+        gridOverlay.hidden = !gridOverlayEnabled;
+        if (!gridOverlayEnabled) {
+            gridCtx.clearRect(0, 0, gridOverlay.width, gridOverlay.height);
+            gridData = null;
+        } else {
+            fetchDetectionGrid();
         }
     });
 
@@ -448,11 +478,15 @@ document.addEventListener('DOMContentLoaded', async () => {
         liveBtn.querySelector('span:last-child') || updateLiveBtnText('Live');
         stabilityOverlay.hidden = !stabilityOverlayEnabled;
         bgOverlay.hidden = !bgOverlayEnabled;
+        gridOverlay.hidden = !gridOverlayEnabled;
         if (stabilityOverlayEnabled) {
             fetchStabilityMap();
         }
         if (bgOverlayEnabled) {
             fetchBackgroundMap();
+        }
+        if (gridOverlayEnabled) {
+            fetchDetectionGrid();
         }
 
         // Reset warm state
@@ -513,6 +547,11 @@ document.addEventListener('DOMContentLoaded', async () => {
         bgOverlayEnabled = false;
         bgToggleBtn.classList.remove('active');
         bgCtx.clearRect(0, 0, bgOverlay.width, bgOverlay.height);
+        gridData = null;
+        gridOverlay.hidden = true;
+        gridOverlayEnabled = false;
+        gridToggleBtn.classList.remove('active');
+        gridCtx.clearRect(0, 0, gridOverlay.width, gridOverlay.height);
         if (stabilityPollInterval) {
             clearInterval(stabilityPollInterval);
             stabilityPollInterval = null;
@@ -821,6 +860,91 @@ document.addEventListener('DOMContentLoaded', async () => {
         bgCtx.drawImage(bgImage, 0, 0, w, h);
     }
 
+    function fetchDetectionGrid() {
+        if (!gridOverlayEnabled || !currentDetailCameraId || isPlayingWarmEvent) return;
+        fetch(`/api/cameras/${encodeURIComponent(currentDetailCameraId)}/detection/grid`)
+            .then(r => r.ok ? r.json() : null)
+            .then(data => {
+                if (data) {
+                    gridData = data;
+                    drawDetectionGrid();
+                }
+            })
+            .catch(() => {});
+    }
+
+    function drawDetectionGrid() {
+        if (!gridData) return;
+        const w = detailVideo.clientWidth;
+        const h = detailVideo.clientHeight;
+        if (w === 0 || h === 0) return;
+        if (gridOverlay.width !== w || gridOverlay.height !== h) {
+            gridOverlay.width = w;
+            gridOverlay.height = h;
+        }
+        gridCtx.clearRect(0, 0, w, h);
+
+        const cellW = w / gridData.cols;
+        const cellH = h / gridData.rows;
+        let fallbackIdx = 0;
+        const legendEntries = [];
+
+        for (const [className, cells] of Object.entries(gridData.classes)) {
+            let color = GRID_CLASS_COLORS[className];
+            if (!color) {
+                color = GRID_FALLBACK_COLORS[fallbackIdx % GRID_FALLBACK_COLORS.length];
+                fallbackIdx++;
+            }
+            let hasVisible = false;
+
+            for (let i = 0; i < cells.length; i++) {
+                if (cells[i] <= 0.01) continue;
+                const col = i % gridData.cols;
+                const row = Math.floor(i / gridData.cols);
+                const x = col * cellW;
+                const y = row * cellH;
+
+                const baseColor = color.replace(/[\d.]+\)$/, `${cells[i] * 0.8})`);
+                gridCtx.fillStyle = baseColor;
+                gridCtx.fillRect(x, y, cellW, cellH);
+
+                if (cells[i] >= 0.6) {
+                    gridCtx.strokeStyle = color.replace(/[\d.]+\)$/, '0.9)');
+                    gridCtx.lineWidth = 2;
+                    gridCtx.strokeRect(x + 1, y + 1, cellW - 2, cellH - 2);
+                }
+                hasVisible = true;
+            }
+
+            if (hasVisible) {
+                legendEntries.push({ className, color });
+            }
+        }
+
+        // Draw legend
+        if (legendEntries.length > 0) {
+            const fontSize = 12;
+            const padding = 6;
+            const lineHeight = fontSize + 4;
+            const legendH = legendEntries.length * lineHeight + padding * 2;
+            const legendW = 100;
+            const lx = w - legendW - 8;
+            const ly = 8;
+
+            gridCtx.fillStyle = 'rgba(0, 0, 0, 0.7)';
+            gridCtx.fillRect(lx, ly, legendW, legendH);
+            gridCtx.font = `${fontSize}px sans-serif`;
+
+            legendEntries.forEach((entry, i) => {
+                const ey = ly + padding + i * lineHeight + fontSize;
+                gridCtx.fillStyle = entry.color.replace(/[\d.]+\)$/, '1)');
+                gridCtx.fillRect(lx + padding, ey - fontSize + 2, fontSize, fontSize);
+                gridCtx.fillStyle = '#fff';
+                gridCtx.fillText(entry.className, lx + padding + fontSize + 4, ey);
+            });
+        }
+    }
+
     function updateLiveState() {
         const duration = bufferDuration || detailVideo.duration;
         if (duration && isFinite(duration)) {
@@ -866,6 +990,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         stabilityPollInterval = setInterval(() => {
             fetchStabilityMap();
             fetchBackgroundMap();
+            fetchDetectionGrid();
         }, 5000);
     }
 
@@ -1224,6 +1349,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     window.addEventListener('resize', () => {
         renderTimeline();
         drawBackground();
+        drawDetectionGrid();
         drawStability();
     });
 });

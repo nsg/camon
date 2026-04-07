@@ -9,6 +9,7 @@ use opencv::imgcodecs;
 use opencv::imgproc;
 use opencv::prelude::*;
 
+use crate::analytics::detection_grid::DetectionGrid;
 use crate::buffer::HotBuffer;
 use crate::config::AnalyticsConfig;
 use crate::storage::{DetectionStore, MotionEntry, MotionStore};
@@ -38,6 +39,7 @@ struct MotionSegment {
 struct SegmentDetectionResult {
     classes: Vec<String>,
     confidences: Vec<f32>,
+    centers: Vec<(f32, f32)>,
     frame_jpeg: Vec<u8>,
 }
 
@@ -54,6 +56,8 @@ pub struct MotionAnalyzer {
     last_processed: u64,
     last_motion_bbox: Option<Rect>,
     score_histogram: ScoreHistogram,
+    detection_grid: Option<DetectionGrid>,
+    grid_save_counter: u32,
 }
 
 impl MotionAnalyzer {
@@ -64,6 +68,7 @@ impl MotionAnalyzer {
         detection_store: Option<DetectionStore>,
         object_detector: Option<ObjectDetector>,
         config: AnalyticsConfig,
+        detection_grid: Option<DetectionGrid>,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let detector = MotionDetector::new()?;
         let decoder = FrameDecoder::new()?;
@@ -91,6 +96,8 @@ impl MotionAnalyzer {
             last_processed,
             last_motion_bbox: None,
             score_histogram,
+            detection_grid,
+            grid_save_counter: 0,
         })
     }
 
@@ -118,9 +125,22 @@ impl MotionAnalyzer {
                 );
             }
 
+            // Save detection grid every ~5 minutes (1500 cycles × 200ms)
+            self.grid_save_counter += 1;
+            if self.grid_save_counter >= 1500 {
+                self.grid_save_counter = 0;
+                if let Some(ref grid) = self.detection_grid {
+                    grid.save(&self.camera_id);
+                }
+            }
+
             thread::sleep(POLL_INTERVAL);
         }
 
+        // Save on shutdown
+        if let Some(ref grid) = self.detection_grid {
+            grid.save(&self.camera_id);
+        }
         tracing::info!(camera = %self.camera_id, "motion analyzer stopped");
     }
 
@@ -205,6 +225,11 @@ impl MotionAnalyzer {
             }
 
             self.last_processed = seq + 1;
+        }
+
+        // Decay detection grid each cycle
+        if let Some(ref grid) = self.detection_grid {
+            grid.decay(&self.camera_id);
         }
 
         // Phase 2: Sampled object detection
@@ -331,14 +356,17 @@ impl MotionAnalyzer {
 
             let mut classes = Vec::with_capacity(detections.len());
             let mut confidences = Vec::with_capacity(detections.len());
+            let mut centers = Vec::with_capacity(detections.len());
             for det in detections {
                 classes.push(det.class_name);
                 confidences.push(det.confidence);
+                centers.push((det.cx, det.cy));
             }
 
             return Some(SegmentDetectionResult {
                 classes,
                 confidences,
+                centers,
                 frame_jpeg,
             });
         }
@@ -352,7 +380,22 @@ impl MotionAnalyzer {
             None => return,
         };
 
-        for (class, &confidence) in result.classes.iter().zip(&result.confidences) {
+        for (i, (class, &confidence)) in result.classes.iter().zip(&result.confidences).enumerate()
+        {
+            let (cx, cy) = result.centers.get(i).copied().unwrap_or((0.5, 0.5));
+
+            // Check detection grid — skip absorbed (stationary) objects
+            if let Some(ref grid) = self.detection_grid {
+                if !grid.record(&self.camera_id, class, cx, cy) {
+                    tracing::trace!(
+                        camera = %self.camera_id,
+                        class = %class,
+                        "detection suppressed (absorbed by grid)"
+                    );
+                    continue;
+                }
+            }
+
             detection_store.insert(
                 &self.camera_id,
                 seq,
@@ -439,6 +482,7 @@ impl MotionAnalyzer {
                 let propagated = SegmentDetectionResult {
                     classes: first_result.classes.clone(),
                     confidences: min_confidences.clone(),
+                    centers: nearest.centers.clone(),
                     frame_jpeg: nearest.frame_jpeg.clone(),
                 };
 
@@ -523,6 +567,7 @@ fn encode_jpeg(mat: &Mat) -> Option<Vec<u8>> {
     Some(buf.to_vec())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_analyzer(
     camera_id: String,
     buffer: Arc<RwLock<HotBuffer>>,
@@ -531,6 +576,7 @@ pub fn spawn_analyzer(
     object_detector: Option<ObjectDetector>,
     config: AnalyticsConfig,
     shutdown: Arc<AtomicBool>,
+    detection_grid: Option<DetectionGrid>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::task::spawn_blocking(move || {
         match MotionAnalyzer::new(
@@ -540,6 +586,7 @@ pub fn spawn_analyzer(
             detection_store,
             object_detector,
             config,
+            detection_grid,
         ) {
             Ok(analyzer) => analyzer.run(shutdown),
             Err(e) => {

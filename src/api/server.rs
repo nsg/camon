@@ -9,6 +9,7 @@ use axum::Router;
 use rust_embed::Embed;
 use serde::{Deserialize, Serialize};
 
+use crate::analytics::detection_grid::DetectionGrid;
 use crate::buffer::HotBuffer;
 use crate::storage::{DetectionStore, MotionStore, WarmEventIndex};
 
@@ -24,6 +25,7 @@ pub struct AppState {
     pub motion_store: MotionStore,
     pub detection_store: DetectionStore,
     pub warm_index: Option<WarmEventIndex>,
+    pub detection_grid: Option<DetectionGrid>,
 }
 
 impl AppState {
@@ -32,12 +34,14 @@ impl AppState {
         motion_store: MotionStore,
         detection_store: DetectionStore,
         warm_index: Option<WarmEventIndex>,
+        detection_grid: Option<DetectionGrid>,
     ) -> Self {
         Self {
             buffers: Arc::new(buffers),
             motion_store,
             detection_store,
             warm_index,
+            detection_grid,
         }
     }
 }
@@ -92,6 +96,10 @@ pub async fn start_server(state: AppState, port: u16) -> Result<(), std::io::Err
         .route(
             "/api/cameras/{id}/motion/background",
             get(background_map_handler),
+        )
+        .route(
+            "/api/cameras/{id}/detection/grid",
+            get(detection_grid_handler),
         )
         .route("/api/cameras/{id}/detections", get(detections_handler))
         .route(
@@ -301,6 +309,20 @@ async fn background_map_handler(State(state): State<AppState>, Path(id): Path<St
     match state.motion_store.get_background_map(&id) {
         Some(jpeg) => ([(header::CONTENT_TYPE, "image/jpeg")], jpeg).into_response(),
         None => (StatusCode::NOT_FOUND, "background not available yet").into_response(),
+    }
+}
+
+async fn detection_grid_handler(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+    if !state.buffers.contains_key(&id) {
+        return (StatusCode::NOT_FOUND, "camera not found").into_response();
+    }
+
+    match &state.detection_grid {
+        Some(grid) => match grid.get_grid(&id) {
+            Some(data) => axum::Json(data).into_response(),
+            None => (StatusCode::NOT_FOUND, "no grid data").into_response(),
+        },
+        None => (StatusCode::NOT_FOUND, "detection grid not enabled").into_response(),
     }
 }
 

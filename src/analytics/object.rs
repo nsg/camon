@@ -90,6 +90,10 @@ const COCO_CLASSES: [&str; 80] = [
 pub struct Detection {
     pub class_name: String,
     pub confidence: f32,
+    /// Bounding box center x, normalized 0.0-1.0
+    pub cx: f32,
+    /// Bounding box center y, normalized 0.0-1.0
+    pub cy: f32,
 }
 
 pub struct ObjectDetector {
@@ -142,13 +146,18 @@ impl ObjectDetector {
         let Some(logits_val) = outputs.get("logits") else {
             return Err("Unsupported model format: expected YOLO26 with 'logits' output".into());
         };
+        let boxes_val = outputs.get("pred_boxes");
 
         let logits = logits_val.try_extract_array::<f32>()?;
         let logits_owned = logits.to_owned();
+        let boxes_owned = boxes_val
+            .and_then(|v| v.try_extract_array::<f32>().ok())
+            .map(|a| a.to_owned());
         drop(outputs);
 
         let detections = Self::postprocess_yolo26(
             &logits_owned.view(),
+            boxes_owned.as_ref().map(|b| b.view()),
             self.confidence_threshold,
             &self.allowed_classes,
         )?;
@@ -222,12 +231,13 @@ impl ObjectDetector {
 
     fn postprocess_yolo26(
         logits: &ArrayViewD<f32>,
+        boxes: Option<ArrayViewD<f32>>,
         confidence_threshold: f32,
         allowed_classes: &[String],
     ) -> Result<Vec<Detection>, Box<dyn std::error::Error + Send + Sync>> {
         let logits_shape = logits.shape();
 
-        // Expected shape: logits [1, 300, 80]
+        // Expected shape: logits [1, 300, 80], boxes [1, 300, 4]
         if logits_shape.len() < 2 {
             return Ok(Vec::new());
         }
@@ -244,6 +254,7 @@ impl ObjectDetector {
         };
 
         let logits_flat = logits.as_slice().ok_or("Cannot get logits slice")?;
+        let boxes_flat = boxes.as_ref().and_then(|b| b.as_slice());
         let mut detections = Vec::new();
 
         for i in 0..num_detections {
@@ -274,9 +285,24 @@ impl ObjectDetector {
                 continue;
             }
 
+            // Extract normalized center from pred_boxes [cx, cy, w, h]
+            let (cx, cy) = match boxes_flat {
+                Some(bf) => {
+                    let base = i * 4;
+                    if base + 1 < bf.len() {
+                        (bf[base].clamp(0.0, 1.0), bf[base + 1].clamp(0.0, 1.0))
+                    } else {
+                        (0.5, 0.5)
+                    }
+                }
+                None => (0.5, 0.5),
+            };
+
             detections.push(Detection {
                 class_name,
                 confidence: max_score,
+                cx,
+                cy,
             });
         }
 

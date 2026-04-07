@@ -36,6 +36,7 @@
             <div class="detail-video-wrapper">
                 <video id="detail-video" playsinline muted></video>
                 <canvas id="bg-overlay"></canvas>
+                <canvas id="detection-grid-overlay"></canvas>
                 <canvas id="stability-overlay"></canvas>
                 <div id="detail-loading" class="loading"><p>Loading...</p></div>
             </div>
@@ -66,6 +67,11 @@
                 <button id="bg-toggle-btn" class="mask-toggle-btn" title="Toggle background model">
                     <svg viewBox="0 0 24 24" fill="currentColor">
                         <path d="M22 16V4c0-1.1-.9-2-2-2H8c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2zm-11-4l2.03 2.71L16 11l4 5H8l3-4zM2 6v14c0 1.1.9 2 2 2h14v-2H4V6H2z"/>
+                    </svg>
+                </button>
+                <button id="grid-toggle-btn" class="mask-toggle-btn" title="Toggle detection grid">
+                    <svg viewBox="0 0 24 24" fill="currentColor">
+                        <path d="M4 8h4V4H4v4zm6 12h4v-4h-4v4zm-6 0h4v-4H4v4zm0-6h4v-4H4v4zm6 0h4v-4h-4v4zm6-10v4h4V4h-4zm-6 4h4V4h-4v4zm6 6h4v-4h-4v4zm0 6h4v-4h-4v4z"/>
                     </svg>
                 </button>
                 <button id="live-btn" class="live-btn">

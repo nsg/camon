@@ -1,4 +1,5 @@
 mod decoder;
+pub mod detection_grid;
 mod motion;
 mod object;
 mod pipeline;
