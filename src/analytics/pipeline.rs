@@ -197,8 +197,11 @@ impl MotionAnalyzer {
             let threshold = self.score_histogram.threshold();
             let triggered = score >= threshold;
 
-            // Report to the adaptive tuner (measures event trigger rate).
-            if let Err(e) = self.detector.report_segment(triggered) {
+            // Report to the adaptive tuner. Uses score > 0 (pre-threshold)
+            // rather than the trigger decision, because the adaptive threshold
+            // normalizes trigger rate to ~10% regardless of noise level —
+            // the tuner needs to see the raw noise floor to react correctly.
+            if let Err(e) = self.detector.report_segment(score > 0.0) {
                 tracing::warn!(camera = %self.camera_id, error = %e, "tuner update failed");
             }
 

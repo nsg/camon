@@ -194,9 +194,9 @@ impl MotionTuner {
         }
     }
 
-    fn record_segment(&mut self, triggered: bool) {
+    fn record_segment(&mut self, had_activity: bool) {
         self.segments_total += 1;
-        if triggered {
+        if had_activity {
             self.segments_triggered += 1;
         }
     }
@@ -502,10 +502,10 @@ impl MotionDetector {
         Ok((foreground_ratio * 10.0).min(1.0))
     }
 
-    /// Report whether a segment triggered a motion event (score >= threshold).
-    /// Called from the pipeline after the threshold comparison.
-    pub fn report_segment(&mut self, triggered: bool) -> CvResult<()> {
-        self.tuner.record_segment(triggered);
+    /// Report whether a segment had any motion activity (score > 0).
+    /// Measures the noise floor independently of the adaptive threshold.
+    pub fn report_segment(&mut self, had_activity: bool) -> CvResult<()> {
+        self.tuner.record_segment(had_activity);
         if let Some(change) = self.tuner.maybe_tune() {
             self.apply_param_change(change)?;
         }
