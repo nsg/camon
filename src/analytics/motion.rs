@@ -1,8 +1,8 @@
 use std::collections::VecDeque;
 
 use opencv::{
-    core::{Mat, Rect, Vector},
-    imgcodecs,
+    core::{Mat, Rect, Size, Vector, BORDER_CONSTANT},
+    imgcodecs, imgproc,
     prelude::*,
     video::{self, BackgroundSubtractorTrait},
     Result as CvResult,
@@ -85,9 +85,18 @@ const MOG2_HISTORY: i32 = 9000;
 // that a person lingering won't fade out.
 const MOG2_LEARNING_RATE: f64 = 0.003;
 
+// Morphological opening kernel size — removes isolated noise pixels.
+const MORPH_KERNEL_SIZE: i32 = 5;
+
+// Minimum contour area (in pixels at 320x240) to count as real motion.
+// Blobs smaller than this are discarded as noise.
+const MIN_CONTOUR_AREA: f64 = 200.0;
+
 pub struct MotionDetector {
     mog2: opencv::core::Ptr<video::BackgroundSubtractorMOG2>,
     fg_mask: Mat,
+    cleaned_mask: Mat,
+    morph_kernel: Mat,
     learning_rate: f64,
     frames_since_stable: u32,
 }
@@ -96,10 +105,18 @@ impl MotionDetector {
     pub fn new() -> CvResult<Self> {
         let mog2 = video::create_background_subtractor_mog2(MOG2_HISTORY, 16.0, true)?;
         let fg_mask = Mat::default();
+        let cleaned_mask = Mat::default();
+        let morph_kernel = imgproc::get_structuring_element(
+            imgproc::MORPH_ELLIPSE,
+            Size::new(MORPH_KERNEL_SIZE, MORPH_KERNEL_SIZE),
+            opencv::core::Point::new(-1, -1),
+        )?;
 
         Ok(Self {
             mog2,
             fg_mask,
+            cleaned_mask,
+            morph_kernel,
             learning_rate: MOG2_LEARNING_RATE,
             frames_since_stable: 0,
         })
@@ -118,10 +135,11 @@ impl MotionDetector {
             return Ok(0.0);
         }
 
-        let fg_pixels = opencv::core::count_non_zero(&self.fg_mask)? as f32;
-        let foreground_ratio = fg_pixels / total_pixels as f32;
+        // Raw ratio for scene-change detection (before cleanup).
+        let raw_fg = opencv::core::count_non_zero(&self.fg_mask)? as f32;
+        let raw_ratio = raw_fg / total_pixels as f32;
 
-        if foreground_ratio >= SCENE_CHANGE_RATIO {
+        if raw_ratio >= SCENE_CHANGE_RATIO {
             self.frames_since_stable = 0;
             return Ok(0.0);
         }
@@ -131,6 +149,58 @@ impl MotionDetector {
         if self.frames_since_stable < WARMUP_FRAMES {
             return Ok(0.0);
         }
+
+        // Morphological opening: erode then dilate to remove isolated noise pixels.
+        let anchor = opencv::core::Point::new(-1, -1);
+        imgproc::morphology_ex(
+            &self.fg_mask,
+            &mut self.cleaned_mask,
+            imgproc::MORPH_OPEN,
+            &self.morph_kernel,
+            anchor,
+            1,
+            BORDER_CONSTANT,
+            imgproc::morphology_default_border_value()?,
+        )?;
+
+        // Contour area filter: zero out blobs smaller than MIN_CONTOUR_AREA.
+        let mut contours = Vector::<Vector<opencv::core::Point>>::new();
+        imgproc::find_contours(
+            &self.cleaned_mask.clone(),
+            &mut contours,
+            imgproc::RETR_EXTERNAL,
+            imgproc::CHAIN_APPROX_SIMPLE,
+            opencv::core::Point::new(0, 0),
+        )?;
+
+        let mut motion_mask = Mat::zeros(
+            self.fg_mask.rows(),
+            self.fg_mask.cols(),
+            opencv::core::CV_8UC1,
+        )?
+        .to_mat()?;
+        for i in 0..contours.len() {
+            let area = imgproc::contour_area(&contours.get(i)?, false)?;
+            if area >= MIN_CONTOUR_AREA {
+                imgproc::draw_contours(
+                    &mut motion_mask,
+                    &contours,
+                    i as i32,
+                    opencv::core::Scalar::new(255.0, 0.0, 0.0, 0.0),
+                    imgproc::FILLED,
+                    imgproc::LINE_8,
+                    &opencv::core::no_array(),
+                    i32::MAX,
+                    opencv::core::Point::new(0, 0),
+                )?;
+            }
+        }
+
+        // Swap cleaned result into fg_mask so downstream (bbox, debug JPEG) sees it.
+        std::mem::swap(&mut self.fg_mask, &mut motion_mask);
+
+        let fg_pixels = opencv::core::count_non_zero(&self.fg_mask)? as f32;
+        let foreground_ratio = fg_pixels / total_pixels as f32;
 
         Ok((foreground_ratio * 10.0).min(1.0))
     }
