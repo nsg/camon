@@ -383,6 +383,16 @@ impl MotionDetector {
             return Ok(0.0);
         }
 
+        // MOG2 with shadow detection marks shadows as 127, foreground as 255.
+        // Threshold to keep only true foreground before cleanup.
+        imgproc::threshold(
+            &self.fg_mask.clone(),
+            &mut self.fg_mask,
+            200.0,
+            255.0,
+            imgproc::THRESH_BINARY,
+        )?;
+
         // Morphological opening: erode then dilate to remove isolated noise pixels.
         let anchor = opencv::core::Point::new(-1, -1);
         imgproc::morphology_ex(
