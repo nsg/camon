@@ -195,8 +195,14 @@ impl MotionAnalyzer {
 
             self.score_histogram.record(score);
             let threshold = self.score_histogram.threshold();
+            let triggered = score >= threshold;
 
-            if score >= threshold {
+            // Report to the adaptive tuner (measures event trigger rate).
+            if let Err(e) = self.detector.report_segment(triggered) {
+                tracing::warn!(camera = %self.camera_id, error = %e, "tuner update failed");
+            }
+
+            if triggered {
                 let mask_jpeg = self.detector.fg_mask_jpeg();
                 self.motion_store.insert(
                     &self.camera_id,

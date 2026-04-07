@@ -158,8 +158,8 @@ struct MotionTuner {
     camera_id: String,
     params: TunedParams,
     params_path: PathBuf,
-    frames_total: u32,
-    frames_with_motion: u32,
+    segments_total: u32,
+    segments_triggered: u32,
     started_at: Instant,
     eval_start: Instant,
     last_adjustment: Option<Instant>,
@@ -186,18 +186,18 @@ impl MotionTuner {
             camera_id,
             params,
             params_path,
-            frames_total: 0,
-            frames_with_motion: 0,
+            segments_total: 0,
+            segments_triggered: 0,
             started_at: now,
             eval_start: now,
             last_adjustment: None,
         }
     }
 
-    fn record_frame(&mut self, score: f32) {
-        self.frames_total += 1;
-        if score > 0.0 {
-            self.frames_with_motion += 1;
+    fn record_segment(&mut self, triggered: bool) {
+        self.segments_total += 1;
+        if triggered {
+            self.segments_triggered += 1;
         }
     }
 
@@ -221,12 +221,12 @@ impl MotionTuner {
             }
         }
 
-        if self.frames_total == 0 {
+        if self.segments_total == 0 {
             self.reset_window();
             return None;
         }
 
-        let activity_rate = self.frames_with_motion as f32 / self.frames_total as f32;
+        let activity_rate = self.segments_triggered as f32 / self.segments_total as f32;
         let change = if activity_rate > ACTIVITY_RATE_HIGH {
             self.tighten(activity_rate)
         } else if activity_rate < ACTIVITY_RATE_LOW {
@@ -372,8 +372,8 @@ impl MotionTuner {
     }
 
     fn reset_window(&mut self) {
-        self.frames_total = 0;
-        self.frames_with_motion = 0;
+        self.segments_total = 0;
+        self.segments_triggered = 0;
         self.eval_start = Instant::now();
     }
 }
@@ -499,15 +499,17 @@ impl MotionDetector {
         let fg_pixels = opencv::core::count_non_zero(&self.fg_mask)? as f32;
         let foreground_ratio = fg_pixels / total_pixels as f32;
 
-        let score = (foreground_ratio * 10.0).min(1.0);
+        Ok((foreground_ratio * 10.0).min(1.0))
+    }
 
-        // Feed the tuner and apply any parameter changes.
-        self.tuner.record_frame(score);
+    /// Report whether a segment triggered a motion event (score >= threshold).
+    /// Called from the pipeline after the threshold comparison.
+    pub fn report_segment(&mut self, triggered: bool) -> CvResult<()> {
+        self.tuner.record_segment(triggered);
         if let Some(change) = self.tuner.maybe_tune() {
             self.apply_param_change(change)?;
         }
-
-        Ok(score)
+        Ok(())
     }
 
     fn apply_param_change(&mut self, change: ParamChange) -> CvResult<()> {
@@ -598,7 +600,7 @@ mod tests {
 
         // Simulate high activity
         for _ in 0..1000 {
-            tuner.record_frame(0.1);
+            tuner.record_segment(true);
         }
         // Force eval window to be ready
         tuner.eval_start = Instant::now() - std::time::Duration::from_secs(TUNER_EVAL_SECS + 1);
@@ -616,8 +618,8 @@ mod tests {
         tuner.eval_start = Instant::now() - std::time::Duration::from_secs(TUNER_EVAL_SECS + 1);
 
         // 50% activity rate — well above 25% threshold
-        tuner.frames_total = 1000;
-        tuner.frames_with_motion = 500;
+        tuner.segments_total = 1000;
+        tuner.segments_triggered = 500;
 
         let change = tuner.maybe_tune();
         assert!(
@@ -637,8 +639,8 @@ mod tests {
         tuner.params.var_threshold = DEFAULT_VAR_THRESHOLD + VAR_THRESHOLD_STEP;
 
         // 1% activity rate — below 5% threshold
-        tuner.frames_total = 1000;
-        tuner.frames_with_motion = 10;
+        tuner.segments_total = 1000;
+        tuner.segments_triggered = 10;
 
         let change = tuner.maybe_tune();
         assert!(matches!(change, Some(ParamChange::VarThreshold(v)) if v == DEFAULT_VAR_THRESHOLD));
@@ -653,8 +655,8 @@ mod tests {
         tuner.eval_start = Instant::now() - std::time::Duration::from_secs(TUNER_EVAL_SECS + 1);
 
         // 15% activity rate — in the 5-25% band
-        tuner.frames_total = 1000;
-        tuner.frames_with_motion = 150;
+        tuner.segments_total = 1000;
+        tuner.segments_triggered = 150;
 
         assert!(tuner.maybe_tune().is_none());
     }
@@ -668,8 +670,8 @@ mod tests {
         tuner.eval_start = Instant::now() - std::time::Duration::from_secs(TUNER_EVAL_SECS + 1);
         tuner.last_adjustment = Some(Instant::now()); // just adjusted
 
-        tuner.frames_total = 1000;
-        tuner.frames_with_motion = 500;
+        tuner.segments_total = 1000;
+        tuner.segments_triggered = 500;
 
         // Should not tune — still in cooldown
         assert!(tuner.maybe_tune().is_none());
@@ -685,8 +687,8 @@ mod tests {
         let set_high_activity = |t: &mut MotionTuner| {
             t.eval_start = Instant::now() - std::time::Duration::from_secs(TUNER_EVAL_SECS + 1);
             t.last_adjustment = None;
-            t.frames_total = 1000;
-            t.frames_with_motion = 500;
+            t.segments_total = 1000;
+            t.segments_triggered = 500;
         };
 
         // First tightening: var_threshold
@@ -743,8 +745,8 @@ mod tests {
         tuner.eval_start = Instant::now() - std::time::Duration::from_secs(TUNER_EVAL_SECS + 1);
 
         // All at defaults, very low activity
-        tuner.frames_total = 1000;
-        tuner.frames_with_motion = 10;
+        tuner.segments_total = 1000;
+        tuner.segments_triggered = 10;
 
         // Should not loosen below defaults
         assert!(tuner.maybe_tune().is_none());
