@@ -153,6 +153,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 config.storage.pre_padding_secs,
                 config.storage.post_padding_secs,
                 warm_index.clone(),
+                config.storage.movement_retention_days,
+                config.storage.object_retention_days,
             );
             let warm_handle = tokio::spawn(writer.run());
             warm_handles.push(warm_handle);

@@ -141,4 +141,69 @@ impl WarmEventIndex {
             .join(entry.event_type.dir_name());
         dir.join(format!("{}_{}.ts", entry.start_pts_ns, entry.duration_ms))
     }
+
+    pub async fn prune(&self, movement_max_age_ns: u64, object_max_age_ns: u64) {
+        let now_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as u64;
+
+        for (camera_id, lock) in self.cameras.iter() {
+            let expired: Vec<WarmEventEntry> = {
+                let entries = lock.read().unwrap();
+                entries
+                    .iter()
+                    .filter(|e| {
+                        let max_age = match e.event_type {
+                            EventType::Movement => movement_max_age_ns,
+                            EventType::Object => object_max_age_ns,
+                        };
+                        now_ns.saturating_sub(e.start_pts_ns) > max_age
+                    })
+                    .cloned()
+                    .collect()
+            };
+
+            if expired.is_empty() {
+                continue;
+            }
+
+            let mut deleted = 0u64;
+            for entry in &expired {
+                let path = self.resolve_file_path(camera_id, entry);
+                let thumb = path.with_extension("jpg");
+                if let Err(e) = tokio::fs::remove_file(&path).await {
+                    if e.kind() != std::io::ErrorKind::NotFound {
+                        tracing::warn!(
+                            camera = %camera_id,
+                            path = %path.display(),
+                            error = %e,
+                            "failed to delete expired warm event"
+                        );
+                    }
+                } else {
+                    deleted += 1;
+                }
+                let _ = tokio::fs::remove_file(&thumb).await;
+            }
+
+            {
+                let cutoff_movement = now_ns.saturating_sub(movement_max_age_ns);
+                let cutoff_object = now_ns.saturating_sub(object_max_age_ns);
+                let mut entries = lock.write().unwrap();
+                entries.retain(|e| match e.event_type {
+                    EventType::Movement => e.start_pts_ns >= cutoff_movement,
+                    EventType::Object => e.start_pts_ns >= cutoff_object,
+                });
+            }
+
+            if deleted > 0 {
+                tracing::info!(
+                    camera = %camera_id,
+                    deleted,
+                    "pruned expired warm events"
+                );
+            }
+        }
+    }
 }

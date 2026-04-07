@@ -36,7 +36,11 @@ pub struct WarmWriter {
     pre_buffer_duration_ns: u64,
     current_event: Option<WarmEvent>,
     warm_index: Option<WarmEventIndex>,
+    movement_retention_ns: u64,
+    object_retention_ns: u64,
 }
+
+const PRUNE_INTERVAL_SECS: u64 = 3600;
 
 impl WarmWriter {
     #[allow(clippy::too_many_arguments)]
@@ -49,6 +53,8 @@ impl WarmWriter {
         pre_padding_secs: u64,
         post_padding_secs: u64,
         warm_index: Option<WarmEventIndex>,
+        movement_retention_days: u64,
+        object_retention_days: u64,
     ) -> Self {
         Self {
             receiver,
@@ -62,18 +68,43 @@ impl WarmWriter {
             pre_buffer_duration_ns: 0,
             current_event: None,
             warm_index,
+            movement_retention_ns: movement_retention_days * 86400 * NANOS_PER_SEC,
+            object_retention_ns: object_retention_days * 86400 * NANOS_PER_SEC,
         }
     }
 
     pub async fn run(mut self) {
-        while let Some(evicted) = self.receiver.recv().await {
-            self.process_segment(evicted);
+        let mut prune_interval =
+            tokio::time::interval(std::time::Duration::from_secs(PRUNE_INTERVAL_SECS));
+        prune_interval.tick().await; // skip immediate first tick
+
+        loop {
+            tokio::select! {
+                evicted = self.receiver.recv() => {
+                    match evicted {
+                        Some(seg) => self.process_segment(seg),
+                        None => break,
+                    }
+                }
+                _ = prune_interval.tick() => {
+                    self.run_prune().await;
+                }
+            }
         }
+
         // Channel closed — finalize any pending event
         if self.current_event.is_some() {
             self.finalize_event().await;
         }
         tracing::debug!(camera = %self.camera_id, "warm writer shutting down");
+    }
+
+    async fn run_prune(&self) {
+        if let Some(ref index) = self.warm_index {
+            index
+                .prune(self.movement_retention_ns, self.object_retention_ns)
+                .await;
+        }
     }
 
     fn process_segment(&mut self, evicted: EvictedSegment) {

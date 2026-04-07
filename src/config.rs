@@ -137,6 +137,14 @@ fn default_warm_post_padding_secs() -> u64 {
     10
 }
 
+fn default_movement_retention_days() -> u64 {
+    2
+}
+
+fn default_object_retention_days() -> u64 {
+    14
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct WarmConfig {
     #[serde(default = "default_warm_enabled")]
@@ -147,6 +155,10 @@ pub struct WarmConfig {
     pub pre_padding_secs: u64,
     #[serde(default = "default_warm_post_padding_secs")]
     pub post_padding_secs: u64,
+    #[serde(default = "default_movement_retention_days")]
+    pub movement_retention_days: u64,
+    #[serde(default = "default_object_retention_days")]
+    pub object_retention_days: u64,
 }
 
 impl Default for WarmConfig {
@@ -156,6 +168,8 @@ impl Default for WarmConfig {
             data_dir: default_warm_data_dir(),
             pre_padding_secs: default_warm_pre_padding_secs(),
             post_padding_secs: default_warm_post_padding_secs(),
+            movement_retention_days: default_movement_retention_days(),
+            object_retention_days: default_object_retention_days(),
         }
     }
 }
