@@ -202,6 +202,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 config.analytics.clone(),
                 Arc::clone(&shutdown),
                 detection_grid.clone(),
+                std::path::PathBuf::from(&config.storage.data_dir),
             );
             analyzer_handles.push(analyzer_handle);
         }

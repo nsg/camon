@@ -1,4 +1,5 @@
 use std::collections::BTreeSet;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::thread;
@@ -61,6 +62,7 @@ pub struct MotionAnalyzer {
 }
 
 impl MotionAnalyzer {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         camera_id: String,
         buffer: Arc<RwLock<HotBuffer>>,
@@ -69,8 +71,9 @@ impl MotionAnalyzer {
         object_detector: Option<ObjectDetector>,
         config: AnalyticsConfig,
         detection_grid: Option<DetectionGrid>,
+        data_dir: PathBuf,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        let detector = MotionDetector::new()?;
+        let detector = MotionDetector::new(&camera_id, &data_dir)?;
         let decoder = FrameDecoder::new()?;
 
         let has_object_detection = object_detector.is_some();
@@ -577,6 +580,7 @@ pub fn spawn_analyzer(
     config: AnalyticsConfig,
     shutdown: Arc<AtomicBool>,
     detection_grid: Option<DetectionGrid>,
+    data_dir: PathBuf,
 ) -> tokio::task::JoinHandle<()> {
     tokio::task::spawn_blocking(move || {
         match MotionAnalyzer::new(
@@ -587,6 +591,7 @@ pub fn spawn_analyzer(
             object_detector,
             config,
             detection_grid,
+            data_dir,
         ) {
             Ok(analyzer) => analyzer.run(shutdown),
             Err(e) => {
