@@ -546,7 +546,7 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     // Grid camera loading
     function loadGridCamera(cameraId, video) {
-        const src = `/api/stream/${cameraId}/playlist.m3u8`;
+        const src = `/api/stream/${cameraId}/playlist.m3u8?live=true`;
         const loading = video.parentElement.querySelector('.loading');
 
         if (typeof Hls !== 'undefined' && Hls.isSupported()) {

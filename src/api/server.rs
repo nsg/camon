@@ -70,6 +70,11 @@ struct DetectionResponse {
     detections: Vec<DetectionItem>,
 }
 
+#[derive(Deserialize)]
+struct PlaylistQuery {
+    live: Option<bool>,
+}
+
 pub async fn start_server(state: AppState, port: u16) -> Result<(), std::io::Error> {
     let app = Router::new()
         .route("/", get(index_handler))
@@ -150,11 +155,17 @@ async fn cameras_handler(State(state): State<AppState>) -> impl IntoResponse {
 async fn playlist_handler(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    Query(query): Query<PlaylistQuery>,
 ) -> impl IntoResponse {
+    let tail_count = if query.live.unwrap_or(false) {
+        Some(6)
+    } else {
+        None
+    };
     match state.buffers.get(&id) {
         Some(buffer) => match buffer.read() {
             Ok(buf) => {
-                let playlist = hls::generate_playlist(&buf);
+                let playlist = hls::generate_playlist(&buf, tail_count);
                 (
                     [(header::CONTENT_TYPE, "application/vnd.apple.mpegurl")],
                     playlist,

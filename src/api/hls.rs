@@ -2,17 +2,24 @@ use crate::buffer::HotBuffer;
 
 const NANOS_PER_SEC: f64 = 1_000_000_000.0;
 
-pub fn generate_playlist(buffer: &HotBuffer) -> String {
+pub fn generate_playlist(buffer: &HotBuffer, tail_count: Option<usize>) -> String {
     let segments = buffer.segments();
     let first_sequence = buffer.first_sequence();
 
-    if segments.is_empty() {
+    let skip = match tail_count {
+        Some(n) if segments.len() > n => segments.len() - n,
+        _ => 0,
+    };
+    let base_sequence = first_sequence + skip as u64;
+
+    if segments.len() <= skip {
         return "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:2\n#EXT-X-MEDIA-SEQUENCE:0\n"
             .to_string();
     }
 
     let max_duration = segments
         .iter()
+        .skip(skip)
         .map(|s| (s.duration_ns as f64 / NANOS_PER_SEC).ceil() as u64)
         .max()
         .unwrap_or(2);
@@ -21,25 +28,19 @@ pub fn generate_playlist(buffer: &HotBuffer) -> String {
     playlist.push_str("#EXTM3U\n");
     playlist.push_str("#EXT-X-VERSION:3\n");
     playlist.push_str(&format!("#EXT-X-TARGETDURATION:{}\n", max_duration));
-    playlist.push_str(&format!("#EXT-X-MEDIA-SEQUENCE:{}\n", first_sequence));
+    playlist.push_str(&format!("#EXT-X-MEDIA-SEQUENCE:{}\n", base_sequence));
 
-    for (i, segment) in segments.iter().enumerate() {
-        let sequence = first_sequence + i as u64;
+    let mut prev_end_pts: Option<u64> = None;
+    for (i, segment) in segments.iter().skip(skip).enumerate() {
+        let sequence = base_sequence + i as u64;
         let duration = segment.duration_ns as f64 / NANOS_PER_SEC;
-        // Only mark discontinuity when there's an actual PTS gap between segments
-        if i > 0 {
-            let prev = &segments[i - 1];
-            let expected_pts = prev.start_pts + prev.duration_ns;
-            let gap = if segment.start_pts > expected_pts {
-                segment.start_pts - expected_pts
-            } else {
-                expected_pts - segment.start_pts
-            };
-            // Allow 100ms tolerance for timestamp jitter
+        if let Some(prev_end) = prev_end_pts {
+            let gap = segment.start_pts.abs_diff(prev_end);
             if gap > 100_000_000 {
                 playlist.push_str("#EXT-X-DISCONTINUITY\n");
             }
         }
+        prev_end_pts = Some(segment.start_pts + segment.duration_ns);
         let secs = (segment.start_pts / 1_000_000_000) as i64;
         let millis = ((segment.start_pts % 1_000_000_000) / 1_000_000) as u32;
         let dt = format_datetime(secs, millis);
