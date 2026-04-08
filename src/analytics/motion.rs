@@ -20,20 +20,22 @@ const MOG2_HISTORY: i32 = 9000;
 // --- Adaptive parameter defaults and bounds ---
 
 const DEFAULT_VAR_THRESHOLD: f64 = 16.0;
-const VAR_THRESHOLD_MAX: f64 = 48.0;
-const VAR_THRESHOLD_STEP: f64 = 2.0;
+const VAR_THRESHOLD_MAX: f64 = 96.0;
+const VAR_THRESHOLD_STEP: f64 = 4.0;
 
 const DEFAULT_LEARNING_RATE: f64 = 0.003;
-const LEARNING_RATE_MAX: f64 = 0.006;
+const LEARNING_RATE_MAX: f64 = 0.010;
 const LEARNING_RATE_STEP: f64 = 0.001;
 
 const DEFAULT_MORPH_KERNEL_SIZE: i32 = 5;
-const MORPH_KERNEL_MAX: i32 = 9;
+const MORPH_KERNEL_MAX: i32 = 15;
 const MORPH_KERNEL_STEP: i32 = 2;
 
+// On a 320x240 analysis frame a person is ~4000px. Max 2000 leaves a
+// safe margin while filtering out wind/leaf blobs that are a few hundred px.
 const DEFAULT_MIN_CONTOUR_AREA: f64 = 200.0;
-const MIN_CONTOUR_AREA_MAX: f64 = 600.0;
-const MIN_CONTOUR_AREA_STEP: f64 = 50.0;
+const MIN_CONTOUR_AREA_MAX: f64 = 2000.0;
+const MIN_CONTOUR_AREA_STEP: f64 = 100.0;
 
 // Tuner timing
 const TUNER_EVAL_SECS: u64 = 600; // 10 minutes
