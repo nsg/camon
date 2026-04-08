@@ -31,6 +31,11 @@ document.addEventListener('DOMContentLoaded', async () => {
     const tunerToggleBtn = document.getElementById('tuner-toggle-btn');
     const tunerOverlay = document.getElementById('tuner-stats-overlay');
     const tunerCtx = tunerOverlay.getContext('2d');
+    const liveScrubber = document.getElementById('live-scrubber');
+    const liveProgressFill = document.getElementById('live-progress-fill');
+    const liveCurrentTime = document.getElementById('live-current-time');
+    const liveDuration = document.getElementById('live-duration');
+    const liveBtn = document.getElementById('live-btn');
 
     // View 2: Event Browser
     const eventsView = document.getElementById('events-view');
@@ -82,6 +87,8 @@ document.addEventListener('DOMContentLoaded', async () => {
     let tunerOverlayEnabled = false;
     let tunerData = null;
     let overlayAnimationId = null;
+    let isLiveScrubbing = false;
+    let isAtLiveEdge = true;
 
     // Warm events (shared between views 2 & 3)
     let warmEvents = [];
@@ -267,6 +274,50 @@ document.addEventListener('DOMContentLoaded', async () => {
             fetchTunerStats();
         }
     });
+
+    liveScrubber.addEventListener('input', () => {
+        isLiveScrubbing = true;
+        const seekable = detailVideo.seekable;
+        if (seekable.length > 0) {
+            const start = seekable.start(0);
+            const end = seekable.end(seekable.length - 1);
+            const range = end - start;
+            const progress = liveScrubber.value / 1000;
+            liveProgressFill.style.width = (progress * 100) + '%';
+            const time = start + progress * range;
+            liveCurrentTime.textContent = '-' + formatTimeShort(end - time);
+        }
+    });
+
+    liveScrubber.addEventListener('change', () => {
+        const seekable = detailVideo.seekable;
+        if (seekable.length > 0) {
+            const start = seekable.start(0);
+            const end = seekable.end(seekable.length - 1);
+            const range = end - start;
+            const progress = liveScrubber.value / 1000;
+            detailVideo.currentTime = start + progress * range;
+
+            const atEdge = progress > 0.98;
+            setLiveEdge(atEdge);
+        }
+        isLiveScrubbing = false;
+    });
+
+    liveBtn.addEventListener('click', () => {
+        if (detailHls) {
+            const seekable = detailVideo.seekable;
+            if (seekable.length > 0) {
+                detailVideo.currentTime = seekable.end(seekable.length - 1) - 0.5;
+            }
+            setLiveEdge(true);
+        }
+    });
+
+    function setLiveEdge(atEdge) {
+        isAtLiveEdge = atEdge;
+        liveBtn.classList.toggle('active', atEdge);
+    }
 
     eventsSummaryBtn.addEventListener('click', () => {
         if (currentDetailCameraId) {
@@ -495,6 +546,13 @@ document.addEventListener('DOMContentLoaded', async () => {
         tunerToggleBtn.classList.remove('active');
         tunerCtx.clearRect(0, 0, tunerOverlay.width, tunerOverlay.height);
 
+        isLiveScrubbing = false;
+        setLiveEdge(true);
+        liveScrubber.value = 1000;
+        liveProgressFill.style.width = '100%';
+        liveCurrentTime.textContent = 'LIVE';
+        liveDuration.textContent = '0:00';
+
         hideTooltip();
         detectionGallery.innerHTML = '';
         eventsSummaryBtn.hidden = true;
@@ -574,7 +632,12 @@ document.addEventListener('DOMContentLoaded', async () => {
         const src = `/api/stream/${cameraId}/playlist.m3u8`;
 
         if (typeof Hls !== 'undefined' && Hls.isSupported()) {
-            detailHls = new Hls({ enableWorker: false });
+            detailHls = new Hls({
+                enableWorker: false,
+                liveBackBufferLength: 600,
+                backBufferLength: 600,
+                liveDurationInfinity: false,
+            });
             detailHls.loadSource(src);
             detailHls.attachMedia(detailVideo);
 
@@ -652,9 +715,37 @@ document.addEventListener('DOMContentLoaded', async () => {
         function update() {
             drawBackground();
             drawStability();
+            updateLiveScrubber();
             overlayAnimationId = requestAnimationFrame(update);
         }
         update();
+    }
+
+    function updateLiveScrubber() {
+        if (isLiveScrubbing) return;
+        const seekable = detailVideo.seekable;
+        if (seekable.length === 0) return;
+
+        const start = seekable.start(0);
+        const end = seekable.end(seekable.length - 1);
+        const range = end - start;
+        if (range <= 0) return;
+
+        const current = detailVideo.currentTime;
+        const progress = Math.max(0, Math.min(1, (current - start) / range));
+        const timeToLive = end - current;
+
+        liveScrubber.value = Math.round(progress * 1000);
+        liveProgressFill.style.width = (progress * 100) + '%';
+        liveDuration.textContent = formatTimeShort(range);
+
+        if (timeToLive < 3) {
+            liveCurrentTime.textContent = 'LIVE';
+            if (!isAtLiveEdge) setLiveEdge(true);
+        } else {
+            liveCurrentTime.textContent = '-' + formatTimeShort(timeToLive);
+            if (isAtLiveEdge) setLiveEdge(false);
+        }
     }
 
     function fetchStabilityMap() {

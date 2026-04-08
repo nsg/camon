@@ -41,9 +41,21 @@
                 <canvas id="tuner-stats-overlay"></canvas>
                 <div id="detail-loading" class="loading"><p>Loading...</p></div>
             </div>
+            <div class="live-scrubber-bar">
+                <span id="live-current-time" class="time-display">0:00</span>
+                <div class="playback-progress-wrapper">
+                    <div class="playback-progress-track">
+                        <div id="live-progress-fill" class="playback-progress-fill"></div>
+                    </div>
+                    <input type="range" id="live-scrubber" class="live-scrubber" min="0" max="1000" value="1000" step="1">
+                </div>
+                <span id="live-duration" class="time-display">0:00</span>
+                <button id="live-btn" class="live-badge-btn active" title="Jump to live">
+                    <span class="live-dot"></span> LIVE
+                </button>
+            </div>
             <div class="live-controls">
                 <div class="live-controls-left">
-                    <span class="live-badge"><span class="live-dot"></span> LIVE</span>
                 </div>
                 <div class="live-controls-right">
                     <button id="mute-toggle-btn" class="icon-btn muted" title="Toggle audio">
