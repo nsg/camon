@@ -11,14 +11,15 @@ const GRID_SIZE: usize = GRID_COLS * GRID_ROWS;
 
 /// Cell value above which detections are suppressed.
 const ABSORPTION_THRESHOLD: f32 = 0.6;
-/// Decay applied per minute. At 0.005/min, a fully absorbed cell (0.6)
-/// takes 2 hours to decay back to novel after the object leaves.
-const DECAY_PER_MINUTE: f32 = 0.005;
+/// Decay applied per minute. At 0.001/min a fully absorbed cell (0.6)
+/// takes ~10 hours to decay back to novel after the object leaves.
+const DECAY_PER_MINUTE: f32 = 0.001;
 /// Minimum interval between decay ticks.
 const DECAY_INTERVAL_SECS: u64 = 60;
-/// Increment per detection hit. With ~3 detections/hour (motion-gated),
-/// this gives +0.15/hour. Absorption at 0.6 takes ~4 hours.
-const HIT_INCREMENT: f32 = 0.05;
+/// Increment per detection hit. At 0.15 per hit, 4 detections at the
+/// same grid cell reach the absorption threshold (0.6). With motion-gated
+/// detection rates of ~1-3/hour, a stationary object absorbs in 1-4 hours.
+const HIT_INCREMENT: f32 = 0.15;
 
 #[derive(Serialize, Deserialize, Clone)]
 struct ClassGrid {
@@ -202,22 +203,22 @@ mod tests {
     fn record_returns_novel_until_absorbed() {
         let (grid, _dir) = make_grid(&["cam1"]);
 
-        // Each hit adds 0.05. Threshold is 0.6. So 12 hits = 0.60.
-        for i in 0..11 {
+        // Each hit adds 0.15. Threshold is 0.6. So 4 hits = 0.60.
+        for i in 0..3 {
             let novel = grid.record("cam1", "car", 0.5, 0.5);
             assert!(novel, "should be novel at hit {i}");
         }
 
-        // 12th hit reaches 0.60 — absorbed
+        // 4th hit reaches 0.60 — absorbed
         let novel = grid.record("cam1", "car", 0.5, 0.5);
-        assert!(!novel, "should be absorbed after 12 hits");
+        assert!(!novel, "should be absorbed after 4 hits");
     }
 
     #[test]
     fn different_classes_are_independent() {
         let (grid, _dir) = make_grid(&["cam1"]);
 
-        for _ in 0..12 {
+        for _ in 0..4 {
             grid.record("cam1", "car", 0.5, 0.5);
         }
 
@@ -229,7 +230,7 @@ mod tests {
     fn different_cells_are_independent() {
         let (grid, _dir) = make_grid(&["cam1"]);
 
-        for _ in 0..12 {
+        for _ in 0..4 {
             grid.record("cam1", "car", 0.1, 0.1);
         }
 
@@ -241,7 +242,7 @@ mod tests {
     fn decay_is_time_gated() {
         let (grid, _dir) = make_grid(&["cam1"]);
 
-        for _ in 0..5 {
+        for _ in 0..3 {
             grid.record("cam1", "car", 0.5, 0.5);
         }
 
@@ -254,8 +255,8 @@ mod tests {
         let idx = row * GRID_COLS + col;
         let val = response.classes["car"][idx];
         assert!(
-            (val - 0.25).abs() < 0.01,
-            "value should be ~0.25 (5 * 0.05) with no decay yet, got {val}"
+            (val - 0.45).abs() < 0.01,
+            "value should be ~0.45 (3 * 0.15) with no decay yet, got {val}"
         );
     }
 
@@ -263,10 +264,10 @@ mod tests {
     fn decay_applies_after_interval() {
         let (grid, _dir) = make_grid(&["cam1"]);
 
-        for _ in 0..10 {
+        for _ in 0..4 {
             grid.record("cam1", "car", 0.5, 0.5);
         }
-        // Value is 0.50
+        // Value is 0.60
 
         // Force the last_decay timestamp back to trigger decay
         {
@@ -282,10 +283,10 @@ mod tests {
         let row = (0.5 * GRID_ROWS as f32) as usize;
         let idx = row * GRID_COLS + col;
         let val = response.classes["car"][idx];
-        // 2 minutes of decay: 0.50 - (0.005 * 2) = 0.49
+        // 2 minutes of decay: 0.60 - (0.001 * 2) = 0.598
         assert!(
-            (val - 0.49).abs() < 0.01,
-            "value should be ~0.49 after 2 min decay, got {val}"
+            (val - 0.598).abs() < 0.01,
+            "value should be ~0.598 after 2 min decay, got {val}"
         );
     }
 
@@ -294,7 +295,7 @@ mod tests {
         let (grid, _dir) = make_grid(&["cam1"]);
 
         grid.record("cam1", "car", 0.5, 0.5);
-        // Value is 0.05
+        // Value is 0.15
 
         // Force a very long elapsed time
         {
@@ -413,9 +414,10 @@ mod tests {
         let row = (0.7 * GRID_ROWS as f32) as usize;
         let idx = row * GRID_COLS + col;
         let car_val = response.classes["car"][idx];
+        // 10 * 0.15 = 1.5, capped at 1.0
         assert!(
-            (car_val - 0.50).abs() < 0.01,
-            "car value should be ~0.50 (10 * 0.05), got {car_val}"
+            (car_val - 1.0).abs() < 0.01,
+            "car value should be 1.0 (10 * 0.15 capped), got {car_val}"
         );
     }
 }

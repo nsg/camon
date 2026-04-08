@@ -190,11 +190,10 @@ impl MotionAnalyzer {
                 self.motion_store.set_background_map(&self.camera_id, jpeg);
             }
 
-            if let Err(e) = self.detector.report_segment(score > 0.0) {
-                tracing::warn!(camera = %self.camera_id, error = %e, "tuner update failed");
-            }
-
             if score >= MOTION_THRESHOLD {
+                if let Err(e) = self.detector.report_motion_event() {
+                    tracing::warn!(camera = %self.camera_id, error = %e, "tuner update failed");
+                }
                 let mask_jpeg = self.detector.fg_mask_jpeg();
                 self.motion_store.insert(
                     &self.camera_id,
@@ -373,12 +372,13 @@ impl MotionAnalyzer {
         None
     }
 
-    fn store_detection_result(&self, seq: u64, result: &SegmentDetectionResult) {
+    fn store_detection_result(&mut self, seq: u64, result: &SegmentDetectionResult) {
         let detection_store = match &self.detection_store {
             Some(s) => s,
             None => return,
         };
 
+        let mut stored_any = false;
         for (i, (class, &confidence)) in result.classes.iter().zip(&result.confidences).enumerate()
         {
             let (cx, cy) = result.centers.get(i).copied().unwrap_or((0.5, 0.5));
@@ -402,6 +402,7 @@ impl MotionAnalyzer {
                 confidence,
                 result.frame_jpeg.clone(),
             );
+            stored_any = true;
 
             tracing::debug!(
                 camera = %self.camera_id,
@@ -410,6 +411,10 @@ impl MotionAnalyzer {
                 confidence = format!("{:.2}", confidence),
                 "object detected"
             );
+        }
+
+        if stored_any {
+            self.detector.report_positive_detection();
         }
     }
 
