@@ -1,6 +1,8 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, RwLock};
 
+use crate::analytics::TunerStats;
+
 /// Number of recent motion entries to retain mask JPEGs for
 const MASK_RETAIN_COUNT: usize = 60;
 
@@ -16,6 +18,7 @@ pub struct MotionStore {
     cameras: Arc<HashMap<String, RwLock<VecDeque<MotionEntry>>>>,
     stability_maps: Arc<HashMap<String, RwLock<Option<Vec<u8>>>>>,
     background_maps: Arc<HashMap<String, RwLock<Option<Vec<u8>>>>>,
+    tuner_stats: Arc<HashMap<String, RwLock<Option<TunerStats>>>>,
 }
 
 impl MotionStore {
@@ -23,15 +26,18 @@ impl MotionStore {
         let mut cameras = HashMap::new();
         let mut stability_maps = HashMap::new();
         let mut background_maps = HashMap::new();
+        let mut tuner_stats = HashMap::new();
         for id in camera_ids {
             cameras.insert(id.clone(), RwLock::new(VecDeque::new()));
             stability_maps.insert(id.clone(), RwLock::new(None));
             background_maps.insert(id.clone(), RwLock::new(None));
+            tuner_stats.insert(id.clone(), RwLock::new(None));
         }
         Self {
             cameras: Arc::new(cameras),
             stability_maps: Arc::new(stability_maps),
             background_maps: Arc::new(background_maps),
+            tuner_stats: Arc::new(tuner_stats),
         }
     }
 
@@ -121,6 +127,17 @@ impl MotionStore {
         lock.read().unwrap().clone()
     }
 
+    pub fn set_tuner_stats(&self, camera_id: &str, stats: TunerStats) {
+        if let Some(lock) = self.tuner_stats.get(camera_id) {
+            *lock.write().unwrap() = Some(stats);
+        }
+    }
+
+    pub fn get_tuner_stats(&self, camera_id: &str) -> Option<TunerStats> {
+        let lock = self.tuner_stats.get(camera_id)?;
+        lock.read().unwrap().clone()
+    }
+
     pub fn last_sequence(&self, camera_id: &str) -> Option<u64> {
         self.cameras
             .get(camera_id)?
@@ -137,6 +154,7 @@ impl Clone for MotionStore {
             cameras: Arc::clone(&self.cameras),
             stability_maps: Arc::clone(&self.stability_maps),
             background_maps: Arc::clone(&self.background_maps),
+            tuner_stats: Arc::clone(&self.tuner_stats),
         }
     }
 }

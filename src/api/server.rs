@@ -97,6 +97,7 @@ pub async fn start_server(state: AppState, port: u16) -> Result<(), std::io::Err
             "/api/cameras/{id}/motion/background",
             get(background_map_handler),
         )
+        .route("/api/cameras/{id}/motion/tuner", get(tuner_stats_handler))
         .route(
             "/api/cameras/{id}/detection/grid",
             get(detection_grid_handler),
@@ -309,6 +310,17 @@ async fn background_map_handler(State(state): State<AppState>, Path(id): Path<St
     match state.motion_store.get_background_map(&id) {
         Some(jpeg) => ([(header::CONTENT_TYPE, "image/jpeg")], jpeg).into_response(),
         None => (StatusCode::NOT_FOUND, "background not available yet").into_response(),
+    }
+}
+
+async fn tuner_stats_handler(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+    if !state.buffers.contains_key(&id) {
+        return (StatusCode::NOT_FOUND, "camera not found").into_response();
+    }
+
+    match state.motion_store.get_tuner_stats(&id) {
+        Some(stats) => axum::Json(stats).into_response(),
+        None => (StatusCode::NOT_FOUND, "tuner stats not available yet").into_response(),
     }
 }
 

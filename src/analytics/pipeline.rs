@@ -189,6 +189,8 @@ impl MotionAnalyzer {
             if let Some(jpeg) = self.detector.background_jpeg() {
                 self.motion_store.set_background_map(&self.camera_id, jpeg);
             }
+            self.motion_store
+                .set_tuner_stats(&self.camera_id, self.detector.tuner_stats());
 
             if score >= MOTION_THRESHOLD {
                 if let Err(e) = self.detector.report_motion_event() {

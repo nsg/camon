@@ -216,7 +216,8 @@ main {
 
 #bg-overlay,
 #detection-grid-overlay,
-#stability-overlay {
+#stability-overlay,
+#tuner-stats-overlay {
     position: absolute;
     top: 0;
     left: 0;
@@ -228,10 +229,12 @@ main {
 #bg-overlay { z-index: 1; }
 #stability-overlay { z-index: 2; }
 #detection-grid-overlay { z-index: 3; }
+#tuner-stats-overlay { z-index: 4; }
 
 #bg-overlay[hidden],
 #detection-grid-overlay[hidden],
-#stability-overlay[hidden] { display: none; }
+#stability-overlay[hidden],
+#tuner-stats-overlay[hidden] { display: none; }
 
 .live-controls {
     display: flex;

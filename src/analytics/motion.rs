@@ -50,6 +50,16 @@ const NOISE_EVENTS_PER_HOUR_HIGH: f32 = 10.0;
 // At 10-min eval windows, 6 windows = 1 hour of silence before relaxing.
 const RELAX_QUIET_WINDOWS: u32 = 6;
 
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TunerStats {
+    pub var_threshold: f64,
+    pub learning_rate: f64,
+    pub morph_kernel_size: i32,
+    pub min_contour_area: f64,
+    pub noise_events: u32,
+    pub quiet_windows: u32,
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TunedParams {
     pub var_threshold: f64,
@@ -457,6 +467,17 @@ impl MotionDetector {
     /// An object detection confirmed this motion was real — subtract one noise event.
     pub fn report_positive_detection(&mut self) {
         self.tuner.record_positive_detection();
+    }
+
+    pub fn tuner_stats(&self) -> TunerStats {
+        TunerStats {
+            var_threshold: self.tuner.params.var_threshold,
+            learning_rate: self.tuner.params.learning_rate,
+            morph_kernel_size: self.tuner.params.morph_kernel_size,
+            min_contour_area: self.tuner.params.min_contour_area,
+            noise_events: self.tuner.noise_events,
+            quiet_windows: self.tuner.quiet_windows,
+        }
     }
 
     fn apply_param_change(&mut self, change: ParamChange) -> CvResult<()> {

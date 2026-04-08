@@ -28,6 +28,9 @@ document.addEventListener('DOMContentLoaded', async () => {
     const bgCtx = bgOverlay.getContext('2d');
     const gridOverlay = document.getElementById('detection-grid-overlay');
     const gridCtx = gridOverlay.getContext('2d');
+    const tunerToggleBtn = document.getElementById('tuner-toggle-btn');
+    const tunerOverlay = document.getElementById('tuner-stats-overlay');
+    const tunerCtx = tunerOverlay.getContext('2d');
 
     // View 2: Event Browser
     const eventsView = document.getElementById('events-view');
@@ -76,6 +79,8 @@ document.addEventListener('DOMContentLoaded', async () => {
     let bgImage = null;
     let gridOverlayEnabled = false;
     let gridData = null;
+    let tunerOverlayEnabled = false;
+    let tunerData = null;
     let overlayAnimationId = null;
 
     // Warm events (shared between views 2 & 3)
@@ -251,6 +256,18 @@ document.addEventListener('DOMContentLoaded', async () => {
         }
     });
 
+    tunerToggleBtn.addEventListener('click', () => {
+        tunerOverlayEnabled = !tunerOverlayEnabled;
+        tunerToggleBtn.classList.toggle('active', tunerOverlayEnabled);
+        tunerOverlay.hidden = !tunerOverlayEnabled;
+        if (!tunerOverlayEnabled) {
+            tunerCtx.clearRect(0, 0, tunerOverlay.width, tunerOverlay.height);
+            tunerData = null;
+        } else {
+            fetchTunerStats();
+        }
+    });
+
     eventsSummaryBtn.addEventListener('click', () => {
         if (currentDetailCameraId) {
             window.location.hash = `/camera/${encodeURIComponent(currentDetailCameraId)}/events`;
@@ -372,10 +389,12 @@ document.addEventListener('DOMContentLoaded', async () => {
             stabilityOverlay.hidden = !stabilityOverlayEnabled;
             bgOverlay.hidden = !bgOverlayEnabled;
             gridOverlay.hidden = !gridOverlayEnabled;
+            tunerOverlay.hidden = !tunerOverlayEnabled;
 
             if (stabilityOverlayEnabled) fetchStabilityMap();
             if (bgOverlayEnabled) fetchBackgroundMap();
             if (gridOverlayEnabled) fetchDetectionGrid();
+            if (tunerOverlayEnabled) fetchTunerStats();
 
             loadDetailCamera(cameraId);
             fetchWarmEvents(cameraId);
@@ -469,6 +488,12 @@ document.addEventListener('DOMContentLoaded', async () => {
         gridOverlayEnabled = false;
         gridToggleBtn.classList.remove('active');
         gridCtx.clearRect(0, 0, gridOverlay.width, gridOverlay.height);
+
+        tunerData = null;
+        tunerOverlay.hidden = true;
+        tunerOverlayEnabled = false;
+        tunerToggleBtn.classList.remove('active');
+        tunerCtx.clearRect(0, 0, tunerOverlay.width, tunerOverlay.height);
 
         hideTooltip();
         detectionGallery.innerHTML = '';
@@ -814,6 +839,64 @@ document.addEventListener('DOMContentLoaded', async () => {
         }
     }
 
+    function fetchTunerStats() {
+        if (!tunerOverlayEnabled || !currentDetailCameraId) return;
+        fetch(`/api/cameras/${encodeURIComponent(currentDetailCameraId)}/motion/tuner`)
+            .then(r => r.ok ? r.json() : null)
+            .then(data => {
+                if (data) { tunerData = data; drawTunerStats(); }
+            })
+            .catch(() => {});
+    }
+
+    function drawTunerStats() {
+        if (!tunerData) return;
+        const w = detailVideo.clientWidth;
+        const h = detailVideo.clientHeight;
+        if (w === 0 || h === 0) return;
+        if (tunerOverlay.width !== w || tunerOverlay.height !== h) {
+            tunerOverlay.width = w;
+            tunerOverlay.height = h;
+        }
+        const ctx = tunerCtx;
+        ctx.clearRect(0, 0, w, h);
+
+        const d = tunerData;
+        const lines = [
+            `var_threshold: ${d.var_threshold}`,
+            `learning_rate: ${d.learning_rate.toFixed(4)}`,
+            `morph_kernel: ${d.morph_kernel_size}`,
+            `min_contour_area: ${d.min_contour_area}`,
+            `noise_events: ${d.noise_events}`,
+            `quiet_windows: ${d.quiet_windows}`,
+        ];
+
+        const fontSize = Math.max(14, Math.min(18, w / 40));
+        const lineHeight = fontSize * 1.4;
+        const padding = 12;
+        const boxWidth = fontSize * 16;
+        const boxHeight = lines.length * lineHeight + padding * 2;
+        const x = w - boxWidth - padding;
+        const y = h - boxHeight - padding;
+
+        ctx.fillStyle = 'rgba(0, 0, 0, 0.7)';
+        ctx.beginPath();
+        ctx.roundRect(x, y, boxWidth, boxHeight, 6);
+        ctx.fill();
+
+        ctx.font = `${fontSize}px monospace`;
+        ctx.textBaseline = 'top';
+
+        for (let i = 0; i < lines.length; i++) {
+            const label = lines[i].split(':')[0] + ':';
+            const value = lines[i].split(':').slice(1).join(':');
+            ctx.fillStyle = 'rgba(255, 255, 255, 0.6)';
+            ctx.fillText(label, x + padding, y + padding + i * lineHeight);
+            ctx.fillStyle = '#fff';
+            ctx.fillText(value, x + padding + ctx.measureText(label).width, y + padding + i * lineHeight);
+        }
+    }
+
     // === Live Monitor: Data Fetching ===
 
     async function fetchMotionSegments(cameraId) {
@@ -841,6 +924,7 @@ document.addEventListener('DOMContentLoaded', async () => {
             fetchStabilityMap();
             fetchBackgroundMap();
             fetchDetectionGrid();
+            fetchTunerStats();
         }, 5000);
     }
 
