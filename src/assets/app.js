@@ -709,8 +709,31 @@ document.addEventListener('DOMContentLoaded', async () => {
         }
         gridCtx.clearRect(0, 0, w, h);
 
-        const cellW = w / gridData.cols;
-        const cellH = h / gridData.rows;
+        const cols = gridData.cols;
+        const rows = gridData.rows;
+        const cellW = w / cols;
+        const cellH = h / rows;
+
+        // Draw grid lines
+        gridCtx.strokeStyle = 'rgba(255, 255, 255, 0.2)';
+        gridCtx.lineWidth = 1;
+        for (let c = 1; c < cols; c++) {
+            const x = Math.round(c * cellW) + 0.5;
+            gridCtx.beginPath();
+            gridCtx.moveTo(x, 0);
+            gridCtx.lineTo(x, h);
+            gridCtx.stroke();
+        }
+        for (let r = 1; r < rows; r++) {
+            const y = Math.round(r * cellH) + 0.5;
+            gridCtx.beginPath();
+            gridCtx.moveTo(0, y);
+            gridCtx.lineTo(w, y);
+            gridCtx.stroke();
+        }
+
+        // Build per-cell max value across all classes for value labels
+        const cellMax = new Float32Array(cols * rows);
         let fallbackIdx = 0;
         const legendEntries = [];
 
@@ -723,9 +746,10 @@ document.addEventListener('DOMContentLoaded', async () => {
             let hasVisible = false;
 
             for (let i = 0; i < cells.length; i++) {
+                if (cells[i] > cellMax[i]) cellMax[i] = cells[i];
                 if (cells[i] <= 0.01) continue;
-                const col = i % gridData.cols;
-                const row = Math.floor(i / gridData.cols);
+                const col = i % cols;
+                const row = Math.floor(i / cols);
                 const x = col * cellW;
                 const y = row * cellH;
 
@@ -744,10 +768,31 @@ document.addEventListener('DOMContentLoaded', async () => {
             if (hasVisible) legendEntries.push({ className, color });
         }
 
+        // Draw cell values if cells are large enough
+        const fontSize = Math.min(Math.floor(cellH * 0.35), Math.floor(cellW * 0.3), 14);
+        if (fontSize >= 8) {
+            gridCtx.font = `${fontSize}px monospace`;
+            gridCtx.textAlign = 'center';
+            gridCtx.textBaseline = 'middle';
+            for (let i = 0; i < cellMax.length; i++) {
+                if (cellMax[i] <= 0.01) continue;
+                const col = i % cols;
+                const row = Math.floor(i / cols);
+                const cx = col * cellW + cellW / 2;
+                const cy = row * cellH + cellH / 2;
+                gridCtx.fillStyle = 'rgba(0, 0, 0, 0.6)';
+                const label = cellMax[i].toFixed(2);
+                const tw = gridCtx.measureText(label).width;
+                gridCtx.fillRect(cx - tw / 2 - 2, cy - fontSize / 2 - 1, tw + 4, fontSize + 2);
+                gridCtx.fillStyle = '#fff';
+                gridCtx.fillText(label, cx, cy);
+            }
+        }
+
         if (legendEntries.length > 0) {
-            const fontSize = 12;
+            const lFontSize = 12;
             const padding = 6;
-            const lineHeight = fontSize + 4;
+            const lineHeight = lFontSize + 4;
             const legendH = legendEntries.length * lineHeight + padding * 2;
             const legendW = 100;
             const lx = w - legendW - 8;
@@ -755,14 +800,16 @@ document.addEventListener('DOMContentLoaded', async () => {
 
             gridCtx.fillStyle = 'rgba(0, 0, 0, 0.7)';
             gridCtx.fillRect(lx, ly, legendW, legendH);
-            gridCtx.font = `${fontSize}px sans-serif`;
+            gridCtx.font = `${lFontSize}px sans-serif`;
+            gridCtx.textAlign = 'left';
+            gridCtx.textBaseline = 'alphabetic';
 
             legendEntries.forEach((entry, i) => {
-                const ey = ly + padding + i * lineHeight + fontSize;
+                const ey = ly + padding + i * lineHeight + lFontSize;
                 gridCtx.fillStyle = entry.color.replace(/[\d.]+\)$/, '1)');
-                gridCtx.fillRect(lx + padding, ey - fontSize + 2, fontSize, fontSize);
+                gridCtx.fillRect(lx + padding, ey - lFontSize + 2, lFontSize, lFontSize);
                 gridCtx.fillStyle = '#fff';
-                gridCtx.fillText(entry.className, lx + padding + fontSize + 4, ey);
+                gridCtx.fillText(entry.className, lx + padding + lFontSize + 4, ey);
             });
         }
     }

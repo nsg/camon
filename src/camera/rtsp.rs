@@ -58,6 +58,8 @@ impl FfmpegPipeline {
                 "warning",
                 "-rtsp_transport",
                 "tcp",
+                "-timeout",
+                "10000000",
                 "-i",
                 &self.url,
                 "-c:v",
