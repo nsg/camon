@@ -527,16 +527,27 @@ impl MotionDetector {
     }
 
     pub fn motion_bbox(&self) -> Option<Rect> {
-        let mut points = Vector::<opencv::core::Point>::new();
-        opencv::core::find_non_zero(&self.fg_mask, &mut points).ok()?;
-        if points.is_empty() {
-            return None;
+        let mut contours = Vector::<Vector<opencv::core::Point>>::new();
+        imgproc::find_contours(
+            &self.fg_mask.clone(),
+            &mut contours,
+            imgproc::RETR_EXTERNAL,
+            imgproc::CHAIN_APPROX_SIMPLE,
+            opencv::core::Point::new(0, 0),
+        )
+        .ok()?;
+
+        let mut best_rect: Option<Rect> = None;
+        let mut best_area = 0.0;
+        for i in 0..contours.len() {
+            let area = imgproc::contour_area(&contours.get(i).ok()?, false).ok()?;
+            if area > best_area {
+                best_area = area;
+                best_rect = imgproc::bounding_rect(&contours.get(i).ok()?).ok();
+            }
         }
-        let rect = opencv::imgproc::bounding_rect(&points).ok()?;
-        if rect.width == 0 || rect.height == 0 {
-            return None;
-        }
-        Some(rect)
+
+        best_rect.filter(|r| r.width > 0 && r.height > 0)
     }
 }
 
