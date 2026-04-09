@@ -24,6 +24,7 @@ pub struct WarmEventEntry {
     pub duration_ms: u32,
     pub event_type: EventType,
     pub file_size: u64,
+    pub object_classes: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -83,6 +84,7 @@ impl WarmEventIndex {
                         duration_ms,
                         event_type: *event_type,
                         file_size,
+                        object_classes: Vec::new(),
                     });
                 }
             }

@@ -83,15 +83,20 @@ impl DetectionStore {
         })
     }
 
-    pub fn has_detections(&self, camera_id: &str, segment_sequence: u64) -> bool {
+    pub fn get_classes(&self, camera_id: &str, segment_sequence: u64) -> Vec<String> {
         match self.cameras.get(camera_id) {
             Some(lock) => {
                 let entries = lock.read().unwrap();
-                entries
+                let mut classes: Vec<String> = entries
                     .iter()
-                    .any(|e| e.segment_sequence == segment_sequence)
+                    .filter(|e| e.segment_sequence == segment_sequence)
+                    .map(|e| e.object_class.clone())
+                    .collect();
+                classes.sort();
+                classes.dedup();
+                classes
             }
-            None => false,
+            None => Vec::new(),
         }
     }
 

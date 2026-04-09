@@ -1205,7 +1205,7 @@ document.addEventListener('DOMContentLoaded', async () => {
                     <img class="event-list-thumb" src="${thumbSrc}" loading="lazy" alt="">
                     <div class="event-list-info">
                         <div class="event-list-type ${typeClass}">${typeLabel}</div>
-                        <div class="event-list-detail">${ev.event_type === 'object' && ev.object_classes ? ev.object_classes : ''}</div>
+                        <div class="event-list-detail">${ev.event_type === 'object' && ev.object_classes ? ev.object_classes.join(', ') : ''}</div>
                     </div>
                     <div class="event-list-meta">
                         <div class="event-list-time">${timeStr}</div>

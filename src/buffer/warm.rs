@@ -16,6 +16,7 @@ struct WarmEvent {
     last_motion_pts: u64,
     total_bytes: usize,
     has_objects: bool,
+    object_classes: Vec<String>,
 }
 
 impl WarmEvent {
@@ -113,10 +114,10 @@ impl WarmWriter {
             .has_motion(&evicted.camera_id, evicted.sequence);
         let segment = evicted.segment;
 
-        let has_objects = has_motion
-            && self
-                .detection_store
-                .has_detections(&evicted.camera_id, evicted.sequence);
+        let segment_classes = self
+            .detection_store
+            .get_classes(&evicted.camera_id, evicted.sequence);
+        let has_objects = has_motion && !segment_classes.is_empty();
 
         if has_motion {
             if let Some(ref mut event) = self.current_event {
@@ -124,6 +125,11 @@ impl WarmWriter {
                 event.total_bytes += segment.data.len();
                 if has_objects {
                     event.has_objects = true;
+                    for class in &segment_classes {
+                        if !event.object_classes.contains(class) {
+                            event.object_classes.push(class.clone());
+                        }
+                    }
                 }
                 event.segments.push(segment);
             } else {
@@ -144,6 +150,7 @@ impl WarmWriter {
                     last_motion_pts: motion_pts,
                     total_bytes,
                     has_objects,
+                    object_classes: segment_classes,
                 });
             }
         } else if let Some(ref mut event) = self.current_event {
@@ -157,6 +164,7 @@ impl WarmWriter {
                 let data_dir = self.data_dir.clone();
                 let camera_id = self.camera_id.clone();
                 let has_objects = event.has_objects;
+                let object_classes = event.object_classes.clone();
                 let warm_index = self.warm_index.clone();
                 tokio::spawn(async move {
                     write_event(
@@ -164,6 +172,7 @@ impl WarmWriter {
                         &camera_id,
                         &mut event,
                         has_objects,
+                        &object_classes,
                         warm_index.as_ref(),
                     )
                     .await;
@@ -192,11 +201,13 @@ impl WarmWriter {
     async fn finalize_event(&mut self) {
         if let Some(ref mut event) = self.current_event.take() {
             let has_objects = event.has_objects;
+            let object_classes = event.object_classes.clone();
             write_event(
                 &self.data_dir,
                 &self.camera_id,
                 event,
                 has_objects,
+                &object_classes,
                 self.warm_index.as_ref(),
             )
             .await;
@@ -209,6 +220,7 @@ async fn write_event(
     camera_id: &str,
     event: &mut WarmEvent,
     has_objects: bool,
+    object_classes: &[String],
     warm_index: Option<&WarmEventIndex>,
 ) {
     let duration_ns = event.duration_ns();
@@ -258,6 +270,7 @@ async fn write_event(
                             EventType::Movement
                         },
                         file_size,
+                        object_classes: object_classes.to_vec(),
                     },
                 );
             }

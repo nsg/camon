@@ -365,6 +365,8 @@ struct WarmEventResponse {
     start_pts_ns: String,
     duration_ms: u32,
     event_type: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    object_classes: Vec<String>,
 }
 
 async fn warm_events_handler(
@@ -394,6 +396,7 @@ async fn warm_events_handler(
                 crate::storage::EventType::Movement => "movement".to_string(),
                 crate::storage::EventType::Object => "object".to_string(),
             },
+            object_classes: e.object_classes.clone(),
         })
         .collect();
 
