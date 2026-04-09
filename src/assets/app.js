@@ -953,19 +953,20 @@ document.addEventListener('DOMContentLoaded', async () => {
         ctx.clearRect(0, 0, w, h);
 
         const d = tunerData;
+        const defaults = { var_threshold: 16, learning_rate: 0.003, morph_kernel_size: 5, min_contour_area: 200 };
         const lines = [
-            `var_threshold: ${d.var_threshold}`,
-            `learning_rate: ${d.learning_rate.toFixed(4)}`,
-            `morph_kernel: ${d.morph_kernel_size}`,
-            `min_contour_area: ${d.min_contour_area}`,
-            `noise_events: ${d.noise_events}`,
-            `quiet_windows: ${d.quiet_windows}`,
+            { label: 'var_threshold', value: d.var_threshold, def: defaults.var_threshold, fmt: v => `${v}` },
+            { label: 'learning_rate', value: d.learning_rate, def: defaults.learning_rate, fmt: v => v.toFixed(4) },
+            { label: 'morph_kernel', value: d.morph_kernel_size, def: defaults.morph_kernel_size, fmt: v => `${v}` },
+            { label: 'min_contour_area', value: d.min_contour_area, def: defaults.min_contour_area, fmt: v => `${v}` },
+            { label: 'noise_events', value: d.noise_events, def: null, fmt: v => `${v}` },
+            { label: 'quiet_windows', value: d.quiet_windows, def: null, fmt: v => `${v}` },
         ];
 
         const fontSize = Math.max(14, Math.min(18, w / 40));
         const lineHeight = fontSize * 1.4;
         const padding = 12;
-        const boxWidth = fontSize * 16;
+        const boxWidth = fontSize * 20;
         const boxHeight = lines.length * lineHeight + padding * 2;
         const x = w - boxWidth - padding;
         const y = h - boxHeight - padding;
@@ -975,16 +976,31 @@ document.addEventListener('DOMContentLoaded', async () => {
         ctx.roundRect(x, y, boxWidth, boxHeight, 6);
         ctx.fill();
 
-        ctx.font = `${fontSize}px monospace`;
         ctx.textBaseline = 'top';
 
         for (let i = 0; i < lines.length; i++) {
-            const label = lines[i].split(':')[0] + ':';
-            const value = lines[i].split(':').slice(1).join(':');
+            const line = lines[i];
+            const changed = line.def !== null && line.value !== line.def;
+            const labelText = line.label + ': ';
+            const valueText = line.fmt(line.value);
+            const defText = line.def !== null ? ` (${line.fmt(line.def)})` : '';
+            const ty = y + padding + i * lineHeight;
+
             ctx.fillStyle = 'rgba(255, 255, 255, 0.6)';
-            ctx.fillText(label, x + padding, y + padding + i * lineHeight);
-            ctx.fillStyle = '#fff';
-            ctx.fillText(value, x + padding + ctx.measureText(label).width, y + padding + i * lineHeight);
+            ctx.font = `${fontSize}px monospace`;
+            ctx.fillText(labelText, x + padding, ty);
+            const labelW = ctx.measureText(labelText).width;
+
+            ctx.fillStyle = changed ? '#f1c40f' : '#fff';
+            ctx.font = changed ? `bold ${fontSize}px monospace` : `${fontSize}px monospace`;
+            ctx.fillText(valueText, x + padding + labelW, ty);
+            const valueW = ctx.measureText(valueText).width;
+
+            if (defText) {
+                ctx.fillStyle = 'rgba(255, 255, 255, 0.35)';
+                ctx.font = `${fontSize}px monospace`;
+                ctx.fillText(defText, x + padding + labelW + valueW, ty);
+            }
         }
     }
 
