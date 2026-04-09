@@ -17,7 +17,29 @@ use crate::storage::{DetectionStore, MotionEntry, MotionStore};
 
 use super::decoder::{CropDecoder, FrameDecoder};
 use super::motion::MotionDetector;
-use super::object::ObjectDetector;
+use super::object::{Detection, ObjectDetector};
+use super::ollama::OllamaDetector;
+
+pub enum DetectorBackend {
+    Onnx(ObjectDetector),
+    Ollama(OllamaDetector),
+}
+
+impl DetectorBackend {
+    fn detect(
+        &mut self,
+        frame: &opencv::core::Mat,
+    ) -> Result<Vec<Detection>, Box<dyn std::error::Error + Send + Sync>> {
+        match self {
+            DetectorBackend::Onnx(d) => d.detect(frame),
+            DetectorBackend::Ollama(_) => Ok(Vec::new()),
+        }
+    }
+
+    fn is_ollama(&self) -> bool {
+        matches!(self, DetectorBackend::Ollama(_))
+    }
+}
 
 const DETECTION_WIDTH: i32 = 640;
 const DETECTION_HEIGHT: i32 = 480;
@@ -55,7 +77,7 @@ pub struct MotionAnalyzer {
     detector: MotionDetector,
     decoder: FrameDecoder,
     has_object_detection: bool,
-    object_detector: Option<ObjectDetector>,
+    object_detector: Option<DetectorBackend>,
     last_processed: u64,
     last_motion_bbox: Option<Rect>,
     detection_grid: Option<DetectionGrid>,
@@ -69,7 +91,7 @@ impl MotionAnalyzer {
         buffer: Arc<RwLock<HotBuffer>>,
         motion_store: MotionStore,
         detection_store: Option<DetectionStore>,
-        object_detector: Option<ObjectDetector>,
+        object_detector: Option<DetectorBackend>,
         config: AnalyticsConfig,
         detection_grid: Option<DetectionGrid>,
         data_dir: PathBuf,
@@ -421,6 +443,12 @@ impl MotionAnalyzer {
     }
 
     fn run_sampled_detections(&mut self, segments: Vec<MotionSegment>) {
+        let is_ollama = self
+            .object_detector
+            .as_ref()
+            .map(|d| d.is_ollama())
+            .unwrap_or(false);
+
         let crop_decoder = match CropDecoder::new(self.config.sample_fps) {
             Ok(d) => d,
             Err(e) => {
@@ -431,9 +459,128 @@ impl MotionAnalyzer {
 
         let runs = group_contiguous_runs(segments);
         for run in runs {
-            self.detect_run(run, &crop_decoder);
+            if is_ollama {
+                self.detect_run_ollama(run, &crop_decoder);
+            } else {
+                self.detect_run(run, &crop_decoder);
+            }
         }
-        // crop_decoder is dropped here, killing the ffmpeg process
+    }
+
+    fn detect_run_ollama(&mut self, run: Vec<MotionSegment>, crop_decoder: &CropDecoder) {
+        let len = run.len();
+        if len == 0 {
+            return;
+        }
+
+        // Sample up to 4 segments spread across the run
+        let indices: Vec<usize> = if len <= 4 {
+            (0..len).collect()
+        } else {
+            vec![0, len / 3, 2 * len / 3, len - 1]
+        };
+
+        let height = crop_decoder.height() as i32;
+        let mut frames = Vec::new();
+        let mut frame_jpeg = None;
+
+        for &idx in &indices {
+            let seg = &run[idx];
+            let raw_frames = crop_decoder.decode_segment(&seg.data, seg.duration_ns);
+            if raw_frames.is_empty() {
+                continue;
+            }
+            // Pick the middle frame from each segment
+            let mid = raw_frames.len() / 2;
+            if let Ok(mat) = Mat::from_slice(&raw_frames[mid]) {
+                if let Ok(reshaped) = mat.reshape(3, height) {
+                    if let Ok(cloned) = reshaped.try_clone() {
+                        if frame_jpeg.is_none() {
+                            // Use the middle segment's middle frame as the thumbnail
+                            if idx == indices[indices.len() / 2] {
+                                frame_jpeg = encode_jpeg(&cloned);
+                            }
+                        }
+                        frames.push(cloned);
+                    }
+                }
+            }
+        }
+
+        if frames.is_empty() {
+            return;
+        }
+
+        // Use first available frame for JPEG if we didn't get the middle one
+        if frame_jpeg.is_none() {
+            frame_jpeg = encode_jpeg(&frames[0]);
+        }
+        let frame_jpeg = match frame_jpeg {
+            Some(j) => j,
+            None => return,
+        };
+
+        // Get motion position from the bbox
+        let (cx, cy) = self
+            .last_motion_bbox
+            .map(|bbox| {
+                let cx = (bbox.x as f32 + bbox.width as f32 / 2.0) / ANALYSIS_WIDTH as f32;
+                let cy = (bbox.y as f32 + bbox.height as f32 / 2.0) / ANALYSIS_HEIGHT as f32;
+                (cx.clamp(0.0, 1.0), cy.clamp(0.0, 1.0))
+            })
+            .unwrap_or((0.5, 0.5));
+
+        let ollama = match &self.object_detector {
+            Some(DetectorBackend::Ollama(d)) => d,
+            _ => return,
+        };
+
+        let detections = match ollama.detect_grid(&frames, cx, cy) {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::warn!(
+                    camera = %self.camera_id,
+                    error = %e,
+                    "ollama detection error"
+                );
+                return;
+            }
+        };
+
+        if detections.is_empty() {
+            return;
+        }
+
+        tracing::debug!(
+            camera = %self.camera_id,
+            count = detections.len(),
+            classes = ?detections.iter().map(|d| &d.class_name).collect::<Vec<_>>(),
+            "ollama detections"
+        );
+
+        // Create a result and store it for the middle segment
+        let mid_seq = run[len / 2].seq;
+        let result = SegmentDetectionResult {
+            classes: detections.iter().map(|d| d.class_name.clone()).collect(),
+            confidences: detections.iter().map(|d| d.confidence).collect(),
+            centers: detections.iter().map(|d| (d.cx, d.cy)).collect(),
+            frame_jpeg: frame_jpeg.clone(),
+        };
+        self.store_detection_result(mid_seq, &result);
+
+        // Propagate to all segments in the run
+        for seg in &run {
+            if seg.seq == mid_seq {
+                continue;
+            }
+            let propagated = SegmentDetectionResult {
+                classes: result.classes.clone(),
+                confidences: result.confidences.clone(),
+                centers: result.centers.clone(),
+                frame_jpeg: frame_jpeg.clone(),
+            };
+            self.store_detection_result(seg.seq, &propagated);
+        }
     }
 
     fn detect_run(&mut self, run: Vec<MotionSegment>, crop_decoder: &CropDecoder) {
@@ -579,7 +726,7 @@ pub fn spawn_analyzer(
     buffer: Arc<RwLock<HotBuffer>>,
     motion_store: MotionStore,
     detection_store: Option<DetectionStore>,
-    object_detector: Option<ObjectDetector>,
+    object_detector: Option<DetectorBackend>,
     config: AnalyticsConfig,
     shutdown: Arc<AtomicBool>,
     detection_grid: Option<DetectionGrid>,
