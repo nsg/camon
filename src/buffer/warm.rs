@@ -258,6 +258,13 @@ async fn write_event(
                 duration_ms = duration_ms,
                 "wrote warm event file"
             );
+            if !object_classes.is_empty() {
+                let meta_path = file_path.with_extension("json");
+                let meta = serde_json::json!({ "classes": object_classes });
+                if let Err(e) = tokio::fs::write(&meta_path, meta.to_string()).await {
+                    tracing::warn!(error = %e, "failed to write event metadata");
+                }
+            }
             if let Some(index) = warm_index {
                 index.insert(
                     camera_id,

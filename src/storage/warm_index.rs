@@ -79,12 +79,13 @@ impl WarmEventIndex {
                         Err(_) => continue,
                     };
                     let file_size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+                    let object_classes = Self::load_classes(&path.with_extension("json"));
                     entries.push(WarmEventEntry {
                         start_pts_ns,
                         duration_ms,
                         event_type: *event_type,
                         file_size,
-                        object_classes: Vec::new(),
+                        object_classes,
                     });
                 }
             }
@@ -101,6 +102,25 @@ impl WarmEventIndex {
             elapsed_ms = start.elapsed().as_millis() as u64,
             "warm index scan complete"
         );
+    }
+
+    fn load_classes(path: &std::path::Path) -> Vec<String> {
+        let data = match std::fs::read_to_string(path) {
+            Ok(d) => d,
+            Err(_) => return Vec::new(),
+        };
+        let parsed: serde_json::Value = match serde_json::from_str(&data) {
+            Ok(v) => v,
+            Err(_) => return Vec::new(),
+        };
+        parsed["classes"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     pub fn insert(&self, camera_id: &str, entry: WarmEventEntry) {
@@ -187,6 +207,7 @@ impl WarmEventIndex {
                     deleted += 1;
                 }
                 let _ = tokio::fs::remove_file(&thumb).await;
+                let _ = tokio::fs::remove_file(&path.with_extension("json")).await;
             }
 
             {
