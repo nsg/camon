@@ -13,12 +13,13 @@ mod install;
 mod storage;
 mod update;
 
-use analytics::ObjectDetector;
+use analytics::{DetectorBackend, ObjectDetector, OllamaDetector};
 use api::AppState;
 use buffer::warm::WarmWriter;
 use buffer::HotBuffer;
 use camera::FfmpegPipeline;
 use config::Config;
+use config::DetectionBackend;
 use storage::{DetectionStore, MotionStore, WarmEventIndex};
 
 fn dispatch_subcommand() -> bool {
@@ -96,26 +97,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let motion_store = MotionStore::new(&camera_ids);
     let detection_store = DetectionStore::new(&camera_ids);
 
-    let object_detector = if config.analytics.enabled && config.analytics.object_detection.enabled {
-        match ObjectDetector::new(
-            &config.analytics.object_detection.model_path,
-            config.analytics.object_detection.confidence_threshold,
-            config.analytics.object_detection.classes.clone(),
-        ) {
-            Ok(detector) => {
+    let object_detection_ready = if config.analytics.enabled
+        && config.analytics.object_detection.enabled
+    {
+        let od = &config.analytics.object_detection;
+        match od.backend {
+            DetectionBackend::Onnx => match ObjectDetector::new(
+                &od.model_path,
+                od.confidence_threshold,
+                od.classes.clone(),
+            ) {
+                Ok(_) => {
+                    tracing::info!(model = %od.model_path, "object detector loaded (onnx)");
+                    true
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "failed to load onnx detector, continuing without it");
+                    false
+                }
+            },
+            DetectionBackend::Ollama => {
                 tracing::info!(
-                    model = %config.analytics.object_detection.model_path,
-                    "object detector loaded"
+                    url = %od.ollama.url,
+                    model = %od.ollama.model,
+                    "object detection configured (ollama)"
                 );
-                Some(Arc::new(detector))
-            }
-            Err(e) => {
-                tracing::error!(error = %e, "failed to load object detector, continuing without it");
-                None
+                true
             }
         }
     } else {
-        None
+        false
     };
 
     let warm_index = if config.storage.enabled {
@@ -178,20 +189,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         handles.push((camera_id.clone(), handle, Arc::clone(&buffer)));
 
         if config.analytics.enabled {
-            let det_store = if object_detector.is_some() {
+            let det_store = if object_detection_ready {
                 Some(detection_store.clone())
             } else {
                 None
             };
 
-            let obj_det = object_detector.as_ref().and_then(|_| {
-                ObjectDetector::new(
-                    &config.analytics.object_detection.model_path,
-                    config.analytics.object_detection.confidence_threshold,
-                    config.analytics.object_detection.classes.clone(),
-                )
-                .ok()
-            });
+            let obj_det = if object_detection_ready {
+                let od = &config.analytics.object_detection;
+                match od.backend {
+                    DetectionBackend::Onnx => ObjectDetector::new(
+                        &od.model_path,
+                        od.confidence_threshold,
+                        od.classes.clone(),
+                    )
+                    .ok()
+                    .map(DetectorBackend::Onnx),
+                    DetectionBackend::Ollama => OllamaDetector::new(
+                        &od.ollama.url,
+                        &od.ollama.model,
+                        od.confidence_threshold,
+                        od.classes.clone(),
+                    )
+                    .ok()
+                    .map(DetectorBackend::Ollama),
+                }
+            } else {
+                None
+            };
 
             let analyzer_handle = analytics::spawn_analyzer(
                 camera_id,

@@ -78,25 +78,64 @@ fn default_classes() -> Vec<String> {
     ]
 }
 
+fn default_ollama_url() -> String {
+    "http://localhost:11434".to_string()
+}
+
+fn default_ollama_model() -> String {
+    "gemma4:e4b".to_string()
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct OllamaConfig {
+    #[serde(default = "default_ollama_url")]
+    pub url: String,
+    #[serde(default = "default_ollama_model")]
+    pub model: String,
+}
+
+impl Default for OllamaConfig {
+    fn default() -> Self {
+        Self {
+            url: default_ollama_url(),
+            model: default_ollama_model(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct ObjectDetectionConfig {
     #[serde(default)]
     pub enabled: bool,
+    #[serde(default)]
+    pub backend: DetectionBackend,
     #[serde(default = "default_model_path")]
     pub model_path: String,
     #[serde(default = "default_confidence_threshold")]
     pub confidence_threshold: f32,
     #[serde(default = "default_classes")]
     pub classes: Vec<String>,
+    #[serde(default)]
+    pub ollama: OllamaConfig,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DetectionBackend {
+    #[default]
+    Onnx,
+    Ollama,
 }
 
 impl Default for ObjectDetectionConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            backend: DetectionBackend::default(),
             model_path: default_model_path(),
             confidence_threshold: default_confidence_threshold(),
             classes: default_classes(),
+            ollama: OllamaConfig::default(),
         }
     }
 }
