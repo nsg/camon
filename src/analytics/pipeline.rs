@@ -31,6 +31,13 @@ struct MotionSegment {
     duration_ns: u64,
 }
 
+struct PendingSegment {
+    seq: u64,
+    data: Vec<u8>,
+    start_pts: u64,
+    duration_ns: u64,
+}
+
 struct SegmentDetectionResult {
     classes: Vec<String>,
     confidences: Vec<f32>,
@@ -153,95 +160,116 @@ impl MotionAnalyzer {
             (buffer.first_sequence(), buffer.last_sequence())
         };
 
+        self.cleanup_old_data(first_seq);
+        let segments = self.collect_pending_segments(last_seq)?;
+        let motion_segments = self.run_motion_analysis(segments)?;
+
+        if let Err(e) = self.detector.maybe_tune() {
+            tracing::warn!(camera = %self.camera_id, error = %e, "tuner update failed");
+        }
+        if let Some(ref grid) = self.detection_grid {
+            grid.decay(&self.camera_id);
+        }
+
+        if !motion_segments.is_empty() {
+            self.run_sampled_detections(motion_segments);
+        }
+
+        Ok(())
+    }
+
+    fn cleanup_old_data(&mut self, first_seq: u64) {
         if first_seq > 0 {
             self.motion_store.cleanup(&self.camera_id, first_seq);
             if let Some(ref ds) = self.detection_store {
                 ds.cleanup(&self.camera_id, first_seq);
             }
         }
-
         if self.last_processed < first_seq {
             self.last_processed = first_seq;
         }
+    }
 
-        let mut segments_to_process = Vec::new();
+    fn collect_pending_segments(
+        &self,
+        last_seq: u64,
+    ) -> Result<Vec<PendingSegment>, Box<dyn std::error::Error + Send + Sync>> {
+        let mut segments = Vec::new();
         for seq in self.last_processed..last_seq {
             let segment = {
                 let buffer = self.buffer.read().map_err(|_| "buffer lock poisoned")?;
-                buffer
-                    .get_segment_by_sequence(seq)
-                    .map(|s| (seq, s.data.clone(), s.start_pts, s.duration_ns))
+                buffer.get_segment_by_sequence(seq).map(|s| PendingSegment {
+                    seq,
+                    data: s.data.clone(),
+                    start_pts: s.start_pts,
+                    duration_ns: s.duration_ns,
+                })
             };
             if let Some(seg) = segment {
-                segments_to_process.push(seg);
+                segments.push(seg);
             }
         }
+        Ok(segments)
+    }
 
+    fn run_motion_analysis(
+        &mut self,
+        segments: Vec<PendingSegment>,
+    ) -> Result<Vec<MotionSegment>, Box<dyn std::error::Error + Send + Sync>> {
         let has_detection = self.object_detector.is_some() && self.detection_store.is_some();
         let mut motion_segments = Vec::new();
 
-        // Phase 1: Motion analysis
-        for (seq, data, start_pts, duration_ns) in segments_to_process {
-            let score = self.analyze_segment(&data)?;
-
-            if let Some(jpeg) = self.detector.stability_map_jpeg() {
-                self.motion_store.set_stability_map(&self.camera_id, jpeg);
-            }
-            if let Some(jpeg) = self.detector.background_jpeg() {
-                self.motion_store.set_background_map(&self.camera_id, jpeg);
-            }
-            self.motion_store
-                .set_tuner_stats(&self.camera_id, self.detector.tuner_stats());
+        for seg in segments {
+            let score = self.analyze_segment(&seg.data)?;
+            self.publish_debug_maps();
 
             if score >= MOTION_THRESHOLD {
-                self.detector.report_motion_event();
-                let mask_jpeg = self.detector.fg_mask_jpeg();
-                self.motion_store.insert(
-                    &self.camera_id,
-                    MotionEntry {
-                        segment_sequence: seq,
-                        start_time_ns: start_pts,
-                        end_time_ns: start_pts + duration_ns,
-                        motion_score: score,
-                        mask_jpeg,
-                    },
-                );
-
-                tracing::debug!(
-                    camera = %self.camera_id,
-                    sequence = seq,
-                    score = format!("{:.3}", score),
-                    "motion detected"
-                );
-
+                self.record_motion(seg.seq, seg.start_pts, seg.duration_ns, score);
                 if has_detection {
                     motion_segments.push(MotionSegment {
-                        seq,
-                        data,
-                        duration_ns,
+                        seq: seg.seq,
+                        data: seg.data,
+                        duration_ns: seg.duration_ns,
                     });
                 }
             }
 
-            self.last_processed = seq + 1;
+            self.last_processed = seg.seq + 1;
         }
 
-        // Evaluate tuner every cycle (not just on motion events)
-        if let Err(e) = self.detector.maybe_tune() {
-            tracing::warn!(camera = %self.camera_id, error = %e, "tuner update failed");
-        }
+        Ok(motion_segments)
+    }
 
-        // Decay detection grid each cycle
-        if let Some(ref grid) = self.detection_grid {
-            grid.decay(&self.camera_id);
+    fn publish_debug_maps(&mut self) {
+        if let Some(jpeg) = self.detector.stability_map_jpeg() {
+            self.motion_store.set_stability_map(&self.camera_id, jpeg);
         }
-
-        // Phase 2: Sampled object detection
-        if !motion_segments.is_empty() {
-            self.run_sampled_detections(motion_segments);
+        if let Some(jpeg) = self.detector.background_jpeg() {
+            self.motion_store.set_background_map(&self.camera_id, jpeg);
         }
+        self.motion_store
+            .set_tuner_stats(&self.camera_id, self.detector.tuner_stats());
+    }
 
-        Ok(())
+    fn record_motion(&mut self, seq: u64, start_pts: u64, duration_ns: u64, score: f32) {
+        self.detector.report_motion_event();
+        let mask_jpeg = self.detector.fg_mask_jpeg();
+        self.motion_store.insert(
+            &self.camera_id,
+            MotionEntry {
+                segment_sequence: seq,
+                start_time_ns: start_pts,
+                end_time_ns: start_pts + duration_ns,
+                motion_score: score,
+                mask_jpeg,
+            },
+        );
+        tracing::debug!(
+            camera = %self.camera_id,
+            sequence = seq,
+            score = format!("{:.3}", score),
+            "motion detected"
+        );
     }
 
     fn analyze_segment(
