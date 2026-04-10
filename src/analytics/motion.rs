@@ -93,6 +93,7 @@ impl TunedParams {
             return Some(params);
         }
         // Migrate old format (morph_kernel_size: i32 → morph_kernel: f64)
+        // TODO: remove this migration in v0.1.15
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&data) {
             let params = Self {
                 var_threshold: v["var_threshold"].as_f64().unwrap_or(DEFAULT_VAR_THRESHOLD),
