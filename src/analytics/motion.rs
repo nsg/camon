@@ -456,8 +456,12 @@ impl MotionDetector {
 
     /// Report a motion event (segment above threshold). The tuner counts these
     /// as potential noise unless offset by `report_positive_detection`.
-    pub fn report_motion_event(&mut self) -> CvResult<()> {
+    pub fn report_motion_event(&mut self) {
         self.tuner.record_motion_event();
+    }
+
+    /// Evaluate tuner — must be called every analysis cycle regardless of motion.
+    pub fn maybe_tune(&mut self) -> CvResult<()> {
         if let Some(change) = self.tuner.maybe_tune() {
             self.apply_param_change(change)?;
         }

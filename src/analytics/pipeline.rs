@@ -207,9 +207,7 @@ impl MotionAnalyzer {
                 .set_tuner_stats(&self.camera_id, self.detector.tuner_stats());
 
             if score >= MOTION_THRESHOLD {
-                if let Err(e) = self.detector.report_motion_event() {
-                    tracing::warn!(camera = %self.camera_id, error = %e, "tuner update failed");
-                }
+                self.detector.report_motion_event();
                 let mask_jpeg = self.detector.fg_mask_jpeg();
                 self.motion_store.insert(
                     &self.camera_id,
@@ -239,6 +237,11 @@ impl MotionAnalyzer {
             }
 
             self.last_processed = seq + 1;
+        }
+
+        // Evaluate tuner every cycle (not just on motion events)
+        if let Err(e) = self.detector.maybe_tune() {
+            tracing::warn!(camera = %self.camera_id, error = %e, "tuner update failed");
         }
 
         // Decay detection grid each cycle
