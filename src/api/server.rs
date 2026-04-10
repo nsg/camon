@@ -207,27 +207,49 @@ async fn segment_handler(
     }
 }
 
+struct BufferContext {
+    first_sequence: u64,
+    total_duration: f64,
+}
+
+#[allow(clippy::result_large_err)]
+fn read_buffer_context<'a>(
+    state: &'a AppState,
+    id: &str,
+) -> Result<
+    (
+        std::sync::RwLockReadGuard<'a, crate::buffer::HotBuffer>,
+        BufferContext,
+    ),
+    Response,
+> {
+    let buffer = state
+        .buffers
+        .get(id)
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "camera not found").into_response())?;
+    let buf = buffer
+        .read()
+        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "buffer lock error").into_response())?;
+    let ctx = BufferContext {
+        first_sequence: buf.first_sequence(),
+        total_duration: buf.total_duration_ns() as f64 / 1_000_000_000.0,
+    };
+    Ok((buf, ctx))
+}
+
 async fn motion_handler(State(state): State<AppState>, Path(id): Path<String>) -> Response {
-    let buffer = match state.buffers.get(&id) {
-        Some(b) => b,
-        None => return (StatusCode::NOT_FOUND, "camera not found").into_response(),
+    let (buf, ctx) = match read_buffer_context(&state, &id) {
+        Ok(v) => v,
+        Err(r) => return r,
     };
-
-    let buf = match buffer.read() {
-        Ok(b) => b,
-        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "buffer lock error").into_response(),
-    };
-
-    let first_sequence = buf.first_sequence();
-    let total_duration = buf.total_duration_ns() as f64 / 1_000_000_000.0;
 
     let segments = state.motion_store.get_motion(&id);
 
     let response = MotionResponse {
-        total_duration,
+        total_duration: ctx.total_duration,
         segments: segments
             .iter()
-            .filter(|s| s.segment_sequence >= first_sequence)
+            .filter(|s| s.segment_sequence >= ctx.first_sequence)
             .filter_map(|s| {
                 let start_ns = buf.sequence_to_offset_ns(s.segment_sequence)?;
                 let start = start_ns as f64 / 1_000_000_000.0;
@@ -246,26 +268,18 @@ async fn motion_handler(State(state): State<AppState>, Path(id): Path<String>) -
 }
 
 async fn detections_handler(State(state): State<AppState>, Path(id): Path<String>) -> Response {
-    let buffer = match state.buffers.get(&id) {
-        Some(b) => b,
-        None => return (StatusCode::NOT_FOUND, "camera not found").into_response(),
+    let (buf, ctx) = match read_buffer_context(&state, &id) {
+        Ok(v) => v,
+        Err(r) => return r,
     };
-
-    let buf = match buffer.read() {
-        Ok(b) => b,
-        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "buffer lock error").into_response(),
-    };
-
-    let first_sequence = buf.first_sequence();
-    let total_duration = buf.total_duration_ns() as f64 / 1_000_000_000.0;
 
     let detections = state.detection_store.get_detections(&id);
 
     let response = DetectionResponse {
-        total_duration,
+        total_duration: ctx.total_duration,
         detections: detections
             .iter()
-            .filter(|d| d.segment_sequence >= first_sequence)
+            .filter(|d| d.segment_sequence >= ctx.first_sequence)
             .filter_map(|d| {
                 let offset_ns = buf.sequence_to_offset_ns(d.segment_sequence)?;
                 Some(DetectionItem {
