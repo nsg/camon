@@ -11,7 +11,7 @@ use opencv::prelude::*;
 use crate::analytics::detection_grid::DetectionGrid;
 use crate::buffer::HotBuffer;
 use crate::config::AnalyticsConfig;
-use crate::storage::{DetectionStore, MotionEntry, MotionStore};
+use crate::storage::{DetectionEntry, DetectionStore, MotionEntry, MotionStore};
 
 use super::decoder::{CropDecoder, FrameDecoder};
 use super::motion::MotionDetector;
@@ -349,7 +349,7 @@ impl MotionAnalyzer {
         }
 
         // Encode filmstrip JPEGs and store in detection store
-        let filmstrip_jpegs: Vec<Vec<u8>> = frames.iter().filter_map(|f| encode_jpeg(f)).collect();
+        let filmstrip_jpegs: Vec<Vec<u8>> = frames.iter().filter_map(encode_jpeg).collect();
         if let Some(ref ds) = self.detection_store {
             let filmstrip = Arc::new(filmstrip_jpegs.clone());
             for seg in &run {
@@ -466,12 +466,15 @@ impl MotionAnalyzer {
 
             detection_store.insert(
                 &self.camera_id,
-                seq,
-                class.clone(),
-                confidence,
-                result.frame_jpeg.clone(),
-                backend.clone(),
-                model.clone(),
+                DetectionEntry {
+                    id: detection_store.next_id(),
+                    segment_sequence: seq,
+                    object_class: class.clone(),
+                    confidence,
+                    frame_jpeg: result.frame_jpeg.clone(),
+                    backend: backend.clone(),
+                    model: model.clone(),
+                },
             );
             stored_any = true;
 

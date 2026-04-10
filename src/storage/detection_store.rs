@@ -2,6 +2,8 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
+type FilmstripMap = HashMap<u64, Arc<Vec<Vec<u8>>>>;
+
 pub struct DetectionEntry {
     pub id: u64,
     pub segment_sequence: u64,
@@ -28,7 +30,7 @@ pub struct DetectionInfo {
 
 pub struct DetectionStore {
     cameras: Arc<HashMap<String, RwLock<VecDeque<DetectionEntry>>>>,
-    filmstrips: Arc<HashMap<String, RwLock<HashMap<u64, Arc<Vec<Vec<u8>>>>>>>,
+    filmstrips: Arc<HashMap<String, RwLock<FilmstripMap>>>,
     next_id: Arc<AtomicU64>,
 }
 
@@ -47,29 +49,16 @@ impl DetectionStore {
         }
     }
 
-    pub fn insert(
-        &self,
-        camera_id: &str,
-        segment_sequence: u64,
-        object_class: String,
-        confidence: f32,
-        frame_jpeg: Vec<u8>,
-        backend: String,
-        model: String,
-    ) -> u64 {
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+    pub fn insert(&self, camera_id: &str, entry: DetectionEntry) -> u64 {
+        let id = entry.id;
         if let Some(lock) = self.cameras.get(camera_id) {
-            lock.write().unwrap().push_back(DetectionEntry {
-                id,
-                segment_sequence,
-                object_class,
-                confidence,
-                frame_jpeg,
-                backend,
-                model,
-            });
+            lock.write().unwrap().push_back(entry);
         }
         id
+    }
+
+    pub fn next_id(&self) -> u64 {
+        self.next_id.fetch_add(1, Ordering::Relaxed)
     }
 
     pub fn insert_filmstrip(&self, camera_id: &str, sequence: u64, frames: Arc<Vec<Vec<u8>>>) {

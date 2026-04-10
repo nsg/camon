@@ -112,7 +112,7 @@ impl OllamaDetector {
         let image_b64 = self.encode_frame(&grid)?;
 
         match self.call_server(&self.primary, &image_b64, cx, cy) {
-            Ok(detections) => return Ok(detections),
+            Ok(detections) => Ok(detections),
             Err(primary_err) => {
                 if let Some(ref fallback) = self.fallback {
                     tracing::warn!(
@@ -132,7 +132,7 @@ impl OllamaDetector {
                         }
                     }
                 }
-                return Err(primary_err);
+                Err(primary_err)
             }
         }
     }
