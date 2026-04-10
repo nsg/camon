@@ -258,14 +258,18 @@ impl MotionTuner {
     }
 
     fn relax(&mut self) -> bool {
+        const RELAX_DIVISOR: f64 = 6.0;
         let p = &mut self.params;
         let before = p.clone();
 
-        p.var_threshold = (p.var_threshold - VAR_THRESHOLD_INCREMENT).max(DEFAULT_VAR_THRESHOLD);
-        p.min_contour_area =
-            (p.min_contour_area - MIN_CONTOUR_AREA_INCREMENT).max(DEFAULT_MIN_CONTOUR_AREA);
-        p.morph_kernel = (p.morph_kernel - MORPH_KERNEL_INCREMENT).max(DEFAULT_MORPH_KERNEL);
-        p.learning_rate = (p.learning_rate - LEARNING_RATE_INCREMENT).max(DEFAULT_LEARNING_RATE);
+        p.var_threshold =
+            (p.var_threshold - VAR_THRESHOLD_INCREMENT / RELAX_DIVISOR).max(DEFAULT_VAR_THRESHOLD);
+        p.min_contour_area = (p.min_contour_area - MIN_CONTOUR_AREA_INCREMENT / RELAX_DIVISOR)
+            .max(DEFAULT_MIN_CONTOUR_AREA);
+        p.morph_kernel =
+            (p.morph_kernel - MORPH_KERNEL_INCREMENT / RELAX_DIVISOR).max(DEFAULT_MORPH_KERNEL);
+        p.learning_rate =
+            (p.learning_rate - LEARNING_RATE_INCREMENT / RELAX_DIVISOR).max(DEFAULT_LEARNING_RATE);
 
         if *p != before {
             tracing::info!(
