@@ -317,50 +317,26 @@ impl MpegTsSegmenter {
     }
 
     fn parse_pat(&mut self, packet: &[u8]) {
-        let payload_offset = if (packet[3] & 0x20) != 0 {
-            5 + packet[4] as usize
-        } else {
-            4
-        };
-
-        if payload_offset + 12 > 188 {
-            return;
-        }
-
-        let start = if (packet[1] & 0x40) != 0 {
-            payload_offset + 1 + packet[payload_offset] as usize
-        } else {
-            payload_offset
+        let start = match table_section_start(packet) {
+            Some(s) => s,
+            None => return,
         };
 
         if start + 12 > 188 {
             return;
         }
 
-        if start + 8 + 4 <= 188 {
-            let pmt_pid = ((packet[start + 10] as u16 & 0x1F) << 8) | packet[start + 11] as u16;
-            if pmt_pid != 0 && pmt_pid != 0x1FFF && self.pmt_pid.is_none() {
-                self.pmt_pid = Some(pmt_pid);
-                tracing::debug!(camera = %self.camera_id, pmt_pid, "detected PMT PID");
-            }
+        let pmt_pid = ((packet[start + 10] as u16 & 0x1F) << 8) | packet[start + 11] as u16;
+        if pmt_pid != 0 && pmt_pid != 0x1FFF && self.pmt_pid.is_none() {
+            self.pmt_pid = Some(pmt_pid);
+            tracing::debug!(camera = %self.camera_id, pmt_pid, "detected PMT PID");
         }
     }
 
     fn parse_pmt(&mut self, packet: &[u8]) {
-        let payload_offset = if (packet[3] & 0x20) != 0 {
-            5 + packet[4] as usize
-        } else {
-            4
-        };
-
-        if payload_offset >= 188 {
-            return;
-        }
-
-        let start = if (packet[1] & 0x40) != 0 && payload_offset < 188 {
-            payload_offset + 1 + packet[payload_offset] as usize
-        } else {
-            payload_offset
+        let start = match table_section_start(packet) {
+            Some(s) => s,
+            None => return,
         };
 
         if start + 12 > 188 {
@@ -394,6 +370,32 @@ impl MpegTsSegmenter {
             pos += 5 + es_info_len;
         }
     }
+}
+
+/// Compute the start of a PSI table section inside an MPEG-TS packet.
+/// Handles adaptation field and PUSI pointer field. Returns None if out of bounds.
+fn table_section_start(packet: &[u8]) -> Option<usize> {
+    let payload_offset = if (packet[3] & 0x20) != 0 {
+        5 + packet[4] as usize
+    } else {
+        4
+    };
+
+    if payload_offset >= 188 {
+        return None;
+    }
+
+    let start = if (packet[1] & 0x40) != 0 {
+        payload_offset + 1 + packet[payload_offset] as usize
+    } else {
+        payload_offset
+    };
+
+    if start + 12 > 188 {
+        return None;
+    }
+
+    Some(start)
 }
 
 /// Poll a file descriptor for readability with a timeout in milliseconds.
