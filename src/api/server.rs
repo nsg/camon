@@ -107,6 +107,7 @@ pub async fn start_server(state: AppState, port: u16) -> Result<(), std::io::Err
             "/api/cameras/{id}/detections/{detection_id}/frame",
             get(detection_frame_handler),
         )
+        .route("/api/cameras/{id}/hot-events", get(hot_events_handler))
         .route("/api/cameras/{id}/events", get(warm_events_handler))
         .route(
             "/api/cameras/{id}/events/{start_pts}/playlist.m3u8",
@@ -368,6 +369,82 @@ async fn detection_frame_handler(
         Some(frame) => ([(header::CONTENT_TYPE, "image/jpeg")], frame).into_response(),
         None => (StatusCode::NOT_FOUND, "detection not found").into_response(),
     }
+}
+
+// Hot event types and handler
+
+/// Gap threshold for grouping motion segments into hot events (nanoseconds).
+/// Segments with a gap larger than this are treated as separate events.
+const HOT_EVENT_GAP_NS: u64 = 10 * 1_000_000_000;
+
+#[derive(Serialize)]
+struct HotEventResponse {
+    offset_secs: f64,
+    duration_secs: f64,
+    ago_secs: f64,
+}
+
+async fn hot_events_handler(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+    let (buf, ctx) = match read_buffer_context(&state, &id) {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+
+    let motion = state.motion_store.get_motion(&id);
+
+    // Collect motion segments that are within the hot buffer, with their timeline offsets
+    let mut motion_spans: Vec<(f64, f64)> = motion
+        .iter()
+        .filter(|s| s.segment_sequence >= ctx.first_sequence)
+        .filter_map(|s| {
+            let start_ns = buf.sequence_to_offset_ns(s.segment_sequence)?;
+            let start = start_ns as f64 / 1_000_000_000.0;
+            let end = start + s.duration_ns as f64 / 1_000_000_000.0;
+            Some((start, end))
+        })
+        .collect();
+
+    motion_spans.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+
+    // Group into events using gap threshold
+    let gap_secs = HOT_EVENT_GAP_NS as f64 / 1_000_000_000.0;
+    let mut events: Vec<HotEventResponse> = Vec::new();
+
+    let mut event_start: Option<f64> = None;
+    let mut event_end: f64 = 0.0;
+
+    for (start, end) in &motion_spans {
+        match event_start {
+            None => {
+                event_start = Some(*start);
+                event_end = *end;
+            }
+            Some(_) => {
+                if *start - event_end <= gap_secs {
+                    event_end = end.max(event_end);
+                } else {
+                    let es = event_start.unwrap();
+                    events.push(HotEventResponse {
+                        offset_secs: es,
+                        duration_secs: event_end - es,
+                        ago_secs: ctx.total_duration - es,
+                    });
+                    event_start = Some(*start);
+                    event_end = *end;
+                }
+            }
+        }
+    }
+
+    if let Some(es) = event_start {
+        events.push(HotEventResponse {
+            offset_secs: es,
+            duration_secs: event_end - es,
+            ago_secs: ctx.total_duration - es,
+        });
+    }
+
+    axum::Json(events).into_response()
 }
 
 // Warm event types and handlers

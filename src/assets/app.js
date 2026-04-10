@@ -17,6 +17,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     const bgToggleBtn = document.getElementById('bg-toggle-btn');
     const gridToggleBtn = document.getElementById('grid-toggle-btn');
     const detectionGallery = document.getElementById('detection-gallery');
+    const hotEventsStrip = document.getElementById('hot-events-strip');
     const eventsSummaryBtn = document.getElementById('events-summary-btn');
     const eventsSummaryText = document.getElementById('events-summary-text');
     const detectionTooltip = document.getElementById('detection-tooltip');
@@ -77,6 +78,8 @@ document.addEventListener('DOMContentLoaded', async () => {
     let motionPollInterval = null;
     let detectionPollInterval = null;
     let warmEventPollInterval = null;
+    let hotEventPollInterval = null;
+    let hotEventsFetchedAt = 0;
     let stabilityPollInterval = null;
     let stabilityOverlayEnabled = false;
     let stabilityImage = null;
@@ -449,6 +452,7 @@ document.addEventListener('DOMContentLoaded', async () => {
 
             loadDetailCamera(cameraId);
             fetchWarmEvents(cameraId);
+            fetchHotEvents(cameraId);
         } else {
             // Returning from events/playback — just show the view
             updateEventsSummary();
@@ -514,10 +518,13 @@ document.addEventListener('DOMContentLoaded', async () => {
         if (motionPollInterval) { clearInterval(motionPollInterval); motionPollInterval = null; }
         if (detectionPollInterval) { clearInterval(detectionPollInterval); detectionPollInterval = null; }
         if (warmEventPollInterval) { clearInterval(warmEventPollInterval); warmEventPollInterval = null; }
+        if (hotEventPollInterval) { clearInterval(hotEventPollInterval); hotEventPollInterval = null; }
         if (stabilityPollInterval) { clearInterval(stabilityPollInterval); stabilityPollInterval = null; }
         if (detailHls) { detailHls.destroy(); detailHls = null; }
         detailVideo.src = '';
         currentDetections = [];
+        hotEventsStrip.innerHTML = '';
+        hotEventsFetchedAt = 0;
         currentDetailCameraId = null;
         bufferDuration = 0;
         warmEvents = [];
@@ -1104,6 +1111,76 @@ document.addEventListener('DOMContentLoaded', async () => {
             });
             detectionGallery.appendChild(card);
         });
+    }
+
+    // === Live Monitor: Hot Events Strip ===
+
+    async function fetchHotEvents(cameraId) {
+        if (hotEventPollInterval) clearInterval(hotEventPollInterval);
+
+        async function poll() {
+            try {
+                const response = await fetch(`/api/cameras/${encodeURIComponent(cameraId)}/hot-events`);
+                if (currentDetailCameraId !== cameraId) return;
+                if (response.ok) {
+                    const events = await response.json();
+                    hotEventsFetchedAt = Date.now() / 1000;
+                    renderHotEvents(events);
+                }
+            } catch (err) {
+                console.error('Failed to fetch hot events:', err);
+            }
+        }
+
+        await poll();
+        hotEventPollInterval = setInterval(poll, 5000);
+    }
+
+    function renderHotEvents(events) {
+        hotEventsStrip.innerHTML = '';
+        if (events.length === 0) return;
+
+        events.forEach(ev => {
+            const card = document.createElement('div');
+            card.className = 'hot-event-card';
+
+            const agoText = formatAgo(ev.ago_secs);
+            const durText = formatDurationShort(ev.duration_secs);
+
+            card.innerHTML = `
+                <span class="hot-event-ago">${agoText}</span>
+                <span class="hot-event-dur">${durText}</span>
+            `;
+
+            card.addEventListener('click', () => {
+                seekLiveByAgo(ev.ago_secs);
+            });
+
+            hotEventsStrip.appendChild(card);
+        });
+    }
+
+    function formatAgo(secs) {
+        if (secs < 60) return `${Math.round(secs)}s ago`;
+        if (secs < 3600) return `${Math.round(secs / 60)}m ago`;
+        return `${Math.round(secs / 3600)}h ago`;
+    }
+
+    function formatDurationShort(secs) {
+        if (secs < 1) return '<1s';
+        if (secs < 60) return `${Math.round(secs)}s`;
+        const m = Math.floor(secs / 60);
+        const s = Math.round(secs % 60);
+        return s > 0 ? `${m}m ${s}s` : `${m}m`;
+    }
+
+    function seekLiveByAgo(agoAtFetch) {
+        const seekable = detailVideo.seekable;
+        if (seekable.length === 0) return;
+        const end = seekable.end(seekable.length - 1);
+        const elapsed = Date.now() / 1000 - hotEventsFetchedAt;
+        detailVideo.currentTime = end - (agoAtFetch + elapsed);
+        setLiveEdge(false);
     }
 
     function updateEventsSummary() {
