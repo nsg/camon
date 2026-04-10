@@ -334,49 +334,32 @@ impl MotionAnalyzer {
             return;
         }
 
-        // Encode filmstrip JPEGs and store in detection store
         let filmstrip_jpegs: Vec<Vec<u8>> = frames.iter().filter_map(encode_jpeg).collect();
-        if let Some(ref ds) = self.detection_store {
-            let filmstrip = Arc::new(filmstrip_jpegs.clone());
-            for seg in &run {
-                ds.insert_filmstrip(&self.camera_id, seg.seq, Arc::clone(&filmstrip));
-            }
-        }
+        self.store_filmstrip_for_run(&run, &filmstrip_jpegs);
 
-        // Get motion position from bbox
-        let (cx, cy) = self
-            .last_motion_bbox
-            .map(|bbox| {
-                let cx = (bbox.x as f32 + bbox.width as f32 / 2.0) / ANALYSIS_WIDTH as f32;
-                let cy = (bbox.y as f32 + bbox.height as f32 / 2.0) / ANALYSIS_HEIGHT as f32;
-                (cx.clamp(0.0, 1.0), cy.clamp(0.0, 1.0))
-            })
-            .unwrap_or((0.5, 0.5));
-
+        let (cx, cy) = bbox_center(self.last_motion_bbox);
         let (detections, best_frame_idx) = self.detect_ollama(&frames, cx, cy);
-
         if detections.is_empty() {
             return;
         }
 
-        // Use the best frame's JPEG as the detection thumbnail
-        let frame_jpeg = filmstrip_jpegs
-            .get(best_frame_idx)
-            .cloned()
-            .or_else(|| filmstrip_jpegs.first().cloned())
-            .unwrap_or_default();
+        let result = build_detection_result(&detections, &filmstrip_jpegs, best_frame_idx);
+        self.propagate_detection(&run, &result);
+    }
 
-        let result = SegmentDetectionResult {
-            classes: detections.iter().map(|d| d.class_name.clone()).collect(),
-            confidences: detections.iter().map(|d| d.confidence).collect(),
-            centers: detections.iter().map(|d| (d.cx, d.cy)).collect(),
-            frame_jpeg,
-        };
+    fn store_filmstrip_for_run(&self, run: &[MotionSegment], jpegs: &[Vec<u8>]) {
+        if let Some(ref ds) = self.detection_store {
+            let filmstrip = Arc::new(jpegs.to_vec());
+            for seg in run {
+                ds.insert_filmstrip(&self.camera_id, seg.seq, Arc::clone(&filmstrip));
+            }
+        }
+    }
 
-        // Store for all segments in the run
+    fn propagate_detection(&mut self, run: &[MotionSegment], result: &SegmentDetectionResult) {
         let mid_seq = run[run.len() / 2].seq;
-        self.store_detection_result(mid_seq, &result);
-        for seg in &run {
+        self.store_detection_result(mid_seq, result);
+        for seg in run {
             if seg.seq == mid_seq {
                 continue;
             }
@@ -476,6 +459,34 @@ impl MotionAnalyzer {
         if stored_any {
             self.detector.report_positive_detection();
         }
+    }
+}
+
+fn bbox_center(bbox: Option<Rect>) -> (f32, f32) {
+    bbox.map(|b| {
+        let cx = (b.x as f32 + b.width as f32 / 2.0) / ANALYSIS_WIDTH as f32;
+        let cy = (b.y as f32 + b.height as f32 / 2.0) / ANALYSIS_HEIGHT as f32;
+        (cx.clamp(0.0, 1.0), cy.clamp(0.0, 1.0))
+    })
+    .unwrap_or((0.5, 0.5))
+}
+
+fn build_detection_result(
+    detections: &[Detection],
+    filmstrip_jpegs: &[Vec<u8>],
+    best_frame_idx: usize,
+) -> SegmentDetectionResult {
+    let frame_jpeg = filmstrip_jpegs
+        .get(best_frame_idx)
+        .cloned()
+        .or_else(|| filmstrip_jpegs.first().cloned())
+        .unwrap_or_default();
+
+    SegmentDetectionResult {
+        classes: detections.iter().map(|d| d.class_name.clone()).collect(),
+        confidences: detections.iter().map(|d| d.confidence).collect(),
+        centers: detections.iter().map(|d| (d.cx, d.cy)).collect(),
+        frame_jpeg,
     }
 }
 
