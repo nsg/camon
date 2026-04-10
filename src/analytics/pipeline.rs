@@ -11,11 +11,13 @@ use opencv::prelude::*;
 use crate::analytics::detection_grid::DetectionGrid;
 use crate::buffer::HotBuffer;
 use crate::config::AnalyticsConfig;
-use crate::storage::{DetectionEntry, DetectionStore, MotionEntry, MotionStore};
+use crate::storage::{
+    DetectionDebugStore, DetectionEntry, DetectionStore, MotionEntry, MotionStore,
+};
 
 use super::decoder::{CropDecoder, FrameDecoder};
 use super::motion::MotionDetector;
-use super::ollama::{Detection, OllamaDetector};
+use super::ollama::{DetectGridResult, Detection, OllamaDetector};
 
 const ANALYSIS_WIDTH: i32 = 320;
 const ANALYSIS_HEIGHT: i32 = 240;
@@ -50,6 +52,7 @@ pub struct AnalyzerContext {
     pub buffer: Arc<RwLock<HotBuffer>>,
     pub motion_store: MotionStore,
     pub detection_store: Option<DetectionStore>,
+    pub debug_store: Option<DetectionDebugStore>,
     pub object_detector: Option<OllamaDetector>,
     pub config: AnalyticsConfig,
     pub detection_grid: Option<DetectionGrid>,
@@ -61,6 +64,7 @@ pub struct MotionAnalyzer {
     buffer: Arc<RwLock<HotBuffer>>,
     motion_store: MotionStore,
     detection_store: Option<DetectionStore>,
+    debug_store: Option<DetectionDebugStore>,
     config: AnalyticsConfig,
     detector: MotionDetector,
     decoder: FrameDecoder,
@@ -87,6 +91,7 @@ impl MotionAnalyzer {
             buffer: ctx.buffer,
             motion_store: ctx.motion_store,
             detection_store: ctx.detection_store,
+            debug_store: ctx.debug_store,
             config: ctx.config,
             detector,
             decoder,
@@ -423,8 +428,8 @@ impl MotionAnalyzer {
             None => return (Vec::new(), 0),
         };
 
-        let detections = match ollama.detect_grid(frames, cx, cy) {
-            Ok(d) => d,
+        let result: DetectGridResult = match ollama.detect_grid(frames, cx, cy) {
+            Ok(r) => r,
             Err(e) => {
                 tracing::warn!(
                     camera = %self.camera_id,
@@ -435,18 +440,31 @@ impl MotionAnalyzer {
             }
         };
 
-        if !detections.is_empty() {
+        // Store debug entry regardless of detection outcome
+        if let Some(ref debug_store) = self.debug_store {
+            if !result.grid_jpeg.is_empty() {
+                debug_store.insert(
+                    &self.camera_id,
+                    result.grid_jpeg,
+                    result.raw_response,
+                    result.model,
+                    result.detections.len(),
+                );
+            }
+        }
+
+        if !result.detections.is_empty() {
             tracing::debug!(
                 camera = %self.camera_id,
-                count = detections.len(),
-                classes = ?detections.iter().map(|d| &d.class_name).collect::<Vec<_>>(),
+                count = result.detections.len(),
+                classes = ?result.detections.iter().map(|d| &d.class_name).collect::<Vec<_>>(),
                 "ollama detections"
             );
         }
 
         // Use second frame (index 1) as thumbnail — inner frame
         let best_idx = if frames.len() > 1 { 1 } else { 0 };
-        (detections, best_idx)
+        (result.detections, best_idx)
     }
 
     fn store_detection_result(&mut self, seq: u64, result: &SegmentDetectionResult) {

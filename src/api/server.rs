@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::analytics::detection_grid::DetectionGrid;
 use crate::buffer::HotBuffer;
-use crate::storage::{DetectionStore, MotionStore, WarmEventIndex};
+use crate::storage::{DetectionDebugStore, DetectionStore, MotionStore, WarmEventIndex};
 
 use super::hls;
 
@@ -24,6 +24,7 @@ pub struct AppState {
     pub buffers: Arc<HashMap<String, Arc<RwLock<HotBuffer>>>>,
     pub motion_store: MotionStore,
     pub detection_store: DetectionStore,
+    pub debug_store: DetectionDebugStore,
     pub warm_index: Option<WarmEventIndex>,
     pub detection_grid: Option<DetectionGrid>,
 }
@@ -33,6 +34,7 @@ impl AppState {
         buffers: HashMap<String, Arc<RwLock<HotBuffer>>>,
         motion_store: MotionStore,
         detection_store: DetectionStore,
+        debug_store: DetectionDebugStore,
         warm_index: Option<WarmEventIndex>,
         detection_grid: Option<DetectionGrid>,
     ) -> Self {
@@ -40,6 +42,7 @@ impl AppState {
             buffers: Arc::new(buffers),
             motion_store,
             detection_store,
+            debug_store,
             warm_index,
             detection_grid,
         }
@@ -124,6 +127,14 @@ pub async fn start_server(state: AppState, port: u16) -> Result<(), std::io::Err
         .route(
             "/api/cameras/{id}/events/{start_pts}/filmstrip/{index}",
             get(warm_filmstrip_handler),
+        )
+        .route(
+            "/api/cameras/{id}/detection-debug",
+            get(detection_debug_handler),
+        )
+        .route(
+            "/api/cameras/{id}/detection-debug/{debug_id}/grid",
+            get(detection_debug_grid_handler),
         )
         .route("/api/stream/{id}/playlist.m3u8", get(playlist_handler))
         .route("/api/stream/{id}/segment/{n}", get(segment_handler))
@@ -666,6 +677,55 @@ async fn warm_thumbnail_handler(
             "failed to read thumbnail",
         )
             .into_response(),
+    }
+}
+
+// Detection debug handlers
+
+#[derive(Serialize)]
+struct DebugEntryResponse {
+    id: u64,
+    timestamp: u64,
+    raw_response: String,
+    model: String,
+    detection_count: usize,
+}
+
+async fn detection_debug_handler(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Response {
+    if !state.buffers.contains_key(&id) {
+        return (StatusCode::NOT_FOUND, "camera not found").into_response();
+    }
+
+    let entries: Vec<DebugEntryResponse> = state
+        .debug_store
+        .list(&id)
+        .into_iter()
+        .map(|e| DebugEntryResponse {
+            id: e.id,
+            timestamp: e.timestamp,
+            raw_response: e.raw_response,
+            model: e.model,
+            detection_count: e.detection_count,
+        })
+        .collect();
+
+    axum::Json(entries).into_response()
+}
+
+async fn detection_debug_grid_handler(
+    State(state): State<AppState>,
+    Path((id, debug_id)): Path<(String, u64)>,
+) -> Response {
+    if !state.buffers.contains_key(&id) {
+        return (StatusCode::NOT_FOUND, "camera not found").into_response();
+    }
+
+    match state.debug_store.get_grid_jpeg(&id, debug_id) {
+        Some(jpeg) => ([(header::CONTENT_TYPE, "image/jpeg")], jpeg).into_response(),
+        None => (StatusCode::NOT_FOUND, "debug entry not found").into_response(),
     }
 }
 

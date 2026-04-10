@@ -19,7 +19,7 @@ use buffer::warm::WarmWriter;
 use buffer::HotBuffer;
 use camera::FfmpegPipeline;
 use config::Config;
-use storage::{DetectionStore, MotionStore, WarmEventIndex};
+use storage::{DetectionDebugStore, DetectionStore, MotionStore, WarmEventIndex};
 
 fn dispatch_subcommand() -> bool {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -155,6 +155,7 @@ struct SpawnContext<'a> {
     config: &'a Config,
     motion_store: &'a MotionStore,
     detection_store: &'a DetectionStore,
+    debug_store: &'a DetectionDebugStore,
     warm_index: &'a Option<WarmEventIndex>,
     detection_grid: &'a Option<analytics::detection_grid::DetectionGrid>,
     object_detection_ready: bool,
@@ -206,6 +207,11 @@ fn spawn_cameras(ctx: &SpawnContext, cameras: Vec<config::CameraConfig>) -> Came
             } else {
                 None
             };
+            let dbg_store = if ctx.object_detection_ready {
+                Some(ctx.debug_store.clone())
+            } else {
+                None
+            };
             let obj_det = if ctx.object_detection_ready {
                 create_object_detector(ctx.config)
             } else {
@@ -218,6 +224,7 @@ fn spawn_cameras(ctx: &SpawnContext, cameras: Vec<config::CameraConfig>) -> Came
                     buffer,
                     motion_store: ctx.motion_store.clone(),
                     detection_store: det_store,
+                    debug_store: dbg_store,
                     object_detector: obj_det,
                     config: ctx.config.analytics.clone(),
                     detection_grid: ctx.detection_grid.clone(),
@@ -296,6 +303,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let camera_ids: Vec<String> = config.cameras.iter().map(|c| c.id.clone()).collect();
     let motion_store = MotionStore::new(&camera_ids);
     let detection_store = DetectionStore::new(&camera_ids);
+    let debug_store = DetectionDebugStore::new(&camera_ids);
     let object_detection_ready = log_object_detection_config(&config);
     let warm_index = init_warm_index(&config, &camera_ids);
     let detection_grid = init_detection_grid(&config, &camera_ids);
@@ -305,6 +313,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config: &config,
         motion_store: &motion_store,
         detection_store: &detection_store,
+        debug_store: &debug_store,
         warm_index: &warm_index,
         detection_grid: &detection_grid,
         object_detection_ready,
@@ -316,6 +325,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         camera_handles.buffers_map.clone(),
         motion_store,
         detection_store,
+        debug_store,
         warm_index,
         detection_grid,
     );

@@ -45,6 +45,15 @@ document.addEventListener('DOMContentLoaded', async () => {
     const eventList = document.getElementById('event-list');
     const filterBtns = document.querySelectorAll('.filter-btn');
 
+    // View 4: Detection Debug
+    const debugView = document.getElementById('debug-view');
+    const debugBackBtn = document.getElementById('debug-back-btn');
+    const debugCameraName = document.getElementById('debug-camera-name');
+    const debugList = document.getElementById('debug-list');
+    const debugEmpty = document.getElementById('debug-empty');
+    const debugLinkBtn = document.getElementById('debug-link-btn');
+    let debugPollInterval = null;
+
     // View 3: Event Playback
     const playbackView = document.getElementById('playback-view');
     const playbackBackBtn = document.getElementById('playback-back-btn');
@@ -165,6 +174,21 @@ document.addEventListener('DOMContentLoaded', async () => {
                 if (currentView !== targetView) {
                     const isBack = currentView && currentView.startsWith('playback:');
                     withViewTransition(() => showPlaybackView(cameraId, pts), isBack);
+                    currentView = targetView;
+                }
+                return;
+            }
+        }
+
+        // #/camera/{id}/debug
+        const debugMatch = hash.match(/^#\/camera\/(.+)\/debug$/);
+        if (debugMatch) {
+            const cameraId = decodeURIComponent(debugMatch[1]);
+            if (cameras.includes(cameraId)) {
+                const targetView = `debug:${cameraId}`;
+                if (currentView !== targetView) {
+                    const isBack = false;
+                    withViewTransition(() => showDebugView(cameraId), isBack);
                     currentView = targetView;
                 }
                 return;
@@ -402,6 +426,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         liveView.hidden = true;
         eventsView.hidden = true;
         playbackView.hidden = true;
+        debugView.hidden = true;
     }
 
     function showGridView() {
@@ -965,7 +990,7 @@ document.addEventListener('DOMContentLoaded', async () => {
             { label: 'var_threshold', value: d.var_threshold, def: defaults.var_threshold, fmt: v => `${v}` },
             { label: 'learning_rate', value: d.learning_rate, def: defaults.learning_rate, fmt: v => v.toFixed(4) },
             { label: 'morph_kernel', value: d.morph_kernel, def: defaults.morph_kernel, fmt: v => v.toFixed(1) },
-            { label: 'min_contour_area', value: d.min_contour_area, def: defaults.min_contour_area, fmt: v => `${v}` },
+            { label: 'min_contour_area', value: d.min_contour_area, def: defaults.min_contour_area, fmt: v => v.toFixed(1) },
             { label: 'noise_events', value: d.noise_events, def: null, fmt: v => `${v}` },
             { label: 'quiet_windows', value: d.quiet_windows, def: null, fmt: v => `${v}` },
         ];
@@ -1367,6 +1392,83 @@ document.addEventListener('DOMContentLoaded', async () => {
         } else {
             nextEventBtn.hidden = true;
         }
+    }
+
+    // === Detection Debug ===
+
+    debugBackBtn.addEventListener('click', () => {
+        window.location.hash = `/camera/${encodeURIComponent(currentDetailCameraId)}`;
+    });
+
+    debugLinkBtn.addEventListener('click', () => {
+        window.location.hash = `/camera/${encodeURIComponent(currentDetailCameraId)}/debug`;
+    });
+
+    function showDebugView(cameraId) {
+        cleanupLiveView();
+        cleanupPlaybackView();
+        cleanupDebugView();
+        hideAllViews();
+        debugView.hidden = false;
+        debugCameraName.textContent = `${cameraId} — Detection Debug`;
+        currentDetailCameraId = cameraId;
+        fetchDebugEntries(cameraId);
+        debugPollInterval = setInterval(() => fetchDebugEntries(cameraId), 5000);
+    }
+
+    function cleanupDebugView() {
+        if (debugPollInterval) {
+            clearInterval(debugPollInterval);
+            debugPollInterval = null;
+        }
+    }
+
+    async function fetchDebugEntries(cameraId) {
+        try {
+            const res = await fetch(`/api/cameras/${encodeURIComponent(cameraId)}/detection-debug`);
+            if (!res.ok) return;
+            const entries = await res.json();
+            renderDebugList(cameraId, entries);
+        } catch (e) {
+            console.error('Failed to fetch debug entries:', e);
+        }
+    }
+
+    function renderDebugList(cameraId, entries) {
+        if (entries.length === 0) {
+            debugList.innerHTML = '';
+            debugEmpty.hidden = false;
+            return;
+        }
+        debugEmpty.hidden = true;
+
+        // Show newest first
+        const reversed = [...entries].reverse();
+        const encodedId = encodeURIComponent(cameraId);
+
+        debugList.innerHTML = reversed.map(entry => {
+            const date = new Date(entry.timestamp * 1000);
+            const timeStr = date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+            const escapedResponse = entry.raw_response
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;');
+            const detectionBadge = entry.detection_count > 0
+                ? `<span class="debug-badge positive">${entry.detection_count} detection${entry.detection_count !== 1 ? 's' : ''}</span>`
+                : '<span class="debug-badge none">no detections</span>';
+
+            return `<div class="debug-entry">
+                <div class="debug-entry-header">
+                    <span class="debug-time">${timeStr}</span>
+                    <span class="debug-model">${entry.model}</span>
+                    ${detectionBadge}
+                </div>
+                <div class="debug-entry-body">
+                    <img class="debug-grid-image" src="/api/cameras/${encodedId}/detection-debug/${entry.id}/grid" alt="Grid sent to model" loading="lazy">
+                    <pre class="debug-raw-response">${escapedResponse || '(empty response)'}</pre>
+                </div>
+            </div>`;
+        }).join('');
     }
 
     // === Utility ===

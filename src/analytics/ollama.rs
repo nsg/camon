@@ -13,6 +13,14 @@ pub struct Detection {
     pub cy: f32,
 }
 
+/// Full result from a detect_grid call, including debug information.
+pub struct DetectGridResult {
+    pub detections: Vec<Detection>,
+    pub grid_jpeg: Vec<u8>,
+    pub raw_response: String,
+    pub model: String,
+}
+
 const DETECT_PROMPT: &str = "This image is a 2x2 grid of 4 frames from a security camera, \
 showing a motion event over time (top-left is earliest, bottom-right is latest). \
 List every noteworthy object you see (person, car, truck, dog, cat, bird, bicycle, motorcycle, bus, boat). \
@@ -103,16 +111,27 @@ impl OllamaDetector {
         frames: &[opencv::core::Mat],
         cx: f32,
         cy: f32,
-    ) -> Result<Vec<Detection>, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<DetectGridResult, Box<dyn std::error::Error + Send + Sync>> {
         if frames.is_empty() {
-            return Ok(Vec::new());
+            return Ok(DetectGridResult {
+                detections: Vec::new(),
+                grid_jpeg: Vec::new(),
+                raw_response: String::new(),
+                model: self.primary.model.clone(),
+            });
         }
 
         let grid = self.stitch_grid(frames)?;
-        let image_b64 = self.encode_frame(&grid)?;
+        let grid_jpeg = self.encode_frame_jpeg(&grid)?;
+        let image_b64 = base64::engine::general_purpose::STANDARD.encode(&grid_jpeg);
 
         match self.call_server(&self.primary, &image_b64, cx, cy) {
-            Ok(detections) => Ok(detections),
+            Ok((detections, raw_response, model)) => Ok(DetectGridResult {
+                detections,
+                grid_jpeg,
+                raw_response,
+                model,
+            }),
             Err(primary_err) => {
                 if let Some(ref fallback) = self.fallback {
                     tracing::warn!(
@@ -124,7 +143,14 @@ impl OllamaDetector {
                         "primary ollama failed, trying fallback"
                     );
                     match self.call_server(fallback, &image_b64, cx, cy) {
-                        Ok(detections) => return Ok(detections),
+                        Ok((detections, raw_response, model)) => {
+                            return Ok(DetectGridResult {
+                                detections,
+                                grid_jpeg,
+                                raw_response,
+                                model,
+                            })
+                        }
                         Err(fallback_err) => {
                             return Err(format!(
                                 "both ollama servers failed — primary: {primary_err}, fallback: {fallback_err}"
@@ -143,7 +169,7 @@ impl OllamaDetector {
         image_b64: &str,
         cx: f32,
         cy: f32,
-    ) -> Result<Vec<Detection>, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<(Vec<Detection>, String, String), Box<dyn std::error::Error + Send + Sync>> {
         let request = ChatRequest {
             model: server.model.clone(),
             messages: vec![Message {
@@ -167,8 +193,9 @@ impl OllamaDetector {
 
         let chat_response: ChatResponse = self.rt.block_on(response.json())?;
         let content = chat_response.message.map(|m| m.content).unwrap_or_default();
+        let detections = self.parse_response(&content, cx, cy);
 
-        Ok(self.parse_response(&content, cx, cy))
+        Ok((detections, content, server.model.clone()))
     }
 
     fn stitch_grid(
@@ -207,14 +234,14 @@ impl OllamaDetector {
         Ok(grid)
     }
 
-    fn encode_frame(
+    fn encode_frame_jpeg(
         &self,
         frame: &opencv::core::Mat,
-    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
         let mut buf = Vector::<u8>::new();
         let params = Vector::<i32>::new();
         imgcodecs::imencode(".jpg", frame, &mut buf, &params)?;
-        Ok(base64::engine::general_purpose::STANDARD.encode(buf.to_vec()))
+        Ok(buf.to_vec())
     }
 
     fn parse_response(&self, content: &str, cx: f32, cy: f32) -> Vec<Detection> {
