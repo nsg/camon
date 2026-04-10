@@ -533,6 +533,20 @@ main {
     flex-shrink: 0;
 }
 
+.event-filmstrip {
+    display: flex;
+    gap: 2px;
+    flex-shrink: 0;
+}
+
+.filmstrip-frame {
+    width: 58px;
+    height: 34px;
+    object-fit: cover;
+    border-radius: 2px;
+    background: #000;
+}
+
 .event-list-info {
     flex: 1;
     min-width: 0;

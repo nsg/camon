@@ -1201,11 +1201,23 @@ document.addEventListener('DOMContentLoaded', async () => {
                 const typeLabel = ev.event_type === 'object' ? 'Object detected' : 'Movement';
                 const typeClass = ev.event_type === 'object' ? 'object' : 'movement';
 
+                let thumbHtml;
+                if (ev.has_filmstrip) {
+                    const cid = encodeURIComponent(currentDetailCameraId);
+                    thumbHtml = `<div class="event-filmstrip">` +
+                        [0,1,2,3].map(i => `<img class="filmstrip-frame" src="/api/cameras/${cid}/events/${ev.start_pts_ns}/filmstrip/${i}" loading="lazy" alt="">`).join('') +
+                        `</div>`;
+                } else {
+                    thumbHtml = `<img class="event-list-thumb" src="${thumbSrc}" loading="lazy" alt="">`;
+                }
+
+                const detailText = ev.event_type === 'object' && ev.object_classes ? ev.object_classes.join(', ') : '';
+
                 item.innerHTML = `
-                    <img class="event-list-thumb" src="${thumbSrc}" loading="lazy" alt="">
+                    ${thumbHtml}
                     <div class="event-list-info">
                         <div class="event-list-type ${typeClass}">${typeLabel}</div>
-                        <div class="event-list-detail">${ev.event_type === 'object' && ev.object_classes ? ev.object_classes.join(', ') : ''}</div>
+                        <div class="event-list-detail">${detailText}</div>
                     </div>
                     <div class="event-list-meta">
                         <div class="event-list-time">${timeStr}</div>

@@ -120,6 +120,10 @@ pub async fn start_server(state: AppState, port: u16) -> Result<(), std::io::Err
             "/api/cameras/{id}/events/{start_pts}/thumbnail",
             get(warm_thumbnail_handler),
         )
+        .route(
+            "/api/cameras/{id}/events/{start_pts}/filmstrip/{index}",
+            get(warm_filmstrip_handler),
+        )
         .route("/api/stream/{id}/playlist.m3u8", get(playlist_handler))
         .route("/api/stream/{id}/segment/{n}", get(segment_handler))
         .with_state(state);
@@ -361,12 +365,25 @@ struct EventsQuery {
 }
 
 #[derive(Serialize)]
+struct ObjectClassResponse {
+    class: String,
+    confidence: f32,
+}
+
+#[derive(Serialize)]
 struct WarmEventResponse {
     start_pts_ns: String,
     duration_ms: u32,
     event_type: String,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     object_classes: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    backend: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    detections: Vec<ObjectClassResponse>,
+    has_filmstrip: bool,
 }
 
 async fn warm_events_handler(
@@ -397,6 +414,17 @@ async fn warm_events_handler(
                 crate::storage::EventType::Object => "object".to_string(),
             },
             object_classes: e.object_classes.clone(),
+            backend: e.backend.clone(),
+            model: e.model.clone(),
+            detections: e
+                .detections
+                .iter()
+                .map(|d| ObjectClassResponse {
+                    class: d.class.clone(),
+                    confidence: d.confidence,
+                })
+                .collect(),
+            has_filmstrip: e.has_filmstrip,
         })
         .collect();
 
@@ -551,5 +579,52 @@ async fn warm_thumbnail_handler(
             "failed to read thumbnail",
         )
             .into_response(),
+    }
+}
+
+async fn warm_filmstrip_handler(
+    State(state): State<AppState>,
+    Path((id, start_pts_str, index)): Path<(String, String, u8)>,
+) -> Response {
+    let index_val = match &state.warm_index {
+        Some(idx) => idx,
+        None => return (StatusCode::NOT_FOUND, "warm storage not enabled").into_response(),
+    };
+
+    if !state.buffers.contains_key(&id) {
+        return (StatusCode::NOT_FOUND, "camera not found").into_response();
+    }
+
+    if index > 3 {
+        return (StatusCode::BAD_REQUEST, "index must be 0-3").into_response();
+    }
+
+    let start_pts_ns: u64 = match start_pts_str.parse() {
+        Ok(v) => v,
+        Err(_) => return (StatusCode::BAD_REQUEST, "invalid start_pts").into_response(),
+    };
+
+    let entry = match index_val.find_event(&id, start_pts_ns) {
+        Some(e) => e,
+        None => return (StatusCode::NOT_FOUND, "event not found").into_response(),
+    };
+
+    let ts_path = index_val.resolve_file_path(&id, &entry);
+    let stem = format!("{}_{}", entry.start_pts_ns, entry.duration_ms);
+    let thumb_path = ts_path
+        .parent()
+        .unwrap()
+        .join(format!("{}_thumb_{}.jpg", stem, index));
+
+    match tokio::fs::read(&thumb_path).await {
+        Ok(data) => (
+            [
+                (header::CONTENT_TYPE, "image/jpeg"),
+                (header::CACHE_CONTROL, "public, max-age=86400"),
+            ],
+            data,
+        )
+            .into_response(),
+        Err(_) => (StatusCode::NOT_FOUND, "filmstrip frame not found").into_response(),
     }
 }

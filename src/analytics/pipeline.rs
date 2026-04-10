@@ -1,4 +1,3 @@
-use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
@@ -26,18 +25,18 @@ pub enum DetectorBackend {
 }
 
 impl DetectorBackend {
-    fn detect(
-        &mut self,
-        frame: &opencv::core::Mat,
-    ) -> Result<Vec<Detection>, Box<dyn std::error::Error + Send + Sync>> {
+    pub fn backend_name(&self) -> &str {
         match self {
-            DetectorBackend::Onnx(d) => d.detect(frame),
-            DetectorBackend::Ollama(_) => Ok(Vec::new()),
+            DetectorBackend::Onnx(_) => "onnx",
+            DetectorBackend::Ollama(_) => "ollama",
         }
     }
 
-    fn is_ollama(&self) -> bool {
-        matches!(self, DetectorBackend::Ollama(_))
+    pub fn model_name(&self) -> &str {
+        match self {
+            DetectorBackend::Onnx(_) => "yolo26n",
+            DetectorBackend::Ollama(d) => d.model(),
+        }
     }
 }
 
@@ -48,9 +47,6 @@ const ANALYSIS_HEIGHT: i32 = 240;
 const CROP_DECODE_WIDTH: i32 = 1920;
 const CROP_DECODE_HEIGHT: i32 = 1080;
 
-// Fixed motion threshold — a score of 0.05 means 0.5% of pixels survived
-// morphological opening and contour area filtering. Below this is too small
-// to be meaningful motion.
 const MOTION_THRESHOLD: f32 = 0.05;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
@@ -147,7 +143,6 @@ impl MotionAnalyzer {
                 );
             }
 
-            // Save detection grid every ~5 minutes (1500 cycles × 200ms)
             self.grid_save_counter += 1;
             if self.grid_save_counter >= 1500 {
                 self.grid_save_counter = 0;
@@ -159,7 +154,6 @@ impl MotionAnalyzer {
             thread::sleep(POLL_INTERVAL);
         }
 
-        // Save on shutdown
         if let Some(ref grid) = self.detection_grid {
             grid.save(&self.camera_id);
         }
@@ -167,7 +161,6 @@ impl MotionAnalyzer {
     }
 
     fn process_new_segments(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        // Grab only the sequence range under the lock, release immediately
         let (first_seq, last_seq) = {
             let buffer = self.buffer.read().map_err(|_| "buffer lock poisoned")?;
             (buffer.first_sequence(), buffer.last_sequence())
@@ -184,7 +177,6 @@ impl MotionAnalyzer {
             self.last_processed = first_seq;
         }
 
-        // Fetch and clone each segment with a short-lived lock
         let mut segments_to_process = Vec::new();
         for seq in self.last_processed..last_seq {
             let segment = {
@@ -304,96 +296,229 @@ impl MotionAnalyzer {
         Ok(total_score / frame_count as f32)
     }
 
-    fn detect_segment(
-        &mut self,
-        data: &[u8],
-        duration_ns: u64,
-        crop_decoder: &CropDecoder,
-    ) -> Option<SegmentDetectionResult> {
-        let raw_frames = crop_decoder.decode_segment(data, duration_ns);
-        if raw_frames.is_empty() {
-            return None;
+    // --- Phase 2: Generic frame extraction + detection ---
+
+    fn run_sampled_detections(&mut self, segments: Vec<MotionSegment>) {
+        let crop_decoder = match CropDecoder::new(self.config.sample_fps) {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::error!(camera = %self.camera_id, error = %e, "failed to create crop decoder");
+                return;
+            }
+        };
+
+        let runs = group_contiguous_runs(segments);
+        for run in runs {
+            self.detect_run(run, &crop_decoder);
         }
+    }
+
+    fn extract_run_frames(&self, run: &[MotionSegment], crop_decoder: &CropDecoder) -> Vec<Mat> {
+        let len = run.len();
+        let indices: Vec<usize> = if len <= 4 {
+            (0..len).collect()
+        } else {
+            vec![0, len / 3, 2 * len / 3, len - 1]
+        };
 
         let height = crop_decoder.height() as i32;
+        let mut frames = Vec::new();
+
+        for &idx in &indices {
+            let seg = &run[idx];
+            let raw_frames = crop_decoder.decode_segment(&seg.data, seg.duration_ns);
+            if raw_frames.is_empty() {
+                continue;
+            }
+            let mid = raw_frames.len() / 2;
+            if let Ok(mat) = Mat::from_slice(&raw_frames[mid]) {
+                if let Ok(reshaped) = mat.reshape(3, height) {
+                    if let Ok(cloned) = reshaped.try_clone() {
+                        frames.push(cloned);
+                    }
+                }
+            }
+        }
+
+        frames
+    }
+
+    fn prepare_detection_input(&self, frame: &Mat) -> Option<Mat> {
         let crop_rect = self.crop_region();
+        match crop_rect {
+            Some(rect) => Mat::roi(frame, rect).ok()?.try_clone().ok(),
+            None => {
+                let mut resized = Mat::default();
+                imgproc::resize(
+                    frame,
+                    &mut resized,
+                    Size::new(DETECTION_WIDTH, DETECTION_HEIGHT),
+                    0.0,
+                    0.0,
+                    imgproc::INTER_LINEAR,
+                )
+                .ok()?;
+                Some(resized)
+            }
+        }
+    }
 
-        for frame_data in raw_frames.iter() {
-            let mat = match Mat::from_slice(frame_data) {
-                Ok(m) => m,
-                Err(_) => continue,
+    fn detect_run(&mut self, run: Vec<MotionSegment>, crop_decoder: &CropDecoder) {
+        if run.is_empty() {
+            return;
+        }
+
+        let frames = self.extract_run_frames(&run, crop_decoder);
+        if frames.is_empty() {
+            return;
+        }
+
+        // Encode filmstrip JPEGs and store in detection store
+        let filmstrip_jpegs: Vec<Vec<u8>> = frames.iter().filter_map(|f| encode_jpeg(f)).collect();
+        if let Some(ref ds) = self.detection_store {
+            let filmstrip = Arc::new(filmstrip_jpegs.clone());
+            for seg in &run {
+                ds.insert_filmstrip(&self.camera_id, seg.seq, Arc::clone(&filmstrip));
+            }
+        }
+
+        // Get motion position from bbox
+        let (cx, cy) = self
+            .last_motion_bbox
+            .map(|bbox| {
+                let cx = (bbox.x as f32 + bbox.width as f32 / 2.0) / ANALYSIS_WIDTH as f32;
+                let cy = (bbox.y as f32 + bbox.height as f32 / 2.0) / ANALYSIS_HEIGHT as f32;
+                (cx.clamp(0.0, 1.0), cy.clamp(0.0, 1.0))
+            })
+            .unwrap_or((0.5, 0.5));
+
+        // Route to backend-specific detection
+        let is_ollama = self
+            .object_detector
+            .as_ref()
+            .map(|d| matches!(d, DetectorBackend::Ollama(_)))
+            .unwrap_or(false);
+
+        let (detections, best_frame_idx) = if is_ollama {
+            self.detect_ollama(&frames, cx, cy)
+        } else {
+            self.detect_onnx(&frames)
+        };
+
+        if detections.is_empty() {
+            return;
+        }
+
+        // Use the best frame's JPEG as the detection thumbnail
+        let frame_jpeg = filmstrip_jpegs
+            .get(best_frame_idx)
+            .cloned()
+            .or_else(|| filmstrip_jpegs.first().cloned())
+            .unwrap_or_default();
+
+        let result = SegmentDetectionResult {
+            classes: detections.iter().map(|d| d.class_name.clone()).collect(),
+            confidences: detections.iter().map(|d| d.confidence).collect(),
+            centers: detections.iter().map(|d| (d.cx, d.cy)).collect(),
+            frame_jpeg,
+        };
+
+        // Store for all segments in the run
+        let mid_seq = run[run.len() / 2].seq;
+        self.store_detection_result(mid_seq, &result);
+        for seg in &run {
+            if seg.seq == mid_seq {
+                continue;
+            }
+            let propagated = SegmentDetectionResult {
+                classes: result.classes.clone(),
+                confidences: result.confidences.clone(),
+                centers: result.centers.clone(),
+                frame_jpeg: result.frame_jpeg.clone(),
             };
-            let reshaped = match mat.reshape(3, height) {
-                Ok(m) => m,
-                Err(_) => continue,
+            self.store_detection_result(seg.seq, &propagated);
+        }
+    }
+
+    fn detect_onnx(&mut self, frames: &[Mat]) -> (Vec<Detection>, usize) {
+        // Try frames in order: inner frames first (1, 2), then boundaries (0, 3)
+        let try_order: Vec<usize> = match frames.len() {
+            1 => vec![0],
+            2 => vec![0, 1],
+            3 => vec![1, 0, 2],
+            _ => vec![1, 2, 0, 3],
+        };
+
+        let mut best_detections: Vec<Detection> = Vec::new();
+        let mut best_confidence: f32 = 0.0;
+        let mut best_idx: usize = 0;
+
+        for &idx in &try_order {
+            if idx >= frames.len() {
+                continue;
+            }
+
+            let detection_input = match self.prepare_detection_input(&frames[idx]) {
+                Some(m) => m,
+                None => continue,
             };
 
-            let detection_input = match crop_rect {
-                Some(rect) => match Mat::roi(&reshaped, rect) {
-                    Ok(roi) => match roi.try_clone() {
-                        Ok(m) => m,
-                        Err(_) => continue,
-                    },
-                    Err(_) => continue,
-                },
-                None => {
-                    let mut resized = Mat::default();
-                    if imgproc::resize(
-                        &reshaped,
-                        &mut resized,
-                        Size::new(DETECTION_WIDTH, DETECTION_HEIGHT),
-                        0.0,
-                        0.0,
-                        imgproc::INTER_LINEAR,
-                    )
-                    .is_err()
-                    {
+            let detections = match &mut self.object_detector {
+                Some(DetectorBackend::Onnx(d)) => match d.detect(&detection_input) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        tracing::trace!(error = %e, "onnx detection error");
                         continue;
                     }
-                    resized
-                }
-            };
-
-            let object_detector = match &mut self.object_detector {
-                Some(d) => d,
-                None => return None,
-            };
-
-            let detections = match object_detector.detect(&detection_input) {
-                Ok(d) => d,
-                Err(e) => {
-                    tracing::trace!(error = %e, "object detection error");
-                    continue;
-                }
+                },
+                _ => continue,
             };
 
             if detections.is_empty() {
                 continue;
             }
 
-            let frame_jpeg = match encode_jpeg(&detection_input) {
-                Some(j) => j,
-                None => continue,
-            };
-
-            let mut classes = Vec::with_capacity(detections.len());
-            let mut confidences = Vec::with_capacity(detections.len());
-            let mut centers = Vec::with_capacity(detections.len());
-            for det in detections {
-                classes.push(det.class_name);
-                confidences.push(det.confidence);
-                centers.push((det.cx, det.cy));
+            let total_conf: f32 = detections.iter().map(|d| d.confidence).sum();
+            if total_conf > best_confidence {
+                best_confidence = total_conf;
+                best_detections = detections;
+                best_idx = idx;
             }
-
-            return Some(SegmentDetectionResult {
-                classes,
-                confidences,
-                centers,
-                frame_jpeg,
-            });
         }
 
-        None
+        (best_detections, best_idx)
+    }
+
+    fn detect_ollama(&self, frames: &[Mat], cx: f32, cy: f32) -> (Vec<Detection>, usize) {
+        let ollama = match &self.object_detector {
+            Some(DetectorBackend::Ollama(d)) => d,
+            _ => return (Vec::new(), 0),
+        };
+
+        let detections = match ollama.detect_grid(frames, cx, cy) {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::warn!(
+                    camera = %self.camera_id,
+                    error = %e,
+                    "ollama detection error"
+                );
+                return (Vec::new(), 0);
+            }
+        };
+
+        if !detections.is_empty() {
+            tracing::debug!(
+                camera = %self.camera_id,
+                count = detections.len(),
+                classes = ?detections.iter().map(|d| &d.class_name).collect::<Vec<_>>(),
+                "ollama detections"
+            );
+        }
+
+        // Use second frame (index 1) as thumbnail — inner frame
+        let best_idx = if frames.len() > 1 { 1 } else { 0 };
+        (detections, best_idx)
     }
 
     fn store_detection_result(&mut self, seq: u64, result: &SegmentDetectionResult) {
@@ -402,12 +527,17 @@ impl MotionAnalyzer {
             None => return,
         };
 
+        let (backend, model) = self
+            .object_detector
+            .as_ref()
+            .map(|d| (d.backend_name().to_string(), d.model_name().to_string()))
+            .unwrap_or_else(|| ("unknown".to_string(), "unknown".to_string()));
+
         let mut stored_any = false;
         for (i, (class, &confidence)) in result.classes.iter().zip(&result.confidences).enumerate()
         {
             let (cx, cy) = result.centers.get(i).copied().unwrap_or((0.5, 0.5));
 
-            // Check detection grid — skip absorbed (stationary) objects
             if let Some(ref grid) = self.detection_grid {
                 if !grid.record(&self.camera_id, class, cx, cy) {
                     tracing::trace!(
@@ -425,6 +555,8 @@ impl MotionAnalyzer {
                 class.clone(),
                 confidence,
                 result.frame_jpeg.clone(),
+                backend.clone(),
+                model.clone(),
             );
             stored_any = true;
 
@@ -439,232 +571,6 @@ impl MotionAnalyzer {
 
         if stored_any {
             self.detector.report_positive_detection();
-        }
-    }
-
-    fn run_sampled_detections(&mut self, segments: Vec<MotionSegment>) {
-        let is_ollama = self
-            .object_detector
-            .as_ref()
-            .map(|d| d.is_ollama())
-            .unwrap_or(false);
-
-        let crop_decoder = match CropDecoder::new(self.config.sample_fps) {
-            Ok(d) => d,
-            Err(e) => {
-                tracing::error!(camera = %self.camera_id, error = %e, "failed to create crop decoder");
-                return;
-            }
-        };
-
-        let runs = group_contiguous_runs(segments);
-        for run in runs {
-            if is_ollama {
-                self.detect_run_ollama(run, &crop_decoder);
-            } else {
-                self.detect_run(run, &crop_decoder);
-            }
-        }
-    }
-
-    fn detect_run_ollama(&mut self, run: Vec<MotionSegment>, crop_decoder: &CropDecoder) {
-        let len = run.len();
-        if len == 0 {
-            return;
-        }
-
-        // Sample up to 4 segments spread across the run
-        let indices: Vec<usize> = if len <= 4 {
-            (0..len).collect()
-        } else {
-            vec![0, len / 3, 2 * len / 3, len - 1]
-        };
-
-        let height = crop_decoder.height() as i32;
-        let mut frames = Vec::new();
-        let mut frame_jpeg = None;
-
-        for &idx in &indices {
-            let seg = &run[idx];
-            let raw_frames = crop_decoder.decode_segment(&seg.data, seg.duration_ns);
-            if raw_frames.is_empty() {
-                continue;
-            }
-            // Pick the middle frame from each segment
-            let mid = raw_frames.len() / 2;
-            if let Ok(mat) = Mat::from_slice(&raw_frames[mid]) {
-                if let Ok(reshaped) = mat.reshape(3, height) {
-                    if let Ok(cloned) = reshaped.try_clone() {
-                        if frame_jpeg.is_none() {
-                            // Use the middle segment's middle frame as the thumbnail
-                            if idx == indices[indices.len() / 2] {
-                                frame_jpeg = encode_jpeg(&cloned);
-                            }
-                        }
-                        frames.push(cloned);
-                    }
-                }
-            }
-        }
-
-        if frames.is_empty() {
-            return;
-        }
-
-        // Use first available frame for JPEG if we didn't get the middle one
-        if frame_jpeg.is_none() {
-            frame_jpeg = encode_jpeg(&frames[0]);
-        }
-        let frame_jpeg = match frame_jpeg {
-            Some(j) => j,
-            None => return,
-        };
-
-        // Get motion position from the bbox
-        let (cx, cy) = self
-            .last_motion_bbox
-            .map(|bbox| {
-                let cx = (bbox.x as f32 + bbox.width as f32 / 2.0) / ANALYSIS_WIDTH as f32;
-                let cy = (bbox.y as f32 + bbox.height as f32 / 2.0) / ANALYSIS_HEIGHT as f32;
-                (cx.clamp(0.0, 1.0), cy.clamp(0.0, 1.0))
-            })
-            .unwrap_or((0.5, 0.5));
-
-        let ollama = match &self.object_detector {
-            Some(DetectorBackend::Ollama(d)) => d,
-            _ => return,
-        };
-
-        let detections = match ollama.detect_grid(&frames, cx, cy) {
-            Ok(d) => d,
-            Err(e) => {
-                tracing::warn!(
-                    camera = %self.camera_id,
-                    error = %e,
-                    "ollama detection error"
-                );
-                return;
-            }
-        };
-
-        if detections.is_empty() {
-            return;
-        }
-
-        tracing::debug!(
-            camera = %self.camera_id,
-            count = detections.len(),
-            classes = ?detections.iter().map(|d| &d.class_name).collect::<Vec<_>>(),
-            "ollama detections"
-        );
-
-        // Create a result and store it for the middle segment
-        let mid_seq = run[len / 2].seq;
-        let result = SegmentDetectionResult {
-            classes: detections.iter().map(|d| d.class_name.clone()).collect(),
-            confidences: detections.iter().map(|d| d.confidence).collect(),
-            centers: detections.iter().map(|d| (d.cx, d.cy)).collect(),
-            frame_jpeg: frame_jpeg.clone(),
-        };
-        self.store_detection_result(mid_seq, &result);
-
-        // Propagate to all segments in the run
-        for seg in &run {
-            if seg.seq == mid_seq {
-                continue;
-            }
-            let propagated = SegmentDetectionResult {
-                classes: result.classes.clone(),
-                confidences: result.confidences.clone(),
-                centers: result.centers.clone(),
-                frame_jpeg: frame_jpeg.clone(),
-            };
-            self.store_detection_result(seg.seq, &propagated);
-        }
-    }
-
-    fn detect_run(&mut self, run: Vec<MotionSegment>, crop_decoder: &CropDecoder) {
-        let len = run.len();
-        if len <= 2 {
-            for seg in &run {
-                if let Some(result) = self.detect_segment(&seg.data, seg.duration_ns, crop_decoder)
-                {
-                    self.store_detection_result(seg.seq, &result);
-                }
-            }
-            return;
-        }
-
-        let first_result = self.detect_segment(&run[0].data, run[0].duration_ns, crop_decoder);
-        let last_result =
-            self.detect_segment(&run[len - 1].data, run[len - 1].duration_ns, crop_decoder);
-
-        let boundaries_agree = match (&first_result, &last_result) {
-            (Some(first), Some(last)) => {
-                let first_classes: BTreeSet<&str> =
-                    first.classes.iter().map(|s| s.as_str()).collect();
-                let last_classes: BTreeSet<&str> =
-                    last.classes.iter().map(|s| s.as_str()).collect();
-                first_classes == last_classes
-            }
-            _ => false,
-        };
-
-        if boundaries_agree {
-            let first_result = first_result.unwrap();
-            let last_result = last_result.unwrap();
-
-            self.store_detection_result(run[0].seq, &first_result);
-            self.store_detection_result(run[len - 1].seq, &last_result);
-
-            let min_confidences: Vec<f32> = first_result
-                .confidences
-                .iter()
-                .zip(&last_result.confidences)
-                .map(|(&a, &b)| a.min(b))
-                .collect();
-
-            let mid = len / 2;
-            for (i, seg) in run.iter().enumerate().take(len - 1).skip(1) {
-                let nearest = if i <= mid {
-                    &first_result
-                } else {
-                    &last_result
-                };
-
-                let propagated = SegmentDetectionResult {
-                    classes: first_result.classes.clone(),
-                    confidences: min_confidences.clone(),
-                    centers: nearest.centers.clone(),
-                    frame_jpeg: nearest.frame_jpeg.clone(),
-                };
-
-                self.store_detection_result(seg.seq, &propagated);
-
-                tracing::debug!(
-                    camera = %self.camera_id,
-                    sequence = seg.seq,
-                    "detection propagated from boundary"
-                );
-            }
-        } else {
-            // Boundaries disagree or empty — split in half and recurse
-            if let Some(result) = first_result {
-                self.store_detection_result(run[0].seq, &result);
-            }
-            if let Some(result) = last_result {
-                self.store_detection_result(run[len - 1].seq, &result);
-            }
-
-            let mut inner: Vec<MotionSegment> = run.into_iter().skip(1).collect();
-            inner.pop(); // remove last (already stored)
-
-            if !inner.is_empty() {
-                let mid = inner.len() / 2;
-                let right = inner.split_off(mid);
-                self.detect_run(inner, crop_decoder);
-                self.detect_run(right, crop_decoder);
-            }
         }
     }
 

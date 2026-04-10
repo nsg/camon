@@ -18,6 +18,12 @@ impl EventType {
 }
 
 #[derive(Debug, Clone)]
+pub struct DetectionDetail {
+    pub class: String,
+    pub confidence: f32,
+}
+
+#[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct WarmEventEntry {
     pub start_pts_ns: u64,
@@ -25,12 +31,23 @@ pub struct WarmEventEntry {
     pub event_type: EventType,
     pub file_size: u64,
     pub object_classes: Vec<String>,
+    pub backend: Option<String>,
+    pub model: Option<String>,
+    pub detections: Vec<DetectionDetail>,
+    pub has_filmstrip: bool,
 }
 
 #[derive(Clone)]
 pub struct WarmEventIndex {
     cameras: Arc<HashMap<String, RwLock<Vec<WarmEventEntry>>>>,
     data_dir: PathBuf,
+}
+
+struct SidecarData {
+    classes: Vec<String>,
+    backend: Option<String>,
+    model: Option<String>,
+    detections: Vec<DetectionDetail>,
 }
 
 impl WarmEventIndex {
@@ -79,13 +96,20 @@ impl WarmEventIndex {
                         Err(_) => continue,
                     };
                     let file_size = entry.metadata().map(|m| m.len()).unwrap_or(0);
-                    let object_classes = Self::load_classes(&path.with_extension("json"));
+                    let sidecar = Self::load_sidecar(&path.with_extension("json"));
+                    let has_filmstrip = path
+                        .with_file_name(format!("{}_thumb_0.jpg", stem))
+                        .exists();
                     entries.push(WarmEventEntry {
                         start_pts_ns,
                         duration_ms,
                         event_type: *event_type,
                         file_size,
-                        object_classes,
+                        object_classes: sidecar.classes,
+                        backend: sidecar.backend,
+                        model: sidecar.model,
+                        detections: sidecar.detections,
+                        has_filmstrip,
                     });
                 }
             }
@@ -104,23 +128,69 @@ impl WarmEventIndex {
         );
     }
 
-    fn load_classes(path: &std::path::Path) -> Vec<String> {
+    fn load_sidecar(path: &std::path::Path) -> SidecarData {
         let data = match std::fs::read_to_string(path) {
             Ok(d) => d,
-            Err(_) => return Vec::new(),
+            Err(_) => {
+                return SidecarData {
+                    classes: Vec::new(),
+                    backend: None,
+                    model: None,
+                    detections: Vec::new(),
+                }
+            }
         };
         let parsed: serde_json::Value = match serde_json::from_str(&data) {
             Ok(v) => v,
-            Err(_) => return Vec::new(),
+            Err(_) => {
+                return SidecarData {
+                    classes: Vec::new(),
+                    backend: None,
+                    model: None,
+                    detections: Vec::new(),
+                }
+            }
         };
-        parsed["classes"]
+
+        let backend = parsed["backend"].as_str().map(String::from);
+        let model = parsed["model"].as_str().map(String::from);
+
+        // New format: {"backend": ..., "detections": [{class, confidence}]}
+        if let Some(dets) = parsed["detections"].as_array() {
+            let detections: Vec<DetectionDetail> = dets
+                .iter()
+                .filter_map(|d| {
+                    Some(DetectionDetail {
+                        class: d["class"].as_str()?.to_string(),
+                        confidence: d["confidence"].as_f64()? as f32,
+                    })
+                })
+                .collect();
+            let classes = detections.iter().map(|d| d.class.clone()).collect();
+            return SidecarData {
+                classes,
+                backend,
+                model,
+                detections,
+            };
+        }
+
+        // Old format: {"classes": ["person", "car"]}
+        let classes = parsed["classes"]
             .as_array()
             .map(|arr| {
                 arr.iter()
                     .filter_map(|v| v.as_str().map(String::from))
                     .collect()
             })
-            .unwrap_or_default()
+            .unwrap_or_default();
+
+        SidecarData {
+            classes,
+            backend,
+            model,
+            detections: Vec::new(),
+        }
     }
 
     pub fn insert(&self, camera_id: &str, entry: WarmEventEntry) {
@@ -208,6 +278,13 @@ impl WarmEventIndex {
                 }
                 let _ = tokio::fs::remove_file(&thumb).await;
                 let _ = tokio::fs::remove_file(&path.with_extension("json")).await;
+                // Clean up filmstrip thumbnails
+                let stem = format!("{}_{}", entry.start_pts_ns, entry.duration_ms);
+                let dir = path.parent().unwrap_or(&self.data_dir);
+                for i in 0..4 {
+                    let _ =
+                        tokio::fs::remove_file(dir.join(format!("{}_thumb_{}.jpg", stem, i))).await;
+                }
             }
 
             {

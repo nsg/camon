@@ -1,10 +1,12 @@
 use std::collections::VecDeque;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use tokio::sync::mpsc;
 
 use super::GopSegment;
 use crate::buffer::EvictedSegment;
+use crate::storage::warm_index::DetectionDetail;
 use crate::storage::{DetectionStore, EventType, MotionStore, WarmEventEntry, WarmEventIndex};
 
 const NANOS_PER_SEC: u64 = 1_000_000_000;
@@ -17,6 +19,10 @@ struct WarmEvent {
     total_bytes: usize,
     has_objects: bool,
     object_classes: Vec<String>,
+    filmstrip_frames: Option<Arc<Vec<Vec<u8>>>>,
+    backend: Option<String>,
+    model: Option<String>,
+    detection_details: Vec<DetectionDetail>,
 }
 
 impl WarmEvent {
@@ -77,7 +83,7 @@ impl WarmWriter {
     pub async fn run(mut self) {
         let mut prune_interval =
             tokio::time::interval(std::time::Duration::from_secs(PRUNE_INTERVAL_SECS));
-        prune_interval.tick().await; // skip immediate first tick
+        prune_interval.tick().await;
 
         loop {
             tokio::select! {
@@ -93,7 +99,6 @@ impl WarmWriter {
             }
         }
 
-        // Channel closed — finalize any pending event
         if self.current_event.is_some() {
             self.finalize_event().await;
         }
@@ -114,10 +119,10 @@ impl WarmWriter {
             .has_motion(&evicted.camera_id, evicted.sequence);
         let segment = evicted.segment;
 
-        let segment_classes = self
+        let det_info = self
             .detection_store
-            .get_classes(&evicted.camera_id, evicted.sequence);
-        let has_objects = has_motion && !segment_classes.is_empty();
+            .get_detection_info(&evicted.camera_id, evicted.sequence);
+        let has_objects = has_motion && !det_info.is_empty();
 
         if has_motion {
             if let Some(ref mut event) = self.current_event {
@@ -125,15 +130,27 @@ impl WarmWriter {
                 event.total_bytes += segment.data.len();
                 if has_objects {
                     event.has_objects = true;
-                    for class in &segment_classes {
-                        if !event.object_classes.contains(class) {
-                            event.object_classes.push(class.clone());
+                    for info in &det_info {
+                        if !event.object_classes.contains(&info.object_class) {
+                            event.object_classes.push(info.object_class.clone());
                         }
+                        event.detection_details.push(DetectionDetail {
+                            class: info.object_class.clone(),
+                            confidence: info.confidence,
+                        });
+                        if event.backend.is_none() {
+                            event.backend = Some(info.backend.clone());
+                            event.model = Some(info.model.clone());
+                        }
+                    }
+                    if event.filmstrip_frames.is_none() {
+                        event.filmstrip_frames = self
+                            .detection_store
+                            .get_filmstrip(&evicted.camera_id, evicted.sequence);
                     }
                 }
                 event.segments.push(segment);
             } else {
-                // Start new event — prepend pre-buffer
                 let mut segments: Vec<GopSegment> = self.pre_buffer.drain(..).collect();
                 self.pre_buffer_duration_ns = 0;
                 let first_pts = segments
@@ -144,13 +161,45 @@ impl WarmWriter {
                     segments.iter().map(|s| s.data.len()).sum::<usize>() + segment.data.len();
                 let motion_pts = segment.start_pts;
                 segments.push(segment);
+
+                let filmstrip = if has_objects {
+                    self.detection_store
+                        .get_filmstrip(&evicted.camera_id, evicted.sequence)
+                } else {
+                    None
+                };
+
+                let (backend, model) = det_info
+                    .first()
+                    .map(|i| (Some(i.backend.clone()), Some(i.model.clone())))
+                    .unwrap_or((None, None));
+
+                let detection_details = det_info
+                    .iter()
+                    .map(|i| DetectionDetail {
+                        class: i.object_class.clone(),
+                        confidence: i.confidence,
+                    })
+                    .collect();
+
+                let object_classes = det_info
+                    .iter()
+                    .map(|i| i.object_class.clone())
+                    .collect::<std::collections::HashSet<_>>()
+                    .into_iter()
+                    .collect();
+
                 self.current_event = Some(WarmEvent {
                     segments,
                     first_pts,
                     last_motion_pts: motion_pts,
                     total_bytes,
                     has_objects,
-                    object_classes: segment_classes,
+                    object_classes,
+                    filmstrip_frames: filmstrip,
+                    backend,
+                    model,
+                    detection_details,
                 });
             }
         } else if let Some(ref mut event) = self.current_event {
@@ -159,25 +208,13 @@ impl WarmWriter {
                 event.total_bytes += segment.data.len();
                 event.segments.push(segment);
             } else {
-                // Post-padding expired — finalize via spawn
-                let mut event = self.current_event.take().unwrap();
+                let event = self.current_event.take().unwrap();
                 let data_dir = self.data_dir.clone();
                 let camera_id = self.camera_id.clone();
-                let has_objects = event.has_objects;
-                let object_classes = event.object_classes.clone();
                 let warm_index = self.warm_index.clone();
                 tokio::spawn(async move {
-                    write_event(
-                        &data_dir,
-                        &camera_id,
-                        &mut event,
-                        has_objects,
-                        &object_classes,
-                        warm_index.as_ref(),
-                    )
-                    .await;
+                    write_event(&data_dir, &camera_id, event, warm_index.as_ref()).await;
                 });
-                // This non-motion segment goes into pre-buffer for next event
                 self.push_pre_buffer(segment);
             }
         } else {
@@ -199,15 +236,11 @@ impl WarmWriter {
     }
 
     async fn finalize_event(&mut self) {
-        if let Some(ref mut event) = self.current_event.take() {
-            let has_objects = event.has_objects;
-            let object_classes = event.object_classes.clone();
+        if let Some(event) = self.current_event.take() {
             write_event(
                 &self.data_dir,
                 &self.camera_id,
                 event,
-                has_objects,
-                &object_classes,
                 self.warm_index.as_ref(),
             )
             .await;
@@ -218,9 +251,7 @@ impl WarmWriter {
 async fn write_event(
     data_dir: &std::path::Path,
     camera_id: &str,
-    event: &mut WarmEvent,
-    has_objects: bool,
-    object_classes: &[String],
+    event: WarmEvent,
     warm_index: Option<&WarmEventIndex>,
 ) {
     let duration_ns = event.duration_ns();
@@ -228,7 +259,11 @@ async fn write_event(
     let segment_count = event.segments.len();
     let total_bytes = event.total_bytes;
 
-    let subdir = if has_objects { "objects" } else { "movements" };
+    let subdir = if event.has_objects {
+        "objects"
+    } else {
+        "movements"
+    };
     let camera_dir = data_dir.join(camera_id).join(subdir);
     if let Err(e) = tokio::fs::create_dir_all(&camera_dir).await {
         tracing::error!(
@@ -239,8 +274,8 @@ async fn write_event(
         return;
     }
 
-    let filename = format!("{}_{}.ts", event.first_pts, duration_ms);
-    let file_path = camera_dir.join(&filename);
+    let stem = format!("{}_{}", event.first_pts, duration_ms);
+    let file_path = camera_dir.join(format!("{}.ts", stem));
 
     let mut data = Vec::with_capacity(total_bytes);
     for seg in &event.segments {
@@ -258,26 +293,75 @@ async fn write_event(
                 duration_ms = duration_ms,
                 "wrote warm event file"
             );
-            if !object_classes.is_empty() {
+
+            // Write sidecar JSON with detection metadata
+            if event.has_objects {
+                let mut meta = serde_json::Map::new();
+                if let Some(ref backend) = event.backend {
+                    meta.insert("backend".to_string(), serde_json::json!(backend));
+                }
+                if let Some(ref model) = event.model {
+                    meta.insert("model".to_string(), serde_json::json!(model));
+                }
+
+                // Deduplicate detections by class, keeping highest confidence
+                let mut best: std::collections::HashMap<String, f32> =
+                    std::collections::HashMap::new();
+                for d in &event.detection_details {
+                    let entry = best.entry(d.class.clone()).or_insert(0.0);
+                    if d.confidence > *entry {
+                        *entry = d.confidence;
+                    }
+                }
+                let detections: Vec<serde_json::Value> = best
+                    .iter()
+                    .map(|(class, confidence)| {
+                        serde_json::json!({"class": class, "confidence": confidence})
+                    })
+                    .collect();
+                meta.insert("detections".to_string(), serde_json::json!(detections));
+
                 let meta_path = file_path.with_extension("json");
-                let meta = serde_json::json!({ "classes": object_classes });
-                if let Err(e) = tokio::fs::write(&meta_path, meta.to_string()).await {
+                if let Err(e) =
+                    tokio::fs::write(&meta_path, serde_json::to_string(&meta).unwrap()).await
+                {
                     tracing::warn!(error = %e, "failed to write event metadata");
                 }
             }
+
+            // Write filmstrip thumbnails
+            let has_filmstrip = if let Some(ref frames) = event.filmstrip_frames {
+                let mut wrote = false;
+                for (i, jpeg) in frames.iter().enumerate() {
+                    let thumb_path = camera_dir.join(format!("{}_thumb_{}.jpg", stem, i));
+                    if let Err(e) = tokio::fs::write(&thumb_path, jpeg).await {
+                        tracing::warn!(error = %e, "failed to write filmstrip thumbnail");
+                    } else {
+                        wrote = true;
+                    }
+                }
+                wrote
+            } else {
+                false
+            };
+
             if let Some(index) = warm_index {
                 index.insert(
                     camera_id,
                     WarmEventEntry {
                         start_pts_ns: event.first_pts,
                         duration_ms: duration_ms as u32,
-                        event_type: if has_objects {
+                        event_type: if event.has_objects {
                             EventType::Object
                         } else {
                             EventType::Movement
                         },
                         file_size,
-                        object_classes: object_classes.to_vec(),
+                        object_classes: event.object_classes,
+                        backend: event.backend,
+                        model: event.model,
+                        detections: event.detection_details,
+                        has_filmstrip,
                     },
                 );
             }

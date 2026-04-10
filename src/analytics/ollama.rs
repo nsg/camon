@@ -73,6 +73,10 @@ impl OllamaDetector {
         })
     }
 
+    pub fn model(&self) -> &str {
+        &self.model
+    }
+
     pub fn detect_grid(
         &self,
         frames: &[opencv::core::Mat],

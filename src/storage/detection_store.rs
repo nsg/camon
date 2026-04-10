@@ -8,6 +8,8 @@ pub struct DetectionEntry {
     pub object_class: String,
     pub confidence: f32,
     pub frame_jpeg: Vec<u8>,
+    pub backend: String,
+    pub model: String,
 }
 
 pub struct DetectionSnapshot {
@@ -17,19 +19,30 @@ pub struct DetectionSnapshot {
     pub confidence: f32,
 }
 
+pub struct DetectionInfo {
+    pub object_class: String,
+    pub confidence: f32,
+    pub backend: String,
+    pub model: String,
+}
+
 pub struct DetectionStore {
     cameras: Arc<HashMap<String, RwLock<VecDeque<DetectionEntry>>>>,
+    filmstrips: Arc<HashMap<String, RwLock<HashMap<u64, Arc<Vec<Vec<u8>>>>>>>,
     next_id: Arc<AtomicU64>,
 }
 
 impl DetectionStore {
     pub fn new(camera_ids: &[String]) -> Self {
         let mut cameras = HashMap::new();
+        let mut filmstrips = HashMap::new();
         for id in camera_ids {
             cameras.insert(id.clone(), RwLock::new(VecDeque::new()));
+            filmstrips.insert(id.clone(), RwLock::new(HashMap::new()));
         }
         Self {
             cameras: Arc::new(cameras),
+            filmstrips: Arc::new(filmstrips),
             next_id: Arc::new(AtomicU64::new(1)),
         }
     }
@@ -41,6 +54,8 @@ impl DetectionStore {
         object_class: String,
         confidence: f32,
         frame_jpeg: Vec<u8>,
+        backend: String,
+        model: String,
     ) -> u64 {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         if let Some(lock) = self.cameras.get(camera_id) {
@@ -50,9 +65,23 @@ impl DetectionStore {
                 object_class,
                 confidence,
                 frame_jpeg,
+                backend,
+                model,
             });
         }
         id
+    }
+
+    pub fn insert_filmstrip(&self, camera_id: &str, sequence: u64, frames: Arc<Vec<Vec<u8>>>) {
+        if let Some(lock) = self.filmstrips.get(camera_id) {
+            lock.write().unwrap().insert(sequence, frames);
+        }
+    }
+
+    pub fn get_filmstrip(&self, camera_id: &str, sequence: u64) -> Option<Arc<Vec<Vec<u8>>>> {
+        let lock = self.filmstrips.get(camera_id)?;
+        let map = lock.read().unwrap();
+        map.get(&sequence).cloned()
     }
 
     pub fn get_detections(&self, camera_id: &str) -> Vec<DetectionSnapshot> {
@@ -83,18 +112,20 @@ impl DetectionStore {
         })
     }
 
-    pub fn get_classes(&self, camera_id: &str, segment_sequence: u64) -> Vec<String> {
+    pub fn get_detection_info(&self, camera_id: &str, segment_sequence: u64) -> Vec<DetectionInfo> {
         match self.cameras.get(camera_id) {
             Some(lock) => {
                 let entries = lock.read().unwrap();
-                let mut classes: Vec<String> = entries
+                entries
                     .iter()
                     .filter(|e| e.segment_sequence == segment_sequence)
-                    .map(|e| e.object_class.clone())
-                    .collect();
-                classes.sort();
-                classes.dedup();
-                classes
+                    .map(|e| DetectionInfo {
+                        object_class: e.object_class.clone(),
+                        confidence: e.confidence,
+                        backend: e.backend.clone(),
+                        model: e.model.clone(),
+                    })
+                    .collect()
             }
             None => Vec::new(),
         }
@@ -111,6 +142,10 @@ impl DetectionStore {
                 }
             }
         }
+        if let Some(lock) = self.filmstrips.get(camera_id) {
+            let mut map = lock.write().unwrap();
+            map.retain(|&seq, _| seq >= min_sequence);
+        }
     }
 }
 
@@ -118,6 +153,7 @@ impl Clone for DetectionStore {
     fn clone(&self) -> Self {
         Self {
             cameras: Arc::clone(&self.cameras),
+            filmstrips: Arc::clone(&self.filmstrips),
             next_id: Arc::clone(&self.next_id),
         }
     }
