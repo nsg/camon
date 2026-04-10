@@ -23,6 +23,7 @@ const ANALYSIS_HEIGHT: i32 = 240;
 const MOTION_THRESHOLD: f32 = 0.05;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
+const GRID_SAVE_INTERVAL: u32 = 1500; // ~5 minutes at 200ms poll interval
 
 struct MotionSegment {
     seq: u64,
@@ -94,16 +95,8 @@ impl MotionAnalyzer {
         tracing::info!(camera = %self.camera_id, "motion analyzer started");
 
         while !shutdown.load(Ordering::Relaxed) {
-            if !self.decoder.is_alive() {
-                tracing::warn!(camera = %self.camera_id, "decoder process died, restarting");
-                match FrameDecoder::new() {
-                    Ok(d) => self.decoder = d,
-                    Err(e) => {
-                        tracing::error!(camera = %self.camera_id, error = %e, "failed to restart decoder");
-                        thread::sleep(Duration::from_secs(5));
-                        continue;
-                    }
-                }
+            if !self.ensure_decoder_alive() {
+                continue;
             }
 
             if let Err(e) = self.process_new_segments() {
@@ -114,21 +107,44 @@ impl MotionAnalyzer {
                 );
             }
 
-            self.grid_save_counter += 1;
-            if self.grid_save_counter >= 1500 {
-                self.grid_save_counter = 0;
-                if let Some(ref grid) = self.detection_grid {
-                    grid.save(&self.camera_id);
-                }
-            }
-
+            self.maybe_save_grid();
             thread::sleep(POLL_INTERVAL);
         }
 
+        self.save_grid();
+        tracing::info!(camera = %self.camera_id, "motion analyzer stopped");
+    }
+
+    fn ensure_decoder_alive(&mut self) -> bool {
+        if self.decoder.is_alive() {
+            return true;
+        }
+        tracing::warn!(camera = %self.camera_id, "decoder process died, restarting");
+        match FrameDecoder::new() {
+            Ok(d) => {
+                self.decoder = d;
+                true
+            }
+            Err(e) => {
+                tracing::error!(camera = %self.camera_id, error = %e, "failed to restart decoder");
+                thread::sleep(Duration::from_secs(5));
+                false
+            }
+        }
+    }
+
+    fn maybe_save_grid(&mut self) {
+        self.grid_save_counter += 1;
+        if self.grid_save_counter >= GRID_SAVE_INTERVAL {
+            self.grid_save_counter = 0;
+            self.save_grid();
+        }
+    }
+
+    fn save_grid(&self) {
         if let Some(ref grid) = self.detection_grid {
             grid.save(&self.camera_id);
         }
-        tracing::info!(camera = %self.camera_id, "motion analyzer stopped");
     }
 
     fn process_new_segments(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
