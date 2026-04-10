@@ -6,6 +6,7 @@ use tokio::sync::mpsc;
 
 use super::GopSegment;
 use crate::buffer::EvictedSegment;
+use crate::config::WarmConfig;
 use crate::storage::warm_index::DetectionDetail;
 use crate::storage::{DetectionStore, EventType, MotionStore, WarmEventEntry, WarmEventIndex};
 
@@ -50,33 +51,28 @@ pub struct WarmWriter {
 const PRUNE_INTERVAL_SECS: u64 = 3600;
 
 impl WarmWriter {
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         receiver: mpsc::Receiver<EvictedSegment>,
         motion_store: MotionStore,
         detection_store: DetectionStore,
-        data_dir: PathBuf,
         camera_id: String,
-        pre_padding_secs: u64,
-        post_padding_secs: u64,
+        warm_config: &WarmConfig,
         warm_index: Option<WarmEventIndex>,
-        movement_retention_days: u64,
-        object_retention_days: u64,
     ) -> Self {
         Self {
             receiver,
             motion_store,
             detection_store,
-            data_dir,
+            data_dir: PathBuf::from(&warm_config.data_dir),
             camera_id,
-            pre_padding_ns: pre_padding_secs * NANOS_PER_SEC,
-            post_padding_ns: post_padding_secs * NANOS_PER_SEC,
+            pre_padding_ns: warm_config.pre_padding_secs * NANOS_PER_SEC,
+            post_padding_ns: warm_config.post_padding_secs * NANOS_PER_SEC,
             pre_buffer: VecDeque::new(),
             pre_buffer_duration_ns: 0,
             current_event: None,
             warm_index,
-            movement_retention_ns: movement_retention_days * 86400 * NANOS_PER_SEC,
-            object_retention_ns: object_retention_days * 86400 * NANOS_PER_SEC,
+            movement_retention_ns: warm_config.movement_retention_days * 86400 * NANOS_PER_SEC,
+            object_retention_ns: warm_config.object_retention_days * 86400 * NANOS_PER_SEC,
         }
     }
 

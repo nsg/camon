@@ -13,7 +13,7 @@ mod install;
 mod storage;
 mod update;
 
-use analytics::OllamaDetector;
+use analytics::{AnalyzerContext, OllamaDetector};
 use api::AppState;
 use buffer::warm::WarmWriter;
 use buffer::HotBuffer;
@@ -155,13 +155,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 rx,
                 motion_store.clone(),
                 detection_store.clone(),
-                std::path::PathBuf::from(&config.storage.data_dir),
                 camera_id.clone(),
-                config.storage.pre_padding_secs,
-                config.storage.post_padding_secs,
+                &config.storage,
                 warm_index.clone(),
-                config.storage.movement_retention_days,
-                config.storage.object_retention_days,
             );
             let warm_handle = tokio::spawn(writer.run());
             warm_handles.push(warm_handle);
@@ -202,15 +198,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
 
             let analyzer_handle = analytics::spawn_analyzer(
-                camera_id,
-                buffer,
-                motion_store.clone(),
-                det_store,
-                obj_det,
-                config.analytics.clone(),
+                AnalyzerContext {
+                    camera_id,
+                    buffer,
+                    motion_store: motion_store.clone(),
+                    detection_store: det_store,
+                    object_detector: obj_det,
+                    config: config.analytics.clone(),
+                    detection_grid: detection_grid.clone(),
+                    data_dir: std::path::PathBuf::from(&config.storage.data_dir),
+                },
                 Arc::clone(&shutdown),
-                detection_grid.clone(),
-                std::path::PathBuf::from(&config.storage.data_dir),
             );
             analyzer_handles.push(analyzer_handle);
         }

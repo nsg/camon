@@ -37,6 +37,17 @@ struct SegmentDetectionResult {
     frame_jpeg: Vec<u8>,
 }
 
+pub struct AnalyzerContext {
+    pub camera_id: String,
+    pub buffer: Arc<RwLock<HotBuffer>>,
+    pub motion_store: MotionStore,
+    pub detection_store: Option<DetectionStore>,
+    pub object_detector: Option<OllamaDetector>,
+    pub config: AnalyticsConfig,
+    pub detection_grid: Option<DetectionGrid>,
+    pub data_dir: PathBuf,
+}
+
 pub struct MotionAnalyzer {
     camera_id: String,
     buffer: Arc<RwLock<HotBuffer>>,
@@ -53,37 +64,28 @@ pub struct MotionAnalyzer {
 }
 
 impl MotionAnalyzer {
-    #[allow(clippy::too_many_arguments)]
-    fn new(
-        camera_id: String,
-        buffer: Arc<RwLock<HotBuffer>>,
-        motion_store: MotionStore,
-        detection_store: Option<DetectionStore>,
-        object_detector: Option<OllamaDetector>,
-        config: AnalyticsConfig,
-        detection_grid: Option<DetectionGrid>,
-        data_dir: PathBuf,
-    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        let detector = MotionDetector::new(&camera_id, &data_dir)?;
+    fn new(ctx: AnalyzerContext) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let detector = MotionDetector::new(&ctx.camera_id, &ctx.data_dir)?;
         let decoder = FrameDecoder::new()?;
 
-        let last_processed = motion_store
-            .last_sequence(&camera_id)
+        let last_processed = ctx
+            .motion_store
+            .last_sequence(&ctx.camera_id)
             .map(|s| s + 1)
             .unwrap_or(0);
 
         Ok(Self {
-            camera_id,
-            buffer,
-            motion_store,
-            detection_store,
-            config,
+            camera_id: ctx.camera_id,
+            buffer: ctx.buffer,
+            motion_store: ctx.motion_store,
+            detection_store: ctx.detection_store,
+            config: ctx.config,
             detector,
             decoder,
-            object_detector,
+            object_detector: ctx.object_detector,
             last_processed,
             last_motion_bbox: None,
-            detection_grid,
+            detection_grid: ctx.detection_grid,
             grid_save_counter: 0,
         })
     }
@@ -522,33 +524,15 @@ fn encode_jpeg(mat: &Mat) -> Option<Vec<u8>> {
     Some(buf.to_vec())
 }
 
-#[allow(clippy::too_many_arguments)]
 pub fn spawn_analyzer(
-    camera_id: String,
-    buffer: Arc<RwLock<HotBuffer>>,
-    motion_store: MotionStore,
-    detection_store: Option<DetectionStore>,
-    object_detector: Option<OllamaDetector>,
-    config: AnalyticsConfig,
+    ctx: AnalyzerContext,
     shutdown: Arc<AtomicBool>,
-    detection_grid: Option<DetectionGrid>,
-    data_dir: PathBuf,
 ) -> tokio::task::JoinHandle<()> {
-    tokio::task::spawn_blocking(move || {
-        match MotionAnalyzer::new(
-            camera_id.clone(),
-            buffer,
-            motion_store,
-            detection_store,
-            object_detector,
-            config,
-            detection_grid,
-            data_dir,
-        ) {
-            Ok(analyzer) => analyzer.run(shutdown),
-            Err(e) => {
-                tracing::error!(camera = %camera_id, error = %e, "failed to create motion analyzer");
-            }
+    let camera_id = ctx.camera_id.clone();
+    tokio::task::spawn_blocking(move || match MotionAnalyzer::new(ctx) {
+        Ok(analyzer) => analyzer.run(shutdown),
+        Err(e) => {
+            tracing::error!(camera = %camera_id, error = %e, "failed to create motion analyzer");
         }
     })
 }
