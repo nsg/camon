@@ -57,7 +57,7 @@ impl OllamaDetector {
         allowed_classes: Vec<String>,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(60))
+            .timeout(std::time::Duration::from_secs(300))
             .build()?;
 
         let rt = Handle::current();
