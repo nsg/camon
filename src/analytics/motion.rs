@@ -89,7 +89,29 @@ impl Default for TunedParams {
 impl TunedParams {
     fn load(path: &Path) -> Option<Self> {
         let data = std::fs::read_to_string(path).ok()?;
-        serde_json::from_str(&data).ok()
+        if let Ok(params) = serde_json::from_str::<Self>(&data) {
+            return Some(params);
+        }
+        // Migrate old format (morph_kernel_size: i32 → morph_kernel: f64)
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&data) {
+            let params = Self {
+                var_threshold: v["var_threshold"].as_f64().unwrap_or(DEFAULT_VAR_THRESHOLD),
+                learning_rate: v["learning_rate"].as_f64().unwrap_or(DEFAULT_LEARNING_RATE),
+                morph_kernel: v["morph_kernel_size"]
+                    .as_i64()
+                    .map(|v| v as f64)
+                    .unwrap_or(DEFAULT_MORPH_KERNEL),
+                min_contour_area: v["min_contour_area"]
+                    .as_f64()
+                    .unwrap_or(DEFAULT_MIN_CONTOUR_AREA),
+            };
+            tracing::info!(path = %path.display(), "migrated old motion tuner format");
+            params.save(path);
+            return Some(params);
+        }
+        // Corrupt file — remove it
+        let _ = std::fs::remove_file(path);
+        None
     }
 
     fn save(&self, path: &Path) {
