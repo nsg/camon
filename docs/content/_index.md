@@ -26,7 +26,7 @@ Each camera has its own hot buffer using a single-producer, multi-consumer (SPMC
 
 ## Analytics Pipeline
 
-Cameras stream H.264 via RTSP into the hot buffer. Frames are sampled at 5fps for analysis. Motion detection (MOG2) produces scores and regions. Zones can be configured with different sensitivity — high sensitivity for doorways, normal for general areas, ignore for trees or busy roads. When motion is detected, object detection (YOLO26n on CPU) identifies objects from a configurable class list (default: person, car, truck, dog, cat). Object detection crops to motion regions rather than processing the full frame, improving small object detection ~3x. LLM analysis runs on warm tier events via Ollama, generating summaries and embeddings for semantic search. Under heavy load, the pipeline gracefully degrades by reducing sample rate, then auto-recovers when load decreases.
+Cameras stream H.264 via RTSP into the hot buffer. Frames are sampled at 5fps for analysis. Motion detection (MOG2) produces scores and regions. Zones can be configured with different sensitivity — high sensitivity for doorways, normal for general areas, ignore for trees or busy roads. When motion is detected, object detection via Ollama vision LLM identifies objects from a configurable class list (default: person, car, truck, dog, cat). A 2x2 grid of frames from the motion event is sent to the model for classification. An optional fallback Ollama server can be configured for redundancy. Under heavy load, the pipeline gracefully degrades by reducing sample rate, then auto-recovers when load decreases.
 
 ## API
 
@@ -48,7 +48,7 @@ Build requires OpenCV and Clang development headers. Runtime requires FFmpeg for
 
 **Runtime:** `ffmpeg`
 
-ONNX Runtime is auto-downloaded by the ort crate.
+Object detection requires a running [Ollama](https://ollama.com/) server with a vision model.
 
 ## Data Storage
 

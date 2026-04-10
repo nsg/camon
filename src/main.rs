@@ -13,13 +13,12 @@ mod install;
 mod storage;
 mod update;
 
-use analytics::{DetectorBackend, ObjectDetector, OllamaDetector};
+use analytics::OllamaDetector;
 use api::AppState;
 use buffer::warm::WarmWriter;
 use buffer::HotBuffer;
 use camera::FfmpegPipeline;
 use config::Config;
-use config::DetectionBackend;
 use storage::{DetectionStore, MotionStore, WarmEventIndex};
 
 fn dispatch_subcommand() -> bool {
@@ -97,44 +96,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let motion_store = MotionStore::new(&camera_ids);
     let detection_store = DetectionStore::new(&camera_ids);
 
-    let object_detection_ready = if config.analytics.enabled
-        && config.analytics.object_detection.enabled
-    {
-        let od = &config.analytics.object_detection;
-        match od.backend {
-            DetectionBackend::Onnx => match ObjectDetector::new(
-                &od.model_path,
-                od.confidence_threshold,
-                od.classes.clone(),
-            ) {
-                Ok(_) => {
-                    tracing::info!(model = %od.model_path, "object detector loaded (onnx)");
-                    true
-                }
-                Err(e) => {
-                    tracing::error!(error = %e, "failed to load onnx detector, continuing without it");
-                    false
-                }
-            },
-            DetectionBackend::Ollama => {
+    let object_detection_ready =
+        if config.analytics.enabled && config.analytics.object_detection.enabled {
+            let od = &config.analytics.object_detection;
+            tracing::info!(
+                url = %od.ollama.url,
+                model = %od.ollama.model,
+                "object detection configured (ollama)"
+            );
+            if let Some(ref fb) = od.ollama.fallback {
                 tracing::info!(
-                    url = %od.ollama.url,
-                    model = %od.ollama.model,
-                    "object detection configured (ollama)"
+                    url = %fb.url,
+                    model = %fb.model,
+                    "ollama fallback server configured"
                 );
-                if let Some(ref fb) = od.ollama.fallback {
-                    tracing::info!(
-                        url = %fb.url,
-                        model = %fb.model,
-                        "ollama fallback server configured"
-                    );
-                }
-                true
             }
-        }
-    } else {
-        false
-    };
+            true
+        } else {
+            false
+        };
 
     let warm_index = if config.storage.enabled {
         let index = WarmEventIndex::new(
@@ -204,31 +184,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let obj_det = if object_detection_ready {
                 let od = &config.analytics.object_detection;
-                match od.backend {
-                    DetectionBackend::Onnx => ObjectDetector::new(
-                        &od.model_path,
-                        od.confidence_threshold,
-                        od.classes.clone(),
-                    )
-                    .ok()
-                    .map(DetectorBackend::Onnx),
-                    DetectionBackend::Ollama => {
-                        let fallback = od
-                            .ollama
-                            .fallback
-                            .as_ref()
-                            .map(|fb| (fb.url.as_str(), fb.model.as_str()));
-                        OllamaDetector::new(
-                            &od.ollama.url,
-                            &od.ollama.model,
-                            od.confidence_threshold,
-                            od.classes.clone(),
-                            fallback,
-                        )
-                        .ok()
-                        .map(DetectorBackend::Ollama)
-                    }
-                }
+                let fallback = od
+                    .ollama
+                    .fallback
+                    .as_ref()
+                    .map(|fb| (fb.url.as_str(), fb.model.as_str()));
+                OllamaDetector::new(
+                    &od.ollama.url,
+                    &od.ollama.model,
+                    od.confidence_threshold,
+                    od.classes.clone(),
+                    fallback,
+                )
+                .ok()
             } else {
                 None
             };

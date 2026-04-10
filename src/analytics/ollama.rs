@@ -5,7 +5,13 @@ use opencv::{imgcodecs, imgproc};
 use serde::{Deserialize, Serialize};
 use tokio::runtime::Handle;
 
-use super::object::Detection;
+#[derive(Debug, Clone)]
+pub struct Detection {
+    pub class_name: String,
+    pub confidence: f32,
+    pub cx: f32,
+    pub cy: f32,
+}
 
 const DETECT_PROMPT: &str = "This image is a 2x2 grid of 4 frames from a security camera, \
 showing a motion event over time (top-left is earliest, bottom-right is latest). \

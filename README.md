@@ -27,7 +27,7 @@ IP Camera ──RTSP──▶ Camon
       │(RAM ~10m)│   │   @5fps   │
       └────┬─────┘   │           │
            │         │ MOG2 ──▶ motion
-           │         │ YOLO ──▶ detections
+           │         │ Ollama ──▶ detections
            │         └───────────┘
            ▼
     ┌──────────────┐
@@ -42,7 +42,7 @@ IP Camera ──RTSP──▶ Camon
 
 - **RTSP ingestion** — H.264 streams from IP cameras via FFmpeg
 - **Motion detection** — MOG2 background subtraction with adaptive percentile-based thresholding
-- **Object detection** — YOLO26n inference on CPU via ONNX Runtime
+- **Object detection** — vision LLM inference via Ollama with fallback server support
 - **Tiered storage** — hot (RAM) for live playback, warm (disk) for event recordings
 - **HLS streaming** — live and recorded event playback over HTTP
 - **Web UI** — live monitor, event browser, and event playback as separate focused views
@@ -105,16 +105,25 @@ enabled = true
 # Frame sample rate for analysis (default: 5)
 sample_fps = 5
 
-# Object detection using YOLO26 (requires analytics enabled)
+# Object detection via Ollama (requires analytics enabled)
 [analytics.object_detection]
-# Enable YOLO26 object detection on motion segments (default: false)
+# Enable object detection on motion segments (default: false)
 enabled = true
-# Path or URL to YOLO26 ONNX model file
-model_path = "https://huggingface.co/onnx-community/yolo26n-ONNX/resolve/main/onnx/model.onnx"
 # Minimum confidence threshold (default: 0.5)
 confidence_threshold = 0.5
 # Object classes to detect (default: person, car, truck, dog, cat)
 classes = ["person", "car", "truck", "dog", "cat"]
+
+[analytics.object_detection.ollama]
+# Ollama server URL (default: http://localhost:11434)
+url = "http://localhost:11434"
+# Vision model to use (default: gemma4:e4b)
+model = "gemma4:e4b"
+
+# Optional fallback server if primary fails
+# [analytics.object_detection.ollama.fallback]
+# url = "http://backup:11434"
+# model = "gemma3:4b"
 
 [storage]
 # Enable warm storage — flush motion events to disk (default: true)

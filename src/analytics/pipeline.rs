@@ -4,9 +4,8 @@ use std::sync::{Arc, RwLock};
 use std::thread;
 use std::time::Duration;
 
-use opencv::core::{Mat, Rect, Size, Vector};
+use opencv::core::{Mat, Rect, Vector};
 use opencv::imgcodecs;
-use opencv::imgproc;
 use opencv::prelude::*;
 
 use crate::analytics::detection_grid::DetectionGrid;
@@ -16,36 +15,10 @@ use crate::storage::{DetectionStore, MotionEntry, MotionStore};
 
 use super::decoder::{CropDecoder, FrameDecoder};
 use super::motion::MotionDetector;
-use super::object::{Detection, ObjectDetector};
-use super::ollama::OllamaDetector;
+use super::ollama::{Detection, OllamaDetector};
 
-pub enum DetectorBackend {
-    Onnx(ObjectDetector),
-    Ollama(OllamaDetector),
-}
-
-impl DetectorBackend {
-    pub fn backend_name(&self) -> &str {
-        match self {
-            DetectorBackend::Onnx(_) => "onnx",
-            DetectorBackend::Ollama(_) => "ollama",
-        }
-    }
-
-    pub fn model_name(&self) -> &str {
-        match self {
-            DetectorBackend::Onnx(_) => "yolo26n",
-            DetectorBackend::Ollama(d) => d.model(),
-        }
-    }
-}
-
-const DETECTION_WIDTH: i32 = 640;
-const DETECTION_HEIGHT: i32 = 480;
 const ANALYSIS_WIDTH: i32 = 320;
 const ANALYSIS_HEIGHT: i32 = 240;
-const CROP_DECODE_WIDTH: i32 = 1920;
-const CROP_DECODE_HEIGHT: i32 = 1080;
 
 const MOTION_THRESHOLD: f32 = 0.05;
 
@@ -73,7 +46,7 @@ pub struct MotionAnalyzer {
     detector: MotionDetector,
     decoder: FrameDecoder,
     has_object_detection: bool,
-    object_detector: Option<DetectorBackend>,
+    object_detector: Option<OllamaDetector>,
     last_processed: u64,
     last_motion_bbox: Option<Rect>,
     detection_grid: Option<DetectionGrid>,
@@ -87,7 +60,7 @@ impl MotionAnalyzer {
         buffer: Arc<RwLock<HotBuffer>>,
         motion_store: MotionStore,
         detection_store: Option<DetectionStore>,
-        object_detector: Option<DetectorBackend>,
+        object_detector: Option<OllamaDetector>,
         config: AnalyticsConfig,
         detection_grid: Option<DetectionGrid>,
         data_dir: PathBuf,
@@ -369,26 +342,6 @@ impl MotionAnalyzer {
             .collect()
     }
 
-    fn prepare_detection_input(&self, frame: &Mat) -> Option<Mat> {
-        let crop_rect = self.crop_region();
-        match crop_rect {
-            Some(rect) => Mat::roi(frame, rect).ok()?.try_clone().ok(),
-            None => {
-                let mut resized = Mat::default();
-                imgproc::resize(
-                    frame,
-                    &mut resized,
-                    Size::new(DETECTION_WIDTH, DETECTION_HEIGHT),
-                    0.0,
-                    0.0,
-                    imgproc::INTER_LINEAR,
-                )
-                .ok()?;
-                Some(resized)
-            }
-        }
-    }
-
     fn detect_run(&mut self, run: Vec<MotionSegment>, crop_decoder: &CropDecoder) {
         if run.is_empty() {
             return;
@@ -418,18 +371,7 @@ impl MotionAnalyzer {
             })
             .unwrap_or((0.5, 0.5));
 
-        // Route to backend-specific detection
-        let is_ollama = self
-            .object_detector
-            .as_ref()
-            .map(|d| matches!(d, DetectorBackend::Ollama(_)))
-            .unwrap_or(false);
-
-        let (detections, best_frame_idx) = if is_ollama {
-            self.detect_ollama(&frames, cx, cy)
-        } else {
-            self.detect_onnx(&frames)
-        };
+        let (detections, best_frame_idx) = self.detect_ollama(&frames, cx, cy);
 
         if detections.is_empty() {
             return;
@@ -466,59 +408,10 @@ impl MotionAnalyzer {
         }
     }
 
-    fn detect_onnx(&mut self, frames: &[Mat]) -> (Vec<Detection>, usize) {
-        // Try frames in order: inner frames first (1, 2), then boundaries (0, 3)
-        let try_order: Vec<usize> = match frames.len() {
-            1 => vec![0],
-            2 => vec![0, 1],
-            3 => vec![1, 0, 2],
-            _ => vec![1, 2, 0, 3],
-        };
-
-        let mut best_detections: Vec<Detection> = Vec::new();
-        let mut best_confidence: f32 = 0.0;
-        let mut best_idx: usize = 0;
-
-        for &idx in &try_order {
-            if idx >= frames.len() {
-                continue;
-            }
-
-            let detection_input = match self.prepare_detection_input(&frames[idx]) {
-                Some(m) => m,
-                None => continue,
-            };
-
-            let detections = match &mut self.object_detector {
-                Some(DetectorBackend::Onnx(d)) => match d.detect(&detection_input) {
-                    Ok(d) => d,
-                    Err(e) => {
-                        tracing::trace!(error = %e, "onnx detection error");
-                        continue;
-                    }
-                },
-                _ => continue,
-            };
-
-            if detections.is_empty() {
-                continue;
-            }
-
-            let total_conf: f32 = detections.iter().map(|d| d.confidence).sum();
-            if total_conf > best_confidence {
-                best_confidence = total_conf;
-                best_detections = detections;
-                best_idx = idx;
-            }
-        }
-
-        (best_detections, best_idx)
-    }
-
     fn detect_ollama(&self, frames: &[Mat], cx: f32, cy: f32) -> (Vec<Detection>, usize) {
         let ollama = match &self.object_detector {
-            Some(DetectorBackend::Ollama(d)) => d,
-            _ => return (Vec::new(), 0),
+            Some(d) => d,
+            None => return (Vec::new(), 0),
         };
 
         let detections = match ollama.detect_grid(frames, cx, cy) {
@@ -556,7 +449,7 @@ impl MotionAnalyzer {
         let (backend, model) = self
             .object_detector
             .as_ref()
-            .map(|d| (d.backend_name().to_string(), d.model_name().to_string()))
+            .map(|d| ("ollama".to_string(), d.model().to_string()))
             .unwrap_or_else(|| ("unknown".to_string(), "unknown".to_string()));
 
         let mut stored_any = false;
@@ -599,28 +492,6 @@ impl MotionAnalyzer {
             self.detector.report_positive_detection();
         }
     }
-
-    fn crop_region(&self) -> Option<Rect> {
-        let bbox = self.last_motion_bbox?;
-
-        let scale_x = CROP_DECODE_WIDTH as f32 / ANALYSIS_WIDTH as f32;
-        let scale_y = CROP_DECODE_HEIGHT as f32 / ANALYSIS_HEIGHT as f32;
-
-        let center_x = ((bbox.x as f32 + bbox.width as f32 / 2.0) * scale_x) as i32;
-        let center_y = ((bbox.y as f32 + bbox.height as f32 / 2.0) * scale_y) as i32;
-
-        let scaled_w = (bbox.width as f32 * scale_x) as i32;
-        let scaled_h = (bbox.height as f32 * scale_y) as i32;
-
-        if scaled_w > DETECTION_WIDTH || scaled_h > DETECTION_HEIGHT {
-            return None;
-        }
-
-        let x = (center_x - DETECTION_WIDTH / 2).clamp(0, CROP_DECODE_WIDTH - DETECTION_WIDTH);
-        let y = (center_y - DETECTION_HEIGHT / 2).clamp(0, CROP_DECODE_HEIGHT - DETECTION_HEIGHT);
-
-        Some(Rect::new(x, y, DETECTION_WIDTH, DETECTION_HEIGHT))
-    }
 }
 
 fn group_contiguous_runs(segments: Vec<MotionSegment>) -> Vec<Vec<MotionSegment>> {
@@ -658,7 +529,7 @@ pub fn spawn_analyzer(
     buffer: Arc<RwLock<HotBuffer>>,
     motion_store: MotionStore,
     detection_store: Option<DetectionStore>,
-    object_detector: Option<DetectorBackend>,
+    object_detector: Option<OllamaDetector>,
     config: AnalyticsConfig,
     shutdown: Arc<AtomicBool>,
     detection_grid: Option<DetectionGrid>,

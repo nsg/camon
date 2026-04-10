@@ -60,10 +60,6 @@ fn default_sample_fps() -> u32 {
     5
 }
 
-fn default_model_path() -> String {
-    "https://huggingface.co/onnx-community/yolo26n-ONNX/resolve/main/onnx/model.onnx".to_string()
-}
-
 fn default_confidence_threshold() -> f32 {
     0.5
 }
@@ -117,10 +113,6 @@ impl Default for OllamaConfig {
 pub struct ObjectDetectionConfig {
     #[serde(default)]
     pub enabled: bool,
-    #[serde(default)]
-    pub backend: DetectionBackend,
-    #[serde(default = "default_model_path")]
-    pub model_path: String,
     #[serde(default = "default_confidence_threshold")]
     pub confidence_threshold: f32,
     #[serde(default = "default_classes")]
@@ -129,20 +121,10 @@ pub struct ObjectDetectionConfig {
     pub ollama: OllamaConfig,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum DetectionBackend {
-    #[default]
-    Onnx,
-    Ollama,
-}
-
 impl Default for ObjectDetectionConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            backend: DetectionBackend::default(),
-            model_path: default_model_path(),
             confidence_threshold: default_confidence_threshold(),
             classes: default_classes(),
             ollama: OllamaConfig::default(),
