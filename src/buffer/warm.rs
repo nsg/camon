@@ -121,99 +121,130 @@ impl WarmWriter {
         let has_objects = has_motion && !det_info.is_empty();
 
         if has_motion {
-            if let Some(ref mut event) = self.current_event {
-                event.last_motion_pts = segment.start_pts;
-                event.total_bytes += segment.data.len();
-                if has_objects {
-                    event.has_objects = true;
-                    for info in &det_info {
-                        if !event.object_classes.contains(&info.object_class) {
-                            event.object_classes.push(info.object_class.clone());
-                        }
-                        event.detection_details.push(DetectionDetail {
-                            class: info.object_class.clone(),
-                            confidence: info.confidence,
-                        });
-                        if event.backend.is_none() {
-                            event.backend = Some(info.backend.clone());
-                            event.model = Some(info.model.clone());
-                        }
-                    }
-                    if event.filmstrip_frames.is_none() {
-                        event.filmstrip_frames = self
-                            .detection_store
-                            .get_filmstrip(&evicted.camera_id, evicted.sequence);
-                    }
-                }
-                event.segments.push(segment);
+            if self.current_event.is_some() {
+                self.append_motion_segment(
+                    segment,
+                    &evicted.camera_id,
+                    evicted.sequence,
+                    &det_info,
+                    has_objects,
+                );
             } else {
-                let mut segments: Vec<GopSegment> = self.pre_buffer.drain(..).collect();
-                self.pre_buffer_duration_ns = 0;
-                let first_pts = segments
-                    .first()
-                    .map(|s| s.start_pts)
-                    .unwrap_or(segment.start_pts);
-                let total_bytes: usize =
-                    segments.iter().map(|s| s.data.len()).sum::<usize>() + segment.data.len();
-                let motion_pts = segment.start_pts;
-                segments.push(segment);
-
                 let filmstrip = if has_objects {
                     self.detection_store
                         .get_filmstrip(&evicted.camera_id, evicted.sequence)
                 } else {
                     None
                 };
-
-                let (backend, model) = det_info
-                    .first()
-                    .map(|i| (Some(i.backend.clone()), Some(i.model.clone())))
-                    .unwrap_or((None, None));
-
-                let detection_details = det_info
-                    .iter()
-                    .map(|i| DetectionDetail {
-                        class: i.object_class.clone(),
-                        confidence: i.confidence,
-                    })
-                    .collect();
-
-                let object_classes = det_info
-                    .iter()
-                    .map(|i| i.object_class.clone())
-                    .collect::<std::collections::HashSet<_>>()
-                    .into_iter()
-                    .collect();
-
-                self.current_event = Some(WarmEvent {
-                    segments,
-                    first_pts,
-                    last_motion_pts: motion_pts,
-                    total_bytes,
-                    has_objects,
-                    object_classes,
-                    filmstrip_frames: filmstrip,
-                    backend,
-                    model,
-                    detection_details,
-                });
+                self.start_new_event(segment, &det_info, has_objects, filmstrip);
             }
-        } else if let Some(ref mut event) = self.current_event {
-            let elapsed_since_motion = segment.start_pts.saturating_sub(event.last_motion_pts);
-            if elapsed_since_motion <= self.post_padding_ns {
-                event.total_bytes += segment.data.len();
-                event.segments.push(segment);
-            } else {
-                let event = self.current_event.take().unwrap();
-                let data_dir = self.data_dir.clone();
-                let camera_id = self.camera_id.clone();
-                let warm_index = self.warm_index.clone();
-                tokio::spawn(async move {
-                    write_event(&data_dir, &camera_id, event, warm_index.as_ref()).await;
-                });
-                self.push_pre_buffer(segment);
-            }
+        } else if self.current_event.is_some() {
+            self.handle_no_motion_during_event(segment);
         } else {
+            self.push_pre_buffer(segment);
+        }
+    }
+
+    fn append_motion_segment(
+        &mut self,
+        segment: GopSegment,
+        camera_id: &str,
+        sequence: u64,
+        det_info: &[crate::storage::DetectionInfo],
+        has_objects: bool,
+    ) {
+        let event = self.current_event.as_mut().unwrap();
+        event.last_motion_pts = segment.start_pts;
+        event.total_bytes += segment.data.len();
+        if has_objects {
+            event.has_objects = true;
+            for info in det_info {
+                if !event.object_classes.contains(&info.object_class) {
+                    event.object_classes.push(info.object_class.clone());
+                }
+                event.detection_details.push(DetectionDetail {
+                    class: info.object_class.clone(),
+                    confidence: info.confidence,
+                });
+                if event.backend.is_none() {
+                    event.backend = Some(info.backend.clone());
+                    event.model = Some(info.model.clone());
+                }
+            }
+            if event.filmstrip_frames.is_none() {
+                event.filmstrip_frames = self.detection_store.get_filmstrip(camera_id, sequence);
+            }
+        }
+        event.segments.push(segment);
+    }
+
+    fn start_new_event(
+        &mut self,
+        segment: GopSegment,
+        det_info: &[crate::storage::DetectionInfo],
+        has_objects: bool,
+        filmstrip: Option<Arc<Vec<Vec<u8>>>>,
+    ) {
+        let mut segments: Vec<GopSegment> = self.pre_buffer.drain(..).collect();
+        self.pre_buffer_duration_ns = 0;
+        let first_pts = segments
+            .first()
+            .map(|s| s.start_pts)
+            .unwrap_or(segment.start_pts);
+        let total_bytes: usize =
+            segments.iter().map(|s| s.data.len()).sum::<usize>() + segment.data.len();
+        let motion_pts = segment.start_pts;
+        segments.push(segment);
+
+        let (backend, model) = det_info
+            .first()
+            .map(|i| (Some(i.backend.clone()), Some(i.model.clone())))
+            .unwrap_or((None, None));
+
+        let detection_details = det_info
+            .iter()
+            .map(|i| DetectionDetail {
+                class: i.object_class.clone(),
+                confidence: i.confidence,
+            })
+            .collect();
+
+        let object_classes = det_info
+            .iter()
+            .map(|i| i.object_class.clone())
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .collect();
+
+        self.current_event = Some(WarmEvent {
+            segments,
+            first_pts,
+            last_motion_pts: motion_pts,
+            total_bytes,
+            has_objects,
+            object_classes,
+            filmstrip_frames: filmstrip,
+            backend,
+            model,
+            detection_details,
+        });
+    }
+
+    fn handle_no_motion_during_event(&mut self, segment: GopSegment) {
+        let event = self.current_event.as_ref().unwrap();
+        let elapsed_since_motion = segment.start_pts.saturating_sub(event.last_motion_pts);
+        if elapsed_since_motion <= self.post_padding_ns {
+            let event = self.current_event.as_mut().unwrap();
+            event.total_bytes += segment.data.len();
+            event.segments.push(segment);
+        } else {
+            let event = self.current_event.take().unwrap();
+            let data_dir = self.data_dir.clone();
+            let camera_id = self.camera_id.clone();
+            let warm_index = self.warm_index.clone();
+            tokio::spawn(async move {
+                write_event(&data_dir, &camera_id, event, warm_index.as_ref()).await;
+            });
             self.push_pre_buffer(segment);
         }
     }
