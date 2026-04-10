@@ -324,26 +324,11 @@ impl MotionAnalyzer {
             vec![0, len / 3, 2 * len / 3, len - 1]
         };
 
-        // Prime ffmpeg with a few seconds of video before the motion run.
-        // This ensures the fps filter and decoder have enough data to produce
-        // frames even for very short motion runs (1-2 segments).
-        let first_seq = run[0].seq;
-        if first_seq >= 3 {
-            if let Ok(buffer) = self.buffer.read() {
-                for prime_seq in (first_seq - 3)..first_seq {
-                    if let Some(seg) = buffer.get_segment_by_sequence(prime_seq) {
-                        let _ = crop_decoder.decode_segment(&seg.data, seg.duration_ns);
-                    }
-                }
-            }
-        }
-
         let height = crop_decoder.height() as i32;
         let mut all_frames = Vec::new();
 
-        for &idx in &indices {
-            let seg = &run[idx];
-            let raw_frames = crop_decoder.decode_segment(&seg.data, seg.duration_ns);
+        let mut collect_frames = |data: &[u8], duration_ns: u64| {
+            let raw_frames = crop_decoder.decode_segment(data, duration_ns);
             for frame_data in &raw_frames {
                 if let Ok(mat) = Mat::from_slice(frame_data) {
                     if let Ok(reshaped) = mat.reshape(3, height) {
@@ -353,6 +338,24 @@ impl MotionAnalyzer {
                     }
                 }
             }
+        };
+
+        // Feed a few preceding segments to ensure ffmpeg has enough data
+        // to produce frames even for very short motion runs.
+        let first_seq = run[0].seq;
+        if first_seq >= 3 {
+            if let Ok(buffer) = self.buffer.read() {
+                for prime_seq in (first_seq - 3)..first_seq {
+                    if let Some(seg) = buffer.get_segment_by_sequence(prime_seq) {
+                        collect_frames(&seg.data, seg.duration_ns);
+                    }
+                }
+            }
+        }
+
+        for &idx in &indices {
+            let seg = &run[idx];
+            collect_frames(&seg.data, seg.duration_ns);
         }
 
         if all_frames.len() <= 4 {
