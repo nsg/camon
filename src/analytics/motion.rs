@@ -102,6 +102,13 @@ impl TunedParams {
     }
 }
 
+// Tightening weights: how fast each parameter advances per cycle.
+// 1.0 = full step every cycle. Lower = slower.
+const WEIGHT_VAR_THRESHOLD: f32 = 1.0;
+const WEIGHT_MIN_CONTOUR_AREA: f32 = 0.5;
+const WEIGHT_MORPH_KERNEL: f32 = 0.33;
+const WEIGHT_LEARNING_RATE: f32 = 0.25;
+
 struct MotionTuner {
     camera_id: String,
     params: TunedParams,
@@ -111,6 +118,11 @@ struct MotionTuner {
     started_at: Instant,
     eval_start: Instant,
     last_adjustment: Option<Instant>,
+    // Accumulators for weighted stepping
+    acc_var_threshold: f32,
+    acc_min_contour_area: f32,
+    acc_morph_kernel: f32,
+    acc_learning_rate: f32,
 }
 
 impl MotionTuner {
@@ -139,6 +151,10 @@ impl MotionTuner {
             started_at: now,
             eval_start: now,
             last_adjustment: None,
+            acc_var_threshold: 0.0,
+            acc_min_contour_area: 0.0,
+            acc_morph_kernel: 0.0,
+            acc_learning_rate: 0.0,
         }
     }
 
@@ -150,111 +166,129 @@ impl MotionTuner {
         self.noise_events = self.noise_events.saturating_sub(1);
     }
 
-    fn maybe_tune(&mut self) -> Option<ParamChange> {
+    fn maybe_tune(&mut self) -> Vec<ParamChange> {
         let now = Instant::now();
 
         if now.duration_since(self.started_at).as_secs() < TUNER_STARTUP_GRACE_SECS {
-            return None;
+            return Vec::new();
         }
 
         let window_secs = now.duration_since(self.eval_start).as_secs();
         if window_secs < TUNER_EVAL_SECS {
-            return None;
+            return Vec::new();
         }
 
         if let Some(last) = self.last_adjustment {
             if now.duration_since(last).as_secs() < TUNER_COOLDOWN_SECS {
-                return None;
+                return Vec::new();
             }
         }
 
         let window_hours = window_secs as f32 / 3600.0;
         let noise_per_hour = self.noise_events as f32 / window_hours;
 
-        let change = if noise_per_hour > NOISE_EVENTS_PER_HOUR_HIGH {
+        let changes = if noise_per_hour > NOISE_EVENTS_PER_HOUR_HIGH {
             self.quiet_windows = 0;
             self.tighten(noise_per_hour)
         } else if self.noise_events == 0 && self.params != TunedParams::default() {
             self.quiet_windows += 1;
             if self.quiet_windows >= RELAX_QUIET_WINDOWS {
                 self.quiet_windows = 0;
-                self.relax()
+                self.relax().into_iter().collect()
             } else {
-                None
+                Vec::new()
             }
         } else {
             self.quiet_windows = 0;
-            None
+            Vec::new()
         };
 
-        if change.is_some() {
+        if !changes.is_empty() {
             self.last_adjustment = Some(now);
             self.params.save(&self.params_path);
         }
 
         self.reset_window();
-        change
+        changes
     }
 
-    fn tighten(&mut self, noise_per_hour: f32) -> Option<ParamChange> {
-        if self.params.var_threshold + VAR_THRESHOLD_STEP <= VAR_THRESHOLD_MAX {
+    fn tighten(&mut self, noise_per_hour: f32) -> Vec<ParamChange> {
+        let mut changes = Vec::new();
+
+        self.acc_var_threshold += WEIGHT_VAR_THRESHOLD;
+        self.acc_min_contour_area += WEIGHT_MIN_CONTOUR_AREA;
+        self.acc_morph_kernel += WEIGHT_MORPH_KERNEL;
+        self.acc_learning_rate += WEIGHT_LEARNING_RATE;
+
+        if self.acc_var_threshold >= 1.0
+            && self.params.var_threshold + VAR_THRESHOLD_STEP <= VAR_THRESHOLD_MAX
+        {
+            self.acc_var_threshold -= 1.0;
             let old = self.params.var_threshold;
             self.params.var_threshold += VAR_THRESHOLD_STEP;
             tracing::info!(
                 camera = %self.camera_id,
                 noise_per_hour = format!("{:.1}", noise_per_hour),
-                old = old,
-                new = self.params.var_threshold,
+                old = old, new = self.params.var_threshold,
                 "motion tuner: raising variance threshold"
             );
-            return Some(ParamChange::VarThreshold(self.params.var_threshold));
+            changes.push(ParamChange::VarThreshold(self.params.var_threshold));
         }
 
-        if self.params.min_contour_area + MIN_CONTOUR_AREA_STEP <= MIN_CONTOUR_AREA_MAX {
+        if self.acc_min_contour_area >= 1.0
+            && self.params.min_contour_area + MIN_CONTOUR_AREA_STEP <= MIN_CONTOUR_AREA_MAX
+        {
+            self.acc_min_contour_area -= 1.0;
             let old = self.params.min_contour_area;
             self.params.min_contour_area += MIN_CONTOUR_AREA_STEP;
             tracing::info!(
                 camera = %self.camera_id,
                 noise_per_hour = format!("{:.1}", noise_per_hour),
-                old = old,
-                new = self.params.min_contour_area,
+                old = old, new = self.params.min_contour_area,
                 "motion tuner: raising minimum blob size"
             );
-            return Some(ParamChange::MinContourArea(self.params.min_contour_area));
+            changes.push(ParamChange::MinContourArea(self.params.min_contour_area));
         }
 
-        if self.params.morph_kernel_size + MORPH_KERNEL_STEP <= MORPH_KERNEL_MAX {
+        if self.acc_morph_kernel >= 1.0
+            && self.params.morph_kernel_size + MORPH_KERNEL_STEP <= MORPH_KERNEL_MAX
+        {
+            self.acc_morph_kernel -= 1.0;
             let old = self.params.morph_kernel_size;
             self.params.morph_kernel_size += MORPH_KERNEL_STEP;
             tracing::info!(
                 camera = %self.camera_id,
                 noise_per_hour = format!("{:.1}", noise_per_hour),
-                old = old,
-                new = self.params.morph_kernel_size,
+                old = old, new = self.params.morph_kernel_size,
                 "motion tuner: enlarging noise filter kernel"
             );
-            return Some(ParamChange::MorphKernel(self.params.morph_kernel_size));
+            changes.push(ParamChange::MorphKernel(self.params.morph_kernel_size));
         }
 
-        if self.params.learning_rate + LEARNING_RATE_STEP <= LEARNING_RATE_MAX {
+        if self.acc_learning_rate >= 1.0
+            && self.params.learning_rate + LEARNING_RATE_STEP <= LEARNING_RATE_MAX
+        {
+            self.acc_learning_rate -= 1.0;
             let old = self.params.learning_rate;
             self.params.learning_rate += LEARNING_RATE_STEP;
             tracing::info!(
                 camera = %self.camera_id,
                 noise_per_hour = format!("{:.1}", noise_per_hour),
-                old = format!("{:.4}", old),
-                new = format!("{:.4}", self.params.learning_rate),
+                old = format!("{:.4}", old), new = format!("{:.4}", self.params.learning_rate),
                 "motion tuner: increasing background absorption rate"
             );
-            return Some(ParamChange::LearningRate(self.params.learning_rate));
+            changes.push(ParamChange::LearningRate(self.params.learning_rate));
         }
 
-        tracing::info!(
-            camera = %self.camera_id,
-            noise_per_hour = format!("{:.1}", noise_per_hour),
-            "motion tuner: all parameters at maximum — noise level remains high"
-        );
-        None
+        if changes.is_empty() {
+            tracing::info!(
+                camera = %self.camera_id,
+                noise_per_hour = format!("{:.1}", noise_per_hour),
+                "motion tuner: all parameters at maximum"
+            );
+        }
+
+        changes
     }
 
     fn relax(&mut self) -> Option<ParamChange> {
@@ -462,7 +496,7 @@ impl MotionDetector {
 
     /// Evaluate tuner — must be called every analysis cycle regardless of motion.
     pub fn maybe_tune(&mut self) -> CvResult<()> {
-        if let Some(change) = self.tuner.maybe_tune() {
+        for change in self.tuner.maybe_tune() {
             self.apply_param_change(change)?;
         }
         Ok(())
@@ -581,12 +615,10 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let mut tuner = MotionTuner::new("test".into(), dir.path());
 
-        // Simulate high noise
         tuner.noise_events = 100;
         tuner.eval_start = Instant::now() - std::time::Duration::from_secs(TUNER_EVAL_SECS + 1);
 
-        // Still in grace period — should not tune
-        assert!(tuner.maybe_tune().is_none());
+        assert!(tuner.maybe_tune().is_empty());
     }
 
     #[test]
@@ -595,68 +627,23 @@ mod tests {
         let mut tuner = MotionTuner::new("test".into(), dir.path());
         tuner.started_at =
             Instant::now() - std::time::Duration::from_secs(TUNER_STARTUP_GRACE_SECS + 1);
-        // 10-min window
         tuner.eval_start = Instant::now() - std::time::Duration::from_secs(TUNER_EVAL_SECS + 1);
 
-        // 30 noise events in ~10 min = ~180/hour — well above threshold
         tuner.noise_events = 30;
 
-        let change = tuner.maybe_tune();
-        assert!(
-            matches!(change, Some(ParamChange::VarThreshold(v)) if v == DEFAULT_VAR_THRESHOLD + VAR_THRESHOLD_STEP)
+        let changes = tuner.maybe_tune();
+        // First cycle: var_threshold always steps (weight 1.0)
+        assert!(changes
+            .iter()
+            .any(|c| matches!(c, ParamChange::VarThreshold(_))));
+        assert_eq!(
+            tuner.params.var_threshold,
+            DEFAULT_VAR_THRESHOLD + VAR_THRESHOLD_STEP
         );
     }
 
     #[test]
-    fn tuner_does_nothing_when_quiet() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let mut tuner = MotionTuner::new("test".into(), dir.path());
-        tuner.started_at =
-            Instant::now() - std::time::Duration::from_secs(TUNER_STARTUP_GRACE_SECS + 1);
-        tuner.eval_start = Instant::now() - std::time::Duration::from_secs(TUNER_EVAL_SECS + 1);
-
-        // 1 event in 10 min = 6/hour — below threshold, no tightening
-        tuner.noise_events = 1;
-
-        assert!(tuner.maybe_tune().is_none());
-    }
-
-    #[test]
-    fn tuner_positive_detections_offset_noise() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let mut tuner = MotionTuner::new("test".into(), dir.path());
-        tuner.started_at =
-            Instant::now() - std::time::Duration::from_secs(TUNER_STARTUP_GRACE_SECS + 1);
-        tuner.eval_start = Instant::now() - std::time::Duration::from_secs(TUNER_EVAL_SECS + 1);
-
-        // 30 motion events, but 25 had object detections → only 5 noise
-        for _ in 0..30 {
-            tuner.record_motion_event();
-        }
-        for _ in 0..25 {
-            tuner.record_positive_detection();
-        }
-        // 5 noise in 10 min = 30/hour — still above threshold
-        // But let's test with more detections:
-        assert!(tuner.noise_events == 5);
-    }
-
-    #[test]
-    fn tuner_respects_cooldown() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let mut tuner = MotionTuner::new("test".into(), dir.path());
-        tuner.started_at =
-            Instant::now() - std::time::Duration::from_secs(TUNER_STARTUP_GRACE_SECS + 1);
-        tuner.eval_start = Instant::now() - std::time::Duration::from_secs(TUNER_EVAL_SECS + 1);
-        tuner.last_adjustment = Some(Instant::now()); // just adjusted
-
-        tuner.noise_events = 100;
-
-        assert!(tuner.maybe_tune().is_none());
-    }
-
-    #[test]
-    fn tuner_tightening_priority_order() {
+    fn tuner_weighted_stepping() {
         let dir = tempfile::TempDir::new().unwrap();
         let mut tuner = MotionTuner::new("test".into(), dir.path());
         tuner.started_at =
@@ -668,49 +655,95 @@ mod tests {
             t.noise_events = 100;
         };
 
-        // First tightening: var_threshold
+        // Cycle 1: var_threshold steps (weight 1.0)
         set_high_noise(&mut tuner);
-        assert!(matches!(
-            tuner.maybe_tune(),
-            Some(ParamChange::VarThreshold(_))
-        ));
+        let c1 = tuner.maybe_tune();
+        assert!(c1.iter().any(|c| matches!(c, ParamChange::VarThreshold(_))));
+        assert!(!c1
+            .iter()
+            .any(|c| matches!(c, ParamChange::MinContourArea(_))));
 
-        // Max out var_threshold
+        // Cycle 2: var_threshold steps again, min_contour_area steps (weight 0.5, acc now 1.0)
+        set_high_noise(&mut tuner);
+        let c2 = tuner.maybe_tune();
+        assert!(c2.iter().any(|c| matches!(c, ParamChange::VarThreshold(_))));
+        assert!(c2
+            .iter()
+            .any(|c| matches!(c, ParamChange::MinContourArea(_))));
+
+        // Cycle 3: var_threshold steps, morph_kernel steps (weight 0.33, acc ~0.99)
+        set_high_noise(&mut tuner);
+        let c3 = tuner.maybe_tune();
+        assert!(c3.iter().any(|c| matches!(c, ParamChange::VarThreshold(_))));
+        // morph_kernel should step on cycle 3 (acc 0.33 + 0.33 + 0.33 = 0.99, not yet 1.0)
+        // Actually it steps on cycle 4 (acc reaches 1.32)
+
+        // Cycle 4: var_threshold + learning_rate (weight 0.25, acc 1.0)
+        set_high_noise(&mut tuner);
+        let c4 = tuner.maybe_tune();
+        assert!(c4.iter().any(|c| matches!(c, ParamChange::VarThreshold(_))));
+        assert!(c4.iter().any(|c| matches!(c, ParamChange::LearningRate(_))));
+    }
+
+    #[test]
+    fn tuner_does_nothing_when_quiet() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut tuner = MotionTuner::new("test".into(), dir.path());
+        tuner.started_at =
+            Instant::now() - std::time::Duration::from_secs(TUNER_STARTUP_GRACE_SECS + 1);
+        tuner.eval_start = Instant::now() - std::time::Duration::from_secs(TUNER_EVAL_SECS + 1);
+
+        tuner.noise_events = 1;
+
+        assert!(tuner.maybe_tune().is_empty());
+    }
+
+    #[test]
+    fn tuner_positive_detections_offset_noise() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut tuner = MotionTuner::new("test".into(), dir.path());
+        tuner.started_at =
+            Instant::now() - std::time::Duration::from_secs(TUNER_STARTUP_GRACE_SECS + 1);
+        tuner.eval_start = Instant::now() - std::time::Duration::from_secs(TUNER_EVAL_SECS + 1);
+
+        for _ in 0..30 {
+            tuner.record_motion_event();
+        }
+        for _ in 0..25 {
+            tuner.record_positive_detection();
+        }
+        assert!(tuner.noise_events == 5);
+    }
+
+    #[test]
+    fn tuner_respects_cooldown() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut tuner = MotionTuner::new("test".into(), dir.path());
+        tuner.started_at =
+            Instant::now() - std::time::Duration::from_secs(TUNER_STARTUP_GRACE_SECS + 1);
+        tuner.eval_start = Instant::now() - std::time::Duration::from_secs(TUNER_EVAL_SECS + 1);
+        tuner.last_adjustment = Some(Instant::now());
+
+        tuner.noise_events = 100;
+
+        assert!(tuner.maybe_tune().is_empty());
+    }
+
+    #[test]
+    fn tuner_all_maxed_returns_empty() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut tuner = MotionTuner::new("test".into(), dir.path());
+        tuner.started_at =
+            Instant::now() - std::time::Duration::from_secs(TUNER_STARTUP_GRACE_SECS + 1);
+        tuner.eval_start = Instant::now() - std::time::Duration::from_secs(TUNER_EVAL_SECS + 1);
+
         tuner.params.var_threshold = VAR_THRESHOLD_MAX;
-
-        // Next: min_contour_area
-        set_high_noise(&mut tuner);
-        assert!(matches!(
-            tuner.maybe_tune(),
-            Some(ParamChange::MinContourArea(_))
-        ));
-
-        // Max out min_contour_area
         tuner.params.min_contour_area = MIN_CONTOUR_AREA_MAX;
-
-        // Next: morph_kernel
-        set_high_noise(&mut tuner);
-        assert!(matches!(
-            tuner.maybe_tune(),
-            Some(ParamChange::MorphKernel(_))
-        ));
-
-        // Max out morph_kernel
         tuner.params.morph_kernel_size = MORPH_KERNEL_MAX;
-
-        // Next: learning_rate
-        set_high_noise(&mut tuner);
-        assert!(matches!(
-            tuner.maybe_tune(),
-            Some(ParamChange::LearningRate(_))
-        ));
-
-        // Max out learning_rate
         tuner.params.learning_rate = LEARNING_RATE_MAX;
+        tuner.noise_events = 100;
 
-        // All maxed — returns None
-        set_high_noise(&mut tuner);
-        assert!(tuner.maybe_tune().is_none());
+        assert!(tuner.maybe_tune().is_empty());
     }
 
     #[test]
@@ -723,25 +756,24 @@ mod tests {
         tuner.params.var_threshold = VAR_THRESHOLD_MAX;
         tuner.params.learning_rate = LEARNING_RATE_MAX;
 
-        // First RELAX_QUIET_WINDOWS - 1 quiet windows: no change
         for _ in 0..RELAX_QUIET_WINDOWS - 1 {
             tuner.eval_start = Instant::now() - std::time::Duration::from_secs(TUNER_EVAL_SECS + 1);
             tuner.last_adjustment = None;
             tuner.noise_events = 0;
-            assert!(tuner.maybe_tune().is_none());
+            assert!(tuner.maybe_tune().is_empty());
         }
 
-        // Next quiet window triggers relaxation
         tuner.eval_start = Instant::now() - std::time::Duration::from_secs(TUNER_EVAL_SECS + 1);
         tuner.last_adjustment = None;
         tuner.noise_events = 0;
-        let change = tuner.maybe_tune();
-        assert!(matches!(change, Some(ParamChange::LearningRate(_))));
+        let changes = tuner.maybe_tune();
+        assert!(changes
+            .iter()
+            .any(|c| matches!(c, ParamChange::LearningRate(_))));
         assert_eq!(
             tuner.params.learning_rate,
             LEARNING_RATE_MAX - LEARNING_RATE_STEP
         );
-        // var_threshold unchanged — only one step per relaxation
         assert_eq!(tuner.params.var_threshold, VAR_THRESHOLD_MAX);
     }
 
@@ -756,7 +788,7 @@ mod tests {
 
         tuner.noise_events = 0;
 
-        assert!(tuner.maybe_tune().is_none());
+        assert!(tuner.maybe_tune().is_empty());
     }
 
     #[test]
@@ -767,20 +799,17 @@ mod tests {
             Instant::now() - std::time::Duration::from_secs(TUNER_STARTUP_GRACE_SECS + 1);
         tuner.params.var_threshold = VAR_THRESHOLD_MAX;
 
-        // Accumulate quiet windows almost to threshold
         tuner.quiet_windows = RELAX_QUIET_WINDOWS - 1;
 
-        // One noisy window resets the counter
         tuner.eval_start = Instant::now() - std::time::Duration::from_secs(TUNER_EVAL_SECS + 1);
         tuner.last_adjustment = None;
         tuner.noise_events = 1;
-        assert!(tuner.maybe_tune().is_none());
+        assert!(tuner.maybe_tune().is_empty());
         assert_eq!(tuner.quiet_windows, 0);
 
-        // Must start counting from scratch
         tuner.eval_start = Instant::now() - std::time::Duration::from_secs(TUNER_EVAL_SECS + 1);
         tuner.noise_events = 0;
-        assert!(tuner.maybe_tune().is_none()); // only 1 quiet window
+        assert!(tuner.maybe_tune().is_empty());
     }
 
     #[test]
