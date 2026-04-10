@@ -324,12 +324,23 @@ impl MotionAnalyzer {
             vec![0, len / 3, 2 * len / 3, len - 1]
         };
 
+        // Prime ffmpeg with a few seconds of video before the motion run.
+        // This ensures the fps filter and decoder have enough data to produce
+        // frames even for very short motion runs (1-2 segments).
+        let first_seq = run[0].seq;
+        if first_seq >= 3 {
+            if let Ok(buffer) = self.buffer.read() {
+                for prime_seq in (first_seq - 3)..first_seq {
+                    if let Some(seg) = buffer.get_segment_by_sequence(prime_seq) {
+                        let _ = crop_decoder.decode_segment(&seg.data, seg.duration_ns);
+                    }
+                }
+            }
+        }
+
         let height = crop_decoder.height() as i32;
         let mut all_frames = Vec::new();
 
-        // Feed sampled segments to ffmpeg sequentially — it accumulates
-        // data internally and may produce frames from earlier segments
-        // only after receiving later ones.
         for &idx in &indices {
             let seg = &run[idx];
             let raw_frames = crop_decoder.decode_segment(&seg.data, seg.duration_ns);
@@ -348,7 +359,6 @@ impl MotionAnalyzer {
             return all_frames;
         }
 
-        // Pick 4 evenly spaced frames
         let n = all_frames.len();
         [0, n / 3, 2 * n / 3, n - 1]
             .iter()
