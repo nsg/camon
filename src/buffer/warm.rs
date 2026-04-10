@@ -130,12 +130,9 @@ impl WarmWriter {
                     has_objects,
                 );
             } else {
-                let filmstrip = if has_objects {
-                    self.detection_store
-                        .get_filmstrip(&evicted.camera_id, evicted.sequence)
-                } else {
-                    None
-                };
+                let filmstrip = self
+                    .detection_store
+                    .get_filmstrip(&evicted.camera_id, evicted.sequence);
                 self.start_new_event(segment, &det_info, has_objects, filmstrip);
             }
         } else if self.current_event.is_some() {
@@ -171,9 +168,9 @@ impl WarmWriter {
                     event.model = Some(info.model.clone());
                 }
             }
-            if event.filmstrip_frames.is_none() {
-                event.filmstrip_frames = self.detection_store.get_filmstrip(camera_id, sequence);
-            }
+        }
+        if event.filmstrip_frames.is_none() {
+            event.filmstrip_frames = self.detection_store.get_filmstrip(camera_id, sequence);
         }
         event.segments.push(segment);
     }
