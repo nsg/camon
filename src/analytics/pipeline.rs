@@ -288,37 +288,23 @@ impl MotionAnalyzer {
     }
 
     fn extract_run_frames(&self, run: &[MotionSegment], crop_decoder: &CropDecoder) -> Vec<Mat> {
-        let len = run.len();
-        let indices: Vec<usize> = if len <= 4 {
-            (0..len).collect()
-        } else {
-            vec![0, len / 3, 2 * len / 3, len - 1]
-        };
-
+        let indices = sample_indices(run.len());
         let height = crop_decoder.height() as i32;
         let mut all_frames = Vec::new();
 
-        let mut collect_frames = |data: &[u8], duration_ns: u64| {
-            let raw_frames = crop_decoder.decode_segment(data, duration_ns);
-            for frame_data in &raw_frames {
-                if let Ok(mat) = Mat::from_slice(frame_data) {
-                    if let Ok(reshaped) = mat.reshape(3, height) {
-                        if let Ok(cloned) = reshaped.try_clone() {
-                            all_frames.push(cloned);
-                        }
-                    }
-                }
-            }
-        };
-
-        // Feed a few preceding segments to ensure ffmpeg has enough data
-        // to produce frames even for very short motion runs.
+        // Feed preceding segments to prime the decoder
         let first_seq = run[0].seq;
         if first_seq >= 3 {
             if let Ok(buffer) = self.buffer.read() {
                 for prime_seq in (first_seq - 3)..first_seq {
                     if let Some(seg) = buffer.get_segment_by_sequence(prime_seq) {
-                        collect_frames(&seg.data, seg.duration_ns);
+                        decode_to_mats(
+                            crop_decoder,
+                            &seg.data,
+                            seg.duration_ns,
+                            height,
+                            &mut all_frames,
+                        );
                     }
                 }
             }
@@ -326,18 +312,16 @@ impl MotionAnalyzer {
 
         for &idx in &indices {
             let seg = &run[idx];
-            collect_frames(&seg.data, seg.duration_ns);
+            decode_to_mats(
+                crop_decoder,
+                &seg.data,
+                seg.duration_ns,
+                height,
+                &mut all_frames,
+            );
         }
 
-        if all_frames.len() <= 4 {
-            return all_frames;
-        }
-
-        let n = all_frames.len();
-        [0, n / 3, 2 * n / 3, n - 1]
-            .iter()
-            .map(|&i| all_frames[i].try_clone().unwrap_or_default())
-            .collect()
+        subsample_frames(all_frames)
     }
 
     fn detect_run(&mut self, run: Vec<MotionSegment>, crop_decoder: &CropDecoder) {
@@ -493,6 +477,43 @@ impl MotionAnalyzer {
             self.detector.report_positive_detection();
         }
     }
+}
+
+fn sample_indices(len: usize) -> Vec<usize> {
+    if len <= 4 {
+        (0..len).collect()
+    } else {
+        vec![0, len / 3, 2 * len / 3, len - 1]
+    }
+}
+
+fn decode_to_mats(
+    decoder: &CropDecoder,
+    data: &[u8],
+    duration_ns: u64,
+    height: i32,
+    out: &mut Vec<Mat>,
+) {
+    for frame_data in &decoder.decode_segment(data, duration_ns) {
+        if let Ok(mat) = Mat::from_slice(frame_data) {
+            if let Ok(reshaped) = mat.reshape(3, height) {
+                if let Ok(cloned) = reshaped.try_clone() {
+                    out.push(cloned);
+                }
+            }
+        }
+    }
+}
+
+fn subsample_frames(frames: Vec<Mat>) -> Vec<Mat> {
+    if frames.len() <= 4 {
+        return frames;
+    }
+    let n = frames.len();
+    [0, n / 3, 2 * n / 3, n - 1]
+        .iter()
+        .map(|&i| frames[i].try_clone().unwrap_or_default())
+        .collect()
 }
 
 fn group_contiguous_runs(segments: Vec<MotionSegment>) -> Vec<Vec<MotionSegment>> {
