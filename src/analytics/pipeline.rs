@@ -45,7 +45,6 @@ pub struct MotionAnalyzer {
     config: AnalyticsConfig,
     detector: MotionDetector,
     decoder: FrameDecoder,
-    has_object_detection: bool,
     object_detector: Option<OllamaDetector>,
     last_processed: u64,
     last_motion_bbox: Option<Rect>,
@@ -68,8 +67,6 @@ impl MotionAnalyzer {
         let detector = MotionDetector::new(&camera_id, &data_dir)?;
         let decoder = FrameDecoder::new()?;
 
-        let has_object_detection = object_detector.is_some();
-
         let last_processed = motion_store
             .last_sequence(&camera_id)
             .map(|s| s + 1)
@@ -83,7 +80,6 @@ impl MotionAnalyzer {
             config,
             detector,
             decoder,
-            has_object_detection,
             object_detector,
             last_processed,
             last_motion_bbox: None,
@@ -163,7 +159,7 @@ impl MotionAnalyzer {
             }
         }
 
-        let has_detection = self.has_object_detection && self.detection_store.is_some();
+        let has_detection = self.object_detector.is_some() && self.detection_store.is_some();
         let mut motion_segments = Vec::new();
 
         // Phase 1: Motion analysis
