@@ -244,16 +244,88 @@ impl WarmWriter {
     }
 }
 
+fn concatenate_segments(segments: &[GopSegment], capacity: usize) -> Vec<u8> {
+    let mut data = Vec::with_capacity(capacity);
+    for seg in segments {
+        data.extend_from_slice(&seg.data);
+    }
+    data
+}
+
+fn build_sidecar_json(event: &WarmEvent) -> String {
+    let mut meta = serde_json::Map::new();
+    if let Some(ref backend) = event.backend {
+        meta.insert("backend".to_string(), serde_json::json!(backend));
+    }
+    if let Some(ref model) = event.model {
+        meta.insert("model".to_string(), serde_json::json!(model));
+    }
+
+    let deduped = deduplicate_detections(&event.detection_details);
+    let detections: Vec<serde_json::Value> = deduped
+        .iter()
+        .map(|(class, confidence)| serde_json::json!({"class": class, "confidence": confidence}))
+        .collect();
+    meta.insert("detections".to_string(), serde_json::json!(detections));
+
+    serde_json::to_string(&meta).unwrap()
+}
+
+fn deduplicate_detections(details: &[DetectionDetail]) -> Vec<(String, f32)> {
+    let mut best: std::collections::HashMap<String, f32> = std::collections::HashMap::new();
+    for d in details {
+        let entry = best.entry(d.class.clone()).or_insert(0.0);
+        if d.confidence > *entry {
+            *entry = d.confidence;
+        }
+    }
+    best.into_iter().collect()
+}
+
+async fn write_filmstrip(camera_dir: &std::path::Path, stem: &str, frames: &[Vec<u8>]) -> bool {
+    let mut wrote = false;
+    for (i, jpeg) in frames.iter().enumerate() {
+        let thumb_path = camera_dir.join(format!("{}_thumb_{}.jpg", stem, i));
+        if let Err(e) = tokio::fs::write(&thumb_path, jpeg).await {
+            tracing::warn!(error = %e, "failed to write filmstrip thumbnail");
+        } else {
+            wrote = true;
+        }
+    }
+    wrote
+}
+
+fn build_index_entry(
+    event: &WarmEvent,
+    duration_ms: u64,
+    file_size: u64,
+    has_filmstrip: bool,
+) -> WarmEventEntry {
+    WarmEventEntry {
+        start_pts_ns: event.first_pts,
+        duration_ms: duration_ms as u32,
+        event_type: if event.has_objects {
+            EventType::Object
+        } else {
+            EventType::Movement
+        },
+        file_size,
+        object_classes: event.object_classes.clone(),
+        backend: event.backend.clone(),
+        model: event.model.clone(),
+        detections: event.detection_details.clone(),
+        has_filmstrip,
+    }
+}
+
 async fn write_event(
     data_dir: &std::path::Path,
     camera_id: &str,
     event: WarmEvent,
     warm_index: Option<&WarmEventIndex>,
 ) {
-    let duration_ns = event.duration_ns();
-    let duration_ms = duration_ns / NANOS_PER_MS;
+    let duration_ms = event.duration_ns() / NANOS_PER_MS;
     let segment_count = event.segments.len();
-    let total_bytes = event.total_bytes;
 
     let subdir = if event.has_objects {
         "objects"
@@ -262,113 +334,45 @@ async fn write_event(
     };
     let camera_dir = data_dir.join(camera_id).join(subdir);
     if let Err(e) = tokio::fs::create_dir_all(&camera_dir).await {
-        tracing::error!(
-            camera = %camera_id,
-            error = %e,
-            "failed to create warm storage directory"
-        );
+        tracing::error!(camera = %camera_id, error = %e, "failed to create warm storage directory");
         return;
     }
 
     let stem = format!("{}_{}", event.first_pts, duration_ms);
     let file_path = camera_dir.join(format!("{}.ts", stem));
+    let data = concatenate_segments(&event.segments, event.total_bytes);
+    let file_size = data.len() as u64;
 
-    let mut data = Vec::with_capacity(total_bytes);
-    for seg in &event.segments {
-        data.extend_from_slice(&seg.data);
+    if let Err(e) = tokio::fs::write(&file_path, &data).await {
+        tracing::error!(camera = %camera_id, path = %file_path.display(), error = %e, "failed to write warm event file");
+        return;
     }
 
-    let file_size = data.len() as u64;
-    match tokio::fs::write(&file_path, &data).await {
-        Ok(()) => {
-            tracing::info!(
-                camera = %camera_id,
-                path = %file_path.display(),
-                segments = segment_count,
-                bytes = total_bytes,
-                duration_ms = duration_ms,
-                "wrote warm event file"
-            );
+    tracing::info!(
+        camera = %camera_id,
+        path = %file_path.display(),
+        segments = segment_count,
+        bytes = event.total_bytes,
+        duration_ms = duration_ms,
+        "wrote warm event file"
+    );
 
-            // Write sidecar JSON with detection metadata
-            if event.has_objects {
-                let mut meta = serde_json::Map::new();
-                if let Some(ref backend) = event.backend {
-                    meta.insert("backend".to_string(), serde_json::json!(backend));
-                }
-                if let Some(ref model) = event.model {
-                    meta.insert("model".to_string(), serde_json::json!(model));
-                }
-
-                // Deduplicate detections by class, keeping highest confidence
-                let mut best: std::collections::HashMap<String, f32> =
-                    std::collections::HashMap::new();
-                for d in &event.detection_details {
-                    let entry = best.entry(d.class.clone()).or_insert(0.0);
-                    if d.confidence > *entry {
-                        *entry = d.confidence;
-                    }
-                }
-                let detections: Vec<serde_json::Value> = best
-                    .iter()
-                    .map(|(class, confidence)| {
-                        serde_json::json!({"class": class, "confidence": confidence})
-                    })
-                    .collect();
-                meta.insert("detections".to_string(), serde_json::json!(detections));
-
-                let meta_path = file_path.with_extension("json");
-                if let Err(e) =
-                    tokio::fs::write(&meta_path, serde_json::to_string(&meta).unwrap()).await
-                {
-                    tracing::warn!(error = %e, "failed to write event metadata");
-                }
-            }
-
-            // Write filmstrip thumbnails
-            let has_filmstrip = if let Some(ref frames) = event.filmstrip_frames {
-                let mut wrote = false;
-                for (i, jpeg) in frames.iter().enumerate() {
-                    let thumb_path = camera_dir.join(format!("{}_thumb_{}.jpg", stem, i));
-                    if let Err(e) = tokio::fs::write(&thumb_path, jpeg).await {
-                        tracing::warn!(error = %e, "failed to write filmstrip thumbnail");
-                    } else {
-                        wrote = true;
-                    }
-                }
-                wrote
-            } else {
-                false
-            };
-
-            if let Some(index) = warm_index {
-                index.insert(
-                    camera_id,
-                    WarmEventEntry {
-                        start_pts_ns: event.first_pts,
-                        duration_ms: duration_ms as u32,
-                        event_type: if event.has_objects {
-                            EventType::Object
-                        } else {
-                            EventType::Movement
-                        },
-                        file_size,
-                        object_classes: event.object_classes,
-                        backend: event.backend,
-                        model: event.model,
-                        detections: event.detection_details,
-                        has_filmstrip,
-                    },
-                );
-            }
+    if event.has_objects {
+        let meta_path = file_path.with_extension("json");
+        if let Err(e) = tokio::fs::write(&meta_path, build_sidecar_json(&event)).await {
+            tracing::warn!(error = %e, "failed to write event metadata");
         }
-        Err(e) => {
-            tracing::error!(
-                camera = %camera_id,
-                path = %file_path.display(),
-                error = %e,
-                "failed to write warm event file"
-            );
-        }
+    }
+
+    let has_filmstrip = match event.filmstrip_frames {
+        Some(ref frames) => write_filmstrip(&camera_dir, &stem, frames).await,
+        None => false,
+    };
+
+    if let Some(index) = warm_index {
+        index.insert(
+            camera_id,
+            build_index_entry(&event, duration_ms, file_size, has_filmstrip),
+        );
     }
 }
