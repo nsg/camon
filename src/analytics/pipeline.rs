@@ -325,25 +325,35 @@ impl MotionAnalyzer {
         };
 
         let height = crop_decoder.height() as i32;
-        let mut frames = Vec::new();
+        let mut all_frames = Vec::new();
 
+        // Feed sampled segments to ffmpeg sequentially — it accumulates
+        // data internally and may produce frames from earlier segments
+        // only after receiving later ones.
         for &idx in &indices {
             let seg = &run[idx];
             let raw_frames = crop_decoder.decode_segment(&seg.data, seg.duration_ns);
-            if raw_frames.is_empty() {
-                continue;
-            }
-            let mid = raw_frames.len() / 2;
-            if let Ok(mat) = Mat::from_slice(&raw_frames[mid]) {
-                if let Ok(reshaped) = mat.reshape(3, height) {
-                    if let Ok(cloned) = reshaped.try_clone() {
-                        frames.push(cloned);
+            for frame_data in &raw_frames {
+                if let Ok(mat) = Mat::from_slice(frame_data) {
+                    if let Ok(reshaped) = mat.reshape(3, height) {
+                        if let Ok(cloned) = reshaped.try_clone() {
+                            all_frames.push(cloned);
+                        }
                     }
                 }
             }
         }
 
-        frames
+        if all_frames.len() <= 4 {
+            return all_frames;
+        }
+
+        // Pick 4 evenly spaced frames
+        let n = all_frames.len();
+        [0, n / 3, 2 * n / 3, n - 1]
+            .iter()
+            .map(|&i| all_frames[i].try_clone().unwrap_or_default())
+            .collect()
     }
 
     fn prepare_detection_input(&self, frame: &Mat) -> Option<Mat> {
