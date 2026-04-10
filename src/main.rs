@@ -122,6 +122,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     model = %od.ollama.model,
                     "object detection configured (ollama)"
                 );
+                if let Some(ref fb) = od.ollama.fallback {
+                    tracing::info!(
+                        url = %fb.url,
+                        model = %fb.model,
+                        "ollama fallback server configured"
+                    );
+                }
                 true
             }
         }
@@ -205,14 +212,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     )
                     .ok()
                     .map(DetectorBackend::Onnx),
-                    DetectionBackend::Ollama => OllamaDetector::new(
-                        &od.ollama.url,
-                        &od.ollama.model,
-                        od.confidence_threshold,
-                        od.classes.clone(),
-                    )
-                    .ok()
-                    .map(DetectorBackend::Ollama),
+                    DetectionBackend::Ollama => {
+                        let fallback = od
+                            .ollama
+                            .fallback
+                            .as_ref()
+                            .map(|fb| (fb.url.as_str(), fb.model.as_str()));
+                        OllamaDetector::new(
+                            &od.ollama.url,
+                            &od.ollama.model,
+                            od.confidence_threshold,
+                            od.classes.clone(),
+                            fallback,
+                        )
+                        .ok()
+                        .map(DetectorBackend::Ollama)
+                    }
                 }
             } else {
                 None

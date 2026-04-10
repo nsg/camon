@@ -87,11 +87,20 @@ fn default_ollama_model() -> String {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+pub struct OllamaServerConfig {
+    #[serde(default = "default_ollama_url")]
+    pub url: String,
+    #[serde(default = "default_ollama_model")]
+    pub model: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct OllamaConfig {
     #[serde(default = "default_ollama_url")]
     pub url: String,
     #[serde(default = "default_ollama_model")]
     pub model: String,
+    pub fallback: Option<OllamaServerConfig>,
 }
 
 impl Default for OllamaConfig {
@@ -99,6 +108,7 @@ impl Default for OllamaConfig {
         Self {
             url: default_ollama_url(),
             model: default_ollama_model(),
+            fallback: None,
         }
     }
 }

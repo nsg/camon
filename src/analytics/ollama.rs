@@ -40,11 +40,16 @@ struct ResponseMessage {
     content: String,
 }
 
+struct OllamaServer {
+    base_url: String,
+    model: String,
+}
+
 pub struct OllamaDetector {
     client: reqwest::Client,
     rt: Handle,
-    base_url: String,
-    model: String,
+    primary: OllamaServer,
+    fallback: Option<OllamaServer>,
     confidence_threshold: f32,
     allowed_classes: Vec<String>,
 }
@@ -55,26 +60,36 @@ impl OllamaDetector {
         model: &str,
         confidence_threshold: f32,
         allowed_classes: Vec<String>,
+        fallback: Option<(&str, &str)>,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(300))
             .build()?;
 
         let rt = Handle::current();
-        let base_url = base_url.trim_end_matches('/').to_string();
+
+        let primary = OllamaServer {
+            base_url: base_url.trim_end_matches('/').to_string(),
+            model: model.to_string(),
+        };
+
+        let fallback = fallback.map(|(url, model)| OllamaServer {
+            base_url: url.trim_end_matches('/').to_string(),
+            model: model.to_string(),
+        });
 
         Ok(Self {
             client,
             rt,
-            base_url,
-            model: model.to_string(),
+            primary,
+            fallback,
             confidence_threshold,
             allowed_classes,
         })
     }
 
     pub fn model(&self) -> &str {
-        &self.model
+        &self.primary.model
     }
 
     pub fn detect_grid(
@@ -90,17 +105,50 @@ impl OllamaDetector {
         let grid = self.stitch_grid(frames)?;
         let image_b64 = self.encode_frame(&grid)?;
 
+        match self.call_server(&self.primary, &image_b64, cx, cy) {
+            Ok(detections) => return Ok(detections),
+            Err(primary_err) => {
+                if let Some(ref fallback) = self.fallback {
+                    tracing::warn!(
+                        primary_url = %self.primary.base_url,
+                        primary_model = %self.primary.model,
+                        error = %primary_err,
+                        fallback_url = %fallback.base_url,
+                        fallback_model = %fallback.model,
+                        "primary ollama failed, trying fallback"
+                    );
+                    match self.call_server(fallback, &image_b64, cx, cy) {
+                        Ok(detections) => return Ok(detections),
+                        Err(fallback_err) => {
+                            return Err(format!(
+                                "both ollama servers failed — primary: {primary_err}, fallback: {fallback_err}"
+                            ).into());
+                        }
+                    }
+                }
+                return Err(primary_err);
+            }
+        }
+    }
+
+    fn call_server(
+        &self,
+        server: &OllamaServer,
+        image_b64: &str,
+        cx: f32,
+        cy: f32,
+    ) -> Result<Vec<Detection>, Box<dyn std::error::Error + Send + Sync>> {
         let request = ChatRequest {
-            model: self.model.clone(),
+            model: server.model.clone(),
             messages: vec![Message {
                 role: "user".to_string(),
                 content: DETECT_PROMPT.to_string(),
-                images: vec![image_b64],
+                images: vec![image_b64.to_string()],
             }],
             stream: false,
         };
 
-        let url = format!("{}/api/chat", self.base_url);
+        let url = format!("{}/api/chat", server.base_url);
         let response = self
             .rt
             .block_on(async { self.client.post(&url).json(&request).send().await })?;
@@ -212,8 +260,11 @@ mod tests {
         OllamaDetector {
             client: reqwest::Client::new(),
             rt: rt.handle().clone(),
-            base_url: "http://localhost:11434".to_string(),
-            model: "test".to_string(),
+            primary: OllamaServer {
+                base_url: "http://localhost:11434".to_string(),
+                model: "test".to_string(),
+            },
+            fallback: None,
             confidence_threshold: 0.5,
             allowed_classes: vec!["person".to_string(), "car".to_string(), "dog".to_string()],
         }
