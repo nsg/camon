@@ -50,6 +50,72 @@ struct SidecarData {
     detections: Vec<DetectionDetail>,
 }
 
+fn parse_event_filename(stem: &str) -> Option<(u64, u32)> {
+    let (start_str, dur_str) = stem.split_once('_')?;
+    let start_pts_ns: u64 = start_str.parse().ok()?;
+    let duration_ms: u32 = dur_str.parse().ok()?;
+    Some((start_pts_ns, duration_ms))
+}
+
+fn parse_sidecar_json(parsed: &serde_json::Value) -> SidecarData {
+    let backend = parsed["backend"].as_str().map(String::from);
+    let model = parsed["model"].as_str().map(String::from);
+
+    // New format: {"backend": ..., "detections": [{class, confidence}]}
+    if let Some(dets) = parsed["detections"].as_array() {
+        let detections: Vec<DetectionDetail> = dets
+            .iter()
+            .filter_map(|d| {
+                Some(DetectionDetail {
+                    class: d["class"].as_str()?.to_string(),
+                    confidence: d["confidence"].as_f64()? as f32,
+                })
+            })
+            .collect();
+        let classes = detections.iter().map(|d| d.class.clone()).collect();
+        return SidecarData {
+            classes,
+            backend,
+            model,
+            detections,
+        };
+    }
+
+    // Old format: {"classes": ["person", "car"]}
+    let classes = parsed["classes"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    SidecarData {
+        classes,
+        backend,
+        model,
+        detections: Vec::new(),
+    }
+}
+
+fn load_sidecar(path: &std::path::Path) -> SidecarData {
+    let empty = SidecarData {
+        classes: Vec::new(),
+        backend: None,
+        model: None,
+        detections: Vec::new(),
+    };
+    let data = match std::fs::read_to_string(path) {
+        Ok(d) => d,
+        Err(_) => return empty,
+    };
+    match serde_json::from_str(&data) {
+        Ok(parsed) => parse_sidecar_json(&parsed),
+        Err(_) => empty,
+    }
+}
+
 impl WarmEventIndex {
     pub fn new(camera_ids: &[String], data_dir: PathBuf) -> Self {
         let mut cameras = HashMap::new();
@@ -66,54 +132,7 @@ impl WarmEventIndex {
         let start = std::time::Instant::now();
         let mut total_events = 0;
         for (camera_id, lock) in self.cameras.iter() {
-            let mut entries = Vec::new();
-            for event_type in &[EventType::Movement, EventType::Object] {
-                let dir = self.data_dir.join(camera_id).join(event_type.dir_name());
-                let read_dir = match std::fs::read_dir(&dir) {
-                    Ok(rd) => rd,
-                    Err(_) => continue,
-                };
-                for entry in read_dir.flatten() {
-                    let path = entry.path();
-                    let ext = path.extension().and_then(|e| e.to_str());
-                    if ext != Some("ts") {
-                        continue;
-                    }
-                    let stem = match path.file_stem().and_then(|s| s.to_str()) {
-                        Some(s) => s,
-                        None => continue,
-                    };
-                    let (start_str, dur_str) = match stem.split_once('_') {
-                        Some(pair) => pair,
-                        None => continue,
-                    };
-                    let start_pts_ns: u64 = match start_str.parse() {
-                        Ok(v) => v,
-                        Err(_) => continue,
-                    };
-                    let duration_ms: u32 = match dur_str.parse() {
-                        Ok(v) => v,
-                        Err(_) => continue,
-                    };
-                    let file_size = entry.metadata().map(|m| m.len()).unwrap_or(0);
-                    let sidecar = Self::load_sidecar(&path.with_extension("json"));
-                    let has_filmstrip = path
-                        .with_file_name(format!("{}_thumb_0.jpg", stem))
-                        .exists();
-                    entries.push(WarmEventEntry {
-                        start_pts_ns,
-                        duration_ms,
-                        event_type: *event_type,
-                        file_size,
-                        object_classes: sidecar.classes,
-                        backend: sidecar.backend,
-                        model: sidecar.model,
-                        detections: sidecar.detections,
-                        has_filmstrip,
-                    });
-                }
-            }
-            entries.sort_by_key(|e| e.start_pts_ns);
+            let entries = self.scan_camera(camera_id);
             let count = entries.len();
             *lock.write().unwrap() = entries;
             total_events += count;
@@ -128,69 +147,52 @@ impl WarmEventIndex {
         );
     }
 
-    fn load_sidecar(path: &std::path::Path) -> SidecarData {
-        let data = match std::fs::read_to_string(path) {
-            Ok(d) => d,
-            Err(_) => {
-                return SidecarData {
-                    classes: Vec::new(),
-                    backend: None,
-                    model: None,
-                    detections: Vec::new(),
-                }
-            }
-        };
-        let parsed: serde_json::Value = match serde_json::from_str(&data) {
-            Ok(v) => v,
-            Err(_) => {
-                return SidecarData {
-                    classes: Vec::new(),
-                    backend: None,
-                    model: None,
-                    detections: Vec::new(),
-                }
-            }
-        };
-
-        let backend = parsed["backend"].as_str().map(String::from);
-        let model = parsed["model"].as_str().map(String::from);
-
-        // New format: {"backend": ..., "detections": [{class, confidence}]}
-        if let Some(dets) = parsed["detections"].as_array() {
-            let detections: Vec<DetectionDetail> = dets
-                .iter()
-                .filter_map(|d| {
-                    Some(DetectionDetail {
-                        class: d["class"].as_str()?.to_string(),
-                        confidence: d["confidence"].as_f64()? as f32,
-                    })
-                })
-                .collect();
-            let classes = detections.iter().map(|d| d.class.clone()).collect();
-            return SidecarData {
-                classes,
-                backend,
-                model,
-                detections,
+    fn scan_camera(&self, camera_id: &str) -> Vec<WarmEventEntry> {
+        let mut entries = Vec::new();
+        for event_type in &[EventType::Movement, EventType::Object] {
+            let dir = self.data_dir.join(camera_id).join(event_type.dir_name());
+            let read_dir = match std::fs::read_dir(&dir) {
+                Ok(rd) => rd,
+                Err(_) => continue,
             };
+            for entry in read_dir.flatten() {
+                if let Some(warm_entry) = self.scan_entry(&entry, *event_type) {
+                    entries.push(warm_entry);
+                }
+            }
         }
+        entries.sort_by_key(|e| e.start_pts_ns);
+        entries
+    }
 
-        // Old format: {"classes": ["person", "car"]}
-        let classes = parsed["classes"]
-            .as_array()
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        SidecarData {
-            classes,
-            backend,
-            model,
-            detections: Vec::new(),
+    fn scan_entry(
+        &self,
+        entry: &std::fs::DirEntry,
+        event_type: EventType,
+    ) -> Option<WarmEventEntry> {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("ts") {
+            return None;
         }
+        let stem = path.file_stem()?.to_str()?;
+        let (start_pts_ns, duration_ms) = parse_event_filename(stem)?;
+        let file_size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+        let sidecar = load_sidecar(&path.with_extension("json"));
+        let has_filmstrip = path
+            .with_file_name(format!("{}_thumb_0.jpg", stem))
+            .exists();
+
+        Some(WarmEventEntry {
+            start_pts_ns,
+            duration_ms,
+            event_type,
+            file_size,
+            object_classes: sidecar.classes,
+            backend: sidecar.backend,
+            model: sidecar.model,
+            detections: sidecar.detections,
+            has_filmstrip,
+        })
     }
 
     pub fn insert(&self, camera_id: &str, entry: WarmEventEntry) {
