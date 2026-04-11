@@ -14,40 +14,79 @@ This is a personal project built for my own cameras, hardware, and use case. It 
 
 ## Pipeline
 
-```
-IP Camera ──RTSP──▶ Camon
-                    │
-                    ▼
-              FFmpeg ──▶ H.264 frames
-                    │
-            ┌───────┴───────┐
-            ▼               ▼
-      ┌──────────┐   ┌───────────┐
-      │Hot Buffer│   │ Analytics │
-      │(RAM ~10m)│   │   @5fps   │
-      └────┬─────┘   │           │
-           │         │ MOG2 ──▶ motion
-           │         │ Ollama ──▶ detections
-           │         └───────────┘
-           ▼
-    ┌──────────────┐
-    │ Warm Storage │◀── on motion
-    │   (disk)     │
-    └──────────────┘
+We keep a single RTSP stream per camera, remux into MPEG-TS, segment at keyframe boundaries, and hold the last 10 minutes in a RAM buffer. We do that to avoid re-encoding to keep it lightweight on CPU usage, and we save it in RAM to spare disk wear.
 
-    Axum HTTP ──▶ HLS + REST + UI
+```mermaid
+flowchart LR
+  Camera -->|RTSP| KeyframeSegmenter("Keyframe Segmenter") --> HotBuffer[("Hot Buffer (10m)")]
 ```
 
-## Features
+Each camera runs its own independent pipeline with its own buffer. From the buffer we feed clients (browsers watching the live stream) and the motion analyzer. As segments age out of the buffer, those marked with motion are written to disk.
 
-- **RTSP ingestion** — H.264 streams from IP cameras via FFmpeg
-- **Motion detection** — MOG2 background subtraction with adaptive percentile-based thresholding
-- **Object detection** — vision LLM inference via Ollama with fallback server support
-- **Tiered storage** — hot (RAM) for live playback, warm (disk) for event recordings
-- **HLS streaming** — live and recorded event playback over HTTP
-- **Web UI** — live monitor, event browser, and event playback as separate focused views
-- **REST API** — query events by time range, camera, and type
-- **Auto-update** — checks GitHub Releases on startup for new versions
+```mermaid
+flowchart LR
+  HotBuffer[("Hot Buffer (10m)")] -->|HLS| Clients
+  HotBuffer -.->|evicted| WW[("Warm Writer (disk)")]
+  HotBuffer -->|keyframes| MA["Motion Analyzer"] --> MS[("Motion Store")]
+  MA -->|Ollama| OD["Object Detection"] --> DS[("Detection Store")]
+  WW -.- MS
+  WW -.- DS
+```
+
+Clients can stream the raw segments from the buffer directly, the only thing we need to do is to serve a playlist.m3u8 which is a simple text file to the player. Object Detection is heavy on the CPU (or GPU) so most "detections" are filtered in the Motion Analyzer stage.
+
+```mermaid
+flowchart LR
+  HotBuffer[("Hot Buffer (10m)")] -->|keyframes| Decode["Decode 320x240 (grayscale)"] --> MA
+  MA -.-> AutomaticTuning("Automatic Tuning") -.-> MA
+  MA --> MS[("Motion Store")]
+
+subgraph MA["Motion Analyzer"]
+   MOG2["Background Subtraction"] --> Shadow["Shadow Removal"] --> Morph["Morphological Opening"] --> Contour["Contour Filtering"]
+end
+```
+
+To make decoding as lightweight as possible, we only extract keyframes because they are self-contained and do not depend on surrounding frames. This also has the added bonus of reducing the framerate.
+
+The Motion Analyzer uses OpenCV's MOG2 (Mixture of Gaussians) background subtractor to detect foreground motion, followed by shadow removal, morphological opening to eliminate noise, and contour filtering to discard small blobs. Several of these parameters are tuned automatically based on the camera's noise level to find an equilibrium between sensitivity and noise suppression.
+
+```mermaid
+flowchart LR
+  HotBuffer[("Hot Buffer (10m)")] -->|motion event| Sub["Subsample 4 Frames"]
+  MA[("Motion Store")] -->|bounding boxes| Sub
+  Sub --> Crop1["Crop"] --> Ollama1["Ollama"] --> Grid["Detection Grid (16x12)"]
+  Sub --> Crop2["Crop"] --> Ollama2["Ollama"] --> Grid
+  Sub --> Crop3["Crop"] --> Ollama3["Ollama"] --> Grid
+  Sub --> Crop4["Crop"] --> Ollama4["Ollama"] --> Grid
+  Grid --> DS[("Detection Store")]
+```
+
+The Motion Store keeps track of motion events. If there are several segments in sequence that have movements, they are considered a single motion event. We sample four frames from each event at 0/3, 1/3, 2/3 and 3/3. Using bounding boxes from the motion event, we crop the image to "zoom in" to the action before sending it to our vision model running in Ollama. We keep track of where in the frame the object was detected and record it in a detection grid. If there are many detections of a specific class of objects in that area, the detection is suppressed (dropped). For example, this prevents repeated detections for a parked car.
+
+We are still running in RAM, our 10 minute video buffer and some metadata stored in the motion and detection stores. At this stage we should have enough information to only save events that we care about on disk!
+
+```mermaid
+flowchart LR
+  HotBuffer[("Hot Buffer (10m)")] -.->|evicted| WarmWriter["Warm Writer"]
+  MS[("Motion Store")] --> WarmWriter
+  DS[("Detection Store")] --> WarmWriter
+  WarmWriter --> DiskMovements
+  WarmWriter --> DiskObjects
+  WarmWriter --> Metadata
+  WarmWriter --> Thumbnails
+
+  subgraph Disc
+    DiskMovements[("Movements")]
+    DiskObjects[("Objects")]
+    Metadata[("Metadata")]
+    Thumbnails[("Thumbnails")]
+  end
+
+  Disc --> Client
+  Prune -.-> Disc
+```
+
+As segments age out of the hot buffer, the warm writer checks the motion and detection stores to decide what to keep. Events are written to disk with padding before and after motion for context. The writer also saves metadata and thumbnails that is used by the web UI. User can stream saved video events via HLS.
 
 ## Quick Start
 
