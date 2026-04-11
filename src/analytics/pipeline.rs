@@ -331,6 +331,17 @@ impl MotionAnalyzer {
         if let Some(jpeg) = self.detector.background_jpeg() {
             self.motion_store.set_background_map(&self.camera_id, jpeg);
         }
+        if let Some(jpeg) = self.detector.raw_mog2_mask_jpeg() {
+            self.motion_store
+                .set_raw_mog2_map(&self.camera_id, jpeg);
+        }
+        if let Some(jpeg) = self.detector.no_shadow_mask_jpeg() {
+            self.motion_store
+                .set_no_shadow_map(&self.camera_id, jpeg);
+        }
+        if let Some(jpeg) = self.detector.morph_mask_jpeg() {
+            self.motion_store.set_morph_map(&self.camera_id, jpeg);
+        }
         self.motion_store
             .set_tuner_stats(&self.camera_id, self.detector.tuner_stats());
     }

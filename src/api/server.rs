@@ -100,6 +100,18 @@ pub async fn start_server(state: AppState, port: u16) -> Result<(), std::io::Err
             "/api/cameras/{id}/motion/background",
             get(background_map_handler),
         )
+        .route(
+            "/api/cameras/{id}/motion/stability/raw",
+            get(raw_mog2_map_handler),
+        )
+        .route(
+            "/api/cameras/{id}/motion/stability/no-shadow",
+            get(no_shadow_map_handler),
+        )
+        .route(
+            "/api/cameras/{id}/motion/stability/morph",
+            get(morph_map_handler),
+        )
         .route("/api/cameras/{id}/motion/tuner", get(tuner_stats_handler))
         .route(
             "/api/cameras/{id}/detection/grid",
@@ -340,6 +352,45 @@ async fn background_map_handler(State(state): State<AppState>, Path(id): Path<St
     match state.motion_store.get_background_map(&id) {
         Some(jpeg) => ([(header::CONTENT_TYPE, "image/jpeg")], jpeg).into_response(),
         None => (StatusCode::NOT_FOUND, "background not available yet").into_response(),
+    }
+}
+
+async fn raw_mog2_map_handler(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Response {
+    if !state.buffers.contains_key(&id) {
+        return (StatusCode::NOT_FOUND, "camera not found").into_response();
+    }
+    match state.motion_store.get_raw_mog2_map(&id) {
+        Some(jpeg) => ([(header::CONTENT_TYPE, "image/jpeg")], jpeg).into_response(),
+        None => (StatusCode::NOT_FOUND, "raw mask not available yet").into_response(),
+    }
+}
+
+async fn no_shadow_map_handler(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Response {
+    if !state.buffers.contains_key(&id) {
+        return (StatusCode::NOT_FOUND, "camera not found").into_response();
+    }
+    match state.motion_store.get_no_shadow_map(&id) {
+        Some(jpeg) => ([(header::CONTENT_TYPE, "image/jpeg")], jpeg).into_response(),
+        None => (StatusCode::NOT_FOUND, "no-shadow mask not available yet").into_response(),
+    }
+}
+
+async fn morph_map_handler(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Response {
+    if !state.buffers.contains_key(&id) {
+        return (StatusCode::NOT_FOUND, "camera not found").into_response();
+    }
+    match state.motion_store.get_morph_map(&id) {
+        Some(jpeg) => ([(header::CONTENT_TYPE, "image/jpeg")], jpeg).into_response(),
+        None => (StatusCode::NOT_FOUND, "morph mask not available yet").into_response(),
     }
 }
 

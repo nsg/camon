@@ -92,6 +92,9 @@ document.addEventListener('DOMContentLoaded', async () => {
     let stabilityPollInterval = null;
     let stabilityOverlayEnabled = false;
     let stabilityImage = null;
+    let rawMog2Image = null;
+    let noShadowImage = null;
+    let morphImage = null;
     let bgOverlayEnabled = false;
     let bgImage = null;
     let gridOverlayEnabled = false;
@@ -261,6 +264,9 @@ document.addEventListener('DOMContentLoaded', async () => {
         if (!stabilityOverlayEnabled) {
             stabilityCtx.clearRect(0, 0, stabilityOverlay.width, stabilityOverlay.height);
             stabilityImage = null;
+            rawMog2Image = null;
+            noShadowImage = null;
+            morphImage = null;
         } else {
             fetchStabilityMap();
         }
@@ -555,6 +561,9 @@ document.addEventListener('DOMContentLoaded', async () => {
         warmEvents = [];
 
         stabilityImage = null;
+        rawMog2Image = null;
+        noShadowImage = null;
+        morphImage = null;
         stabilityOverlay.hidden = true;
         stabilityOverlayEnabled = false;
         maskToggleBtn.classList.remove('active');
@@ -782,14 +791,31 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     function fetchStabilityMap() {
         if (!stabilityOverlayEnabled || !currentDetailCameraId) return;
+        const cam = encodeURIComponent(currentDetailCameraId);
+        const t = Date.now();
+
         const img = new Image();
         img.onload = () => { stabilityImage = img; drawStability(); };
         img.onerror = () => {};
-        img.src = `/api/cameras/${encodeURIComponent(currentDetailCameraId)}/motion/stability?t=${Date.now()}`;
+        img.src = `/api/cameras/${cam}/motion/stability?t=${t}`;
+
+        const raw = new Image();
+        raw.onload = () => { rawMog2Image = raw; drawStability(); };
+        raw.onerror = () => {};
+        raw.src = `/api/cameras/${cam}/motion/stability/raw?t=${t}`;
+
+        const noShadow = new Image();
+        noShadow.onload = () => { noShadowImage = noShadow; drawStability(); };
+        noShadow.onerror = () => {};
+        noShadow.src = `/api/cameras/${cam}/motion/stability/no-shadow?t=${t}`;
+
+        const morph = new Image();
+        morph.onload = () => { morphImage = morph; drawStability(); };
+        morph.onerror = () => {};
+        morph.src = `/api/cameras/${cam}/motion/stability/morph?t=${t}`;
     }
 
     function drawStability() {
-        if (!stabilityImage) return;
         const w = detailVideo.clientWidth;
         const h = detailVideo.clientHeight;
         if (w === 0 || h === 0) return;
@@ -798,21 +824,48 @@ document.addEventListener('DOMContentLoaded', async () => {
             stabilityOverlay.height = h;
         }
         stabilityCtx.clearRect(0, 0, w, h);
-        stabilityCtx.drawImage(stabilityImage, 0, 0, w, h);
-        const imageData = stabilityCtx.getImageData(0, 0, w, h);
+
+        // Paint layers bottom-to-top: each successive stage is a subset,
+        // so later layers overwrite earlier ones where they overlap.
+        // Layer 1: Raw MOG2 (red) — largest area, low threshold to include shadow pixels (127)
+        if (rawMog2Image) {
+            recolorMask(rawMog2Image, w, h, 180, 60, 60, 150, 50);
+        }
+        // Layer 2: After shadow removal (orange)
+        if (noShadowImage) {
+            recolorMask(noShadowImage, w, h, 220, 140, 0, 160, 128);
+        }
+        // Layer 3: After morphological opening (yellow)
+        if (morphImage) {
+            recolorMask(morphImage, w, h, 240, 240, 0, 170, 128);
+        }
+        // Layer 4: Final filtered (green) — smallest area, always on top
+        if (stabilityImage) {
+            recolorMask(stabilityImage, w, h, 0, 255, 0, 180, 128);
+        }
+    }
+
+    function recolorMask(img, w, h, r, g, b, a, threshold) {
+        // Use a temporary canvas to avoid corrupting the main overlay between layers.
+        const tmp = document.createElement('canvas');
+        tmp.width = w;
+        tmp.height = h;
+        const ctx = tmp.getContext('2d');
+        ctx.drawImage(img, 0, 0, w, h);
+        const imageData = ctx.getImageData(0, 0, w, h);
         const px = imageData.data;
         for (let i = 0; i < px.length; i += 4) {
-            const brightness = px[i];
-            if (brightness > 128) {
-                px[i]     = 0;
-                px[i + 1] = 255;
-                px[i + 2] = 0;
-                px[i + 3] = 180;
+            if (px[i] > threshold) {
+                px[i]     = r;
+                px[i + 1] = g;
+                px[i + 2] = b;
+                px[i + 3] = a;
             } else {
                 px[i + 3] = 0;
             }
         }
-        stabilityCtx.putImageData(imageData, 0, 0);
+        ctx.putImageData(imageData, 0, 0);
+        stabilityCtx.drawImage(tmp, 0, 0);
     }
 
     function fetchBackgroundMap() {

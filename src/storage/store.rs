@@ -19,6 +19,9 @@ pub struct MotionStore {
     stability_maps: Arc<HashMap<String, RwLock<Option<Vec<u8>>>>>,
     background_maps: Arc<HashMap<String, RwLock<Option<Vec<u8>>>>>,
     tuner_stats: Arc<HashMap<String, RwLock<Option<TunerStats>>>>,
+    raw_mog2_maps: Arc<HashMap<String, RwLock<Option<Vec<u8>>>>>,
+    no_shadow_maps: Arc<HashMap<String, RwLock<Option<Vec<u8>>>>>,
+    morph_maps: Arc<HashMap<String, RwLock<Option<Vec<u8>>>>>,
 }
 
 impl MotionStore {
@@ -27,17 +30,26 @@ impl MotionStore {
         let mut stability_maps = HashMap::new();
         let mut background_maps = HashMap::new();
         let mut tuner_stats = HashMap::new();
+        let mut raw_mog2_maps = HashMap::new();
+        let mut no_shadow_maps = HashMap::new();
+        let mut morph_maps = HashMap::new();
         for id in camera_ids {
             cameras.insert(id.clone(), RwLock::new(VecDeque::new()));
             stability_maps.insert(id.clone(), RwLock::new(None));
             background_maps.insert(id.clone(), RwLock::new(None));
             tuner_stats.insert(id.clone(), RwLock::new(None));
+            raw_mog2_maps.insert(id.clone(), RwLock::new(None));
+            no_shadow_maps.insert(id.clone(), RwLock::new(None));
+            morph_maps.insert(id.clone(), RwLock::new(None));
         }
         Self {
             cameras: Arc::new(cameras),
             stability_maps: Arc::new(stability_maps),
             background_maps: Arc::new(background_maps),
             tuner_stats: Arc::new(tuner_stats),
+            raw_mog2_maps: Arc::new(raw_mog2_maps),
+            no_shadow_maps: Arc::new(no_shadow_maps),
+            morph_maps: Arc::new(morph_maps),
         }
     }
 
@@ -138,6 +150,39 @@ impl MotionStore {
         lock.read().unwrap().clone()
     }
 
+    pub fn set_raw_mog2_map(&self, camera_id: &str, jpeg: Vec<u8>) {
+        if let Some(lock) = self.raw_mog2_maps.get(camera_id) {
+            *lock.write().unwrap() = Some(jpeg);
+        }
+    }
+
+    pub fn get_raw_mog2_map(&self, camera_id: &str) -> Option<Vec<u8>> {
+        let lock = self.raw_mog2_maps.get(camera_id)?;
+        lock.read().unwrap().clone()
+    }
+
+    pub fn set_no_shadow_map(&self, camera_id: &str, jpeg: Vec<u8>) {
+        if let Some(lock) = self.no_shadow_maps.get(camera_id) {
+            *lock.write().unwrap() = Some(jpeg);
+        }
+    }
+
+    pub fn get_no_shadow_map(&self, camera_id: &str) -> Option<Vec<u8>> {
+        let lock = self.no_shadow_maps.get(camera_id)?;
+        lock.read().unwrap().clone()
+    }
+
+    pub fn set_morph_map(&self, camera_id: &str, jpeg: Vec<u8>) {
+        if let Some(lock) = self.morph_maps.get(camera_id) {
+            *lock.write().unwrap() = Some(jpeg);
+        }
+    }
+
+    pub fn get_morph_map(&self, camera_id: &str) -> Option<Vec<u8>> {
+        let lock = self.morph_maps.get(camera_id)?;
+        lock.read().unwrap().clone()
+    }
+
     pub fn last_sequence(&self, camera_id: &str) -> Option<u64> {
         self.cameras
             .get(camera_id)?
@@ -155,6 +200,9 @@ impl Clone for MotionStore {
             stability_maps: Arc::clone(&self.stability_maps),
             background_maps: Arc::clone(&self.background_maps),
             tuner_stats: Arc::clone(&self.tuner_stats),
+            raw_mog2_maps: Arc::clone(&self.raw_mog2_maps),
+            no_shadow_maps: Arc::clone(&self.no_shadow_maps),
+            morph_maps: Arc::clone(&self.morph_maps),
         }
     }
 }

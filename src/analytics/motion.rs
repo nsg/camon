@@ -301,6 +301,9 @@ pub struct MotionDetector {
     min_contour_area: f64,
     frames_since_stable: u32,
     tuner: MotionTuner,
+    raw_mog2_mask: Mat,
+    no_shadow_mask: Mat,
+    morph_mask: Mat,
 }
 
 impl MotionDetector {
@@ -323,6 +326,9 @@ impl MotionDetector {
             min_contour_area: params.min_contour_area,
             frames_since_stable: 0,
             tuner,
+            raw_mog2_mask: Mat::default(),
+            no_shadow_mask: Mat::default(),
+            morph_mask: Mat::default(),
         })
     }
 
@@ -354,6 +360,9 @@ impl MotionDetector {
             return Ok(0.0);
         }
 
+        // Snapshot: raw MOG2 output (shadows=127, foreground=255).
+        self.raw_mog2_mask = self.fg_mask.clone();
+
         // MOG2 with shadow detection marks shadows as 127, foreground as 255.
         // Threshold to keep only true foreground before cleanup.
         imgproc::threshold(
@@ -363,6 +372,9 @@ impl MotionDetector {
             255.0,
             imgproc::THRESH_BINARY,
         )?;
+
+        // Snapshot: after shadow removal (only true foreground remains).
+        self.no_shadow_mask = self.fg_mask.clone();
 
         // Morphological opening: erode then dilate to remove isolated noise pixels.
         let anchor = opencv::core::Point::new(-1, -1);
@@ -376,6 +388,9 @@ impl MotionDetector {
             BORDER_CONSTANT,
             imgproc::morphology_default_border_value()?,
         )?;
+
+        // Snapshot: after morphological opening.
+        self.morph_mask = self.cleaned_mask.clone();
 
         // Contour area filter: zero out blobs smaller than min_contour_area.
         let mut contours = Vector::<Vector<opencv::core::Point>>::new();
@@ -477,12 +492,31 @@ impl MotionDetector {
     }
 
     pub fn fg_mask_jpeg(&self) -> Option<Vec<u8>> {
-        if self.fg_mask.empty() {
+        Self::mat_to_jpeg(&self.fg_mask)
+    }
+
+    /// Raw MOG2 output including shadow pixels.
+    pub fn raw_mog2_mask_jpeg(&self) -> Option<Vec<u8>> {
+        Self::mat_to_jpeg(&self.raw_mog2_mask)
+    }
+
+    /// After shadow removal, before morphological cleanup.
+    pub fn no_shadow_mask_jpeg(&self) -> Option<Vec<u8>> {
+        Self::mat_to_jpeg(&self.no_shadow_mask)
+    }
+
+    /// After morphological opening, before contour area filtering.
+    pub fn morph_mask_jpeg(&self) -> Option<Vec<u8>> {
+        Self::mat_to_jpeg(&self.morph_mask)
+    }
+
+    fn mat_to_jpeg(mat: &Mat) -> Option<Vec<u8>> {
+        if mat.empty() {
             return None;
         }
         let mut buf = Vector::<u8>::new();
         let params = Vector::<i32>::new();
-        imgcodecs::imencode(".jpg", &self.fg_mask, &mut buf, &params).ok()?;
+        imgcodecs::imencode(".jpg", mat, &mut buf, &params).ok()?;
         Some(buf.to_vec())
     }
 
