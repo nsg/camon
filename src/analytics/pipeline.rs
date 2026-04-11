@@ -112,7 +112,7 @@ struct PendingSegment {
 struct SegmentDetectionResult {
     classes: Vec<String>,
     confidences: Vec<f32>,
-    centers: Vec<(f32, f32)>,
+    motion_rects: Vec<(f32, f32, f32, f32)>,
     frame_jpeg: Vec<u8>,
 }
 
@@ -139,10 +139,10 @@ pub struct MotionAnalyzer {
     decoder: FrameDecoder,
     object_detector: Option<OllamaDetector>,
     last_processed: u64,
-    last_motion_bbox: Option<Rect>,
     detection_grid: Option<DetectionGrid>,
     grid_save_counter: u32,
     segment_crops: HashMap<u64, NormalizedRect>,
+    segment_motion_rects: HashMap<u64, Vec<NormalizedRect>>,
 }
 
 impl MotionAnalyzer {
@@ -167,10 +167,10 @@ impl MotionAnalyzer {
             decoder,
             object_detector: ctx.object_detector,
             last_processed,
-            last_motion_bbox: None,
             detection_grid: ctx.detection_grid,
             grid_save_counter: 0,
             segment_crops: HashMap::new(),
+            segment_motion_rects: HashMap::new(),
         })
     }
 
@@ -261,6 +261,7 @@ impl MotionAnalyzer {
                 ds.cleanup(&self.camera_id, first_seq);
             }
             self.segment_crops.retain(|&seq, _| seq >= first_seq);
+            self.segment_motion_rects.retain(|&seq, _| seq >= first_seq);
         }
         if self.last_processed < first_seq {
             self.last_processed = first_seq;
@@ -297,7 +298,7 @@ impl MotionAnalyzer {
         let mut motion_segments = Vec::new();
 
         for seg in segments {
-            let (score, crop) = self.analyze_segment(&seg.data)?;
+            let (score, crop, motion_rects) = self.analyze_segment(&seg.data)?;
             self.publish_debug_maps();
 
             if score >= MOTION_THRESHOLD {
@@ -305,6 +306,9 @@ impl MotionAnalyzer {
                 if has_detection {
                     if let Some(crop) = crop {
                         self.segment_crops.insert(seg.seq, crop);
+                    }
+                    if !motion_rects.is_empty() {
+                        self.segment_motion_rects.insert(seg.seq, motion_rects);
                     }
                     motion_segments.push(MotionSegment {
                         seq: seg.seq,
@@ -352,20 +356,23 @@ impl MotionAnalyzer {
         );
     }
 
+    #[allow(clippy::type_complexity)]
     fn analyze_segment(
         &mut self,
         data: &[u8],
-    ) -> Result<(f32, Option<NormalizedRect>), Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<
+        (f32, Option<NormalizedRect>, Vec<NormalizedRect>),
+        Box<dyn std::error::Error + Send + Sync>,
+    > {
         let raw_frames = self.decoder.decode_segment(data);
 
         if raw_frames.is_empty() {
-            return Ok((0.0, None));
+            return Ok((0.0, None, Vec::new()));
         }
 
         let height = self.decoder.height() as i32;
         let mut total_score = 0.0f32;
         let mut frame_count = 0u32;
-        let mut last_bbox = None;
         let mut all_rects = Vec::new();
 
         for frame_data in &raw_frames {
@@ -376,9 +383,6 @@ impl MotionAnalyzer {
                 Ok(score) => {
                     total_score += score;
                     frame_count += 1;
-                    if let Some(bbox) = self.detector.motion_bbox() {
-                        last_bbox = Some(bbox);
-                    }
                     for r in self.detector.motion_bboxes() {
                         all_rects.push(normalize_rect(r, ANALYSIS_WIDTH, ANALYSIS_HEIGHT));
                     }
@@ -389,14 +393,13 @@ impl MotionAnalyzer {
             }
         }
 
-        self.last_motion_bbox = last_bbox;
         let crop = union_rects_padded(&all_rects, CROP_PADDING);
 
         if frame_count == 0 {
-            return Ok((0.0, None));
+            return Ok((0.0, None, Vec::new()));
         }
 
-        Ok((total_score / frame_count as f32, crop))
+        Ok((total_score / frame_count as f32, crop, all_rects))
     }
 
     // --- Phase 2: Generic frame extraction + detection ---
@@ -484,11 +487,16 @@ impl MotionAnalyzer {
         let filmstrip_jpegs: Vec<Vec<u8>> = cropped.iter().filter_map(encode_jpeg).collect();
         self.store_filmstrip_for_run(&run, &filmstrip_jpegs);
 
-        let (cx, cy) = bbox_center(self.last_motion_bbox);
-        let (detections, best_frame_idx) = self.detect_ollama(&cropped, cx, cy);
+        let (detections, best_frame_idx) = self.detect_ollama(&cropped);
 
-        // Clean up segment_crops for this run
+        // Collect all motion rects from segments in this run
+        let mut run_motion_rects: Vec<(f32, f32, f32, f32)> = Vec::new();
         for seg in &run {
+            if let Some(rects) = self.segment_motion_rects.remove(&seg.seq) {
+                for r in rects {
+                    run_motion_rects.push((r.x, r.y, r.w, r.h));
+                }
+            }
             self.segment_crops.remove(&seg.seq);
         }
 
@@ -496,7 +504,12 @@ impl MotionAnalyzer {
             return;
         }
 
-        let result = build_detection_result(&detections, &filmstrip_jpegs, best_frame_idx);
+        let result = build_detection_result(
+            &detections,
+            &filmstrip_jpegs,
+            best_frame_idx,
+            run_motion_rects,
+        );
         self.propagate_detection(&run, &result);
     }
 
@@ -519,20 +532,20 @@ impl MotionAnalyzer {
             let propagated = SegmentDetectionResult {
                 classes: result.classes.clone(),
                 confidences: result.confidences.clone(),
-                centers: result.centers.clone(),
+                motion_rects: result.motion_rects.clone(),
                 frame_jpeg: result.frame_jpeg.clone(),
             };
             self.store_detection_result(seg.seq, &propagated);
         }
     }
 
-    fn detect_ollama(&self, frames: &[Mat], cx: f32, cy: f32) -> (Vec<Detection>, usize) {
+    fn detect_ollama(&self, frames: &[Mat]) -> (Vec<Detection>, usize) {
         let ollama = match &self.object_detector {
             Some(d) => d,
             None => return (Vec::new(), 0),
         };
 
-        let result: DetectResult = match ollama.detect_frames(frames, cx, cy) {
+        let result: DetectResult = match ollama.detect_frames(frames) {
             Ok(r) => r,
             Err(e) => {
                 tracing::warn!(
@@ -584,12 +597,9 @@ impl MotionAnalyzer {
             .unwrap_or_else(|| ("unknown".to_string(), "unknown".to_string()));
 
         let mut stored_any = false;
-        for (i, (class, &confidence)) in result.classes.iter().zip(&result.confidences).enumerate()
-        {
-            let (cx, cy) = result.centers.get(i).copied().unwrap_or((0.5, 0.5));
-
+        for (class, &confidence) in result.classes.iter().zip(&result.confidences) {
             if let Some(ref grid) = self.detection_grid {
-                if !grid.record(&self.camera_id, class, cx, cy) {
+                if !grid.record_rects(&self.camera_id, class, &result.motion_rects) {
                     tracing::trace!(
                         camera = %self.camera_id,
                         class = %class,
@@ -628,19 +638,11 @@ impl MotionAnalyzer {
     }
 }
 
-fn bbox_center(bbox: Option<Rect>) -> (f32, f32) {
-    bbox.map(|b| {
-        let cx = (b.x as f32 + b.width as f32 / 2.0) / ANALYSIS_WIDTH as f32;
-        let cy = (b.y as f32 + b.height as f32 / 2.0) / ANALYSIS_HEIGHT as f32;
-        (cx.clamp(0.0, 1.0), cy.clamp(0.0, 1.0))
-    })
-    .unwrap_or((0.5, 0.5))
-}
-
 fn build_detection_result(
     detections: &[Detection],
     filmstrip_jpegs: &[Vec<u8>],
     best_frame_idx: usize,
+    motion_rects: Vec<(f32, f32, f32, f32)>,
 ) -> SegmentDetectionResult {
     let frame_jpeg = filmstrip_jpegs
         .get(best_frame_idx)
@@ -664,7 +666,7 @@ fn build_detection_result(
     SegmentDetectionResult {
         classes: deduped.iter().map(|d| d.class_name.clone()).collect(),
         confidences: deduped.iter().map(|d| d.confidence).collect(),
-        centers: deduped.iter().map(|d| (d.cx, d.cy)).collect(),
+        motion_rects,
         frame_jpeg,
     }
 }

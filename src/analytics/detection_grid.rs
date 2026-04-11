@@ -85,17 +85,23 @@ impl DetectionGrid {
         }
     }
 
-    /// Record a detection at normalized coordinates (0.0-1.0).
-    /// Returns true if this detection is novel (not yet absorbed).
-    pub fn record(&self, camera_id: &str, class: &str, cx: f32, cy: f32) -> bool {
+    /// Record a detection across all grid cells overlapping the given
+    /// normalized rects (x, y, w, h in 0.0-1.0). Returns true if any
+    /// touched cell was below the absorption threshold (i.e. novel).
+    pub fn record_rects(
+        &self,
+        camera_id: &str,
+        class: &str,
+        rects: &[(f32, f32, f32, f32)],
+    ) -> bool {
+        if rects.is_empty() {
+            return true;
+        }
+
         let lock = match self.cameras.get(camera_id) {
             Some(l) => l,
             None => return true,
         };
-
-        let col = ((cx * GRID_COLS as f32) as usize).min(GRID_COLS - 1);
-        let row = ((cy * GRID_ROWS as f32) as usize).min(GRID_ROWS - 1);
-        let idx = row * GRID_COLS + col;
 
         let mut state = lock.write().unwrap();
         let class_grid = state
@@ -104,9 +110,26 @@ impl DetectionGrid {
             .entry(class.to_string())
             .or_insert_with(ClassGrid::new);
 
-        class_grid.cells[idx] = (class_grid.cells[idx] + HIT_INCREMENT).min(1.0);
+        let mut any_novel = false;
 
-        class_grid.cells[idx] < ABSORPTION_THRESHOLD
+        for &(x, y, w, h) in rects {
+            let col_min = ((x * GRID_COLS as f32) as usize).min(GRID_COLS - 1);
+            let col_max = (((x + w) * GRID_COLS as f32).ceil() as usize).min(GRID_COLS);
+            let row_min = ((y * GRID_ROWS as f32) as usize).min(GRID_ROWS - 1);
+            let row_max = (((y + h) * GRID_ROWS as f32).ceil() as usize).min(GRID_ROWS);
+
+            for row in row_min..row_max {
+                for col in col_min..col_max {
+                    let idx = row * GRID_COLS + col;
+                    class_grid.cells[idx] = (class_grid.cells[idx] + HIT_INCREMENT).min(1.0);
+                    if class_grid.cells[idx] < ABSORPTION_THRESHOLD {
+                        any_novel = true;
+                    }
+                }
+            }
+        }
+
+        any_novel
     }
 
     /// Decay all cells. Safe to call frequently — only applies decay
@@ -199,30 +222,48 @@ mod tests {
         (grid, dir)
     }
 
+    /// Build a tiny rect that covers exactly one grid cell at the given
+    /// normalized coordinate, matching the semantics of the old `record()`.
+    fn point_rect(cx: f32, cy: f32) -> Vec<(f32, f32, f32, f32)> {
+        let cw = 1.0 / GRID_COLS as f32;
+        let ch = 1.0 / GRID_ROWS as f32;
+        let col = (cx * GRID_COLS as f32) as usize;
+        let row = (cy * GRID_ROWS as f32) as usize;
+        vec![(col as f32 * cw, row as f32 * ch, cw * 0.5, ch * 0.5)]
+    }
+
+    fn cell_idx(cx: f32, cy: f32) -> usize {
+        let col = ((cx * GRID_COLS as f32) as usize).min(GRID_COLS - 1);
+        let row = ((cy * GRID_ROWS as f32) as usize).min(GRID_ROWS - 1);
+        row * GRID_COLS + col
+    }
+
     #[test]
     fn record_returns_novel_until_absorbed() {
         let (grid, _dir) = make_grid(&["cam1"]);
+        let r = point_rect(0.5, 0.5);
 
         // Each hit adds 0.15. Threshold is 0.6. So 4 hits = 0.60.
         for i in 0..3 {
-            let novel = grid.record("cam1", "car", 0.5, 0.5);
+            let novel = grid.record_rects("cam1", "car", &r);
             assert!(novel, "should be novel at hit {i}");
         }
 
         // 4th hit reaches 0.60 — absorbed
-        let novel = grid.record("cam1", "car", 0.5, 0.5);
+        let novel = grid.record_rects("cam1", "car", &r);
         assert!(!novel, "should be absorbed after 4 hits");
     }
 
     #[test]
     fn different_classes_are_independent() {
         let (grid, _dir) = make_grid(&["cam1"]);
+        let r = point_rect(0.5, 0.5);
 
         for _ in 0..4 {
-            grid.record("cam1", "car", 0.5, 0.5);
+            grid.record_rects("cam1", "car", &r);
         }
 
-        let novel = grid.record("cam1", "person", 0.5, 0.5);
+        let novel = grid.record_rects("cam1", "person", &r);
         assert!(novel, "different class should be independent");
     }
 
@@ -231,29 +272,27 @@ mod tests {
         let (grid, _dir) = make_grid(&["cam1"]);
 
         for _ in 0..4 {
-            grid.record("cam1", "car", 0.1, 0.1);
+            grid.record_rects("cam1", "car", &point_rect(0.1, 0.1));
         }
 
-        let novel = grid.record("cam1", "car", 0.9, 0.9);
+        let novel = grid.record_rects("cam1", "car", &point_rect(0.9, 0.9));
         assert!(novel, "different cell should be independent");
     }
 
     #[test]
     fn decay_is_time_gated() {
         let (grid, _dir) = make_grid(&["cam1"]);
+        let r = point_rect(0.5, 0.5);
 
         for _ in 0..3 {
-            grid.record("cam1", "car", 0.5, 0.5);
+            grid.record_rects("cam1", "car", &r);
         }
 
         // Calling decay immediately should not reduce values (interval not reached)
         grid.decay("cam1");
 
         let response = grid.get_grid("cam1").unwrap();
-        let col = (0.5 * GRID_COLS as f32) as usize;
-        let row = (0.5 * GRID_ROWS as f32) as usize;
-        let idx = row * GRID_COLS + col;
-        let val = response.classes["car"][idx];
+        let val = response.classes["car"][cell_idx(0.5, 0.5)];
         assert!(
             (val - 0.45).abs() < 0.01,
             "value should be ~0.45 (3 * 0.15) with no decay yet, got {val}"
@@ -263,9 +302,10 @@ mod tests {
     #[test]
     fn decay_applies_after_interval() {
         let (grid, _dir) = make_grid(&["cam1"]);
+        let r = point_rect(0.5, 0.5);
 
         for _ in 0..4 {
-            grid.record("cam1", "car", 0.5, 0.5);
+            grid.record_rects("cam1", "car", &r);
         }
         // Value is 0.60
 
@@ -279,10 +319,7 @@ mod tests {
         grid.decay("cam1");
 
         let response = grid.get_grid("cam1").unwrap();
-        let col = (0.5 * GRID_COLS as f32) as usize;
-        let row = (0.5 * GRID_ROWS as f32) as usize;
-        let idx = row * GRID_COLS + col;
-        let val = response.classes["car"][idx];
+        let val = response.classes["car"][cell_idx(0.5, 0.5)];
         // 2 minutes of decay: 0.60 - (0.001 * 2) = 0.598
         assert!(
             (val - 0.598).abs() < 0.01,
@@ -293,9 +330,7 @@ mod tests {
     #[test]
     fn decay_does_not_go_below_zero() {
         let (grid, _dir) = make_grid(&["cam1"]);
-
-        grid.record("cam1", "car", 0.5, 0.5);
-        // Value is 0.15
+        grid.record_rects("cam1", "car", &point_rect(0.5, 0.5));
 
         // Force a very long elapsed time
         {
@@ -316,16 +351,15 @@ mod tests {
     #[test]
     fn value_capped_at_one() {
         let (grid, _dir) = make_grid(&["cam1"]);
+        let r = point_rect(0.5, 0.5);
 
         for _ in 0..100 {
-            grid.record("cam1", "car", 0.5, 0.5);
+            grid.record_rects("cam1", "car", &r);
         }
 
         let response = grid.get_grid("cam1").unwrap();
         let cells = &response.classes["car"];
-        let col = (0.5 * GRID_COLS as f32) as usize;
-        let row = (0.5 * GRID_ROWS as f32) as usize;
-        let idx = row * GRID_COLS + col;
+        let idx = cell_idx(0.5, 0.5);
         assert!(cells[idx] <= 1.0, "value should be capped at 1.0");
         assert!(cells[idx] >= 0.99, "value should be near 1.0");
     }
@@ -333,7 +367,7 @@ mod tests {
     #[test]
     fn unknown_camera_returns_novel() {
         let (grid, _dir) = make_grid(&["cam1"]);
-        let novel = grid.record("unknown", "car", 0.5, 0.5);
+        let novel = grid.record_rects("unknown", "car", &point_rect(0.5, 0.5));
         assert!(novel, "unknown camera should always return novel");
     }
 
@@ -347,7 +381,7 @@ mod tests {
     fn get_grid_filters_empty_classes() {
         let (grid, _dir) = make_grid(&["cam1"]);
 
-        grid.record("cam1", "car", 0.5, 0.5);
+        grid.record_rects("cam1", "car", &point_rect(0.5, 0.5));
         let response = grid.get_grid("cam1").unwrap();
         assert!(response.classes.contains_key("car"));
 
@@ -378,8 +412,8 @@ mod tests {
     fn coordinate_mapping_edges() {
         let (grid, _dir) = make_grid(&["cam1"]);
 
-        grid.record("cam1", "car", 0.0, 0.0);
-        grid.record("cam1", "car", 1.0, 1.0);
+        grid.record_rects("cam1", "car", &point_rect(0.0, 0.0));
+        grid.record_rects("cam1", "car", &[(0.9, 0.9, 0.1, 0.1)]);
 
         let response = grid.get_grid("cam1").unwrap();
         let cells = &response.classes["car"];
@@ -394,13 +428,15 @@ mod tests {
     fn save_and_load_roundtrip() {
         let dir = TempDir::new().unwrap();
         let ids = vec!["cam1".to_string()];
+        let r_car = point_rect(0.3, 0.7);
+        let r_person = point_rect(0.8, 0.2);
 
         let grid = DetectionGrid::new(&ids, dir.path().to_path_buf());
         for _ in 0..10 {
-            grid.record("cam1", "car", 0.3, 0.7);
+            grid.record_rects("cam1", "car", &r_car);
         }
         for _ in 0..5 {
-            grid.record("cam1", "person", 0.8, 0.2);
+            grid.record_rects("cam1", "person", &r_person);
         }
         grid.save("cam1");
 
@@ -410,14 +446,81 @@ mod tests {
         assert!(response.classes.contains_key("car"));
         assert!(response.classes.contains_key("person"));
 
-        let col = (0.3 * GRID_COLS as f32) as usize;
-        let row = (0.7 * GRID_ROWS as f32) as usize;
-        let idx = row * GRID_COLS + col;
-        let car_val = response.classes["car"][idx];
+        let car_val = response.classes["car"][cell_idx(0.3, 0.7)];
         // 10 * 0.15 = 1.5, capped at 1.0
         assert!(
             (car_val - 1.0).abs() < 0.01,
             "car value should be 1.0 (10 * 0.15 capped), got {car_val}"
+        );
+    }
+
+    #[test]
+    fn record_rects_marks_multiple_cells() {
+        let (grid, _dir) = make_grid(&["cam1"]);
+
+        // Rect spanning columns 4-7, rows 3-5 (normalized: x=0.25..0.5, y=0.25..0.5)
+        let novel = grid.record_rects("cam1", "car", &[(0.25, 0.25, 0.25, 0.25)]);
+        assert!(novel);
+
+        let response = grid.get_grid("cam1").unwrap();
+        let cells = &response.classes["car"];
+
+        // Check that cells in the rect region got incremented
+        for row in 3..6 {
+            for col in 4..8 {
+                let idx = row * GRID_COLS + col;
+                assert!(
+                    cells[idx] > 0.0,
+                    "cell ({col}, {row}) should be marked, got {}",
+                    cells[idx]
+                );
+            }
+        }
+
+        // Check that a cell outside the rect was NOT marked
+        assert!(
+            cells[0] == 0.0,
+            "cell (0,0) should be unmarked, got {}",
+            cells[0]
+        );
+    }
+
+    #[test]
+    fn record_rects_empty_returns_novel() {
+        let (grid, _dir) = make_grid(&["cam1"]);
+        assert!(grid.record_rects("cam1", "car", &[]));
+    }
+
+    #[test]
+    fn record_rects_absorbs_after_repeated_hits() {
+        let (grid, _dir) = make_grid(&["cam1"]);
+        let rect = &[(0.0, 0.0, 0.0625, 0.0833)]; // Single cell (col 0, row 0)
+
+        for _ in 0..3 {
+            assert!(grid.record_rects("cam1", "car", rect));
+        }
+        // 4th hit reaches absorption (4 * 0.15 = 0.60)
+        assert!(
+            !grid.record_rects("cam1", "car", rect),
+            "should be absorbed after 4 hits"
+        );
+    }
+
+    #[test]
+    fn record_rects_novel_if_any_cell_below_threshold() {
+        let (grid, _dir) = make_grid(&["cam1"]);
+
+        // Absorb cell (0,0) via single-cell rect
+        let small = &[(0.0, 0.0, 0.0625, 0.0833)];
+        for _ in 0..4 {
+            grid.record_rects("cam1", "car", small);
+        }
+
+        // Now record a wider rect that includes (0,0) plus fresh cells
+        let wide = &[(0.0, 0.0, 0.25, 0.0833)];
+        assert!(
+            grid.record_rects("cam1", "car", wide),
+            "should be novel because fresh cells are included"
         );
     }
 }

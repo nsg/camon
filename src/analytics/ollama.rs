@@ -9,8 +9,6 @@ use tokio::runtime::Handle;
 pub struct Detection {
     pub class_name: String,
     pub confidence: f32,
-    pub cx: f32,
-    pub cy: f32,
 }
 
 /// Result from a single frame detection call.
@@ -115,8 +113,6 @@ impl OllamaDetector {
     pub fn detect_frames(
         &self,
         frames: &[opencv::core::Mat],
-        cx: f32,
-        cy: f32,
     ) -> Result<DetectResult, Box<dyn std::error::Error + Send + Sync>> {
         if frames.is_empty() {
             return Ok(DetectResult {
@@ -136,7 +132,7 @@ impl OllamaDetector {
             let jpeg = self.encode_frame_jpeg(frame)?;
             let image_b64 = base64::engine::general_purpose::STANDARD.encode(&jpeg);
 
-            let result = self.call_single_frame(&image_b64, cx, cy);
+            let result = self.call_single_frame(&image_b64);
             match result {
                 Ok(r) => {
                     all_detections.extend(r.detections);
@@ -163,10 +159,8 @@ impl OllamaDetector {
     fn call_single_frame(
         &self,
         image_b64: &str,
-        cx: f32,
-        cy: f32,
     ) -> Result<FrameDetectResult, Box<dyn std::error::Error + Send + Sync>> {
-        match self.call_server(&self.primary, image_b64, cx, cy) {
+        match self.call_server(&self.primary, image_b64) {
             Ok((detections, raw_response, model)) => Ok(FrameDetectResult {
                 detections,
                 raw_response,
@@ -178,7 +172,7 @@ impl OllamaDetector {
                         error = %primary_err,
                         "primary ollama failed, trying fallback"
                     );
-                    match self.call_server(fallback, image_b64, cx, cy) {
+                    match self.call_server(fallback, image_b64) {
                         Ok((detections, raw_response, model)) => Ok(FrameDetectResult {
                             detections,
                             raw_response,
@@ -200,8 +194,6 @@ impl OllamaDetector {
         &self,
         server: &OllamaServer,
         image_b64: &str,
-        cx: f32,
-        cy: f32,
     ) -> Result<(Vec<Detection>, String, String), Box<dyn std::error::Error + Send + Sync>> {
         let request = ChatRequest {
             model: server.model.clone(),
@@ -226,7 +218,7 @@ impl OllamaDetector {
 
         let chat_response: ChatResponse = self.rt.block_on(response.json())?;
         let content = chat_response.message.map(|m| m.content).unwrap_or_default();
-        let detections = self.parse_response(&content, cx, cy);
+        let detections = self.parse_response(&content);
 
         Ok((detections, content, server.model.clone()))
     }
@@ -241,7 +233,7 @@ impl OllamaDetector {
         Ok(buf.to_vec())
     }
 
-    fn parse_response(&self, content: &str, cx: f32, cy: f32) -> Vec<Detection> {
+    fn parse_response(&self, content: &str) -> Vec<Detection> {
         let mut detections = Vec::new();
 
         for line in content.lines() {
@@ -272,8 +264,6 @@ impl OllamaDetector {
             detections.push(Detection {
                 class_name,
                 confidence: confidence.clamp(0.0, 1.0),
-                cx,
-                cy,
             });
         }
 
@@ -304,28 +294,26 @@ mod tests {
     fn parse_valid_detections() {
         let det = make_detector();
         let response = "person 0.95\ncar 0.80\n";
-        let results = det.parse_response(response, 0.5, 0.6);
+        let results = det.parse_response(response);
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].class_name, "person");
         assert!((results[0].confidence - 0.95).abs() < 0.01);
-        assert_eq!(results[0].cx, 0.5);
-        assert_eq!(results[0].cy, 0.6);
         assert_eq!(results[1].class_name, "car");
     }
 
     #[test]
     fn parse_none_response() {
         let det = make_detector();
-        assert!(det.parse_response("NONE", 0.5, 0.5).is_empty());
-        assert!(det.parse_response("none", 0.5, 0.5).is_empty());
-        assert!(det.parse_response("NONE\n", 0.5, 0.5).is_empty());
+        assert!(det.parse_response("NONE").is_empty());
+        assert!(det.parse_response("none").is_empty());
+        assert!(det.parse_response("NONE\n").is_empty());
     }
 
     #[test]
     fn parse_filters_low_confidence() {
         let det = make_detector();
         let response = "person 0.3\ncar 0.8\n";
-        let results = det.parse_response(response, 0.5, 0.5);
+        let results = det.parse_response(response);
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].class_name, "car");
     }
@@ -334,7 +322,7 @@ mod tests {
     fn parse_filters_disallowed_classes() {
         let det = make_detector();
         let response = "truck 0.9\nperson 0.8\n";
-        let results = det.parse_response(response, 0.5, 0.5);
+        let results = det.parse_response(response);
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].class_name, "person");
     }
@@ -343,24 +331,14 @@ mod tests {
     fn parse_ignores_garbage() {
         let det = make_detector();
         let response = "Here are the objects I see:\nperson 0.9\nsome random text\n";
-        let results = det.parse_response(response, 0.5, 0.5);
+        let results = det.parse_response(response);
         assert_eq!(results.len(), 1);
-    }
-
-    #[test]
-    fn parse_uses_provided_coordinates() {
-        let det = make_detector();
-        let response = "person 0.9\n";
-        let results = det.parse_response(response, 0.3, 0.7);
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].cx, 0.3);
-        assert_eq!(results[0].cy, 0.7);
     }
 
     #[test]
     fn parse_empty_response() {
         let det = make_detector();
-        assert!(det.parse_response("", 0.5, 0.5).is_empty());
-        assert!(det.parse_response("\n\n", 0.5, 0.5).is_empty());
+        assert!(det.parse_response("").is_empty());
+        assert!(det.parse_response("\n\n").is_empty());
     }
 }

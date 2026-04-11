@@ -486,30 +486,6 @@ impl MotionDetector {
         Some(buf.to_vec())
     }
 
-    pub fn motion_bbox(&self) -> Option<Rect> {
-        let mut contours = Vector::<Vector<opencv::core::Point>>::new();
-        imgproc::find_contours(
-            &self.fg_mask.clone(),
-            &mut contours,
-            imgproc::RETR_EXTERNAL,
-            imgproc::CHAIN_APPROX_SIMPLE,
-            opencv::core::Point::new(0, 0),
-        )
-        .ok()?;
-
-        let mut best_rect: Option<Rect> = None;
-        let mut best_area = 0.0;
-        for i in 0..contours.len() {
-            let area = imgproc::contour_area(&contours.get(i).ok()?, false).ok()?;
-            if area > best_area {
-                best_area = area;
-                best_rect = imgproc::bounding_rect(&contours.get(i).ok()?).ok();
-            }
-        }
-
-        best_rect.filter(|r| r.width > 0 && r.height > 0)
-    }
-
     /// Returns bounding rects for ALL contours in the foreground mask.
     /// The mask is already filtered to min_contour_area by process_frame().
     pub fn motion_bboxes(&self) -> Vec<Rect> {
