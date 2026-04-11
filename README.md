@@ -200,14 +200,22 @@ url = "rtsp://admin:password@192.168.1.100:554/stream1"
 | `GET` | `/api/cameras/{id}/motion` | Motion segments with timestamps |
 | `GET` | `/api/cameras/{id}/motion/{seq}/mask` | JPEG motion mask for a segment |
 | `GET` | `/api/cameras/{id}/motion/stability` | JPEG motion foreground mask |
+| `GET` | `/api/cameras/{id}/motion/stability/raw` | JPEG raw MOG2 output (with shadows) |
+| `GET` | `/api/cameras/{id}/motion/stability/no-shadow` | JPEG after shadow removal |
+| `GET` | `/api/cameras/{id}/motion/stability/morph` | JPEG after morphological opening |
 | `GET` | `/api/cameras/{id}/motion/background` | JPEG learned background model |
+| `GET` | `/api/cameras/{id}/motion/tuner` | Adaptive tuner stats (JSON) |
 | `GET` | `/api/cameras/{id}/detection/grid` | Detection heatmap grid (JSON) |
 | `GET` | `/api/cameras/{id}/detections` | Detected objects with confidence |
 | `GET` | `/api/cameras/{id}/detections/{id}/frame` | JPEG frame of detection |
+| `GET` | `/api/cameras/{id}/hot-events` | Hot buffer motion events |
 | `GET` | `/api/cameras/{id}/events?from=&to=` | Query warm events by time range |
 | `GET` | `/api/cameras/{id}/events/{pts}/playlist.m3u8` | Warm event HLS playlist |
 | `GET` | `/api/cameras/{id}/events/{pts}/segment` | Warm event HLS segment |
 | `GET` | `/api/cameras/{id}/events/{pts}/thumbnail` | Warm event thumbnail JPEG |
+| `GET` | `/api/cameras/{id}/events/{pts}/filmstrip/{index}` | Filmstrip frame JPEG |
+| `GET` | `/api/cameras/{id}/detection-debug` | Detection debug entries |
+| `GET` | `/api/cameras/{id}/detection-debug/{id}/frame/{index}` | Detection debug frame JPEG |
 
 ## Storage Tiers
 
