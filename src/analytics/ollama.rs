@@ -9,6 +9,8 @@ use tokio::runtime::Handle;
 pub struct Detection {
     pub class_name: String,
     pub confidence: f32,
+    /// Normalized bounding box (x, y, w, h) in 0.0-1.0 image coordinates.
+    pub bbox: Option<(f32, f32, f32, f32)>,
 }
 
 /// Result from a single frame detection call.
@@ -28,8 +30,10 @@ pub struct DetectResult {
 
 const DETECT_PROMPT: &str = "This image is a single frame from a security camera during a motion event. \
 List every noteworthy object you see (person, car, truck, dog, cat, bird, bicycle, motorcycle, bus, boat). \
-For each distinct object, respond with exactly one line: CLASS CONFIDENCE\n\
+For each distinct object, respond with exactly one line: CLASS CONFIDENCE X Y W H\n\
 CONFIDENCE = a number 0.0 to 1.0 indicating how certain you are.\n\
+X Y W H = bounding box as fractions of image width/height (0.0 to 1.0). \
+X Y is the top-left corner, W H is the size.\n\
 If you see nothing noteworthy, respond with exactly: NONE\n\
 Do not add any other text, headers, or explanations.";
 
@@ -261,9 +265,34 @@ impl OllamaDetector {
                 continue;
             }
 
+            let bbox = if parts.len() >= 6 {
+                match (
+                    parts[2].parse::<f32>(),
+                    parts[3].parse::<f32>(),
+                    parts[4].parse::<f32>(),
+                    parts[5].parse::<f32>(),
+                ) {
+                    (Ok(x), Ok(y), Ok(w), Ok(h)) => {
+                        let x = x.clamp(0.0, 1.0);
+                        let y = y.clamp(0.0, 1.0);
+                        let w = w.clamp(0.0, 1.0 - x);
+                        let h = h.clamp(0.0, 1.0 - y);
+                        if w > 0.0 && h > 0.0 {
+                            Some((x, y, w, h))
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                }
+            } else {
+                None
+            };
+
             detections.push(Detection {
                 class_name,
                 confidence: confidence.clamp(0.0, 1.0),
+                bbox,
             });
         }
 
@@ -298,7 +327,32 @@ mod tests {
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].class_name, "person");
         assert!((results[0].confidence - 0.95).abs() < 0.01);
+        assert!(results[0].bbox.is_none());
         assert_eq!(results[1].class_name, "car");
+    }
+
+    #[test]
+    fn parse_detections_with_bbox() {
+        let det = make_detector();
+        let response = "person 0.95 0.1 0.2 0.3 0.4\ncar 0.80 0.5 0.6 0.2 0.3\n";
+        let results = det.parse_response(response);
+        assert_eq!(results.len(), 2);
+        let bbox = results[0].bbox.unwrap();
+        assert!((bbox.0 - 0.1).abs() < 0.01);
+        assert!((bbox.1 - 0.2).abs() < 0.01);
+        assert!((bbox.2 - 0.3).abs() < 0.01);
+        assert!((bbox.3 - 0.4).abs() < 0.01);
+        assert!(results[1].bbox.is_some());
+    }
+
+    #[test]
+    fn parse_mixed_bbox_and_no_bbox() {
+        let det = make_detector();
+        let response = "person 0.95 0.1 0.2 0.3 0.4\ncar 0.80\n";
+        let results = det.parse_response(response);
+        assert_eq!(results.len(), 2);
+        assert!(results[0].bbox.is_some());
+        assert!(results[1].bbox.is_none());
     }
 
     #[test]

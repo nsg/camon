@@ -71,6 +71,19 @@ fn union_rects_padded(rects: &[NormalizedRect], padding: f32) -> Option<Normaliz
     })
 }
 
+fn union_two_rects(a: NormalizedRect, b: NormalizedRect) -> NormalizedRect {
+    let x = a.x.min(b.x);
+    let y = a.y.min(b.y);
+    let max_x = (a.x + a.w).max(b.x + b.w);
+    let max_y = (a.y + a.h).max(b.y + b.h);
+    NormalizedRect {
+        x,
+        y,
+        w: max_x - x,
+        h: max_y - y,
+    }
+}
+
 fn crop_mat(frame: &Mat, region: &NormalizedRect) -> Option<Mat> {
     let cols = frame.cols();
     let rows = frame.rows();
@@ -112,7 +125,8 @@ struct PendingSegment {
 struct SegmentDetectionResult {
     classes: Vec<String>,
     confidences: Vec<f32>,
-    motion_rects: Vec<(f32, f32, f32, f32)>,
+    /// Per-class bounding rects in full-frame normalized coordinates.
+    class_rects: Vec<Vec<(f32, f32, f32, f32)>>,
     frame_jpeg: Vec<u8>,
 }
 
@@ -332,12 +346,10 @@ impl MotionAnalyzer {
             self.motion_store.set_background_map(&self.camera_id, jpeg);
         }
         if let Some(jpeg) = self.detector.raw_mog2_mask_jpeg() {
-            self.motion_store
-                .set_raw_mog2_map(&self.camera_id, jpeg);
+            self.motion_store.set_raw_mog2_map(&self.camera_id, jpeg);
         }
         if let Some(jpeg) = self.detector.no_shadow_mask_jpeg() {
-            self.motion_store
-                .set_no_shadow_map(&self.camera_id, jpeg);
+            self.motion_store.set_no_shadow_map(&self.camera_id, jpeg);
         }
         if let Some(jpeg) = self.detector.morph_mask_jpeg() {
             self.motion_store.set_morph_map(&self.camera_id, jpeg);
@@ -500,27 +512,25 @@ impl MotionAnalyzer {
 
         let (detections, best_frame_idx) = self.detect_ollama(&cropped);
 
-        // Collect all motion rects from segments in this run
-        let mut run_motion_rects: Vec<(f32, f32, f32, f32)> = Vec::new();
+        // Compute union crop for this run (used as fallback location if
+        // Ollama doesn't return bounding boxes).
+        let mut run_crop: Option<NormalizedRect> = None;
         for seg in &run {
-            if let Some(rects) = self.segment_motion_rects.remove(&seg.seq) {
-                for r in rects {
-                    run_motion_rects.push((r.x, r.y, r.w, r.h));
-                }
+            if let Some(crop) = self.segment_crops.remove(&seg.seq) {
+                run_crop = Some(match run_crop {
+                    Some(existing) => union_two_rects(existing, crop),
+                    None => crop,
+                });
             }
-            self.segment_crops.remove(&seg.seq);
+            self.segment_motion_rects.remove(&seg.seq);
         }
 
         if detections.is_empty() {
             return;
         }
 
-        let result = build_detection_result(
-            &detections,
-            &filmstrip_jpegs,
-            best_frame_idx,
-            run_motion_rects,
-        );
+        let result =
+            build_detection_result(&detections, &filmstrip_jpegs, best_frame_idx, run_crop);
         self.propagate_detection(&run, &result);
     }
 
@@ -543,7 +553,7 @@ impl MotionAnalyzer {
             let propagated = SegmentDetectionResult {
                 classes: result.classes.clone(),
                 confidences: result.confidences.clone(),
-                motion_rects: result.motion_rects.clone(),
+                class_rects: result.class_rects.clone(),
                 frame_jpeg: result.frame_jpeg.clone(),
             };
             self.store_detection_result(seg.seq, &propagated);
@@ -608,9 +618,11 @@ impl MotionAnalyzer {
             .unwrap_or_else(|| ("unknown".to_string(), "unknown".to_string()));
 
         let mut stored_any = false;
-        for (class, &confidence) in result.classes.iter().zip(&result.confidences) {
+        for (i, (class, &confidence)) in result.classes.iter().zip(&result.confidences).enumerate()
+        {
+            let rects = &result.class_rects[i];
             if let Some(ref grid) = self.detection_grid {
-                if !grid.record_rects(&self.camera_id, class, &result.motion_rects) {
+                if !grid.record_rects(&self.camera_id, class, rects) {
                     tracing::trace!(
                         camera = %self.camera_id,
                         class = %class,
@@ -653,7 +665,7 @@ fn build_detection_result(
     detections: &[Detection],
     filmstrip_jpegs: &[Vec<u8>],
     best_frame_idx: usize,
-    motion_rects: Vec<(f32, f32, f32, f32)>,
+    crop: Option<NormalizedRect>,
 ) -> SegmentDetectionResult {
     let frame_jpeg = filmstrip_jpegs
         .get(best_frame_idx)
@@ -661,23 +673,51 @@ fn build_detection_result(
         .or_else(|| filmstrip_jpegs.first().cloned())
         .unwrap_or_default();
 
-    // Deduplicate by class — keep highest confidence per class
-    let mut best: std::collections::HashMap<&str, &Detection> = std::collections::HashMap::new();
+    // Deduplicate by class — keep highest confidence per class,
+    // and collect all bboxes for each class.
+    let mut best_conf: std::collections::HashMap<&str, f32> = std::collections::HashMap::new();
+    let mut class_bboxes: std::collections::HashMap<&str, Vec<(f32, f32, f32, f32)>> =
+        std::collections::HashMap::new();
+
     for d in detections {
-        best.entry(d.class_name.as_str())
-            .and_modify(|existing| {
-                if d.confidence > existing.confidence {
-                    *existing = d;
+        best_conf
+            .entry(d.class_name.as_str())
+            .and_modify(|c| {
+                if d.confidence > *c {
+                    *c = d.confidence;
                 }
             })
-            .or_insert(d);
+            .or_insert(d.confidence);
+
+        // Map Ollama bbox from crop space to full-frame space.
+        // If no bbox from Ollama, fall back to the crop rect.
+        let rect = match (d.bbox, crop) {
+            (Some((bx, by, bw, bh)), Some(c)) => {
+                // Ollama bbox is in cropped image coords → map to full frame
+                (c.x + bx * c.w, c.y + by * c.h, bw * c.w, bh * c.h)
+            }
+            (Some(b), None) => b, // No crop, bbox is already in full frame
+            (None, Some(c)) => (c.x, c.y, c.w, c.h), // No bbox, use crop
+            (None, None) => continue, // No location info at all
+        };
+
+        class_bboxes
+            .entry(d.class_name.as_str())
+            .or_default()
+            .push(rect);
     }
-    let deduped: Vec<&Detection> = best.into_values().collect();
+
+    let classes: Vec<String> = best_conf.keys().map(|k| k.to_string()).collect();
+    let confidences: Vec<f32> = classes.iter().map(|c| best_conf[c.as_str()]).collect();
+    let class_rects: Vec<Vec<(f32, f32, f32, f32)>> = classes
+        .iter()
+        .map(|c| class_bboxes.remove(c.as_str()).unwrap_or_default())
+        .collect();
 
     SegmentDetectionResult {
-        classes: deduped.iter().map(|d| d.class_name.clone()).collect(),
-        confidences: deduped.iter().map(|d| d.confidence).collect(),
-        motion_rects,
+        classes,
+        confidences,
+        class_rects,
         frame_jpeg,
     }
 }

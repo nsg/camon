@@ -355,10 +355,7 @@ async fn background_map_handler(State(state): State<AppState>, Path(id): Path<St
     }
 }
 
-async fn raw_mog2_map_handler(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-) -> Response {
+async fn raw_mog2_map_handler(State(state): State<AppState>, Path(id): Path<String>) -> Response {
     if !state.buffers.contains_key(&id) {
         return (StatusCode::NOT_FOUND, "camera not found").into_response();
     }
@@ -368,10 +365,7 @@ async fn raw_mog2_map_handler(
     }
 }
 
-async fn no_shadow_map_handler(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-) -> Response {
+async fn no_shadow_map_handler(State(state): State<AppState>, Path(id): Path<String>) -> Response {
     if !state.buffers.contains_key(&id) {
         return (StatusCode::NOT_FOUND, "camera not found").into_response();
     }
@@ -381,10 +375,7 @@ async fn no_shadow_map_handler(
     }
 }
 
-async fn morph_map_handler(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-) -> Response {
+async fn morph_map_handler(State(state): State<AppState>, Path(id): Path<String>) -> Response {
     if !state.buffers.contains_key(&id) {
         return (StatusCode::NOT_FOUND, "camera not found").into_response();
     }
