@@ -909,23 +909,27 @@ footer {
     color: #999;
 }
 
-.debug-entry-body {
-    display: flex;
-    gap: 1rem;
+.debug-frames {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+    gap: 0.75rem;
     padding: 1rem;
-    align-items: flex-start;
 }
 
-.debug-grid-image {
-    width: 320px;
-    min-width: 320px;
+.debug-frame-pair {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+}
+
+.debug-frame-image {
+    width: 100%;
     height: auto;
     border-radius: 4px;
     border: 1px solid #444;
 }
 
 .debug-raw-response {
-    flex: 1;
     font-family: monospace;
     font-size: 0.85rem;
     color: #ccc;
@@ -934,18 +938,7 @@ footer {
     border-radius: 4px;
     white-space: pre-wrap;
     word-break: break-word;
-    max-height: 200px;
+    max-height: 120px;
     overflow-y: auto;
     margin: 0;
-}
-
-@media (max-width: 700px) {
-    .debug-entry-body {
-        flex-direction: column;
-    }
-
-    .debug-grid-image {
-        width: 100%;
-        min-width: 0;
-    }
 }

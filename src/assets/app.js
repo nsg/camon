@@ -1449,13 +1449,20 @@ document.addEventListener('DOMContentLoaded', async () => {
         debugList.innerHTML = reversed.map(entry => {
             const date = new Date(entry.timestamp * 1000);
             const timeStr = date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
-            const escapedResponse = entry.raw_response
-                .replace(/&/g, '&amp;')
-                .replace(/</g, '&lt;')
-                .replace(/>/g, '&gt;');
             const detectionBadge = entry.detection_count > 0
                 ? `<span class="debug-badge positive">${entry.detection_count} detection${entry.detection_count !== 1 ? 's' : ''}</span>`
                 : '<span class="debug-badge none">no detections</span>';
+
+            const framesHtml = Array.from({length: entry.frame_count}, (_, i) => {
+                const response = (entry.raw_responses[i] || '(no response)')
+                    .replace(/&/g, '&amp;')
+                    .replace(/</g, '&lt;')
+                    .replace(/>/g, '&gt;');
+                return `<div class="debug-frame-pair">
+                    <img class="debug-frame-image" src="/api/cameras/${encodedId}/detection-debug/${entry.id}/frame/${i}" alt="Frame ${i + 1}" loading="lazy">
+                    <pre class="debug-raw-response">${response}</pre>
+                </div>`;
+            }).join('');
 
             return `<div class="debug-entry">
                 <div class="debug-entry-header">
@@ -1463,10 +1470,7 @@ document.addEventListener('DOMContentLoaded', async () => {
                     <span class="debug-model">${entry.model}</span>
                     ${detectionBadge}
                 </div>
-                <div class="debug-entry-body">
-                    <img class="debug-grid-image" src="/api/cameras/${encodedId}/detection-debug/${entry.id}/grid" alt="Grid sent to model" loading="lazy">
-                    <pre class="debug-raw-response">${escapedResponse || '(empty response)'}</pre>
-                </div>
+                <div class="debug-frames">${framesHtml}</div>
             </div>`;
         }).join('');
     }

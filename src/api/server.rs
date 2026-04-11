@@ -133,8 +133,8 @@ pub async fn start_server(state: AppState, port: u16) -> Result<(), std::io::Err
             get(detection_debug_handler),
         )
         .route(
-            "/api/cameras/{id}/detection-debug/{debug_id}/grid",
-            get(detection_debug_grid_handler),
+            "/api/cameras/{id}/detection-debug/{debug_id}/frame/{frame_index}",
+            get(detection_debug_frame_handler),
         )
         .route("/api/stream/{id}/playlist.m3u8", get(playlist_handler))
         .route("/api/stream/{id}/segment/{n}", get(segment_handler))
@@ -686,9 +686,10 @@ async fn warm_thumbnail_handler(
 struct DebugEntryResponse {
     id: u64,
     timestamp: u64,
-    raw_response: String,
+    raw_responses: Vec<String>,
     model: String,
     detection_count: usize,
+    frame_count: usize,
 }
 
 async fn detection_debug_handler(
@@ -706,26 +707,27 @@ async fn detection_debug_handler(
         .map(|e| DebugEntryResponse {
             id: e.id,
             timestamp: e.timestamp,
-            raw_response: e.raw_response,
+            raw_responses: e.raw_responses,
             model: e.model,
             detection_count: e.detection_count,
+            frame_count: e.frame_count,
         })
         .collect();
 
     axum::Json(entries).into_response()
 }
 
-async fn detection_debug_grid_handler(
+async fn detection_debug_frame_handler(
     State(state): State<AppState>,
-    Path((id, debug_id)): Path<(String, u64)>,
+    Path((id, debug_id, frame_index)): Path<(String, u64, usize)>,
 ) -> Response {
     if !state.buffers.contains_key(&id) {
         return (StatusCode::NOT_FOUND, "camera not found").into_response();
     }
 
-    match state.debug_store.get_grid_jpeg(&id, debug_id) {
+    match state.debug_store.get_frame_jpeg(&id, debug_id, frame_index) {
         Some(jpeg) => ([(header::CONTENT_TYPE, "image/jpeg")], jpeg).into_response(),
-        None => (StatusCode::NOT_FOUND, "debug entry not found").into_response(),
+        None => (StatusCode::NOT_FOUND, "debug frame not found").into_response(),
     }
 }
 

@@ -8,8 +8,8 @@ const MAX_ENTRIES: usize = 50;
 pub struct DebugEntry {
     pub id: u64,
     pub timestamp: u64,
-    pub grid_jpeg: Vec<u8>,
-    pub raw_response: String,
+    pub frame_jpegs: Vec<Vec<u8>>,
+    pub raw_responses: Vec<String>,
     pub model: String,
     pub detection_count: usize,
 }
@@ -17,9 +17,10 @@ pub struct DebugEntry {
 pub struct DebugSnapshot {
     pub id: u64,
     pub timestamp: u64,
-    pub raw_response: String,
+    pub raw_responses: Vec<String>,
     pub model: String,
     pub detection_count: usize,
+    pub frame_count: usize,
 }
 
 pub struct DetectionDebugStore {
@@ -42,8 +43,8 @@ impl DetectionDebugStore {
     pub fn insert(
         &self,
         camera_id: &str,
-        grid_jpeg: Vec<u8>,
-        raw_response: String,
+        frame_jpegs: Vec<Vec<u8>>,
+        raw_responses: Vec<String>,
         model: String,
         detection_count: usize,
     ) {
@@ -57,8 +58,8 @@ impl DetectionDebugStore {
             entries.push_back(DebugEntry {
                 id,
                 timestamp,
-                grid_jpeg,
-                raw_response,
+                frame_jpegs,
+                raw_responses,
                 model,
                 detection_count,
             });
@@ -77,9 +78,10 @@ impl DetectionDebugStore {
                     .map(|e| DebugSnapshot {
                         id: e.id,
                         timestamp: e.timestamp,
-                        raw_response: e.raw_response.clone(),
+                        raw_responses: e.raw_responses.clone(),
                         model: e.model.clone(),
                         detection_count: e.detection_count,
+                        frame_count: e.frame_jpegs.len(),
                     })
                     .collect()
             }
@@ -87,13 +89,13 @@ impl DetectionDebugStore {
         }
     }
 
-    pub fn get_grid_jpeg(&self, camera_id: &str, id: u64) -> Option<Vec<u8>> {
+    pub fn get_frame_jpeg(&self, camera_id: &str, id: u64, frame_index: usize) -> Option<Vec<u8>> {
         self.cameras.get(camera_id).and_then(|lock| {
             let entries = lock.read().unwrap();
             entries
                 .iter()
                 .find(|e| e.id == id)
-                .map(|e| e.grid_jpeg.clone())
+                .and_then(|e| e.frame_jpegs.get(frame_index).cloned())
         })
     }
 }

@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
@@ -17,7 +18,7 @@ use crate::storage::{
 
 use super::decoder::{CropDecoder, FrameDecoder};
 use super::motion::MotionDetector;
-use super::ollama::{DetectGridResult, Detection, OllamaDetector};
+use super::ollama::{DetectResult, Detection, OllamaDetector};
 
 const ANALYSIS_WIDTH: i32 = 320;
 const ANALYSIS_HEIGHT: i32 = 240;
@@ -26,6 +27,74 @@ const MOTION_THRESHOLD: f32 = 0.05;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
 const GRID_SAVE_INTERVAL: u32 = 1500; // ~5 minutes at 200ms poll interval
+const CROP_PADDING: f32 = 0.2;
+const MIN_CROP_FRACTION: f32 = 0.15;
+
+#[derive(Clone, Copy)]
+struct NormalizedRect {
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+}
+
+fn normalize_rect(r: Rect, frame_w: i32, frame_h: i32) -> NormalizedRect {
+    NormalizedRect {
+        x: r.x as f32 / frame_w as f32,
+        y: r.y as f32 / frame_h as f32,
+        w: r.width as f32 / frame_w as f32,
+        h: r.height as f32 / frame_h as f32,
+    }
+}
+
+fn union_rects_padded(rects: &[NormalizedRect], padding: f32) -> Option<NormalizedRect> {
+    if rects.is_empty() {
+        return None;
+    }
+    let min_x = rects.iter().map(|r| r.x).fold(f32::MAX, f32::min);
+    let min_y = rects.iter().map(|r| r.y).fold(f32::MAX, f32::min);
+    let max_x = rects.iter().map(|r| r.x + r.w).fold(0.0f32, f32::max);
+    let max_y = rects.iter().map(|r| r.y + r.h).fold(0.0f32, f32::max);
+
+    let w = (max_x - min_x).max(MIN_CROP_FRACTION);
+    let h = (max_y - min_y).max(MIN_CROP_FRACTION);
+    let pad_x = w * padding;
+    let pad_y = h * padding;
+
+    let x = (min_x - pad_x).max(0.0);
+    let y = (min_y - pad_y).max(0.0);
+    Some(NormalizedRect {
+        x,
+        y,
+        w: (w + 2.0 * pad_x).min(1.0 - x),
+        h: (h + 2.0 * pad_y).min(1.0 - y),
+    })
+}
+
+fn crop_mat(frame: &Mat, region: &NormalizedRect) -> Option<Mat> {
+    let cols = frame.cols();
+    let rows = frame.rows();
+    if cols == 0 || rows == 0 {
+        return None;
+    }
+
+    let x = (region.x * cols as f32) as i32;
+    let y = (region.y * rows as f32) as i32;
+    let w = (region.w * cols as f32) as i32;
+    let h = (region.h * rows as f32) as i32;
+
+    let roi = Rect::new(
+        x.max(0),
+        y.max(0),
+        w.min(cols - x.max(0)),
+        h.min(rows - y.max(0)),
+    );
+    if roi.width <= 0 || roi.height <= 0 {
+        return None;
+    }
+
+    Mat::roi(frame, roi).ok()?.try_clone().ok()
+}
 
 struct MotionSegment {
     seq: u64,
@@ -73,6 +142,7 @@ pub struct MotionAnalyzer {
     last_motion_bbox: Option<Rect>,
     detection_grid: Option<DetectionGrid>,
     grid_save_counter: u32,
+    segment_crops: HashMap<u64, NormalizedRect>,
 }
 
 impl MotionAnalyzer {
@@ -100,6 +170,7 @@ impl MotionAnalyzer {
             last_motion_bbox: None,
             detection_grid: ctx.detection_grid,
             grid_save_counter: 0,
+            segment_crops: HashMap::new(),
         })
     }
 
@@ -189,6 +260,7 @@ impl MotionAnalyzer {
             if let Some(ref ds) = self.detection_store {
                 ds.cleanup(&self.camera_id, first_seq);
             }
+            self.segment_crops.retain(|&seq, _| seq >= first_seq);
         }
         if self.last_processed < first_seq {
             self.last_processed = first_seq;
@@ -225,12 +297,15 @@ impl MotionAnalyzer {
         let mut motion_segments = Vec::new();
 
         for seg in segments {
-            let score = self.analyze_segment(&seg.data)?;
+            let (score, crop) = self.analyze_segment(&seg.data)?;
             self.publish_debug_maps();
 
             if score >= MOTION_THRESHOLD {
                 self.record_motion(seg.seq, seg.start_pts, seg.duration_ns, score);
                 if has_detection {
+                    if let Some(crop) = crop {
+                        self.segment_crops.insert(seg.seq, crop);
+                    }
                     motion_segments.push(MotionSegment {
                         seq: seg.seq,
                         data: seg.data,
@@ -280,17 +355,18 @@ impl MotionAnalyzer {
     fn analyze_segment(
         &mut self,
         data: &[u8],
-    ) -> Result<f32, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<(f32, Option<NormalizedRect>), Box<dyn std::error::Error + Send + Sync>> {
         let raw_frames = self.decoder.decode_segment(data);
 
         if raw_frames.is_empty() {
-            return Ok(0.0);
+            return Ok((0.0, None));
         }
 
         let height = self.decoder.height() as i32;
         let mut total_score = 0.0f32;
         let mut frame_count = 0u32;
         let mut last_bbox = None;
+        let mut all_rects = Vec::new();
 
         for frame_data in &raw_frames {
             let mat = Mat::from_slice(frame_data)?;
@@ -303,6 +379,9 @@ impl MotionAnalyzer {
                     if let Some(bbox) = self.detector.motion_bbox() {
                         last_bbox = Some(bbox);
                     }
+                    for r in self.detector.motion_bboxes() {
+                        all_rects.push(normalize_rect(r, ANALYSIS_WIDTH, ANALYSIS_HEIGHT));
+                    }
                 }
                 Err(e) => {
                     tracing::trace!(error = %e, "frame processing error");
@@ -311,12 +390,13 @@ impl MotionAnalyzer {
         }
 
         self.last_motion_bbox = last_bbox;
+        let crop = union_rects_padded(&all_rects, CROP_PADDING);
 
         if frame_count == 0 {
-            return Ok(0.0);
+            return Ok((0.0, None));
         }
 
-        Ok(total_score / frame_count as f32)
+        Ok((total_score / frame_count as f32, crop))
     }
 
     // --- Phase 2: Generic frame extraction + detection ---
@@ -336,24 +416,31 @@ impl MotionAnalyzer {
         }
     }
 
-    fn extract_run_frames(&self, run: &[MotionSegment], crop_decoder: &CropDecoder) -> Vec<Mat> {
+    fn extract_run_frames(
+        &self,
+        run: &[MotionSegment],
+        crop_decoder: &CropDecoder,
+    ) -> Vec<(Mat, Option<NormalizedRect>)> {
         let indices = sample_indices(run.len());
         let height = crop_decoder.height() as i32;
-        let mut all_frames = Vec::new();
+        let mut all_frames: Vec<(Mat, Option<NormalizedRect>)> = Vec::new();
 
-        // Feed preceding segments to prime the decoder
+        // Feed preceding segments to prime the decoder (no crop — not motion-positive)
         let first_seq = run[0].seq;
         if first_seq >= 3 {
             if let Ok(buffer) = self.buffer.read() {
                 for prime_seq in (first_seq - 3)..first_seq {
                     if let Some(seg) = buffer.get_segment_by_sequence(prime_seq) {
-                        decode_to_mats(
+                        let before = all_frames.len();
+                        decode_to_mats_tagged(
                             crop_decoder,
                             &seg.data,
                             seg.duration_ns,
                             height,
+                            None,
                             &mut all_frames,
                         );
+                        let _ = before; // priming frames have None crop
                     }
                 }
             }
@@ -361,16 +448,18 @@ impl MotionAnalyzer {
 
         for &idx in &indices {
             let seg = &run[idx];
-            decode_to_mats(
+            let crop = self.segment_crops.get(&seg.seq).copied();
+            decode_to_mats_tagged(
                 crop_decoder,
                 &seg.data,
                 seg.duration_ns,
                 height,
+                crop,
                 &mut all_frames,
             );
         }
 
-        subsample_frames(all_frames)
+        subsample_tagged(all_frames)
     }
 
     fn detect_run(&mut self, run: Vec<MotionSegment>, crop_decoder: &CropDecoder) {
@@ -378,16 +467,31 @@ impl MotionAnalyzer {
             return;
         }
 
-        let frames = self.extract_run_frames(&run, crop_decoder);
-        if frames.is_empty() {
+        let tagged_frames = self.extract_run_frames(&run, crop_decoder);
+        if tagged_frames.is_empty() {
             return;
         }
 
-        let filmstrip_jpegs: Vec<Vec<u8>> = frames.iter().filter_map(encode_jpeg).collect();
+        // Apply per-frame crops
+        let cropped: Vec<Mat> = tagged_frames
+            .iter()
+            .map(|(frame, crop)| {
+                crop.and_then(|r| crop_mat(frame, &r))
+                    .unwrap_or_else(|| frame.try_clone().unwrap_or_default())
+            })
+            .collect();
+
+        let filmstrip_jpegs: Vec<Vec<u8>> = cropped.iter().filter_map(encode_jpeg).collect();
         self.store_filmstrip_for_run(&run, &filmstrip_jpegs);
 
         let (cx, cy) = bbox_center(self.last_motion_bbox);
-        let (detections, best_frame_idx) = self.detect_ollama(&frames, cx, cy);
+        let (detections, best_frame_idx) = self.detect_ollama(&cropped, cx, cy);
+
+        // Clean up segment_crops for this run
+        for seg in &run {
+            self.segment_crops.remove(&seg.seq);
+        }
+
         if detections.is_empty() {
             return;
         }
@@ -428,7 +532,7 @@ impl MotionAnalyzer {
             None => return (Vec::new(), 0),
         };
 
-        let result: DetectGridResult = match ollama.detect_grid(frames, cx, cy) {
+        let result: DetectResult = match ollama.detect_frames(frames, cx, cy) {
             Ok(r) => r,
             Err(e) => {
                 tracing::warn!(
@@ -442,11 +546,11 @@ impl MotionAnalyzer {
 
         // Store debug entry regardless of detection outcome
         if let Some(ref debug_store) = self.debug_store {
-            if !result.grid_jpeg.is_empty() {
+            if !result.frame_jpegs.is_empty() {
                 debug_store.insert(
                     &self.camera_id,
-                    result.grid_jpeg,
-                    result.raw_response,
+                    result.frame_jpegs,
+                    result.raw_responses,
                     result.model,
                     result.detections.len(),
                 );
@@ -544,10 +648,23 @@ fn build_detection_result(
         .or_else(|| filmstrip_jpegs.first().cloned())
         .unwrap_or_default();
 
+    // Deduplicate by class — keep highest confidence per class
+    let mut best: std::collections::HashMap<&str, &Detection> = std::collections::HashMap::new();
+    for d in detections {
+        best.entry(d.class_name.as_str())
+            .and_modify(|existing| {
+                if d.confidence > existing.confidence {
+                    *existing = d;
+                }
+            })
+            .or_insert(d);
+    }
+    let deduped: Vec<&Detection> = best.into_values().collect();
+
     SegmentDetectionResult {
-        classes: detections.iter().map(|d| d.class_name.clone()).collect(),
-        confidences: detections.iter().map(|d| d.confidence).collect(),
-        centers: detections.iter().map(|d| (d.cx, d.cy)).collect(),
+        classes: deduped.iter().map(|d| d.class_name.clone()).collect(),
+        confidences: deduped.iter().map(|d| d.confidence).collect(),
+        centers: deduped.iter().map(|d| (d.cx, d.cy)).collect(),
         frame_jpeg,
     }
 }
@@ -560,32 +677,38 @@ fn sample_indices(len: usize) -> Vec<usize> {
     }
 }
 
-fn decode_to_mats(
+fn decode_to_mats_tagged(
     decoder: &CropDecoder,
     data: &[u8],
     duration_ns: u64,
     height: i32,
-    out: &mut Vec<Mat>,
+    crop: Option<NormalizedRect>,
+    out: &mut Vec<(Mat, Option<NormalizedRect>)>,
 ) {
     for frame_data in &decoder.decode_segment(data, duration_ns) {
         if let Ok(mat) = Mat::from_slice(frame_data) {
             if let Ok(reshaped) = mat.reshape(3, height) {
                 if let Ok(cloned) = reshaped.try_clone() {
-                    out.push(cloned);
+                    out.push((cloned, crop));
                 }
             }
         }
     }
 }
 
-fn subsample_frames(frames: Vec<Mat>) -> Vec<Mat> {
+fn subsample_tagged(
+    frames: Vec<(Mat, Option<NormalizedRect>)>,
+) -> Vec<(Mat, Option<NormalizedRect>)> {
     if frames.len() <= 4 {
         return frames;
     }
     let n = frames.len();
     [0, n / 3, 2 * n / 3, n - 1]
         .iter()
-        .map(|&i| frames[i].try_clone().unwrap_or_default())
+        .map(|&i| {
+            let (ref mat, crop) = frames[i];
+            (mat.try_clone().unwrap_or_default(), crop)
+        })
         .collect()
 }
 
@@ -616,6 +739,127 @@ fn encode_jpeg(mat: &Mat) -> Option<Vec<u8>> {
     let params = Vector::<i32>::new();
     imgcodecs::imencode(".jpg", mat, &mut buf, &params).ok()?;
     Some(buf.to_vec())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_rect_maps_to_unit_coords() {
+        let r = Rect::new(80, 60, 160, 120);
+        let n = normalize_rect(r, 320, 240);
+        assert!((n.x - 0.25).abs() < 0.01);
+        assert!((n.y - 0.25).abs() < 0.01);
+        assert!((n.w - 0.50).abs() < 0.01);
+        assert!((n.h - 0.50).abs() < 0.01);
+    }
+
+    #[test]
+    fn union_rects_empty_returns_none() {
+        assert!(union_rects_padded(&[], 0.2).is_none());
+    }
+
+    #[test]
+    fn union_rects_single_rect_with_padding() {
+        let r = NormalizedRect {
+            x: 0.4,
+            y: 0.4,
+            w: 0.2,
+            h: 0.2,
+        };
+        let u = union_rects_padded(&[r], 0.2).unwrap();
+        // w=0.2, pad_x=0.04, so x=0.36, w=0.28
+        assert!((u.x - 0.36).abs() < 0.01);
+        assert!((u.w - 0.28).abs() < 0.01);
+    }
+
+    #[test]
+    fn union_rects_clamps_to_bounds() {
+        let r = NormalizedRect {
+            x: 0.0,
+            y: 0.0,
+            w: 0.1,
+            h: 0.1,
+        };
+        let u = union_rects_padded(&[r], 0.5).unwrap();
+        assert!(u.x >= 0.0);
+        assert!(u.y >= 0.0);
+        assert!(u.x + u.w <= 1.0);
+        assert!(u.y + u.h <= 1.0);
+    }
+
+    #[test]
+    fn union_rects_merges_two_rects() {
+        let rects = vec![
+            NormalizedRect {
+                x: 0.1,
+                y: 0.1,
+                w: 0.2,
+                h: 0.2,
+            },
+            NormalizedRect {
+                x: 0.6,
+                y: 0.6,
+                w: 0.2,
+                h: 0.2,
+            },
+        ];
+        let u = union_rects_padded(&rects, 0.0).unwrap();
+        // Union spans 0.1..0.8 in both axes = 0.7
+        assert!((u.x - 0.1).abs() < 0.01);
+        assert!((u.y - 0.1).abs() < 0.01);
+        assert!((u.w - 0.7).abs() < 0.01);
+        assert!((u.h - 0.7).abs() < 0.01);
+    }
+
+    #[test]
+    fn union_rects_enforces_minimum_size() {
+        let r = NormalizedRect {
+            x: 0.5,
+            y: 0.5,
+            w: 0.01,
+            h: 0.01,
+        };
+        let u = union_rects_padded(&[r], 0.0).unwrap();
+        assert!(u.w >= MIN_CROP_FRACTION);
+        assert!(u.h >= MIN_CROP_FRACTION);
+    }
+
+    #[test]
+    fn crop_mat_extracts_region() {
+        let mat = Mat::zeros(100, 200, opencv::core::CV_8UC3)
+            .unwrap()
+            .to_mat()
+            .unwrap();
+        let region = NormalizedRect {
+            x: 0.25,
+            y: 0.25,
+            w: 0.5,
+            h: 0.5,
+        };
+        let cropped = crop_mat(&mat, &region).unwrap();
+        assert_eq!(cropped.cols(), 100);
+        assert_eq!(cropped.rows(), 50);
+    }
+
+    #[test]
+    fn crop_mat_clamps_at_edge() {
+        let mat = Mat::zeros(100, 200, opencv::core::CV_8UC3)
+            .unwrap()
+            .to_mat()
+            .unwrap();
+        let region = NormalizedRect {
+            x: 0.8,
+            y: 0.8,
+            w: 0.5,
+            h: 0.5,
+        };
+        let cropped = crop_mat(&mat, &region).unwrap();
+        // Should clamp: x=160, w=min(100, 200-160)=40; y=80, h=min(50, 100-80)=20
+        assert_eq!(cropped.cols(), 40);
+        assert_eq!(cropped.rows(), 20);
+    }
 }
 
 pub fn spawn_analyzer(

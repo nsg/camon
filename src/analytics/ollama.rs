@@ -1,7 +1,7 @@
 use base64::Engine;
-use opencv::core::{Size, Vector};
+use opencv::core::Vector;
+use opencv::imgcodecs;
 use opencv::prelude::*;
-use opencv::{imgcodecs, imgproc};
 use serde::{Deserialize, Serialize};
 use tokio::runtime::Handle;
 
@@ -13,16 +13,22 @@ pub struct Detection {
     pub cy: f32,
 }
 
-/// Full result from a detect_grid call, including debug information.
-pub struct DetectGridResult {
+/// Result from a single frame detection call.
+struct FrameDetectResult {
+    detections: Vec<Detection>,
+    raw_response: String,
+    model: String,
+}
+
+/// Full result from detecting across multiple frames.
+pub struct DetectResult {
     pub detections: Vec<Detection>,
-    pub grid_jpeg: Vec<u8>,
-    pub raw_response: String,
+    pub frame_jpegs: Vec<Vec<u8>>,
+    pub raw_responses: Vec<String>,
     pub model: String,
 }
 
-const DETECT_PROMPT: &str = "This image is a 2x2 grid of 4 frames from a security camera, \
-showing a motion event over time (top-left is earliest, bottom-right is latest). \
+const DETECT_PROMPT: &str = "This image is a single frame from a security camera during a motion event. \
 List every noteworthy object you see (person, car, truck, dog, cat, bird, bicycle, motorcycle, bus, boat). \
 For each distinct object, respond with exactly one line: CLASS CONFIDENCE\n\
 CONFIDENCE = a number 0.0 to 1.0 indicating how certain you are.\n\
@@ -106,59 +112,86 @@ impl OllamaDetector {
         &self.primary.model
     }
 
-    pub fn detect_grid(
+    pub fn detect_frames(
         &self,
         frames: &[opencv::core::Mat],
         cx: f32,
         cy: f32,
-    ) -> Result<DetectGridResult, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<DetectResult, Box<dyn std::error::Error + Send + Sync>> {
         if frames.is_empty() {
-            return Ok(DetectGridResult {
+            return Ok(DetectResult {
                 detections: Vec::new(),
-                grid_jpeg: Vec::new(),
-                raw_response: String::new(),
+                frame_jpegs: Vec::new(),
+                raw_responses: Vec::new(),
                 model: self.primary.model.clone(),
             });
         }
 
-        let grid = self.stitch_grid(frames)?;
-        let grid_jpeg = self.encode_frame_jpeg(&grid)?;
-        let image_b64 = base64::engine::general_purpose::STANDARD.encode(&grid_jpeg);
+        let mut frame_jpegs = Vec::with_capacity(frames.len());
+        let mut all_detections = Vec::new();
+        let mut raw_responses = Vec::new();
+        let mut model = self.primary.model.clone();
 
-        match self.call_server(&self.primary, &image_b64, cx, cy) {
-            Ok((detections, raw_response, model)) => Ok(DetectGridResult {
+        for frame in frames.iter().take(4) {
+            let jpeg = self.encode_frame_jpeg(frame)?;
+            let image_b64 = base64::engine::general_purpose::STANDARD.encode(&jpeg);
+
+            let result = self.call_single_frame(&image_b64, cx, cy);
+            match result {
+                Ok(r) => {
+                    all_detections.extend(r.detections);
+                    raw_responses.push(r.raw_response);
+                    model = r.model;
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "frame detection failed");
+                    raw_responses.push(format!("ERROR: {e}"));
+                }
+            }
+
+            frame_jpegs.push(jpeg);
+        }
+
+        Ok(DetectResult {
+            detections: all_detections,
+            frame_jpegs,
+            raw_responses,
+            model,
+        })
+    }
+
+    fn call_single_frame(
+        &self,
+        image_b64: &str,
+        cx: f32,
+        cy: f32,
+    ) -> Result<FrameDetectResult, Box<dyn std::error::Error + Send + Sync>> {
+        match self.call_server(&self.primary, image_b64, cx, cy) {
+            Ok((detections, raw_response, model)) => Ok(FrameDetectResult {
                 detections,
-                grid_jpeg,
                 raw_response,
                 model,
             }),
             Err(primary_err) => {
                 if let Some(ref fallback) = self.fallback {
                     tracing::warn!(
-                        primary_url = %self.primary.base_url,
-                        primary_model = %self.primary.model,
                         error = %primary_err,
-                        fallback_url = %fallback.base_url,
-                        fallback_model = %fallback.model,
                         "primary ollama failed, trying fallback"
                     );
-                    match self.call_server(fallback, &image_b64, cx, cy) {
-                        Ok((detections, raw_response, model)) => {
-                            return Ok(DetectGridResult {
-                                detections,
-                                grid_jpeg,
-                                raw_response,
-                                model,
-                            })
-                        }
-                        Err(fallback_err) => {
-                            return Err(format!(
-                                "both ollama servers failed — primary: {primary_err}, fallback: {fallback_err}"
-                            ).into());
-                        }
+                    match self.call_server(fallback, image_b64, cx, cy) {
+                        Ok((detections, raw_response, model)) => Ok(FrameDetectResult {
+                            detections,
+                            raw_response,
+                            model,
+                        }),
+                        Err(fallback_err) => Err(format!(
+                            "both servers failed — primary: {primary_err}, fallback: {fallback_err}"
+                        )
+                        .into()),
                     }
+                } else {
+                    Err(primary_err)
                 }
-                Err(primary_err)
             }
         }
     }
@@ -196,42 +229,6 @@ impl OllamaDetector {
         let detections = self.parse_response(&content, cx, cy);
 
         Ok((detections, content, server.model.clone()))
-    }
-
-    fn stitch_grid(
-        &self,
-        frames: &[opencv::core::Mat],
-    ) -> Result<opencv::core::Mat, Box<dyn std::error::Error + Send + Sync>> {
-        let cell_w = 320;
-        let cell_h = 240;
-        let grid_w = cell_w * 2;
-        let grid_h = cell_h * 2;
-
-        let mut grid = opencv::core::Mat::zeros(grid_h, grid_w, opencv::core::CV_8UC3)?.to_mat()?;
-
-        let positions = [(0, 0), (cell_w, 0), (0, cell_h), (cell_w, cell_h)];
-
-        for (i, frame) in frames.iter().take(4).enumerate() {
-            if frame.empty() {
-                continue;
-            }
-            let mut resized = opencv::core::Mat::default();
-            imgproc::resize(
-                frame,
-                &mut resized,
-                Size::new(cell_w, cell_h),
-                0.0,
-                0.0,
-                imgproc::INTER_LINEAR,
-            )?;
-
-            let (px, py) = positions[i];
-            let roi = opencv::core::Rect::new(px, py, cell_w, cell_h);
-            let mut dst = opencv::core::Mat::roi_mut(&mut grid, roi)?;
-            resized.copy_to(&mut dst)?;
-        }
-
-        Ok(grid)
     }
 
     fn encode_frame_jpeg(
