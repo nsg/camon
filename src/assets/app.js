@@ -1508,6 +1508,20 @@ document.addEventListener('DOMContentLoaded', async () => {
                 ? `<span class="debug-badge positive">${entry.detection_count} detection${entry.detection_count !== 1 ? 's' : ''}</span>`
                 : '<span class="debug-badge none">no detections</span>';
 
+            const fullFrameHtml = entry.has_full_frame
+                ? `<div class="debug-full-frame-container">
+                    <div class="debug-full-frame-wrap">
+                        <img class="debug-full-frame-image" data-entry-id="${entry.id}" src="/api/cameras/${encodedId}/detection-debug/${entry.id}/full-frame" alt="Full frame" loading="lazy">
+                        <canvas class="debug-overlay-canvas" data-entry-id="${entry.id}"></canvas>
+                    </div>
+                    <div class="debug-overlay-legend">
+                        <span class="debug-legend-item"><span class="debug-legend-color" style="border-color:#0f0"></span>Motion</span>
+                        <span class="debug-legend-item"><span class="debug-legend-color" style="border-color:#ff0"></span>Crop</span>
+                        <span class="debug-legend-item"><span class="debug-legend-color" style="border-color:#f44"></span>Ollama</span>
+                    </div>
+                </div>`
+                : '';
+
             const framesHtml = Array.from({length: entry.frame_count}, (_, i) => {
                 const response = (entry.raw_responses[i] || '(no response)')
                     .replace(/&/g, '&amp;')
@@ -1525,9 +1539,68 @@ document.addEventListener('DOMContentLoaded', async () => {
                     <span class="debug-model">${entry.model}</span>
                     ${detectionBadge}
                 </div>
+                ${fullFrameHtml}
                 <div class="debug-frames">${framesHtml}</div>
             </div>`;
         }).join('');
+
+        // Draw overlays once full-frame images load
+        debugList.querySelectorAll('.debug-full-frame-image').forEach(img => {
+            const entryId = img.dataset.entryId;
+            const entry = entries.find(e => String(e.id) === entryId);
+            if (!entry) return;
+            const draw = () => drawDebugOverlay(img, entry);
+            if (img.complete && img.naturalWidth) draw();
+            else img.addEventListener('load', draw);
+        });
+    }
+
+    function drawDebugOverlay(img, entry) {
+        const canvas = img.parentElement.querySelector('.debug-overlay-canvas');
+        if (!canvas) return;
+        const w = img.naturalWidth;
+        const h = img.naturalHeight;
+        canvas.width = w;
+        canvas.height = h;
+        const ctx = canvas.getContext('2d');
+        ctx.clearRect(0, 0, w, h);
+
+        // Motion rects — green
+        ctx.strokeStyle = '#0f0';
+        ctx.lineWidth = 2;
+        ctx.setLineDash([6, 3]);
+        for (const [rx, ry, rw, rh] of entry.motion_rects) {
+            ctx.strokeRect(rx * w, ry * h, rw * w, rh * h);
+        }
+
+        // Crop rect — yellow
+        ctx.setLineDash([]);
+        if (entry.crop_rect) {
+            const [cx, cy, cw, ch] = entry.crop_rect;
+            ctx.strokeStyle = '#ff0';
+            ctx.lineWidth = 2;
+            ctx.strokeRect(cx * w, cy * h, cw * w, ch * h);
+            ctx.fillStyle = 'rgba(255,255,0,0.06)';
+            ctx.fillRect(cx * w, cy * h, cw * w, ch * h);
+        }
+
+        // Ollama rects — red with class label
+        ctx.setLineDash([]);
+        ctx.lineWidth = 2;
+        ctx.font = `bold ${Math.max(12, Math.round(h * 0.025))}px monospace`;
+        ctx.textBaseline = 'bottom';
+        for (const [className, ox, oy, ow, oh] of entry.ollama_rects) {
+            ctx.strokeStyle = '#f44';
+            ctx.strokeRect(ox * w, oy * h, ow * w, oh * h);
+            const label = className;
+            const tx = ox * w + 2;
+            const ty = oy * h - 3;
+            ctx.fillStyle = 'rgba(0,0,0,0.6)';
+            const tm = ctx.measureText(label);
+            ctx.fillRect(tx - 1, ty - tm.actualBoundingBoxAscent - 2, tm.width + 4, tm.actualBoundingBoxAscent + 4);
+            ctx.fillStyle = '#f44';
+            ctx.fillText(label, tx, ty);
+        }
     }
 
     // === Utility ===

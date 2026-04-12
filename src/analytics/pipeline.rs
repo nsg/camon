@@ -571,6 +571,30 @@ impl MotionAnalyzer {
             return;
         }
 
+        // Collect motion rects and crop before consuming them
+        let mut all_motion_rects: Vec<(f32, f32, f32, f32)> = Vec::new();
+        let mut run_crop: Option<NormalizedRect> = None;
+        for seg in &run {
+            if let Some(rects) = self.segment_motion_rects.get(&seg.seq) {
+                for r in rects {
+                    all_motion_rects.push((r.x, r.y, r.w, r.h));
+                }
+            }
+            if let Some(&crop) = self.segment_crops.get(&seg.seq) {
+                run_crop = Some(match run_crop {
+                    Some(existing) => union_two_rects(existing, crop),
+                    None => crop,
+                });
+            }
+        }
+
+        // Encode a full (uncropped) frame for debug overlay.
+        // Pick the first tagged frame that has a crop (i.e. had motion).
+        let full_frame_jpeg = tagged_frames
+            .iter()
+            .find(|(_, crop)| crop.is_some())
+            .and_then(|(frame, _)| encode_jpeg(frame));
+
         // Apply per-frame crops
         let cropped: Vec<Mat> = tagged_frames
             .iter()
@@ -583,18 +607,12 @@ impl MotionAnalyzer {
         let filmstrip_jpegs: Vec<Vec<u8>> = cropped.iter().filter_map(encode_jpeg).collect();
         self.store_filmstrip_for_run(&run, &filmstrip_jpegs);
 
-        let (detections, best_frame_idx) = self.detect_ollama(&cropped);
+        let (detections, best_frame_idx) =
+            self.detect_ollama(&cropped, full_frame_jpeg, &all_motion_rects, run_crop);
 
-        // Compute union crop for this run (used as fallback location if
-        // Ollama doesn't return bounding boxes).
-        let mut run_crop: Option<NormalizedRect> = None;
+        // Remove consumed segment data
         for seg in &run {
-            if let Some(crop) = self.segment_crops.remove(&seg.seq) {
-                run_crop = Some(match run_crop {
-                    Some(existing) => union_two_rects(existing, crop),
-                    None => crop,
-                });
-            }
+            self.segment_crops.remove(&seg.seq);
             self.segment_motion_rects.remove(&seg.seq);
         }
 
@@ -633,7 +651,13 @@ impl MotionAnalyzer {
         }
     }
 
-    fn detect_ollama(&self, frames: &[Mat]) -> (Vec<Detection>, usize) {
+    fn detect_ollama(
+        &self,
+        frames: &[Mat],
+        full_frame_jpeg: Option<Vec<u8>>,
+        motion_rects: &[(f32, f32, f32, f32)],
+        run_crop: Option<NormalizedRect>,
+    ) -> (Vec<Detection>, usize) {
         let ollama = match &self.object_detector {
             Some(d) => d,
             None => return (Vec::new(), 0),
@@ -654,12 +678,33 @@ impl MotionAnalyzer {
         // Store debug entry regardless of detection outcome
         if let Some(ref debug_store) = self.debug_store {
             if !result.frame_jpegs.is_empty() {
+                // Map ollama bboxes from crop space to full-frame space for debug
+                let ollama_rects: Vec<(String, f32, f32, f32, f32)> = result
+                    .detections
+                    .iter()
+                    .filter_map(|d| {
+                        let (x, y, w, h) = match (d.bbox, run_crop) {
+                            (Some((bx, by, bw, bh)), Some(c)) => {
+                                (c.x + bx * c.w, c.y + by * c.h, bw * c.w, bh * c.h)
+                            }
+                            (Some(b), None) => b,
+                            (None, Some(c)) => (c.x, c.y, c.w, c.h),
+                            (None, None) => return None,
+                        };
+                        Some((d.class_name.clone(), x, y, w, h))
+                    })
+                    .collect();
+                let crop_tuple = run_crop.map(|c| (c.x, c.y, c.w, c.h));
                 debug_store.insert(
                     &self.camera_id,
                     result.frame_jpegs,
                     result.raw_responses,
                     result.model,
                     result.detections.len(),
+                    full_frame_jpeg,
+                    motion_rects.to_vec(),
+                    crop_tuple,
+                    ollama_rects,
                 );
             }
         }

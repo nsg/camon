@@ -12,6 +12,13 @@ pub struct DebugEntry {
     pub raw_responses: Vec<String>,
     pub model: String,
     pub detection_count: usize,
+    pub full_frame_jpeg: Option<Vec<u8>>,
+    /// Individual motion bounding boxes in normalized coords (x, y, w, h).
+    pub motion_rects: Vec<(f32, f32, f32, f32)>,
+    /// Union crop region sent to Ollama in normalized coords.
+    pub crop_rect: Option<(f32, f32, f32, f32)>,
+    /// Ollama-returned bboxes mapped to full-frame normalized coords.
+    pub ollama_rects: Vec<(String, f32, f32, f32, f32)>,
 }
 
 pub struct DebugSnapshot {
@@ -21,6 +28,10 @@ pub struct DebugSnapshot {
     pub model: String,
     pub detection_count: usize,
     pub frame_count: usize,
+    pub has_full_frame: bool,
+    pub motion_rects: Vec<(f32, f32, f32, f32)>,
+    pub crop_rect: Option<(f32, f32, f32, f32)>,
+    pub ollama_rects: Vec<(String, f32, f32, f32, f32)>,
 }
 
 pub struct DetectionDebugStore {
@@ -40,6 +51,7 @@ impl DetectionDebugStore {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn insert(
         &self,
         camera_id: &str,
@@ -47,6 +59,10 @@ impl DetectionDebugStore {
         raw_responses: Vec<String>,
         model: String,
         detection_count: usize,
+        full_frame_jpeg: Option<Vec<u8>>,
+        motion_rects: Vec<(f32, f32, f32, f32)>,
+        crop_rect: Option<(f32, f32, f32, f32)>,
+        ollama_rects: Vec<(String, f32, f32, f32, f32)>,
     ) {
         if let Some(lock) = self.cameras.get(camera_id) {
             let mut entries = lock.write().unwrap();
@@ -62,6 +78,10 @@ impl DetectionDebugStore {
                 raw_responses,
                 model,
                 detection_count,
+                full_frame_jpeg,
+                motion_rects,
+                crop_rect,
+                ollama_rects,
             });
             while entries.len() > MAX_ENTRIES {
                 entries.pop_front();
@@ -82,11 +102,25 @@ impl DetectionDebugStore {
                         model: e.model.clone(),
                         detection_count: e.detection_count,
                         frame_count: e.frame_jpegs.len(),
+                        has_full_frame: e.full_frame_jpeg.is_some(),
+                        motion_rects: e.motion_rects.clone(),
+                        crop_rect: e.crop_rect,
+                        ollama_rects: e.ollama_rects.clone(),
                     })
                     .collect()
             }
             None => Vec::new(),
         }
+    }
+
+    pub fn get_full_frame_jpeg(&self, camera_id: &str, id: u64) -> Option<Vec<u8>> {
+        self.cameras.get(camera_id).and_then(|lock| {
+            let entries = lock.read().unwrap();
+            entries
+                .iter()
+                .find(|e| e.id == id)
+                .and_then(|e| e.full_frame_jpeg.clone())
+        })
     }
 
     pub fn get_frame_jpeg(&self, camera_id: &str, id: u64, frame_index: usize) -> Option<Vec<u8>> {

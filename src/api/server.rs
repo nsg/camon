@@ -148,6 +148,10 @@ pub async fn start_server(state: AppState, port: u16) -> Result<(), std::io::Err
             "/api/cameras/{id}/detection-debug/{debug_id}/frame/{frame_index}",
             get(detection_debug_frame_handler),
         )
+        .route(
+            "/api/cameras/{id}/detection-debug/{debug_id}/full-frame",
+            get(detection_debug_full_frame_handler),
+        )
         .route("/api/stream/{id}/playlist.m3u8", get(playlist_handler))
         .route("/api/stream/{id}/segment/{n}", get(segment_handler))
         .with_state(state);
@@ -733,6 +737,10 @@ struct DebugEntryResponse {
     model: String,
     detection_count: usize,
     frame_count: usize,
+    has_full_frame: bool,
+    motion_rects: Vec<(f32, f32, f32, f32)>,
+    crop_rect: Option<(f32, f32, f32, f32)>,
+    ollama_rects: Vec<(String, f32, f32, f32, f32)>,
 }
 
 async fn detection_debug_handler(
@@ -754,6 +762,10 @@ async fn detection_debug_handler(
             model: e.model,
             detection_count: e.detection_count,
             frame_count: e.frame_count,
+            has_full_frame: e.has_full_frame,
+            motion_rects: e.motion_rects,
+            crop_rect: e.crop_rect,
+            ollama_rects: e.ollama_rects,
         })
         .collect();
 
@@ -771,6 +783,20 @@ async fn detection_debug_frame_handler(
     match state.debug_store.get_frame_jpeg(&id, debug_id, frame_index) {
         Some(jpeg) => ([(header::CONTENT_TYPE, "image/jpeg")], jpeg).into_response(),
         None => (StatusCode::NOT_FOUND, "debug frame not found").into_response(),
+    }
+}
+
+async fn detection_debug_full_frame_handler(
+    State(state): State<AppState>,
+    Path((id, debug_id)): Path<(String, u64)>,
+) -> Response {
+    if !state.buffers.contains_key(&id) {
+        return (StatusCode::NOT_FOUND, "camera not found").into_response();
+    }
+
+    match state.debug_store.get_full_frame_jpeg(&id, debug_id) {
+        Some(jpeg) => ([(header::CONTENT_TYPE, "image/jpeg")], jpeg).into_response(),
+        None => (StatusCode::NOT_FOUND, "full frame not found").into_response(),
     }
 }
 
