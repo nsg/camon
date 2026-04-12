@@ -28,14 +28,16 @@ pub struct DetectResult {
     pub model: String,
 }
 
-const DETECT_PROMPT: &str = "This image is a single frame from a security camera during a motion event. \
-List every noteworthy object you see (person, car, truck, dog, cat, bird, bicycle, motorcycle, bus, boat). \
-For each distinct object, respond with exactly one line: CLASS CONFIDENCE X Y W H\n\
-CONFIDENCE = a number 0.0 to 1.0 indicating how certain you are.\n\
-X Y W H = bounding box as fractions of image width/height (0.0 to 1.0). \
-X Y is the top-left corner, W H is the size.\n\
-If you see nothing noteworthy, respond with exactly: NONE\n\
-Do not add any other text, headers, or explanations.";
+const DETECT_PROMPT_TEMPLATE: &str = "Security camera frame. List objects: {classes}.\n\
+One line per object: CLASS CONF X Y W H\n\
+CONF is 0.0-1.0. X Y W H are bounding box fractions of image size (0.0-1.0), top-left corner and size.\n\
+Examples:\n\
+person 0.92 0.40 0.10 0.15 0.60\n\
+car 0.87 0.05 0.50 0.30 0.20\n\
+If nothing noteworthy: NONE\n\
+No other text.";
+
+const DEFAULT_CLASSES: &str = "person, car, truck, dog, cat, bird, bicycle, motorcycle, bus, boat";
 
 #[derive(Serialize)]
 struct ChatRequest {
@@ -112,6 +114,15 @@ impl OllamaDetector {
 
     pub fn model(&self) -> &str {
         &self.primary.model
+    }
+
+    fn build_prompt(&self) -> String {
+        let classes = if self.allowed_classes.is_empty() {
+            DEFAULT_CLASSES.to_string()
+        } else {
+            self.allowed_classes.join(", ")
+        };
+        DETECT_PROMPT_TEMPLATE.replace("{classes}", &classes)
     }
 
     pub fn detect_frames(
@@ -203,7 +214,7 @@ impl OllamaDetector {
             model: server.model.clone(),
             messages: vec![Message {
                 role: "user".to_string(),
-                content: DETECT_PROMPT.to_string(),
+                content: self.build_prompt(),
                 images: vec![image_b64.to_string()],
             }],
             stream: false,
@@ -251,11 +262,24 @@ impl OllamaDetector {
                 continue;
             }
 
+            // Find the class name (first token) and then scan forward for the
+            // first parseable float as the confidence value. This handles cases
+            // where the model inserts extra words like "CONFIDENCE" between the
+            // class and the number.
             let class_name = parts[0].to_lowercase();
-            let confidence: f32 = match parts[1].parse() {
-                Ok(v) => v,
-                Err(_) => continue,
+            let mut conf_idx = None;
+            for (i, part) in parts.iter().enumerate().skip(1) {
+                if let Ok(_v) = part.parse::<f32>() {
+                    conf_idx = Some(i);
+                    break;
+                }
+            }
+            let conf_idx = match conf_idx {
+                Some(i) => i,
+                None => continue,
             };
+
+            let confidence: f32 = parts[conf_idx].parse().unwrap();
 
             if confidence < self.confidence_threshold {
                 continue;
@@ -265,12 +289,14 @@ impl OllamaDetector {
                 continue;
             }
 
-            let bbox = if parts.len() >= 6 {
+            // Parse bounding box from the 4 floats after the confidence value.
+            let remaining = &parts[conf_idx + 1..];
+            let bbox = if remaining.len() >= 4 {
                 match (
-                    parts[2].parse::<f32>(),
-                    parts[3].parse::<f32>(),
-                    parts[4].parse::<f32>(),
-                    parts[5].parse::<f32>(),
+                    remaining[0].parse::<f32>(),
+                    remaining[1].parse::<f32>(),
+                    remaining[2].parse::<f32>(),
+                    remaining[3].parse::<f32>(),
                 ) {
                     (Ok(x), Ok(y), Ok(w), Ok(h)) => {
                         let x = x.clamp(0.0, 1.0);
@@ -394,5 +420,63 @@ mod tests {
         let det = make_detector();
         assert!(det.parse_response("").is_empty());
         assert!(det.parse_response("\n\n").is_empty());
+    }
+
+    #[test]
+    fn parse_confidence_word_before_number() {
+        let det = make_detector();
+        let response = "car CONFIDENCE 0.95 0.065 0.22 0.12 0.08\n";
+        let results = det.parse_response(response);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].class_name, "car");
+        assert!((results[0].confidence - 0.95).abs() < 0.01);
+        let bbox = results[0].bbox.unwrap();
+        assert!((bbox.0 - 0.065).abs() < 0.01);
+    }
+
+    #[test]
+    fn parse_all_caps_class() {
+        let det = make_detector();
+        let response = "CAR 0.85 0.73 0.12 0.65 0.25\nPERSON 0.90 0.1 0.2 0.3 0.4\n";
+        let results = det.parse_response(response);
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].class_name, "car");
+        assert_eq!(results[1].class_name, "person");
+    }
+
+    #[test]
+    fn parse_extra_tokens_before_confidence() {
+        let det = make_detector();
+        let response = "dog confidence_score 0.75 0.1 0.2 0.3 0.4\n";
+        let results = det.parse_response(response);
+        assert_eq!(results.len(), 1);
+        assert!((results[0].confidence - 0.75).abs() < 0.01);
+        assert!(results[0].bbox.is_some());
+    }
+
+    #[test]
+    fn prompt_uses_allowed_classes() {
+        let det = make_detector();
+        let prompt = det.build_prompt();
+        assert!(prompt.contains("person, car, dog"));
+        assert!(!prompt.contains("truck"));
+    }
+
+    #[test]
+    fn prompt_uses_defaults_when_no_classes() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let det = OllamaDetector {
+            client: reqwest::Client::new(),
+            rt: rt.handle().clone(),
+            primary: OllamaServer {
+                base_url: "http://localhost:11434".to_string(),
+                model: "test".to_string(),
+            },
+            fallback: None,
+            confidence_threshold: 0.5,
+            allowed_classes: vec![],
+        };
+        let prompt = det.build_prompt();
+        assert!(prompt.contains("person, car, truck, dog, cat, bird"));
     }
 }
