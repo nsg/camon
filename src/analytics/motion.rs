@@ -37,6 +37,11 @@ const DEFAULT_MIN_CONTOUR_AREA: f64 = 200.0;
 const MIN_CONTOUR_AREA_MAX: f64 = 2000.0;
 const MIN_CONTOUR_AREA_INCREMENT: f64 = 50.0;
 
+// Per-region contour area tuning grid. 4x3 on 320x240 → 80x80px per cell.
+const REGION_COLS: usize = 4;
+const REGION_ROWS: usize = 3;
+const REGION_COUNT: usize = REGION_COLS * REGION_ROWS;
+
 // Tuner timing
 const TUNER_EVAL_SECS: u64 = 600; // 10 minutes
 const TUNER_COOLDOWN_SECS: u64 = 300; // 5 minutes
@@ -55,23 +60,69 @@ pub struct TunerStats {
     pub var_threshold: f64,
     pub learning_rate: f64,
     pub morph_kernel: f64,
-    pub min_contour_area: f64,
     pub noise_events: u32,
     pub quiet_windows: u32,
+    pub region_min_contour_areas: Vec<f64>,
+    pub region_noise_events: Vec<u32>,
+    pub region_cols: usize,
+    pub region_rows: usize,
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct TunedParams {
     pub var_threshold: f64,
     pub learning_rate: f64,
     pub morph_kernel: f64,
+    /// Legacy global min_contour_area — kept for backward compat in serialization.
+    /// At runtime, `region_min_contour_areas` is used instead.
+    #[serde(default = "default_min_contour_area")]
     pub min_contour_area: f64,
+    #[serde(default = "default_region_min_contour_areas")]
+    pub region_min_contour_areas: Vec<f64>,
+}
+
+fn default_min_contour_area() -> f64 {
+    DEFAULT_MIN_CONTOUR_AREA
+}
+
+fn default_region_min_contour_areas() -> Vec<f64> {
+    vec![DEFAULT_MIN_CONTOUR_AREA; REGION_COUNT]
 }
 
 impl TunedParams {
     fn morph_kernel_size(&self) -> i32 {
         let v = (self.morph_kernel.floor() as i32) | 1; // ensure odd
         v.max(3)
+    }
+
+    fn ensure_regions(&mut self) {
+        if self.region_min_contour_areas.len() != REGION_COUNT {
+            let fill = if self.min_contour_area != DEFAULT_MIN_CONTOUR_AREA {
+                self.min_contour_area
+            } else {
+                DEFAULT_MIN_CONTOUR_AREA
+            };
+            self.region_min_contour_areas = vec![fill; REGION_COUNT];
+        } else if self.min_contour_area != DEFAULT_MIN_CONTOUR_AREA
+            && self
+                .region_min_contour_areas
+                .iter()
+                .all(|&v| v == DEFAULT_MIN_CONTOUR_AREA)
+        {
+            // Loaded from format that had no region data — backfill from global.
+            self.region_min_contour_areas = vec![self.min_contour_area; REGION_COUNT];
+        }
+    }
+
+    fn is_at_defaults(&self) -> bool {
+        let d = Self::default();
+        self.var_threshold == d.var_threshold
+            && self.learning_rate == d.learning_rate
+            && self.morph_kernel == d.morph_kernel
+            && self
+                .region_min_contour_areas
+                .iter()
+                .all(|&v| v == DEFAULT_MIN_CONTOUR_AREA)
     }
 }
 
@@ -82,6 +133,7 @@ impl Default for TunedParams {
             learning_rate: DEFAULT_LEARNING_RATE,
             morph_kernel: DEFAULT_MORPH_KERNEL,
             min_contour_area: DEFAULT_MIN_CONTOUR_AREA,
+            region_min_contour_areas: vec![DEFAULT_MIN_CONTOUR_AREA; REGION_COUNT],
         }
     }
 }
@@ -89,23 +141,27 @@ impl Default for TunedParams {
 impl TunedParams {
     fn load(path: &Path) -> Option<Self> {
         let data = std::fs::read_to_string(path).ok()?;
-        if let Ok(params) = serde_json::from_str::<Self>(&data) {
+        if let Ok(mut params) = serde_json::from_str::<Self>(&data) {
+            params.ensure_regions();
             return Some(params);
         }
         // Migrate old format (morph_kernel_size: i32 → morph_kernel: f64)
-        // TODO: remove this migration in v0.1.15
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&data) {
-            let params = Self {
+            let global_mca = v["min_contour_area"]
+                .as_f64()
+                .unwrap_or(DEFAULT_MIN_CONTOUR_AREA);
+            let mut params = Self {
                 var_threshold: v["var_threshold"].as_f64().unwrap_or(DEFAULT_VAR_THRESHOLD),
                 learning_rate: v["learning_rate"].as_f64().unwrap_or(DEFAULT_LEARNING_RATE),
                 morph_kernel: v["morph_kernel_size"]
                     .as_i64()
                     .map(|v| v as f64)
+                    .or_else(|| v["morph_kernel"].as_f64())
                     .unwrap_or(DEFAULT_MORPH_KERNEL),
-                min_contour_area: v["min_contour_area"]
-                    .as_f64()
-                    .unwrap_or(DEFAULT_MIN_CONTOUR_AREA),
+                min_contour_area: global_mca,
+                region_min_contour_areas: vec![global_mca; REGION_COUNT],
             };
+            params.ensure_regions();
             tracing::info!(path = %path.display(), "migrated old motion tuner format");
             params.save(path);
             return Some(params);
@@ -136,8 +192,8 @@ struct MotionTuner {
     camera_id: String,
     params: TunedParams,
     params_path: PathBuf,
-    noise_events: u32,
-    quiet_windows: u32,
+    region_noise_events: [u32; REGION_COUNT],
+    region_quiet_windows: [u32; REGION_COUNT],
     started_at: Instant,
     eval_start: Instant,
     last_adjustment: Option<Instant>,
@@ -146,9 +202,10 @@ struct MotionTuner {
 impl MotionTuner {
     fn new(camera_id: String, data_dir: &Path) -> Self {
         let params_path = data_dir.join(&camera_id).join("motion_tuner.json");
-        let params = TunedParams::load(&params_path).unwrap_or_default();
+        let mut params = TunedParams::load(&params_path).unwrap_or_default();
+        params.ensure_regions();
 
-        if params != TunedParams::default() {
+        if !params.is_at_defaults() {
             tracing::info!(
                 camera = %camera_id,
                 var_threshold = params.var_threshold,
@@ -164,20 +221,32 @@ impl MotionTuner {
             camera_id,
             params,
             params_path,
-            noise_events: 0,
-            quiet_windows: 0,
+            region_noise_events: [0; REGION_COUNT],
+            region_quiet_windows: [0; REGION_COUNT],
             started_at: now,
             eval_start: now,
             last_adjustment: None,
         }
     }
 
-    fn record_motion_event(&mut self) {
-        self.noise_events += 1;
+    fn total_noise_events(&self) -> u32 {
+        self.region_noise_events.iter().sum()
     }
 
-    fn record_positive_detection(&mut self) {
-        self.noise_events = self.noise_events.saturating_sub(1);
+    fn record_motion_event(&mut self, regions: &[usize]) {
+        for &r in regions {
+            if r < REGION_COUNT {
+                self.region_noise_events[r] += 1;
+            }
+        }
+    }
+
+    fn record_positive_detection(&mut self, regions: &[usize]) {
+        for &r in regions {
+            if r < REGION_COUNT {
+                self.region_noise_events[r] = self.region_noise_events[r].saturating_sub(1);
+            }
+        }
     }
 
     fn maybe_tune(&mut self) -> bool {
@@ -199,26 +268,57 @@ impl MotionTuner {
         }
 
         let window_hours = window_secs as f32 / 3600.0;
-        let noise_per_hour = self.noise_events as f32 / window_hours;
+        let total_noise = self.total_noise_events();
+        let aggregate_noise_per_hour = total_noise as f32 / window_hours;
 
-        let changed = if noise_per_hour > NOISE_EVENTS_PER_HOUR_HIGH {
-            self.quiet_windows = 0;
-            self.tighten(noise_per_hour)
-        } else if self.noise_events == 0 && self.params != TunedParams::default() {
-            self.quiet_windows += 1;
-            if self.quiet_windows >= RELAX_QUIET_WINDOWS {
-                self.quiet_windows = 0;
-                self.relax()
+        let mut changed = false;
+
+        // Global params (var_threshold, learning_rate, morph_kernel) use aggregate noise.
+        if aggregate_noise_per_hour > NOISE_EVENTS_PER_HOUR_HIGH {
+            changed |= self.tighten_global(aggregate_noise_per_hour);
+        }
+
+        // Per-region min_contour_area tuning.
+        for region in 0..REGION_COUNT {
+            let region_noise = self.region_noise_events[region];
+            let region_noise_per_hour = region_noise as f32 / window_hours;
+
+            if region_noise_per_hour > NOISE_EVENTS_PER_HOUR_HIGH {
+                self.region_quiet_windows[region] = 0;
+                changed |= self.tighten_region(region, region_noise_per_hour);
+            } else if region_noise == 0 {
+                self.region_quiet_windows[region] += 1;
+                if self.params.region_min_contour_areas[region] != DEFAULT_MIN_CONTOUR_AREA
+                    && self.region_quiet_windows[region] >= RELAX_QUIET_WINDOWS
+                {
+                    self.region_quiet_windows[region] = 0;
+                    changed |= self.relax_region(region);
+                }
             } else {
-                false
+                self.region_quiet_windows[region] = 0;
             }
-        } else {
-            self.quiet_windows = 0;
-            false
-        };
+        }
+
+        // Relax global params after all regions have been quiet long enough.
+        if total_noise == 0 && !self.params.is_at_defaults() {
+            let all_quiet = self
+                .region_quiet_windows
+                .iter()
+                .all(|&w| w >= RELAX_QUIET_WINDOWS);
+            if all_quiet {
+                changed |= self.relax_global();
+            }
+        }
 
         if changed {
             self.last_adjustment = Some(now);
+            // Update legacy global field to max of regional values.
+            self.params.min_contour_area = self
+                .params
+                .region_min_contour_areas
+                .iter()
+                .cloned()
+                .fold(0.0f64, f64::max);
             self.params.save(&self.params_path);
         }
 
@@ -226,68 +326,99 @@ impl MotionTuner {
         changed
     }
 
-    fn tighten(&mut self, noise_per_hour: f32) -> bool {
+    fn tighten_global(&mut self, noise_per_hour: f32) -> bool {
         let p = &mut self.params;
-        let before = p.clone();
+        let before_vt = p.var_threshold;
+        let before_mk = p.morph_kernel;
+        let before_lr = p.learning_rate;
 
         p.var_threshold = (p.var_threshold + VAR_THRESHOLD_INCREMENT).min(VAR_THRESHOLD_MAX);
-        p.min_contour_area =
-            (p.min_contour_area + MIN_CONTOUR_AREA_INCREMENT).min(MIN_CONTOUR_AREA_MAX);
         p.morph_kernel = (p.morph_kernel + MORPH_KERNEL_INCREMENT).min(MORPH_KERNEL_MAX);
         p.learning_rate = (p.learning_rate + LEARNING_RATE_INCREMENT).min(LEARNING_RATE_MAX);
 
-        if *p != before {
+        let changed = p.var_threshold != before_vt
+            || p.morph_kernel != before_mk
+            || p.learning_rate != before_lr;
+
+        if changed {
             tracing::info!(
                 camera = %self.camera_id,
                 noise_per_hour = format!("{:.1}", noise_per_hour),
                 var_threshold = format!("{:.1}", p.var_threshold),
-                min_contour_area = format!("{:.0}", p.min_contour_area),
                 morph_kernel = p.morph_kernel_size(),
                 learning_rate = format!("{:.4}", p.learning_rate),
-                "motion tuner: tightening"
+                "motion tuner: tightening global params"
             );
-            true
-        } else {
-            tracing::info!(
-                camera = %self.camera_id,
-                noise_per_hour = format!("{:.1}", noise_per_hour),
-                "motion tuner: all parameters at maximum"
-            );
-            false
         }
+        changed
     }
 
-    fn relax(&mut self) -> bool {
+    fn tighten_region(&mut self, region: usize, noise_per_hour: f32) -> bool {
+        let v = &mut self.params.region_min_contour_areas[region];
+        let before = *v;
+        *v = (*v + MIN_CONTOUR_AREA_INCREMENT).min(MIN_CONTOUR_AREA_MAX);
+        let changed = *v != before;
+        if changed {
+            tracing::info!(
+                camera = %self.camera_id,
+                region,
+                noise_per_hour = format!("{:.1}", noise_per_hour),
+                min_contour_area = format!("{:.0}", *v),
+                "motion tuner: tightening region"
+            );
+        }
+        changed
+    }
+
+    fn relax_global(&mut self) -> bool {
         const RELAX_DIVISOR: f64 = 6.0;
         let p = &mut self.params;
-        let before = p.clone();
+        let before_vt = p.var_threshold;
+        let before_mk = p.morph_kernel;
+        let before_lr = p.learning_rate;
 
         p.var_threshold =
             (p.var_threshold - VAR_THRESHOLD_INCREMENT / RELAX_DIVISOR).max(DEFAULT_VAR_THRESHOLD);
-        p.min_contour_area = (p.min_contour_area - MIN_CONTOUR_AREA_INCREMENT / RELAX_DIVISOR)
-            .max(DEFAULT_MIN_CONTOUR_AREA);
         p.morph_kernel =
             (p.morph_kernel - MORPH_KERNEL_INCREMENT / RELAX_DIVISOR).max(DEFAULT_MORPH_KERNEL);
         p.learning_rate =
             (p.learning_rate - LEARNING_RATE_INCREMENT / RELAX_DIVISOR).max(DEFAULT_LEARNING_RATE);
 
-        if *p != before {
+        let changed = p.var_threshold != before_vt
+            || p.morph_kernel != before_mk
+            || p.learning_rate != before_lr;
+
+        if changed {
             tracing::info!(
                 camera = %self.camera_id,
                 var_threshold = format!("{:.1}", p.var_threshold),
-                min_contour_area = format!("{:.0}", p.min_contour_area),
                 morph_kernel = p.morph_kernel_size(),
                 learning_rate = format!("{:.4}", p.learning_rate),
-                "motion tuner: relaxing after sustained quiet"
+                "motion tuner: relaxing global params"
             );
-            true
-        } else {
-            false
         }
+        changed
+    }
+
+    fn relax_region(&mut self, region: usize) -> bool {
+        const RELAX_DIVISOR: f64 = 6.0;
+        let v = &mut self.params.region_min_contour_areas[region];
+        let before = *v;
+        *v = (*v - MIN_CONTOUR_AREA_INCREMENT / RELAX_DIVISOR).max(DEFAULT_MIN_CONTOUR_AREA);
+        let changed = *v != before;
+        if changed {
+            tracing::info!(
+                camera = %self.camera_id,
+                region,
+                min_contour_area = format!("{:.0}", *v),
+                "motion tuner: relaxing region"
+            );
+        }
+        changed
     }
 
     fn reset_window(&mut self) {
-        self.noise_events = 0;
+        self.region_noise_events = [0; REGION_COUNT];
         self.eval_start = Instant::now();
     }
 }
@@ -298,7 +429,7 @@ pub struct MotionDetector {
     cleaned_mask: Mat,
     morph_kernel: Mat,
     learning_rate: f64,
-    min_contour_area: f64,
+    region_min_contour_areas: [f64; REGION_COUNT],
     frames_since_stable: u32,
     tuner: MotionTuner,
     raw_mog2_mask: Mat,
@@ -317,13 +448,20 @@ impl MotionDetector {
         let cleaned_mask = Mat::default();
         let morph_kernel = build_morph_kernel(params.morph_kernel_size())?;
 
+        let mut region_areas = [DEFAULT_MIN_CONTOUR_AREA; REGION_COUNT];
+        for (i, &v) in params.region_min_contour_areas.iter().enumerate() {
+            if i < REGION_COUNT {
+                region_areas[i] = v;
+            }
+        }
+
         Ok(Self {
             mog2,
             fg_mask,
             cleaned_mask,
             morph_kernel,
             learning_rate: params.learning_rate,
-            min_contour_area: params.min_contour_area,
+            region_min_contour_areas: region_areas,
             frames_since_stable: 0,
             tuner,
             raw_mog2_mask: Mat::default(),
@@ -402,15 +540,16 @@ impl MotionDetector {
             opencv::core::Point::new(0, 0),
         )?;
 
-        let mut motion_mask = Mat::zeros(
-            self.fg_mask.rows(),
-            self.fg_mask.cols(),
-            opencv::core::CV_8UC1,
-        )?
-        .to_mat()?;
+        let frame_w = self.fg_mask.cols();
+        let frame_h = self.fg_mask.rows();
+        let mut motion_mask = Mat::zeros(frame_h, frame_w, opencv::core::CV_8UC1)?.to_mat()?;
         for i in 0..contours.len() {
-            let area = imgproc::contour_area(&contours.get(i)?, false)?;
-            if area >= self.min_contour_area {
+            let contour = contours.get(i)?;
+            let area = imgproc::contour_area(&contour, false)?;
+            let rect = imgproc::bounding_rect(&contour)?;
+            let region = contour_region(&rect, frame_w, frame_h);
+            let threshold = self.region_min_contour_areas[region];
+            if area >= threshold {
                 imgproc::draw_contours(
                     &mut motion_mask,
                     &contours,
@@ -434,10 +573,11 @@ impl MotionDetector {
         Ok((foreground_ratio * 10.0).min(1.0))
     }
 
-    /// Report a motion event (segment above threshold). The tuner counts these
-    /// as potential noise unless offset by `report_positive_detection`.
-    pub fn report_motion_event(&mut self) {
-        self.tuner.record_motion_event();
+    /// Report a motion event for regions covered by the given bounding boxes
+    /// (in analysis-frame pixel coordinates).
+    pub fn report_motion_event(&mut self, bboxes: &[Rect], frame_w: i32, frame_h: i32) {
+        let regions = unique_regions_from_rects(bboxes, frame_w, frame_h);
+        self.tuner.record_motion_event(&regions);
     }
 
     /// Evaluate tuner — must be called every analysis cycle regardless of motion.
@@ -448,9 +588,11 @@ impl MotionDetector {
         Ok(())
     }
 
-    /// An object detection confirmed this motion was real — subtract one noise event.
-    pub fn report_positive_detection(&mut self) {
-        self.tuner.record_positive_detection();
+    /// An object detection confirmed this motion was real — subtract noise for
+    /// the regions covered by the given normalized bounding boxes.
+    pub fn report_positive_detection(&mut self, normalized_rects: &[(f32, f32, f32, f32)]) {
+        let regions = unique_regions_from_normalized(normalized_rects);
+        self.tuner.record_positive_detection(&regions);
     }
 
     pub fn tuner_stats(&self) -> TunerStats {
@@ -458,9 +600,12 @@ impl MotionDetector {
             var_threshold: self.tuner.params.var_threshold,
             learning_rate: self.tuner.params.learning_rate,
             morph_kernel: self.tuner.params.morph_kernel,
-            min_contour_area: self.tuner.params.min_contour_area,
-            noise_events: self.tuner.noise_events,
-            quiet_windows: self.tuner.quiet_windows,
+            noise_events: self.tuner.total_noise_events(),
+            quiet_windows: *self.tuner.region_quiet_windows.iter().min().unwrap_or(&0),
+            region_min_contour_areas: self.tuner.params.region_min_contour_areas.clone(),
+            region_noise_events: self.tuner.region_noise_events.to_vec(),
+            region_cols: REGION_COLS,
+            region_rows: REGION_ROWS,
         }
     }
 
@@ -468,7 +613,11 @@ impl MotionDetector {
         let p = &self.tuner.params;
         self.mog2.set_var_threshold(p.var_threshold)?;
         self.learning_rate = p.learning_rate;
-        self.min_contour_area = p.min_contour_area;
+        for (i, &v) in p.region_min_contour_areas.iter().enumerate() {
+            if i < REGION_COUNT {
+                self.region_min_contour_areas[i] = v;
+            }
+        }
         self.morph_kernel = build_morph_kernel(p.morph_kernel_size())?;
         Ok(())
     }
@@ -558,59 +707,103 @@ fn build_morph_kernel(size: i32) -> CvResult<Mat> {
     )
 }
 
-impl PartialEq for TunedParams {
-    fn eq(&self, other: &Self) -> bool {
-        self.var_threshold == other.var_threshold
-            && self.learning_rate == other.learning_rate
-            && self.morph_kernel == other.morph_kernel
-            && self.min_contour_area == other.min_contour_area
+fn contour_region(rect: &Rect, frame_w: i32, frame_h: i32) -> usize {
+    let cx = rect.x + rect.width / 2;
+    let cy = rect.y + rect.height / 2;
+    let col = ((cx as usize) * REGION_COLS / frame_w.max(1) as usize).min(REGION_COLS - 1);
+    let row = ((cy as usize) * REGION_ROWS / frame_h.max(1) as usize).min(REGION_ROWS - 1);
+    row * REGION_COLS + col
+}
+
+fn unique_regions_from_rects(rects: &[Rect], frame_w: i32, frame_h: i32) -> Vec<usize> {
+    let mut seen = [false; REGION_COUNT];
+    let mut result = Vec::new();
+    for r in rects {
+        let region = contour_region(r, frame_w, frame_h);
+        if !seen[region] {
+            seen[region] = true;
+            result.push(region);
+        }
     }
+    result
+}
+
+fn unique_regions_from_normalized(rects: &[(f32, f32, f32, f32)]) -> Vec<usize> {
+    let mut seen = [false; REGION_COUNT];
+    let mut result = Vec::new();
+    for &(x, y, w, h) in rects {
+        let cx = x + w / 2.0;
+        let cy = y + h / 2.0;
+        let col = ((cx * REGION_COLS as f32) as usize).min(REGION_COLS - 1);
+        let row = ((cy * REGION_ROWS as f32) as usize).min(REGION_ROWS - 1);
+        let region = row * REGION_COLS + col;
+        if !seen[region] {
+            seen[region] = true;
+            result.push(region);
+        }
+    }
+    result
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn make_tuner_past_grace(dir: &Path) -> MotionTuner {
+        let mut tuner = MotionTuner::new("test".into(), dir);
+        tuner.started_at =
+            Instant::now() - std::time::Duration::from_secs(TUNER_STARTUP_GRACE_SECS + 1);
+        tuner.eval_start = Instant::now() - std::time::Duration::from_secs(TUNER_EVAL_SECS + 1);
+        tuner
+    }
+
+    fn add_noise(tuner: &mut MotionTuner, region: usize, count: u32) {
+        for _ in 0..count {
+            tuner.record_motion_event(&[region]);
+        }
+    }
+
     #[test]
     fn tuner_does_not_tune_during_grace_period() {
         let dir = tempfile::TempDir::new().unwrap();
         let mut tuner = MotionTuner::new("test".into(), dir.path());
-
-        tuner.noise_events = 100;
+        add_noise(&mut tuner, 0, 100);
         tuner.eval_start = Instant::now() - std::time::Duration::from_secs(TUNER_EVAL_SECS + 1);
-
         assert!(!tuner.maybe_tune());
     }
 
     #[test]
-    fn tuner_tightens_all_params_proportionally() {
+    fn tuner_tightens_global_and_noisy_region() {
         let dir = tempfile::TempDir::new().unwrap();
-        let mut tuner = MotionTuner::new("test".into(), dir.path());
-        tuner.started_at =
-            Instant::now() - std::time::Duration::from_secs(TUNER_STARTUP_GRACE_SECS + 1);
-        tuner.eval_start = Instant::now() - std::time::Duration::from_secs(TUNER_EVAL_SECS + 1);
-        tuner.noise_events = 30;
+        let mut tuner = make_tuner_past_grace(dir.path());
+        // Concentrate all noise in region 0
+        add_noise(&mut tuner, 0, 30);
 
         assert!(tuner.maybe_tune());
-        // All params should have moved from defaults
         assert!(tuner.params.var_threshold > DEFAULT_VAR_THRESHOLD);
-        assert!(tuner.params.min_contour_area > DEFAULT_MIN_CONTOUR_AREA);
         assert!(tuner.params.morph_kernel > DEFAULT_MORPH_KERNEL);
         assert!(tuner.params.learning_rate > DEFAULT_LEARNING_RATE);
+        // Only region 0 should have tightened
+        assert!(tuner.params.region_min_contour_areas[0] > DEFAULT_MIN_CONTOUR_AREA);
+        // Other regions should stay at default
+        assert_eq!(
+            tuner.params.region_min_contour_areas[1],
+            DEFAULT_MIN_CONTOUR_AREA
+        );
+        assert_eq!(
+            tuner.params.region_min_contour_areas[5],
+            DEFAULT_MIN_CONTOUR_AREA
+        );
     }
 
     #[test]
     fn tuner_increments_are_proportional() {
         let dir = tempfile::TempDir::new().unwrap();
-        let mut tuner = MotionTuner::new("test".into(), dir.path());
-        tuner.started_at =
-            Instant::now() - std::time::Duration::from_secs(TUNER_STARTUP_GRACE_SECS + 1);
-        tuner.eval_start = Instant::now() - std::time::Duration::from_secs(TUNER_EVAL_SECS + 1);
-        tuner.noise_events = 100;
+        let mut tuner = make_tuner_past_grace(dir.path());
+        add_noise(&mut tuner, 0, 100);
 
         tuner.maybe_tune();
 
-        // var_threshold moves fastest
         let vt_progress = (tuner.params.var_threshold - DEFAULT_VAR_THRESHOLD)
             / (VAR_THRESHOLD_MAX - DEFAULT_VAR_THRESHOLD);
         let lr_progress = (tuner.params.learning_rate - DEFAULT_LEARNING_RATE)
@@ -624,12 +817,8 @@ mod tests {
     #[test]
     fn tuner_does_nothing_when_quiet() {
         let dir = tempfile::TempDir::new().unwrap();
-        let mut tuner = MotionTuner::new("test".into(), dir.path());
-        tuner.started_at =
-            Instant::now() - std::time::Duration::from_secs(TUNER_STARTUP_GRACE_SECS + 1);
-        tuner.eval_start = Instant::now() - std::time::Duration::from_secs(TUNER_EVAL_SECS + 1);
-        tuner.noise_events = 1;
-
+        let mut tuner = make_tuner_past_grace(dir.path());
+        add_noise(&mut tuner, 3, 1);
         assert!(!tuner.maybe_tune());
     }
 
@@ -639,68 +828,81 @@ mod tests {
         let mut tuner = MotionTuner::new("test".into(), dir.path());
 
         for _ in 0..30 {
-            tuner.record_motion_event();
+            tuner.record_motion_event(&[2]);
         }
         for _ in 0..25 {
-            tuner.record_positive_detection();
+            tuner.record_positive_detection(&[2]);
         }
-        assert_eq!(tuner.noise_events, 5);
+        assert_eq!(tuner.region_noise_events[2], 5);
+        assert_eq!(tuner.total_noise_events(), 5);
     }
 
     #[test]
     fn tuner_respects_cooldown() {
         let dir = tempfile::TempDir::new().unwrap();
-        let mut tuner = MotionTuner::new("test".into(), dir.path());
-        tuner.started_at =
-            Instant::now() - std::time::Duration::from_secs(TUNER_STARTUP_GRACE_SECS + 1);
-        tuner.eval_start = Instant::now() - std::time::Duration::from_secs(TUNER_EVAL_SECS + 1);
+        let mut tuner = make_tuner_past_grace(dir.path());
         tuner.last_adjustment = Some(Instant::now());
-        tuner.noise_events = 100;
-
+        add_noise(&mut tuner, 0, 100);
         assert!(!tuner.maybe_tune());
     }
 
     #[test]
     fn tuner_all_maxed() {
         let dir = tempfile::TempDir::new().unwrap();
-        let mut tuner = MotionTuner::new("test".into(), dir.path());
-        tuner.started_at =
-            Instant::now() - std::time::Duration::from_secs(TUNER_STARTUP_GRACE_SECS + 1);
-        tuner.eval_start = Instant::now() - std::time::Duration::from_secs(TUNER_EVAL_SECS + 1);
-
+        let mut tuner = make_tuner_past_grace(dir.path());
         tuner.params.var_threshold = VAR_THRESHOLD_MAX;
-        tuner.params.min_contour_area = MIN_CONTOUR_AREA_MAX;
         tuner.params.morph_kernel = MORPH_KERNEL_MAX;
         tuner.params.learning_rate = LEARNING_RATE_MAX;
-        tuner.noise_events = 100;
-
+        for v in &mut tuner.params.region_min_contour_areas {
+            *v = MIN_CONTOUR_AREA_MAX;
+        }
+        add_noise(&mut tuner, 0, 100);
         assert!(!tuner.maybe_tune());
     }
 
     #[test]
-    fn tuner_relaxes_after_sustained_quiet() {
+    fn tuner_region_relaxes_independently() {
         let dir = tempfile::TempDir::new().unwrap();
-        let mut tuner = MotionTuner::new("test".into(), dir.path());
-        tuner.started_at =
-            Instant::now() - std::time::Duration::from_secs(TUNER_STARTUP_GRACE_SECS + 1);
+        let mut tuner = make_tuner_past_grace(dir.path());
 
-        tuner.params.var_threshold = VAR_THRESHOLD_MAX;
-        tuner.params.learning_rate = LEARNING_RATE_MAX;
-        tuner.params.morph_kernel = MORPH_KERNEL_MAX;
-        tuner.params.min_contour_area = MIN_CONTOUR_AREA_MAX;
+        // Tighten region 3 only
+        tuner.params.region_min_contour_areas[3] = MIN_CONTOUR_AREA_MAX;
 
         for _ in 0..RELAX_QUIET_WINDOWS - 1 {
             tuner.eval_start = Instant::now() - std::time::Duration::from_secs(TUNER_EVAL_SECS + 1);
             tuner.last_adjustment = None;
-            tuner.noise_events = 0;
+            // No noise anywhere → region quiet windows accumulate
             assert!(!tuner.maybe_tune());
         }
 
         tuner.eval_start = Instant::now() - std::time::Duration::from_secs(TUNER_EVAL_SECS + 1);
         tuner.last_adjustment = None;
-        tuner.noise_events = 0;
         assert!(tuner.maybe_tune());
-        // All params should have decreased
+        assert!(tuner.params.region_min_contour_areas[3] < MIN_CONTOUR_AREA_MAX);
+        // Other regions should still be at default
+        assert_eq!(
+            tuner.params.region_min_contour_areas[0],
+            DEFAULT_MIN_CONTOUR_AREA
+        );
+    }
+
+    #[test]
+    fn tuner_relaxes_global_after_sustained_quiet() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut tuner = make_tuner_past_grace(dir.path());
+        tuner.params.var_threshold = VAR_THRESHOLD_MAX;
+        tuner.params.learning_rate = LEARNING_RATE_MAX;
+        tuner.params.morph_kernel = MORPH_KERNEL_MAX;
+
+        for _ in 0..RELAX_QUIET_WINDOWS - 1 {
+            tuner.eval_start = Instant::now() - std::time::Duration::from_secs(TUNER_EVAL_SECS + 1);
+            tuner.last_adjustment = None;
+            assert!(!tuner.maybe_tune());
+        }
+
+        tuner.eval_start = Instant::now() - std::time::Duration::from_secs(TUNER_EVAL_SECS + 1);
+        tuner.last_adjustment = None;
+        assert!(tuner.maybe_tune());
         assert!(tuner.params.var_threshold < VAR_THRESHOLD_MAX);
         assert!(tuner.params.learning_rate < LEARNING_RATE_MAX);
     }
@@ -708,30 +910,24 @@ mod tests {
     #[test]
     fn tuner_does_not_relax_at_defaults() {
         let dir = tempfile::TempDir::new().unwrap();
-        let mut tuner = MotionTuner::new("test".into(), dir.path());
-        tuner.started_at =
-            Instant::now() - std::time::Duration::from_secs(TUNER_STARTUP_GRACE_SECS + 1);
-        tuner.eval_start = Instant::now() - std::time::Duration::from_secs(TUNER_EVAL_SECS + 1);
-        tuner.quiet_windows = RELAX_QUIET_WINDOWS;
-        tuner.noise_events = 0;
-
+        let mut tuner = make_tuner_past_grace(dir.path());
+        for rqw in &mut tuner.region_quiet_windows {
+            *rqw = RELAX_QUIET_WINDOWS;
+        }
         assert!(!tuner.maybe_tune());
     }
 
     #[test]
-    fn tuner_any_noise_resets_quiet_counter() {
+    fn tuner_noise_in_region_resets_its_quiet_counter() {
         let dir = tempfile::TempDir::new().unwrap();
-        let mut tuner = MotionTuner::new("test".into(), dir.path());
-        tuner.started_at =
-            Instant::now() - std::time::Duration::from_secs(TUNER_STARTUP_GRACE_SECS + 1);
-        tuner.params.var_threshold = VAR_THRESHOLD_MAX;
-        tuner.quiet_windows = RELAX_QUIET_WINDOWS - 1;
+        let mut tuner = make_tuner_past_grace(dir.path());
+        tuner.params.region_min_contour_areas[5] = 500.0;
+        tuner.region_quiet_windows[5] = RELAX_QUIET_WINDOWS - 1;
 
-        tuner.eval_start = Instant::now() - std::time::Duration::from_secs(TUNER_EVAL_SECS + 1);
-        tuner.last_adjustment = None;
-        tuner.noise_events = 1;
+        // Add low noise (below threshold) in region 5
+        add_noise(&mut tuner, 5, 1);
         assert!(!tuner.maybe_tune());
-        assert_eq!(tuner.quiet_windows, 0);
+        assert_eq!(tuner.region_quiet_windows[5], 0);
     }
 
     #[test]
@@ -740,22 +936,72 @@ mod tests {
             morph_kernel: 6.3,
             ..TunedParams::default()
         };
-        assert_eq!(params.morph_kernel_size(), 7); // floor(6.3)=6, 6|1=7
+        assert_eq!(params.morph_kernel_size(), 7);
     }
 
     #[test]
     fn tuner_persistence_roundtrip() {
         let dir = tempfile::TempDir::new().unwrap();
-        let params = TunedParams {
+        let mut params = TunedParams {
             var_threshold: 24.0,
             learning_rate: 0.004,
             morph_kernel: 7.5,
             min_contour_area: 350.0,
+            region_min_contour_areas: vec![DEFAULT_MIN_CONTOUR_AREA; REGION_COUNT],
         };
+        params.region_min_contour_areas[2] = 450.0;
+        params.region_min_contour_areas[7] = 800.0;
+
         let path = dir.path().join("test").join("motion_tuner.json");
         params.save(&path);
 
         let loaded = TunedParams::load(&path).unwrap();
         assert_eq!(params, loaded);
+        assert_eq!(loaded.region_min_contour_areas[2], 450.0);
+        assert_eq!(loaded.region_min_contour_areas[7], 800.0);
+    }
+
+    #[test]
+    fn tuner_loads_legacy_format_without_regions() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("test").join("motion_tuner.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            r#"{"var_threshold":28.0,"learning_rate":0.00375,"morph_kernel":6.98,"min_contour_area":350.0}"#,
+        ).unwrap();
+
+        let loaded = TunedParams::load(&path).unwrap();
+        assert_eq!(loaded.var_threshold, 28.0);
+        // All regions should be initialized from the global value
+        assert!(loaded.region_min_contour_areas.iter().all(|&v| v == 350.0));
+    }
+
+    #[test]
+    fn contour_region_boundaries() {
+        // Top-left corner
+        let r = Rect::new(0, 0, 10, 10);
+        assert_eq!(contour_region(&r, 320, 240), 0);
+
+        // Bottom-right corner
+        let r = Rect::new(310, 230, 10, 10);
+        assert_eq!(contour_region(&r, 320, 240), REGION_COUNT - 1);
+
+        // Center of frame
+        let r = Rect::new(155, 115, 10, 10);
+        assert_eq!(contour_region(&r, 320, 240), 1 * REGION_COLS + 2); // row 1, col 2
+    }
+
+    #[test]
+    fn unique_regions_deduplicates() {
+        let rects = vec![
+            (0.1, 0.1, 0.05, 0.05),   // region 0
+            (0.15, 0.15, 0.05, 0.05), // also region 0
+            (0.9, 0.9, 0.05, 0.05),   // region 11
+        ];
+        let regions = unique_regions_from_normalized(&rects);
+        assert_eq!(regions.len(), 2);
+        assert_eq!(regions[0], 0);
+        assert_eq!(regions[1], REGION_COUNT - 1);
     }
 }

@@ -157,6 +157,7 @@ pub struct MotionAnalyzer {
     grid_save_counter: u32,
     segment_crops: HashMap<u64, NormalizedRect>,
     segment_motion_rects: HashMap<u64, Vec<NormalizedRect>>,
+    last_run_motion_rects: Vec<(f32, f32, f32, f32)>,
 }
 
 impl MotionAnalyzer {
@@ -185,6 +186,7 @@ impl MotionAnalyzer {
             grid_save_counter: 0,
             segment_crops: HashMap::new(),
             segment_motion_rects: HashMap::new(),
+            last_run_motion_rects: Vec::new(),
         })
     }
 
@@ -411,7 +413,9 @@ impl MotionAnalyzer {
     }
 
     fn record_motion(&mut self, seq: u64, start_pts: u64, duration_ns: u64, score: f32) {
-        self.detector.report_motion_event();
+        let bboxes = self.detector.motion_bboxes();
+        self.detector
+            .report_motion_event(&bboxes, ANALYSIS_WIDTH, ANALYSIS_HEIGHT);
         let mask_jpeg = self.detector.fg_mask_jpeg();
         self.motion_store.insert(
             &self.camera_id,
@@ -620,6 +624,7 @@ impl MotionAnalyzer {
             return;
         }
 
+        self.last_run_motion_rects = all_motion_rects;
         let result =
             build_detection_result(&detections, &filmstrip_jpegs, best_frame_idx, run_crop);
         self.propagate_detection(&run, &result);
@@ -774,7 +779,8 @@ impl MotionAnalyzer {
         }
 
         if stored_any {
-            self.detector.report_positive_detection();
+            self.detector
+                .report_positive_detection(&self.last_run_motion_rects);
         }
     }
 }

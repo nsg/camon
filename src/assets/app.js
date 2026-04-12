@@ -1038,12 +1038,11 @@ document.addEventListener('DOMContentLoaded', async () => {
         ctx.clearRect(0, 0, w, h);
 
         const d = tunerData;
-        const defaults = { var_threshold: 16, learning_rate: 0.003, morph_kernel: 5, min_contour_area: 200 };
+        const defaults = { var_threshold: 16, learning_rate: 0.003, morph_kernel: 5 };
         const lines = [
             { label: 'var_threshold', value: d.var_threshold, def: defaults.var_threshold, fmt: v => v.toFixed(1) },
             { label: 'learning_rate', value: d.learning_rate, def: defaults.learning_rate, fmt: v => v.toFixed(4) },
             { label: 'morph_kernel', value: d.morph_kernel, def: defaults.morph_kernel, fmt: v => v.toFixed(1) },
-            { label: 'min_contour_area', value: d.min_contour_area, def: defaults.min_contour_area, fmt: v => v.toFixed(0) },
             { label: 'noise_events', value: d.noise_events, def: null, fmt: v => `${v}` },
             { label: 'quiet_windows', value: d.quiet_windows, def: null, fmt: v => `${v}` },
         ];
@@ -1052,7 +1051,16 @@ document.addEventListener('DOMContentLoaded', async () => {
         const lineHeight = fontSize * 1.4;
         const padding = 12;
         const boxWidth = fontSize * 20;
-        const boxHeight = lines.length * lineHeight + padding * 2;
+
+        // Region heatmap dimensions
+        const regionCols = d.region_cols || 4;
+        const regionRows = d.region_rows || 3;
+        const regions = d.region_min_contour_areas || [];
+        const gridCellW = (boxWidth - padding * 2) / regionCols;
+        const gridCellH = gridCellW * 0.75;
+        const gridHeight = regions.length > 0 ? regionRows * gridCellH + lineHeight + 4 : 0;
+
+        const boxHeight = lines.length * lineHeight + padding * 2 + gridHeight;
         const x = w - boxWidth - padding;
         const y = h - boxHeight - padding;
 
@@ -1086,6 +1094,48 @@ document.addEventListener('DOMContentLoaded', async () => {
                 ctx.font = `${fontSize}px monospace`;
                 ctx.fillText(defText, x + padding + labelW + valueW, ty);
             }
+        }
+
+        // Draw region min_contour_area heatmap
+        if (regions.length > 0) {
+            const gridY = y + padding + lines.length * lineHeight + 4;
+
+            // Label
+            ctx.fillStyle = 'rgba(255, 255, 255, 0.6)';
+            ctx.font = `${fontSize}px monospace`;
+            ctx.textAlign = 'left';
+            ctx.fillText('min_contour_area:', x + padding, gridY);
+
+            const cellsY = gridY + lineHeight;
+            const cellFontSize = Math.max(10, fontSize * 0.6);
+
+            for (let r = 0; r < regionRows; r++) {
+                for (let c = 0; c < regionCols; c++) {
+                    const idx = r * regionCols + c;
+                    const val = regions[idx] || 200;
+                    const t = Math.min(1, (val - 200) / (2000 - 200));
+
+                    // Green (default) → yellow → red (max)
+                    const red = Math.round(t < 0.5 ? t * 2 * 255 : 255);
+                    const green = Math.round(t < 0.5 ? 255 : (1 - (t - 0.5) * 2) * 255);
+                    const alpha = val === 200 ? 0.25 : 0.7;
+                    ctx.fillStyle = `rgba(${red},${green},50,${alpha})`;
+
+                    const cx = x + padding + c * gridCellW;
+                    const cy = cellsY + r * gridCellH;
+                    ctx.fillRect(cx, cy, gridCellW - 1, gridCellH - 1);
+
+                    // Value label
+                    ctx.fillStyle = val === 200 ? 'rgba(255,255,255,0.4)' : '#fff';
+                    ctx.font = `${cellFontSize}px monospace`;
+                    ctx.textAlign = 'center';
+                    ctx.textBaseline = 'middle';
+                    ctx.fillText(val.toFixed(0), cx + gridCellW / 2, cy + gridCellH / 2);
+                }
+            }
+
+            ctx.textAlign = 'left';
+            ctx.textBaseline = 'top';
         }
     }
 
