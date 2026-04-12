@@ -202,11 +202,7 @@ fn spawn_cameras(ctx: &SpawnContext, cameras: Vec<config::CameraConfig>) -> Came
             .push((camera_id.clone(), handle, Arc::clone(&buffer)));
 
         if ctx.config.analytics.enabled {
-            let det_store = if ctx.object_detection_ready {
-                Some(ctx.detection_store.clone())
-            } else {
-                None
-            };
+            let det_store = Some(ctx.detection_store.clone());
             let dbg_store = if ctx.object_detection_ready {
                 Some(ctx.debug_store.clone())
             } else {

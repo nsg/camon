@@ -309,14 +309,20 @@ impl MotionAnalyzer {
         segments: Vec<PendingSegment>,
     ) -> Result<Vec<MotionSegment>, Box<dyn std::error::Error + Send + Sync>> {
         let has_detection = self.object_detector.is_some() && self.detection_store.is_some();
+        let capture_frames = self.detection_store.is_some();
         let mut motion_segments = Vec::new();
+        let mut motion_frames: Vec<(u64, Vec<u8>)> = Vec::new();
 
         for seg in segments {
-            let (score, crop, motion_rects) = self.analyze_segment(&seg.data)?;
+            let (score, crop, motion_rects, frame_jpeg) =
+                self.analyze_segment(&seg.data, capture_frames)?;
             self.publish_debug_maps();
 
             if score >= MOTION_THRESHOLD {
                 self.record_motion(seg.seq, seg.start_pts, seg.duration_ns, score);
+                if let Some(jpeg) = frame_jpeg {
+                    motion_frames.push((seg.seq, jpeg));
+                }
                 if has_detection {
                     if let Some(crop) = crop {
                         self.segment_crops.insert(seg.seq, crop);
@@ -335,7 +341,53 @@ impl MotionAnalyzer {
             self.last_processed = seg.seq + 1;
         }
 
+        if !motion_frames.is_empty() {
+            self.store_movement_filmstrips(motion_frames);
+        }
+
         Ok(motion_segments)
+    }
+
+    fn store_movement_filmstrips(&self, frames: Vec<(u64, Vec<u8>)>) {
+        let ds = match self.detection_store {
+            Some(ref ds) => ds,
+            None => return,
+        };
+
+        // Group contiguous sequences into runs
+        let mut runs: Vec<Vec<(u64, Vec<u8>)>> = Vec::new();
+        for item in frames {
+            let start_new = match runs.last() {
+                Some(run) => item.0 != run.last().unwrap().0 + 1,
+                None => true,
+            };
+            if start_new {
+                runs.push(vec![item]);
+            } else {
+                runs.last_mut().unwrap().push(item);
+            }
+        }
+
+        for run in runs {
+            let seqs: Vec<u64> = run.iter().map(|(seq, _)| *seq).collect();
+            let all_jpegs: Vec<Vec<u8>> = run.into_iter().map(|(_, jpeg)| jpeg).collect();
+
+            // Subsample to at most 4 representative frames
+            let filmstrip_jpegs: Vec<Vec<u8>> = if all_jpegs.len() <= 4 {
+                all_jpegs
+            } else {
+                let n = all_jpegs.len();
+                [0, n / 3, 2 * n / 3, n - 1]
+                    .iter()
+                    .map(|&i| all_jpegs[i].clone())
+                    .collect()
+            };
+
+            let filmstrip = Arc::new(filmstrip_jpegs);
+            for seq in &seqs {
+                ds.insert_filmstrip(&self.camera_id, *seq, Arc::clone(&filmstrip));
+            }
+        }
     }
 
     fn publish_debug_maps(&mut self) {
@@ -383,20 +435,22 @@ impl MotionAnalyzer {
     fn analyze_segment(
         &mut self,
         data: &[u8],
+        capture_frame: bool,
     ) -> Result<
-        (f32, Option<NormalizedRect>, Vec<NormalizedRect>),
+        (f32, Option<NormalizedRect>, Vec<NormalizedRect>, Option<Vec<u8>>),
         Box<dyn std::error::Error + Send + Sync>,
     > {
         let raw_frames = self.decoder.decode_segment(data);
 
         if raw_frames.is_empty() {
-            return Ok((0.0, None, Vec::new()));
+            return Ok((0.0, None, Vec::new(), None));
         }
 
         let height = self.decoder.height() as i32;
         let mut total_score = 0.0f32;
         let mut frame_count = 0u32;
         let mut all_rects = Vec::new();
+        let mut last_mat = None;
 
         for frame_data in &raw_frames {
             let mat = Mat::from_slice(frame_data)?;
@@ -409,6 +463,9 @@ impl MotionAnalyzer {
                     for r in self.detector.motion_bboxes() {
                         all_rects.push(normalize_rect(r, ANALYSIS_WIDTH, ANALYSIS_HEIGHT));
                     }
+                    if capture_frame {
+                        last_mat = mat.try_clone().ok();
+                    }
                 }
                 Err(e) => {
                     tracing::trace!(error = %e, "frame processing error");
@@ -419,10 +476,16 @@ impl MotionAnalyzer {
         let crop = union_rects_padded(&all_rects, CROP_PADDING);
 
         if frame_count == 0 {
-            return Ok((0.0, None, Vec::new()));
+            return Ok((0.0, None, Vec::new(), None));
         }
 
-        Ok((total_score / frame_count as f32, crop, all_rects))
+        let frame_jpeg = if capture_frame {
+            last_mat.and_then(|m| encode_jpeg(&m))
+        } else {
+            None
+        };
+
+        Ok((total_score / frame_count as f32, crop, all_rects, frame_jpeg))
     }
 
     // --- Phase 2: Generic frame extraction + detection ---

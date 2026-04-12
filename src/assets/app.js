@@ -1356,6 +1356,8 @@ document.addEventListener('DOMContentLoaded', async () => {
                 const typeLabel = ev.event_type === 'object' ? 'Object detected' : 'Movement';
                 const typeClass = ev.event_type === 'object' ? 'object' : 'movement';
 
+                // TODO(2026-04-26): remove has_filmstrip check — all events now generate filmstrips.
+                // The fallback branch only exists for events saved before this change.
                 let thumbHtml;
                 if (ev.has_filmstrip) {
                     const cid = encodeURIComponent(currentDetailCameraId);

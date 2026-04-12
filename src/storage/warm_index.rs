@@ -34,6 +34,8 @@ pub struct WarmEventEntry {
     pub backend: Option<String>,
     pub model: Option<String>,
     pub detections: Vec<DetectionDetail>,
+    /// TODO(2026-04-26): remove — all events now generate filmstrips.
+    /// Only needed for events saved before this change.
     pub has_filmstrip: bool,
 }
 

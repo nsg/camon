@@ -527,6 +527,7 @@ struct WarmEventResponse {
     model: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     detections: Vec<ObjectClassResponse>,
+    /// TODO(2026-04-26): remove — all events now generate filmstrips.
     has_filmstrip: bool,
 }
 
