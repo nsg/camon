@@ -1040,10 +1040,10 @@ document.addEventListener('DOMContentLoaded', async () => {
         const d = tunerData;
         const defaults = { var_threshold: 16, learning_rate: 0.003, morph_kernel: 5, min_contour_area: 200 };
         const lines = [
-            { label: 'var_threshold', value: d.var_threshold, def: defaults.var_threshold, fmt: v => `${v}` },
+            { label: 'var_threshold', value: d.var_threshold, def: defaults.var_threshold, fmt: v => v.toFixed(1) },
             { label: 'learning_rate', value: d.learning_rate, def: defaults.learning_rate, fmt: v => v.toFixed(4) },
             { label: 'morph_kernel', value: d.morph_kernel, def: defaults.morph_kernel, fmt: v => v.toFixed(1) },
-            { label: 'min_contour_area', value: d.min_contour_area, def: defaults.min_contour_area, fmt: v => v.toFixed(1) },
+            { label: 'min_contour_area', value: d.min_contour_area, def: defaults.min_contour_area, fmt: v => v.toFixed(0) },
             { label: 'noise_events', value: d.noise_events, def: null, fmt: v => `${v}` },
             { label: 'quiet_windows', value: d.quiet_windows, def: null, fmt: v => `${v}` },
         ];
