@@ -216,6 +216,7 @@ url = "rtsp://admin:password@192.168.1.100:554/stream1"
 | `GET` | `/api/cameras/{id}/events/{pts}/filmstrip/{index}` | Filmstrip frame JPEG |
 | `GET` | `/api/cameras/{id}/detection-debug` | Detection debug entries |
 | `GET` | `/api/cameras/{id}/detection-debug/{id}/frame/{index}` | Detection debug frame JPEG |
+| `GET` | `/api/cameras/{id}/detection-debug/{id}/full-frame` | Detection debug full frame JPEG |
 
 ## Storage Tiers
 
