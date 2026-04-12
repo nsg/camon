@@ -437,7 +437,12 @@ impl MotionAnalyzer {
         data: &[u8],
         capture_frame: bool,
     ) -> Result<
-        (f32, Option<NormalizedRect>, Vec<NormalizedRect>, Option<Vec<u8>>),
+        (
+            f32,
+            Option<NormalizedRect>,
+            Vec<NormalizedRect>,
+            Option<Vec<u8>>,
+        ),
         Box<dyn std::error::Error + Send + Sync>,
     > {
         let raw_frames = self.decoder.decode_segment(data);
@@ -485,7 +490,12 @@ impl MotionAnalyzer {
             None
         };
 
-        Ok((total_score / frame_count as f32, crop, all_rects, frame_jpeg))
+        Ok((
+            total_score / frame_count as f32,
+            crop,
+            all_rects,
+            frame_jpeg,
+        ))
     }
 
     // --- Phase 2: Generic frame extraction + detection ---
