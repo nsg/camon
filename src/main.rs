@@ -15,14 +15,16 @@ mod mpegts;
 mod storage;
 mod update;
 
-use analytics::{AnalyzerContext, OllamaDetector};
+use analytics::{
+    AnalyzerContext, DetectionJob, DetectionWorker, OllamaClient, DETECT_QUEUE_CAPACITY,
+};
 use api::AppState;
-use buffer::warm::{run_continuous_recorder, FinishedEvent, WarmWriter};
+use buffer::warm::{run_continuous_recorder, WarmWriter, WriterMessage};
 use buffer::HotBuffer;
 use camera::FfmpegPipeline;
 use config::Config;
 use locks::LockExt;
-use storage::{DetectionDebugStore, DetectionStore, MotionStore, WarmEventIndex};
+use storage::{DetectionDebugStore, DetectionStore, EventRegistry, MotionStore, WarmEventIndex};
 
 fn dispatch_subcommand() -> bool {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -134,21 +136,27 @@ fn init_motion_settings(
     ))
 }
 
-fn create_object_detector(config: &Config) -> Option<OllamaDetector> {
+fn create_ollama_client(config: &Config) -> Option<OllamaClient> {
     let od = &config.analytics.object_detection;
     let fallback = od
         .ollama
         .fallback
         .as_ref()
         .map(|fb| (fb.url.as_str(), fb.model.as_str()));
-    OllamaDetector::new(
+    match OllamaClient::new(
         &od.ollama.url,
         &od.ollama.model,
+        od.ollama.timeout_secs,
         od.confidence_threshold,
         od.classes.clone(),
         fallback,
-    )
-    .ok()
+    ) {
+        Ok(client) => Some(client),
+        Err(e) => {
+            tracing::error!(error = %e, "failed to create ollama client, object detection disabled");
+            None
+        }
+    }
 }
 
 /// Small bounded queue between each analyzer and its warm writer. Events are
@@ -165,7 +173,10 @@ struct CameraHandles {
     warm_handles: Vec<tokio::task::JoinHandle<()>>,
     /// Kept alive so warm writers keep running (prune tick) even without
     /// analyzers; dropped during shutdown to let the writers drain and exit.
-    event_senders: Vec<tokio::sync::mpsc::Sender<FinishedEvent>>,
+    event_senders: Vec<tokio::sync::mpsc::Sender<WriterMessage>>,
+    /// The same senders keyed by camera, for the detection worker's post-hoc
+    /// event upgrades.
+    event_sender_map: HashMap<String, tokio::sync::mpsc::Sender<WriterMessage>>,
     buffers_map: HashMap<String, Arc<RwLock<HotBuffer>>>,
 }
 
@@ -173,10 +184,12 @@ struct SpawnContext<'a> {
     config: &'a Config,
     motion_store: &'a MotionStore,
     detection_store: &'a DetectionStore,
-    debug_store: &'a DetectionDebugStore,
     warm_index: &'a Option<WarmEventIndex>,
     motion_settings: &'a Option<analytics::MotionSettingsStore>,
-    object_detection_ready: bool,
+    /// Crop-job queue into the global detection worker; `None` when object
+    /// detection is off.
+    detect_tx: &'a Option<tokio::sync::mpsc::Sender<DetectionJob>>,
+    event_registry: &'a Option<EventRegistry>,
     shutdown: &'a Arc<AtomicBool>,
 }
 
@@ -187,6 +200,7 @@ fn spawn_cameras(ctx: &SpawnContext, cameras: Vec<config::CameraConfig>) -> Came
         continuous_handles: Vec::new(),
         warm_handles: Vec::new(),
         event_senders: Vec::new(),
+        event_sender_map: HashMap::new(),
         buffers_map: HashMap::new(),
     };
 
@@ -204,6 +218,9 @@ fn spawn_cameras(ctx: &SpawnContext, cameras: Vec<config::CameraConfig>) -> Came
             );
             handles.warm_handles.push(tokio::spawn(writer.run()));
             handles.event_senders.push(tx.clone());
+            handles
+                .event_sender_map
+                .insert(camera_id.clone(), tx.clone());
             Some(tx)
         } else {
             None
@@ -239,26 +256,14 @@ fn spawn_cameras(ctx: &SpawnContext, cameras: Vec<config::CameraConfig>) -> Came
         }
 
         if ctx.config.analytics.enabled {
-            let det_store = Some(ctx.detection_store.clone());
-            let dbg_store = if ctx.object_detection_ready {
-                Some(ctx.debug_store.clone())
-            } else {
-                None
-            };
-            let obj_det = if ctx.object_detection_ready {
-                create_object_detector(ctx.config)
-            } else {
-                None
-            };
-
             let analyzer_handle = analytics::spawn_analyzer(
                 AnalyzerContext {
                     camera_id,
                     buffer,
                     motion_store: ctx.motion_store.clone(),
-                    detection_store: det_store,
-                    debug_store: dbg_store,
-                    object_detector: obj_det,
+                    detection_store: Some(ctx.detection_store.clone()),
+                    detect_tx: ctx.detect_tx.clone(),
+                    event_registry: ctx.event_registry.clone(),
                     config: ctx.config.analytics.clone(),
                     motion_settings: ctx
                         .motion_settings
@@ -296,7 +301,10 @@ async fn wait_for_signal(shutdown: &AtomicBool) {
     shutdown.store(true, Ordering::Relaxed);
 }
 
-async fn graceful_shutdown(handles: CameraHandles) {
+async fn graceful_shutdown(
+    handles: CameraHandles,
+    detect_worker_handle: Option<tokio::task::JoinHandle<()>>,
+) {
     // Analyzers poll the shutdown flag every ~200ms and flush any open motion
     // run as a complete event before exiting — join them, never abort.
     for handle in handles.analyzer_handles {
@@ -307,6 +315,15 @@ async fn graceful_shutdown(handles: CameraHandles) {
     // partial chunk to the writer and exits. Awaited here — before the senders
     // are dropped below — so the final chunk is guaranteed accepted.
     for handle in handles.continuous_handles {
+        let _ = handle.await;
+    }
+
+    // The detection worker is aborted, not drained: queued jobs and even an
+    // in-flight Ollama request (up to 90s) are droppable by design — losing
+    // one costs only an object upgrade, never footage. Aborting also releases
+    // the worker's warm-writer senders so the writers below can drain.
+    if let Some(handle) = detect_worker_handle {
+        handle.abort();
         let _ = handle.await;
     }
 
@@ -368,18 +385,56 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    // Object detection runs on ONE global worker task with a small bounded
+    // job queue — strictly serial, at most one in-flight Ollama request
+    // across all cameras (the GPU degrades badly under parallel load).
+    let ollama_client = if object_detection_ready {
+        create_ollama_client(&config)
+    } else {
+        None
+    };
+    let event_registry = if ollama_client.is_some() && config.storage.enabled {
+        Some(EventRegistry::new(&camera_ids))
+    } else {
+        None
+    };
+    let (detect_tx, detect_rx) = match ollama_client {
+        Some(_) => {
+            let (tx, rx) = tokio::sync::mpsc::channel(DETECT_QUEUE_CAPACITY);
+            (Some(tx), Some(rx))
+        }
+        None => (None, None),
+    };
+
     let shutdown = Arc::new(AtomicBool::new(false));
     let spawn_ctx = SpawnContext {
         config: &config,
         motion_store: &motion_store,
         detection_store: &detection_store,
-        debug_store: &debug_store,
         warm_index: &warm_index,
         motion_settings: &motion_settings,
-        object_detection_ready,
+        detect_tx: &detect_tx,
+        event_registry: &event_registry,
         shutdown: &shutdown,
     };
     let camera_handles = spawn_cameras(&spawn_ctx, config.cameras.clone());
+
+    let detect_worker_handle = match (ollama_client, detect_rx) {
+        (Some(client), Some(rx)) => {
+            let worker = DetectionWorker::new(
+                client,
+                detection_store.clone(),
+                Some(debug_store.clone()),
+                event_registry.clone(),
+                camera_handles.event_sender_map.clone(),
+            );
+            Some(tokio::spawn(worker.run(rx)))
+        }
+        _ => None,
+    };
+    // Analyzers hold their own clones; dropping the original closes the job
+    // channel once they exit, letting the worker finish in normal operation.
+    drop(detect_tx);
 
     let app_state = AppState::new(
         camera_handles.buffers_map.clone(),
@@ -399,7 +454,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     wait_for_signal(&shutdown).await;
     server_handle.abort();
 
-    graceful_shutdown(camera_handles).await;
+    graceful_shutdown(camera_handles, detect_worker_handle).await;
 
     tracing::info!("shutdown complete");
     Ok(())

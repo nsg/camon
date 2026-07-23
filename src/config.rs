@@ -82,6 +82,14 @@ fn default_ollama_model() -> String {
     "gemma4:e4b".to_string()
 }
 
+/// Per-request timeout for Ollama calls. Warm-inference latency on modest
+/// GPUs runs up to ~50s per frame (measured 2026-07-23), so 90s gives real
+/// headroom; a timeout only costs the object upgrade of an event, never the
+/// footage.
+fn default_ollama_timeout_secs() -> u64 {
+    90
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct OllamaServerConfig {
     #[serde(default = "default_ollama_url")]
@@ -96,6 +104,9 @@ pub struct OllamaConfig {
     pub url: String,
     #[serde(default = "default_ollama_model")]
     pub model: String,
+    /// Request timeout in seconds, applied to primary and fallback alike.
+    #[serde(default = "default_ollama_timeout_secs")]
+    pub timeout_secs: u64,
     pub fallback: Option<OllamaServerConfig>,
 }
 
@@ -104,6 +115,7 @@ impl Default for OllamaConfig {
         Self {
             url: default_ollama_url(),
             model: default_ollama_model(),
+            timeout_secs: default_ollama_timeout_secs(),
             fallback: None,
         }
     }

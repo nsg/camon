@@ -1,5 +1,6 @@
 mod ccl;
 mod decoder;
+pub mod detect_worker;
 mod mog2;
 mod morph;
 mod motion;
@@ -10,8 +11,9 @@ pub mod run_tracker;
 
 // Consumed through the library crate root (examples/, integration tests);
 // the binary crate reaches MotionDetector via the pipeline instead.
+pub use detect_worker::{DetectionJob, DetectionWorker, DETECT_QUEUE_CAPACITY};
 #[allow(unused_imports)]
 pub use motion::{MotionBox, MotionDetector};
 pub use motion_settings::{MotionSettingsStore, SettingsUpdate};
-pub use ollama::OllamaDetector;
+pub use ollama::OllamaClient;
 pub use pipeline::{spawn_analyzer, AnalyzerContext};

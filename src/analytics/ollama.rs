@@ -1,9 +1,45 @@
+//! Ollama vision-model client for object detection.
+//!
+//! Requests structured output via Ollama's `format` field with a strict JSON
+//! schema (flat numeric-only fields, the class as an enum of the configured
+//! allowlist, `maxItems` on the detections array). The enum sidesteps a Gemma
+//! repetition-collapse bug seen with free-text fields, and the schema was
+//! validated empirically against the production server (2026-07-23 A/B run:
+//! JSON-schema output parsed cleanly on every image, warm latency 9-17s).
+//!
+//! The client is async and is only ever driven by the single global detection
+//! worker (see `detect_worker`), which guarantees at most ONE in-flight
+//! request to Ollama at any time — the production GPU handles parallel load
+//! badly.
+
 use base64::Engine;
-use opencv::core::Vector;
-use opencv::imgcodecs;
-use opencv::prelude::*;
 use serde::{Deserialize, Serialize};
-use tokio::runtime::Handle;
+
+/// Fallback class list when the config allowlist is empty.
+const DEFAULT_CLASSES: [&str; 10] = [
+    "person",
+    "car",
+    "truck",
+    "dog",
+    "cat",
+    "bird",
+    "bicycle",
+    "motorcycle",
+    "bus",
+    "boat",
+];
+
+/// TCP connect timeout. A down or unreachable server fails in seconds instead
+/// of eating the whole request timeout.
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Hard cap on generated tokens. Fifteen schema-shaped detections fit in well
+/// under half of this; the cap only exists to bound a runaway generation.
+const NUM_PREDICT: u32 = 768;
+
+/// Cap on the detections array in the response schema. Keeps a degenerate
+/// "everything is a person" response bounded in both tokens and latency.
+const MAX_DETECTIONS: usize = 15;
 
 #[derive(Debug, Clone)]
 pub struct Detection {
@@ -14,36 +50,26 @@ pub struct Detection {
 }
 
 /// Result from a single frame detection call.
-struct FrameDetectResult {
-    detections: Vec<Detection>,
-    raw_response: String,
-    model: String,
-}
-
-/// Full result from detecting across multiple frames.
-pub struct DetectResult {
+pub struct FrameDetectResult {
     pub detections: Vec<Detection>,
-    pub frame_jpegs: Vec<Vec<u8>>,
-    pub raw_responses: Vec<String>,
+    pub raw_response: String,
     pub model: String,
 }
-
-const DETECT_PROMPT_TEMPLATE: &str = "Security camera frame. List objects: {classes}.\n\
-One line per object: CLASS CONF X Y W H\n\
-CONF is 0.0-1.0. X Y W H are bounding box fractions of image size (0.0-1.0), top-left corner and size.\n\
-Examples:\n\
-person 0.92 0.40 0.10 0.15 0.60\n\
-car 0.87 0.05 0.50 0.30 0.20\n\
-If nothing noteworthy: NONE\n\
-No other text.";
-
-const DEFAULT_CLASSES: &str = "person, car, truck, dog, cat, bird, bicycle, motorcycle, bus, boat";
 
 #[derive(Serialize)]
 struct ChatRequest {
     model: String,
     messages: Vec<Message>,
     stream: bool,
+    /// JSON schema for structured output (Ollama constrains decoding to it).
+    format: serde_json::Value,
+    options: RequestOptions,
+}
+
+#[derive(Serialize)]
+struct RequestOptions {
+    temperature: f32,
+    num_predict: u32,
 }
 
 #[derive(Serialize)]
@@ -64,47 +90,70 @@ struct ResponseMessage {
     content: String,
 }
 
+/// The shape the response schema enforces; serde does the strict parse.
+#[derive(Deserialize)]
+struct DetectionsPayload {
+    detections: Vec<RawDetection>,
+}
+
+#[derive(Deserialize)]
+struct RawDetection {
+    class: String,
+    confidence: f32,
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+}
+
 struct OllamaServer {
     base_url: String,
     model: String,
 }
 
-pub struct OllamaDetector {
+pub struct OllamaClient {
     client: reqwest::Client,
-    rt: Handle,
     primary: OllamaServer,
     fallback: Option<OllamaServer>,
     confidence_threshold: f32,
+    /// Lowercased allowlist; never empty (defaults applied at construction).
     allowed_classes: Vec<String>,
 }
 
-impl OllamaDetector {
+impl OllamaClient {
     pub fn new(
         base_url: &str,
         model: &str,
+        timeout_secs: u64,
         confidence_threshold: f32,
         allowed_classes: Vec<String>,
         fallback: Option<(&str, &str)>,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(300))
+            .timeout(std::time::Duration::from_secs(timeout_secs))
+            .connect_timeout(CONNECT_TIMEOUT)
             .build()?;
-
-        let rt = Handle::current();
 
         let primary = OllamaServer {
             base_url: base_url.trim_end_matches('/').to_string(),
             model: model.to_string(),
         };
-
         let fallback = fallback.map(|(url, model)| OllamaServer {
             base_url: url.trim_end_matches('/').to_string(),
             model: model.to_string(),
         });
 
+        let allowed_classes = if allowed_classes.is_empty() {
+            DEFAULT_CLASSES.iter().map(|c| c.to_string()).collect()
+        } else {
+            allowed_classes
+                .into_iter()
+                .map(|c| c.to_lowercase())
+                .collect()
+        };
+
         Ok(Self {
             client,
-            rt,
             primary,
             fallback,
             confidence_threshold,
@@ -116,88 +165,70 @@ impl OllamaDetector {
         &self.primary.model
     }
 
-    fn build_prompt(&self) -> String {
-        let classes = if self.allowed_classes.is_empty() {
-            DEFAULT_CLASSES.to_string()
-        } else {
-            self.allowed_classes.join(", ")
-        };
-        DETECT_PROMPT_TEMPLATE.replace("{classes}", &classes)
-    }
-
-    pub fn detect_frames(
-        &self,
-        frames: &[opencv::core::Mat],
-    ) -> Result<DetectResult, Box<dyn std::error::Error + Send + Sync>> {
-        if frames.is_empty() {
-            return Ok(DetectResult {
-                detections: Vec::new(),
-                frame_jpegs: Vec::new(),
-                raw_responses: Vec::new(),
-                model: self.primary.model.clone(),
-            });
-        }
-
-        let mut frame_jpegs = Vec::with_capacity(frames.len());
-        let mut all_detections = Vec::new();
-        let mut raw_responses = Vec::new();
-        let mut model = self.primary.model.clone();
-
-        for frame in frames.iter().take(4) {
-            let jpeg = self.encode_frame_jpeg(frame)?;
-            let image_b64 = base64::engine::general_purpose::STANDARD.encode(&jpeg);
-
-            let result = self.call_single_frame(&image_b64);
-            match result {
-                Ok(r) => {
-                    all_detections.extend(r.detections);
-                    raw_responses.push(r.raw_response);
-                    model = r.model;
-                }
+    /// Startup sanity check: ask each configured server for its pulled models
+    /// (`/api/tags`) and warn loudly if the configured model is missing. This
+    /// surfaces a typo'd model name in seconds instead of a silent string of
+    /// failed detections. Non-fatal — the server may simply be down right now.
+    pub async fn check_models(&self) {
+        for server in std::iter::once(&self.primary).chain(self.fallback.as_ref()) {
+            let url = format!("{}/api/tags", server.base_url);
+            let names: Vec<String> = match self.client.get(&url).send().await {
+                Ok(resp) => match resp.json::<TagsResponse>().await {
+                    Ok(tags) => tags.models.into_iter().map(|m| m.name).collect(),
+                    Err(e) => {
+                        tracing::warn!(url = %server.base_url, error = %e,
+                            "could not parse ollama /api/tags response, skipping model check");
+                        continue;
+                    }
+                },
                 Err(e) => {
-                    tracing::warn!(error = %e, "frame detection failed");
-                    raw_responses.push(format!("ERROR: {e}"));
+                    tracing::warn!(url = %server.base_url, error = %e,
+                        "ollama server unreachable, skipping model check");
+                    continue;
                 }
+            };
+            // A model configured without a tag implies ":latest" on the server.
+            let with_latest = format!("{}:latest", server.model);
+            if names
+                .iter()
+                .any(|n| *n == server.model || *n == with_latest)
+            {
+                tracing::info!(url = %server.base_url, model = %server.model,
+                    "ollama model available");
+            } else {
+                tracing::warn!(
+                    url = %server.base_url,
+                    model = %server.model,
+                    available = ?names,
+                    "configured model is NOT pulled on the ollama server — object \
+                     detection will fail until you run: ollama pull {}",
+                    server.model
+                );
             }
-
-            frame_jpegs.push(jpeg);
         }
-
-        Ok(DetectResult {
-            detections: all_detections,
-            frame_jpegs,
-            raw_responses,
-            model,
-        })
     }
 
-    fn call_single_frame(
+    /// Detect objects in one JPEG-encoded frame. Tries the primary server,
+    /// then the fallback (if configured). The caller (the serial detection
+    /// worker) guarantees no other request is in flight.
+    pub async fn detect_jpeg(
         &self,
-        image_b64: &str,
+        jpeg: &[u8],
     ) -> Result<FrameDetectResult, Box<dyn std::error::Error + Send + Sync>> {
-        match self.call_server(&self.primary, image_b64) {
-            Ok((detections, raw_response, model)) => Ok(FrameDetectResult {
-                detections,
-                raw_response,
-                model,
-            }),
+        let image_b64 = base64::engine::general_purpose::STANDARD.encode(jpeg);
+
+        match self.call_server(&self.primary, &image_b64).await {
+            Ok(result) => Ok(result),
             Err(primary_err) => {
                 if let Some(ref fallback) = self.fallback {
                     tracing::warn!(
                         error = %primary_err,
                         "primary ollama failed, trying fallback"
                     );
-                    match self.call_server(fallback, image_b64) {
-                        Ok((detections, raw_response, model)) => Ok(FrameDetectResult {
-                            detections,
-                            raw_response,
-                            model,
-                        }),
-                        Err(fallback_err) => Err(format!(
-                            "both servers failed — primary: {primary_err}, fallback: {fallback_err}"
-                        )
-                        .into()),
-                    }
+                    self.call_server(fallback, &image_b64).await.map_err(|e| {
+                        format!("both servers failed — primary: {primary_err}, fallback: {e}")
+                            .into()
+                    })
                 } else {
                     Err(primary_err)
                 }
@@ -205,11 +236,11 @@ impl OllamaDetector {
         }
     }
 
-    fn call_server(
+    async fn call_server(
         &self,
         server: &OllamaServer,
         image_b64: &str,
-    ) -> Result<(Vec<Detection>, String, String), Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<FrameDetectResult, Box<dyn std::error::Error + Send + Sync>> {
         let request = ChatRequest {
             model: server.model.clone(),
             messages: vec![Message {
@@ -218,265 +249,410 @@ impl OllamaDetector {
                 images: vec![image_b64.to_string()],
             }],
             stream: false,
+            format: build_format_schema(&self.allowed_classes),
+            options: RequestOptions {
+                temperature: 0.0,
+                num_predict: NUM_PREDICT,
+            },
         };
 
         let url = format!("{}/api/chat", server.base_url);
-        let response = self
-            .rt
-            .block_on(async { self.client.post(&url).json(&request).send().await })?;
+        let response = self.client.post(&url).json(&request).send().await?;
 
         if !response.status().is_success() {
             let status = response.status();
-            let body = self.rt.block_on(response.text()).unwrap_or_default();
+            let body = response.text().await.unwrap_or_default();
             return Err(format!("ollama API error {}: {}", status, body).into());
         }
 
-        let chat_response: ChatResponse = self.rt.block_on(response.json())?;
+        let chat_response: ChatResponse = response.json().await?;
         let content = chat_response.message.map(|m| m.content).unwrap_or_default();
-        let detections = self.parse_response(&content);
+        let detections =
+            parse_detections(&content, self.confidence_threshold, &self.allowed_classes);
 
-        Ok((detections, content, server.model.clone()))
+        Ok(FrameDetectResult {
+            detections,
+            raw_response: content,
+            model: server.model.clone(),
+        })
     }
 
-    fn encode_frame_jpeg(
-        &self,
-        frame: &opencv::core::Mat,
-    ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
-        let mut buf = Vector::<u8>::new();
-        let params = Vector::<i32>::new();
-        imgcodecs::imencode(".jpg", frame, &mut buf, &params)?;
-        Ok(buf.to_vec())
+    fn build_prompt(&self) -> String {
+        let classes = self.allowed_classes.join(", ");
+        format!(
+            "Security camera frame. List objects: {classes}.\n\
+             Return JSON matching the schema: a \"detections\" array. Each detection has \
+             \"class\" (one of the listed objects), \"confidence\" (0.0-1.0), and bounding box \
+             \"x\",\"y\",\"w\",\"h\" as fractions of image size (0.0-1.0), where x,y is the \
+             top-left corner and w,h are the width and height.\n\
+             If nothing noteworthy, return an empty detections array. No other text."
+        )
     }
+}
 
-    fn parse_response(&self, content: &str) -> Vec<Detection> {
-        let mut detections = Vec::new();
+#[derive(Deserialize)]
+struct TagsResponse {
+    #[serde(default)]
+    models: Vec<TagModel>,
+}
 
-        for line in content.lines() {
-            let line = line.trim();
-            if line.is_empty() || line.eq_ignore_ascii_case("NONE") {
-                continue;
+#[derive(Deserialize)]
+struct TagModel {
+    name: String,
+}
+
+/// The JSON schema sent in the request's `format` field. Flat numeric-only
+/// detection objects, class constrained to the allowlist enum, and a hard cap
+/// on the array length.
+fn build_format_schema(allowed_classes: &[String]) -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "detections": {
+                "type": "array",
+                "maxItems": MAX_DETECTIONS,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "class": {"type": "string", "enum": allowed_classes},
+                        "confidence": {"type": "number"},
+                        "x": {"type": "number"},
+                        "y": {"type": "number"},
+                        "w": {"type": "number"},
+                        "h": {"type": "number"},
+                    },
+                    "required": ["class", "confidence", "x", "y", "w", "h"],
+                },
             }
+        },
+        "required": ["detections"],
+    })
+}
 
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() < 2 {
-                continue;
+/// Parse a structured response and apply semantic validation. Anything
+/// nonsensical — class outside the allowlist, confidence outside [0, 1],
+/// bounding box outside the frame — is dropped with a log line rather than
+/// propagated. Detections below the confidence threshold are filtered
+/// silently (expected, not an error).
+fn parse_detections(content: &str, threshold: f32, allowed_classes: &[String]) -> Vec<Detection> {
+    let payload: DetectionsPayload = match serde_json::from_str(content) {
+        Ok(p) => p,
+        Err(e) => match salvage_truncated(content) {
+            // Dense scenes can blow past maxItems (Ollama does not enforce it
+            // in the constrained-decoding grammar; observed live 2026-07-23)
+            // and get cut mid-array by the num_predict cap. The complete
+            // leading detections are still good — salvage them.
+            Some(p) => {
+                tracing::warn!(
+                    count = p.detections.len(),
+                    "ollama response truncated at token cap, salvaged complete detections"
+                );
+                p
             }
-
-            // Find the class name (first token) and then scan forward for the
-            // first parseable float as the confidence value. This handles cases
-            // where the model inserts extra words like "CONFIDENCE" between the
-            // class and the number.
-            let class_name = parts[0].to_lowercase();
-            let mut conf_idx = None;
-            for (i, part) in parts.iter().enumerate().skip(1) {
-                if let Ok(_v) = part.parse::<f32>() {
-                    conf_idx = Some(i);
-                    break;
-                }
+            None => {
+                tracing::warn!(error = %e, raw = %content,
+                    "ollama response is not valid schema JSON, dropping");
+                return Vec::new();
             }
-            let conf_idx = match conf_idx {
-                Some(i) => i,
-                None => continue,
-            };
+        },
+    };
 
-            let confidence: f32 = parts[conf_idx].parse().unwrap();
-
-            if confidence < self.confidence_threshold {
-                continue;
-            }
-
-            if !self.allowed_classes.is_empty() && !self.allowed_classes.contains(&class_name) {
-                continue;
-            }
-
-            // Parse bounding box from the 4 floats after the confidence value.
-            let remaining = &parts[conf_idx + 1..];
-            let bbox = if remaining.len() >= 4 {
-                match (
-                    remaining[0].parse::<f32>(),
-                    remaining[1].parse::<f32>(),
-                    remaining[2].parse::<f32>(),
-                    remaining[3].parse::<f32>(),
-                ) {
-                    (Ok(x), Ok(y), Ok(w), Ok(h)) => {
-                        let x = x.clamp(0.0, 1.0);
-                        let y = y.clamp(0.0, 1.0);
-                        let w = w.clamp(0.0, 1.0 - x);
-                        let h = h.clamp(0.0, 1.0 - y);
-                        if w > 0.0 && h > 0.0 {
-                            Some((x, y, w, h))
-                        } else {
-                            None
-                        }
-                    }
-                    _ => None,
-                }
-            } else {
-                None
-            };
-
-            detections.push(Detection {
-                class_name,
-                confidence: confidence.clamp(0.0, 1.0),
-                bbox,
-            });
+    let mut detections = Vec::new();
+    // maxItems is advisory to the model; enforce the cap for real here.
+    for raw in payload.detections.into_iter().take(MAX_DETECTIONS) {
+        let class_name = raw.class.to_lowercase();
+        if !allowed_classes.contains(&class_name) {
+            tracing::debug!(class = %raw.class, "dropping detection with class outside allowlist");
+            continue;
         }
-
-        detections
+        if !raw.confidence.is_finite() || !(0.0..=1.0).contains(&raw.confidence) {
+            tracing::debug!(class = %class_name, confidence = raw.confidence,
+                "dropping detection with nonsensical confidence");
+            continue;
+        }
+        if raw.confidence < threshold {
+            continue;
+        }
+        let bbox = validate_bbox(raw.x, raw.y, raw.w, raw.h);
+        if bbox.is_none() {
+            tracing::debug!(class = %class_name, x = raw.x, y = raw.y, w = raw.w, h = raw.h,
+                "dropping detection with nonsensical bounding box");
+            continue;
+        }
+        detections.push(Detection {
+            class_name,
+            confidence: raw.confidence,
+            bbox,
+        });
     }
+    detections
+}
+
+/// Repair a generation cut off mid-array by the `num_predict` cap: walk the
+/// closing braces from the end, cut back to the last complete detection
+/// object, close the array, and re-parse. Returns `None` when nothing
+/// salvageable remains.
+fn salvage_truncated(content: &str) -> Option<DetectionsPayload> {
+    for (i, _) in content.char_indices().rev().filter(|&(_, c)| c == '}') {
+        let candidate = format!("{}]}}", &content[..=i]);
+        if let Ok(payload) = serde_json::from_str::<DetectionsPayload>(&candidate) {
+            return Some(payload);
+        }
+    }
+    None
+}
+
+/// Validate and normalize a bounding box. The origin must lie inside the
+/// frame and the size must be positive; a box slightly overhanging the right
+/// or bottom edge (model slop) is clamped back in. Anything else is garbage.
+fn validate_bbox(x: f32, y: f32, w: f32, h: f32) -> Option<(f32, f32, f32, f32)> {
+    if ![x, y, w, h].iter().all(|v| v.is_finite()) {
+        return None;
+    }
+    if !(0.0..=1.0).contains(&x) || !(0.0..=1.0).contains(&y) || w <= 0.0 || h <= 0.0 {
+        return None;
+    }
+    if w > 1.0 || h > 1.0 {
+        return None;
+    }
+    let w = w.min(1.0 - x);
+    let h = h.min(1.0 - y);
+    if w <= 0.0 || h <= 0.0 {
+        return None;
+    }
+    Some((x, y, w, h))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn make_detector() -> OllamaDetector {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        OllamaDetector {
-            client: reqwest::Client::new(),
-            rt: rt.handle().clone(),
-            primary: OllamaServer {
-                base_url: "http://localhost:11434".to_string(),
-                model: "test".to_string(),
-            },
-            fallback: None,
-            confidence_threshold: 0.5,
-            allowed_classes: vec!["person".to_string(), "car".to_string(), "dog".to_string()],
-        }
+    fn classes() -> Vec<String> {
+        vec!["person".to_string(), "car".to_string(), "dog".to_string()]
+    }
+
+    fn make_client() -> OllamaClient {
+        OllamaClient::new("http://localhost:11434", "test", 90, 0.5, classes(), None).unwrap()
     }
 
     #[test]
-    fn parse_valid_detections() {
-        let det = make_detector();
-        let response = "person 0.95\ncar 0.80\n";
-        let results = det.parse_response(response);
+    fn format_schema_exact_shape() {
+        let schema = build_format_schema(&classes());
+        let expected = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "detections": {
+                    "type": "array",
+                    "maxItems": 15,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "class": {"type": "string", "enum": ["person", "car", "dog"]},
+                            "confidence": {"type": "number"},
+                            "x": {"type": "number"},
+                            "y": {"type": "number"},
+                            "w": {"type": "number"},
+                            "h": {"type": "number"},
+                        },
+                        "required": ["class", "confidence", "x", "y", "w", "h"],
+                    },
+                }
+            },
+            "required": ["detections"],
+        });
+        assert_eq!(schema, expected);
+    }
+
+    #[test]
+    fn chat_request_serializes_format_and_options() {
+        let request = ChatRequest {
+            model: "test".to_string(),
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: "prompt".to_string(),
+                images: vec!["QUJD".to_string()],
+            }],
+            stream: false,
+            format: build_format_schema(&classes()),
+            options: RequestOptions {
+                temperature: 0.0,
+                num_predict: NUM_PREDICT,
+            },
+        };
+        let value = serde_json::to_value(&request).unwrap();
+        assert_eq!(value["stream"], serde_json::json!(false));
+        assert_eq!(value["options"]["temperature"], serde_json::json!(0.0));
+        assert_eq!(value["options"]["num_predict"], serde_json::json!(768));
+        assert_eq!(value["format"]["type"], serde_json::json!("object"));
+        assert_eq!(
+            value["format"]["properties"]["detections"]["maxItems"],
+            serde_json::json!(15)
+        );
+        assert_eq!(value["messages"][0]["images"][0], serde_json::json!("QUJD"));
+    }
+
+    #[test]
+    fn parse_valid_detections_kept() {
+        let content = r#"{"detections": [
+            {"class": "person", "confidence": 0.95, "x": 0.1, "y": 0.2, "w": 0.3, "h": 0.4},
+            {"class": "car", "confidence": 0.8, "x": 0.5, "y": 0.6, "w": 0.2, "h": 0.3}
+        ]}"#;
+        let results = parse_detections(content, 0.5, &classes());
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].class_name, "person");
         assert!((results[0].confidence - 0.95).abs() < 0.01);
-        assert!(results[0].bbox.is_none());
+        let bbox = results[0].bbox.unwrap();
+        assert!((bbox.0 - 0.1).abs() < 0.01);
+        assert!((bbox.3 - 0.4).abs() < 0.01);
         assert_eq!(results[1].class_name, "car");
     }
 
     #[test]
-    fn parse_detections_with_bbox() {
-        let det = make_detector();
-        let response = "person 0.95 0.1 0.2 0.3 0.4\ncar 0.80 0.5 0.6 0.2 0.3\n";
-        let results = det.parse_response(response);
-        assert_eq!(results.len(), 2);
-        let bbox = results[0].bbox.unwrap();
-        assert!((bbox.0 - 0.1).abs() < 0.01);
-        assert!((bbox.1 - 0.2).abs() < 0.01);
-        assert!((bbox.2 - 0.3).abs() < 0.01);
-        assert!((bbox.3 - 0.4).abs() < 0.01);
-        assert!(results[1].bbox.is_some());
+    fn parse_empty_detections() {
+        assert!(parse_detections(r#"{"detections": []}"#, 0.5, &classes()).is_empty());
     }
 
     #[test]
-    fn parse_mixed_bbox_and_no_bbox() {
-        let det = make_detector();
-        let response = "person 0.95 0.1 0.2 0.3 0.4\ncar 0.80\n";
-        let results = det.parse_response(response);
-        assert_eq!(results.len(), 2);
-        assert!(results[0].bbox.is_some());
-        assert!(results[1].bbox.is_none());
+    fn parse_garbage_json_dropped() {
+        assert!(parse_detections("NONE", 0.5, &classes()).is_empty());
+        assert!(parse_detections("", 0.5, &classes()).is_empty());
+        assert!(parse_detections(r#"{"foo": 1}"#, 0.5, &classes()).is_empty());
+        // Missing required field
+        assert!(parse_detections(
+            r#"{"detections": [{"class": "person", "confidence": 0.9}]}"#,
+            0.5,
+            &classes()
+        )
+        .is_empty());
     }
 
     #[test]
-    fn parse_none_response() {
-        let det = make_detector();
-        assert!(det.parse_response("NONE").is_empty());
-        assert!(det.parse_response("none").is_empty());
-        assert!(det.parse_response("NONE\n").is_empty());
-    }
-
-    #[test]
-    fn parse_filters_low_confidence() {
-        let det = make_detector();
-        let response = "person 0.3\ncar 0.8\n";
-        let results = det.parse_response(response);
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].class_name, "car");
-    }
-
-    #[test]
-    fn parse_filters_disallowed_classes() {
-        let det = make_detector();
-        let response = "truck 0.9\nperson 0.8\n";
-        let results = det.parse_response(response);
+    fn parse_unknown_class_dropped() {
+        let content = r#"{"detections": [
+            {"class": "unicorn", "confidence": 0.9, "x": 0.1, "y": 0.1, "w": 0.2, "h": 0.2},
+            {"class": "person", "confidence": 0.9, "x": 0.1, "y": 0.1, "w": 0.2, "h": 0.2}
+        ]}"#;
+        let results = parse_detections(content, 0.5, &classes());
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].class_name, "person");
     }
 
     #[test]
-    fn parse_ignores_garbage() {
-        let det = make_detector();
-        let response = "Here are the objects I see:\nperson 0.9\nsome random text\n";
-        let results = det.parse_response(response);
+    fn parse_class_case_insensitive() {
+        let content = r#"{"detections": [{"class": "PERSON", "confidence": 0.9, "x": 0.1, "y": 0.1, "w": 0.2, "h": 0.2}]}"#;
+        let results = parse_detections(content, 0.5, &classes());
         assert_eq!(results.len(), 1);
+        assert_eq!(results[0].class_name, "person");
     }
 
     #[test]
-    fn parse_empty_response() {
-        let det = make_detector();
-        assert!(det.parse_response("").is_empty());
-        assert!(det.parse_response("\n\n").is_empty());
-    }
-
-    #[test]
-    fn parse_confidence_word_before_number() {
-        let det = make_detector();
-        let response = "car CONFIDENCE 0.95 0.065 0.22 0.12 0.08\n";
-        let results = det.parse_response(response);
+    fn parse_below_threshold_filtered() {
+        let content = r#"{"detections": [
+            {"class": "person", "confidence": 0.3, "x": 0.1, "y": 0.1, "w": 0.2, "h": 0.2},
+            {"class": "car", "confidence": 0.8, "x": 0.1, "y": 0.1, "w": 0.2, "h": 0.2}
+        ]}"#;
+        let results = parse_detections(content, 0.5, &classes());
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].class_name, "car");
-        assert!((results[0].confidence - 0.95).abs() < 0.01);
+    }
+
+    #[test]
+    fn parse_nonsensical_confidence_dropped() {
+        let content = r#"{"detections": [
+            {"class": "person", "confidence": 1.5, "x": 0.1, "y": 0.1, "w": 0.2, "h": 0.2},
+            {"class": "person", "confidence": -0.2, "x": 0.1, "y": 0.1, "w": 0.2, "h": 0.2}
+        ]}"#;
+        assert!(parse_detections(content, 0.5, &classes()).is_empty());
+    }
+
+    #[test]
+    fn parse_garbage_bbox_dropped() {
+        // Origin outside the frame, negative size, absurd size.
+        let content = r#"{"detections": [
+            {"class": "person", "confidence": 0.9, "x": 1.2, "y": 0.1, "w": 0.2, "h": 0.2},
+            {"class": "person", "confidence": 0.9, "x": 0.1, "y": -0.5, "w": 0.2, "h": 0.2},
+            {"class": "person", "confidence": 0.9, "x": 0.1, "y": 0.1, "w": -0.2, "h": 0.2},
+            {"class": "person", "confidence": 0.9, "x": 0.1, "y": 0.1, "w": 0.2, "h": 0.0},
+            {"class": "person", "confidence": 0.9, "x": 0.1, "y": 0.1, "w": 5.0, "h": 0.2}
+        ]}"#;
+        assert!(parse_detections(content, 0.5, &classes()).is_empty());
+    }
+
+    #[test]
+    fn parse_overhanging_bbox_clamped() {
+        // Box slightly overhangs the right edge: clamp, keep.
+        let content = r#"{"detections": [{"class": "car", "confidence": 0.9, "x": 0.9, "y": 0.9, "w": 0.3, "h": 0.3}]}"#;
+        let results = parse_detections(content, 0.5, &classes());
+        assert_eq!(results.len(), 1);
         let bbox = results[0].bbox.unwrap();
-        assert!((bbox.0 - 0.065).abs() < 0.01);
+        assert!((bbox.2 - 0.1).abs() < 0.001);
+        assert!((bbox.3 - 0.1).abs() < 0.001);
     }
 
     #[test]
-    fn parse_all_caps_class() {
-        let det = make_detector();
-        let response = "CAR 0.85 0.73 0.12 0.65 0.25\nPERSON 0.90 0.1 0.2 0.3 0.4\n";
-        let results = det.parse_response(response);
+    fn parse_salvages_truncated_response() {
+        // A generation cut off mid-string by the num_predict cap, as observed
+        // live on a dense pedestrian scene (2026-07-23).
+        let content = r#"{"detections": [
+            {"class": "person", "confidence": 0.95, "x": 0.01, "y": 0.53, "w": 0.03, "h": 0.47},
+            {"class": "person", "confidence": 0.9, "x": 0.02, "y": 0.55, "w": 0.02, "h": 0.45},
+            {"class": "person", "confidence": 0.9, "x": 0.18, "y": 0.68, "w"#;
+        let results = parse_detections(content, 0.5, &classes());
         assert_eq!(results.len(), 2);
-        assert_eq!(results[0].class_name, "car");
-        assert_eq!(results[1].class_name, "person");
+        assert!(results.iter().all(|d| d.class_name == "person"));
     }
 
     #[test]
-    fn parse_extra_tokens_before_confidence() {
-        let det = make_detector();
-        let response = "dog confidence_score 0.75 0.1 0.2 0.3 0.4\n";
-        let results = det.parse_response(response);
-        assert_eq!(results.len(), 1);
-        assert!((results[0].confidence - 0.75).abs() < 0.01);
-        assert!(results[0].bbox.is_some());
+    fn parse_unsalvageable_truncation_is_empty() {
+        assert!(parse_detections(r#"{"detections": [{"class": "per"#, 0.5, &classes()).is_empty());
+    }
+
+    #[test]
+    fn parse_enforces_detection_cap_client_side() {
+        // Ollama does not enforce maxItems in its grammar; the client caps.
+        let one =
+            r#"{"class": "person", "confidence": 0.9, "x": 0.1, "y": 0.1, "w": 0.2, "h": 0.2}"#;
+        let content = format!(r#"{{"detections": [{}]}}"#, vec![one; 40].join(","));
+        let results = parse_detections(&content, 0.5, &classes());
+        assert_eq!(results.len(), 15);
     }
 
     #[test]
     fn prompt_uses_allowed_classes() {
-        let det = make_detector();
-        let prompt = det.build_prompt();
+        let client = make_client();
+        let prompt = client.build_prompt();
         assert!(prompt.contains("person, car, dog"));
         assert!(!prompt.contains("truck"));
+        assert!(prompt.contains("detections"));
     }
 
     #[test]
-    fn prompt_uses_defaults_when_no_classes() {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let det = OllamaDetector {
-            client: reqwest::Client::new(),
-            rt: rt.handle().clone(),
-            primary: OllamaServer {
-                base_url: "http://localhost:11434".to_string(),
-                model: "test".to_string(),
-            },
-            fallback: None,
-            confidence_threshold: 0.5,
-            allowed_classes: vec![],
-        };
-        let prompt = det.build_prompt();
+    fn empty_class_list_falls_back_to_defaults() {
+        let client =
+            OllamaClient::new("http://localhost:11434", "test", 90, 0.5, vec![], None).unwrap();
+        let prompt = client.build_prompt();
         assert!(prompt.contains("person, car, truck, dog, cat, bird"));
+        let schema = build_format_schema(&client.allowed_classes);
+        assert_eq!(
+            schema["properties"]["detections"]["items"]["properties"]["class"]["enum"]
+                .as_array()
+                .unwrap()
+                .len(),
+            10
+        );
+    }
+
+    #[test]
+    fn classes_lowercased_at_construction() {
+        let client = OllamaClient::new(
+            "http://localhost:11434",
+            "test",
+            90,
+            0.5,
+            vec!["Person".to_string(), "CAR".to_string()],
+            None,
+        )
+        .unwrap();
+        assert_eq!(client.allowed_classes, vec!["person", "car"]);
     }
 }

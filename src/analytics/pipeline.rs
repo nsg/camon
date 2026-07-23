@@ -11,17 +11,15 @@ use opencv::prelude::*;
 use crate::analytics::motion_settings::{
     MotionSettingsStore, DEFAULT_MIN_CONTOUR_AREA, DEFAULT_VAR_THRESHOLD,
 };
-use crate::buffer::warm::{assemble_event, FinishedEvent};
+use crate::buffer::warm::{assemble_event, WriterMessage};
 use crate::buffer::HotBuffer;
 use crate::config::AnalyticsConfig;
 use crate::locks::LockExt;
-use crate::storage::{
-    DetectionDebugStore, DetectionEntry, DetectionStore, MotionEntry, MotionStore,
-};
+use crate::storage::{DetectionStore, EventRecord, EventRegistry, MotionEntry, MotionStore};
 
 use super::decoder::{CropDecoder, FrameDecoder};
+use super::detect_worker::{enqueue_job, DetectionJob};
 use super::motion::{MotionBox, MotionDetector};
-use super::ollama::{DetectResult, Detection, OllamaDetector};
 use super::run_tracker::{ClosedRun, RunTracker};
 
 const ANALYSIS_WIDTH: i32 = 320;
@@ -125,26 +123,25 @@ struct PendingSegment {
     duration_ns: u64,
 }
 
-struct SegmentDetectionResult {
-    classes: Vec<String>,
-    confidences: Vec<f32>,
-    frame_jpeg: Arc<Vec<u8>>,
-}
-
 pub struct AnalyzerContext {
     pub camera_id: String,
     pub buffer: Arc<RwLock<HotBuffer>>,
     pub motion_store: MotionStore,
     pub detection_store: Option<DetectionStore>,
-    pub debug_store: Option<DetectionDebugStore>,
-    pub object_detector: Option<OllamaDetector>,
+    /// Crop jobs for the global (serial) detection worker. `None` when
+    /// object detection is disabled. The analyzer only ever `try_send`s —
+    /// motion detection never stalls on the vision model.
+    pub detect_tx: Option<tokio::sync::mpsc::Sender<DetectionJob>>,
+    /// Recently written events, recorded here for the detection worker's
+    /// post-hoc upgrade lookup. `None` when warm storage or detection is off.
+    pub event_registry: Option<EventRegistry>,
     pub config: AnalyticsConfig,
     /// Deterministic per-camera motion settings (sensitivity, min object size,
     /// ignore mask). Shared so live edits apply without a restart.
     pub motion_settings: MotionSettingsStore,
     /// Finished events go to the warm writer over this channel. `None` when
     /// warm storage is disabled.
-    pub event_tx: Option<tokio::sync::mpsc::Sender<FinishedEvent>>,
+    pub event_tx: Option<tokio::sync::mpsc::Sender<WriterMessage>>,
     /// Pre-padding reach, in media PTS nanoseconds. Media timing — stays PTS.
     pub pre_padding_ns: u64,
     /// Post-padding window, as monotonic wall time. Lifecycle timing — Instant.
@@ -159,17 +156,17 @@ pub struct MotionAnalyzer {
     buffer: Arc<RwLock<HotBuffer>>,
     motion_store: MotionStore,
     detection_store: Option<DetectionStore>,
-    debug_store: Option<DetectionDebugStore>,
     config: AnalyticsConfig,
     detector: MotionDetector,
     decoder: FrameDecoder,
-    object_detector: Option<OllamaDetector>,
+    detect_tx: Option<tokio::sync::mpsc::Sender<DetectionJob>>,
+    event_registry: Option<EventRegistry>,
     last_processed: u64,
     motion_settings: MotionSettingsStore,
     segment_crops: HashMap<u64, NormalizedRect>,
     segment_motion_rects: HashMap<u64, Vec<NormalizedRect>>,
     run_tracker: RunTracker,
-    event_tx: Option<tokio::sync::mpsc::Sender<FinishedEvent>>,
+    event_tx: Option<tokio::sync::mpsc::Sender<WriterMessage>>,
     pre_padding_ns: u64,
 }
 
@@ -199,11 +196,11 @@ impl MotionAnalyzer {
             buffer: ctx.buffer,
             motion_store: ctx.motion_store,
             detection_store: ctx.detection_store,
-            debug_store: ctx.debug_store,
             config: ctx.config,
             detector,
             decoder,
-            object_detector: ctx.object_detector,
+            detect_tx: ctx.detect_tx,
+            event_registry: ctx.event_registry,
             last_processed,
             motion_settings: ctx.motion_settings,
             segment_crops: HashMap::new(),
@@ -332,7 +329,7 @@ impl MotionAnalyzer {
         segments: Vec<PendingSegment>,
     ) -> Result<(Vec<MotionSegment>, Vec<ClosedRun>), Box<dyn std::error::Error + Send + Sync>>
     {
-        let has_detection = self.object_detector.is_some() && self.detection_store.is_some();
+        let has_detection = self.detect_tx.is_some() && self.detection_store.is_some();
         let capture_frames = self.detection_store.is_some();
         let mut motion_segments = Vec::new();
         let mut motion_frames: Vec<(u64, Vec<u8>)> = Vec::new();
@@ -417,10 +414,33 @@ impl MotionAnalyzer {
             }
         };
 
+        let start_pts_ns = event.first_pts;
+        let duration_ms = event.duration_ms() as u32;
+        let has_objects = event.has_objects;
+
         // Events are durability-critical: block this analyzer thread until
         // the writer has room rather than dropping the event.
-        if tx.blocking_send(event).is_err() {
+        if tx.blocking_send(WriterMessage::Event(event)).is_err() {
             tracing::error!(camera = %self.camera_id, "warm writer gone, event lost");
+            return;
+        }
+
+        // Record the event AFTER enqueuing the write, so any upgrade the
+        // detection worker derives from this record is guaranteed to reach
+        // the writer behind the write itself (same channel, FIFO). See
+        // `storage::event_registry` for the full race analysis.
+        if let Some(ref registry) = self.event_registry {
+            registry.record(
+                &self.camera_id,
+                EventRecord {
+                    start_pts_ns,
+                    duration_ms,
+                    first_motion_seq: run.first_motion_seq,
+                    last_seq: run.last_seq,
+                    has_objects,
+                    continues: run.continues,
+                },
+            );
         }
     }
 
@@ -637,6 +657,11 @@ impl MotionAnalyzer {
         subsample_tagged(all_frames)
     }
 
+    /// Prepare a crop job for one contiguous motion run and hand it to the
+    /// global detection worker. This never blocks: the frames are extracted,
+    /// cropped, and JPEG-encoded here, then `try_send`-queued. If the queue
+    /// is full the job is dropped with a warning — the motion event still
+    /// persists; only the object upgrade is lost.
     fn detect_run(&mut self, run: Vec<MotionSegment>, crop_decoder: &CropDecoder) {
         if run.is_empty() {
             return;
@@ -683,21 +708,25 @@ impl MotionAnalyzer {
         let filmstrip_jpegs: Vec<Vec<u8>> = cropped.iter().filter_map(encode_jpeg).collect();
         self.store_filmstrip_for_run(&run, &filmstrip_jpegs);
 
-        let (detections, best_frame_idx) =
-            self.detect_ollama(&cropped, full_frame_jpeg, &all_motion_rects, run_crop);
-
         // Remove consumed segment data
         for seg in &run {
             self.segment_crops.remove(&seg.seq);
             self.segment_motion_rects.remove(&seg.seq);
         }
 
-        if detections.is_empty() {
-            return;
+        if let Some(ref tx) = self.detect_tx {
+            enqueue_job(
+                tx,
+                DetectionJob {
+                    camera_id: self.camera_id.clone(),
+                    seqs: run.iter().map(|seg| seg.seq).collect(),
+                    crop_jpegs: filmstrip_jpegs,
+                    full_frame_jpeg,
+                    motion_rects: all_motion_rects,
+                    run_crop: run_crop.map(|c| (c.x, c.y, c.w, c.h)),
+                },
+            );
         }
-
-        let result = build_detection_result(&detections, &filmstrip_jpegs, best_frame_idx);
-        self.propagate_detection(&run, &result);
     }
 
     fn store_filmstrip_for_run(&self, run: &[MotionSegment], jpegs: &[Vec<u8>]) {
@@ -707,169 +736,6 @@ impl MotionAnalyzer {
                 ds.insert_filmstrip(&self.camera_id, seg.seq, Arc::clone(&filmstrip));
             }
         }
-    }
-
-    fn propagate_detection(&mut self, run: &[MotionSegment], result: &SegmentDetectionResult) {
-        let mid_seq = run[run.len() / 2].seq;
-        self.store_detection_result(mid_seq, result);
-        for seg in run {
-            if seg.seq == mid_seq {
-                continue;
-            }
-            let propagated = SegmentDetectionResult {
-                classes: result.classes.clone(),
-                confidences: result.confidences.clone(),
-                frame_jpeg: Arc::clone(&result.frame_jpeg),
-            };
-            self.store_detection_result(seg.seq, &propagated);
-        }
-    }
-
-    fn detect_ollama(
-        &self,
-        frames: &[Mat],
-        full_frame_jpeg: Option<Vec<u8>>,
-        motion_rects: &[(f32, f32, f32, f32)],
-        run_crop: Option<NormalizedRect>,
-    ) -> (Vec<Detection>, usize) {
-        let ollama = match &self.object_detector {
-            Some(d) => d,
-            None => return (Vec::new(), 0),
-        };
-
-        let result: DetectResult = match ollama.detect_frames(frames) {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::warn!(
-                    camera = %self.camera_id,
-                    error = %e,
-                    "ollama detection error"
-                );
-                return (Vec::new(), 0);
-            }
-        };
-
-        // Store debug entry regardless of detection outcome
-        if let Some(ref debug_store) = self.debug_store {
-            if !result.frame_jpegs.is_empty() {
-                // Map ollama bboxes from crop space to full-frame space for debug
-                let ollama_rects: Vec<(String, f32, f32, f32, f32)> = result
-                    .detections
-                    .iter()
-                    .filter_map(|d| {
-                        let (x, y, w, h) = match (d.bbox, run_crop) {
-                            (Some((bx, by, bw, bh)), Some(c)) => {
-                                (c.x + bx * c.w, c.y + by * c.h, bw * c.w, bh * c.h)
-                            }
-                            (Some(b), None) => b,
-                            (None, Some(c)) => (c.x, c.y, c.w, c.h),
-                            (None, None) => return None,
-                        };
-                        Some((d.class_name.clone(), x, y, w, h))
-                    })
-                    .collect();
-                let crop_tuple = run_crop.map(|c| (c.x, c.y, c.w, c.h));
-                debug_store.insert(
-                    &self.camera_id,
-                    result.frame_jpegs.into_iter().map(Arc::new).collect(),
-                    result.raw_responses,
-                    result.model,
-                    result.detections.len(),
-                    full_frame_jpeg.map(Arc::new),
-                    motion_rects.to_vec(),
-                    crop_tuple,
-                    ollama_rects,
-                );
-            }
-        }
-
-        if !result.detections.is_empty() {
-            tracing::debug!(
-                camera = %self.camera_id,
-                count = result.detections.len(),
-                classes = ?result.detections.iter().map(|d| &d.class_name).collect::<Vec<_>>(),
-                "ollama detections"
-            );
-        }
-
-        // Use second frame (index 1) as thumbnail — inner frame
-        let best_idx = if frames.len() > 1 { 1 } else { 0 };
-        (result.detections, best_idx)
-    }
-
-    fn store_detection_result(&mut self, seq: u64, result: &SegmentDetectionResult) {
-        let detection_store = match &self.detection_store {
-            Some(s) => s,
-            None => return,
-        };
-
-        let (backend, model) = self
-            .object_detector
-            .as_ref()
-            .map(|d| ("ollama".to_string(), d.model().to_string()))
-            .unwrap_or_else(|| ("unknown".to_string(), "unknown".to_string()));
-
-        // Every detection is reported. There is no learned suppression: MOG2's
-        // (user-tuned) verdict is the sole gate on what footage persists, and a
-        // false negative here would be unrecoverable.
-        for (class, &confidence) in result.classes.iter().zip(&result.confidences) {
-            detection_store.insert(
-                &self.camera_id,
-                DetectionEntry {
-                    id: detection_store.next_id(),
-                    segment_sequence: seq,
-                    object_class: class.clone(),
-                    confidence,
-                    frame_jpeg: Arc::clone(&result.frame_jpeg),
-                    backend: backend.clone(),
-                    model: model.clone(),
-                },
-            );
-
-            tracing::debug!(
-                camera = %self.camera_id,
-                sequence = seq,
-                class = %class,
-                confidence = format!("{:.2}", confidence),
-                "object detected"
-            );
-        }
-    }
-}
-
-fn build_detection_result(
-    detections: &[Detection],
-    filmstrip_jpegs: &[Vec<u8>],
-    best_frame_idx: usize,
-) -> SegmentDetectionResult {
-    let frame_jpeg = Arc::new(
-        filmstrip_jpegs
-            .get(best_frame_idx)
-            .cloned()
-            .or_else(|| filmstrip_jpegs.first().cloned())
-            .unwrap_or_default(),
-    );
-
-    // Deduplicate by class — keep the highest confidence per class.
-    let mut best_conf: std::collections::HashMap<&str, f32> = std::collections::HashMap::new();
-    for d in detections {
-        best_conf
-            .entry(d.class_name.as_str())
-            .and_modify(|c| {
-                if d.confidence > *c {
-                    *c = d.confidence;
-                }
-            })
-            .or_insert(d.confidence);
-    }
-
-    let classes: Vec<String> = best_conf.keys().map(|k| k.to_string()).collect();
-    let confidences: Vec<f32> = classes.iter().map(|c| best_conf[c.as_str()]).collect();
-
-    SegmentDetectionResult {
-        classes,
-        confidences,
-        frame_jpeg,
     }
 }
 

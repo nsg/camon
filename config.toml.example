@@ -29,13 +29,19 @@ var_threshold = 16
 # Minimum object size in foreground pixels. Range 50-2000 (default: 200).
 min_contour_area = 200
 
-# Object detection via Ollama (requires analytics enabled)
+# Object detection via Ollama (requires analytics enabled).
+# All cameras share ONE detection worker that sends at most one request to
+# Ollama at a time (strictly serial — kind to modest GPUs). Motion detection
+# and event recording never wait for the model: events are written the moment
+# a motion run ends and upgraded to object events when a verdict arrives.
 [analytics.object_detection]
 # Enable object detection on motion segments (default: false)
 enabled = true
 # Minimum confidence threshold (default: 0.5)
 confidence_threshold = 0.5
-# Object classes to detect (default: person, car, truck, dog, cat)
+# Object classes to detect (default: person, car, truck, dog, cat).
+# Also constrains the model's structured JSON output — only these classes can
+# be returned.
 classes = ["person", "car", "truck", "dog", "cat"]
 
 [analytics.object_detection.ollama]
@@ -43,6 +49,10 @@ classes = ["person", "car", "truck", "dog", "cat"]
 url = "http://localhost:11434"
 # Vision model to use (default: gemma4:e4b)
 model = "gemma4:e4b"
+# Per-request timeout in seconds (default: 90). Warm inference on a modest
+# GPU takes up to ~50s per frame; a timeout only costs that event's object
+# upgrade, never the footage.
+timeout_secs = 90
 
 # Optional fallback server if primary fails
 # [analytics.object_detection.ollama.fallback]

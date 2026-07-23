@@ -27,8 +27,9 @@ Each camera runs its own independent pipeline with its own buffer. From the buff
 flowchart LR
   HotBuffer[("Hot Buffer (10m)")] -->|HLS| Clients
   HotBuffer -->|keyframes| MA["Motion Analyzer"] --> MS[("Motion Store")]
-  MA -->|Ollama| OD["Object Detection"] --> DS[("Detection Store")]
+  MA -->|crop jobs| OD["Detection Worker (Ollama)"] --> DS[("Detection Store")]
   MA -->|finished events| WW[("Warm Writer (disk)")]
+  OD -.->|post-hoc upgrades| WW
 ```
 
 Clients can stream the raw segments from the buffer directly, the only thing we need to do is to serve a playlist.m3u8 which is a simple text file to the player. Object Detection is heavy on the CPU (or GPU) so most "detections" are filtered in the Motion Analyzer stage.
@@ -60,13 +61,15 @@ There is no automatic tuning and no learned suppression: MOG2's verdict is the s
 flowchart LR
   HotBuffer[("Hot Buffer (10m)")] -->|motion event| Sub["Subsample 4 Frames"]
   MA[("Motion Store")] -->|bounding boxes| Sub
-  Sub --> Crop1["Crop"] --> Ollama1["Ollama"] --> DS[("Detection Store")]
-  Sub --> Crop2["Crop"] --> Ollama2["Ollama"] --> DS
-  Sub --> Crop3["Crop"] --> Ollama3["Ollama"] --> DS
-  Sub --> Crop4["Crop"] --> Ollama4["Ollama"] --> DS
+  Sub --> Crop["Crop + JPEG"] -->|bounded queue| Worker["Detection Worker (global, serial)"]
+  Worker -->|one request at a time| Ollama["Ollama"]
+  Worker --> DS[("Detection Store")]
+  Worker -.->|upgrade event| WW["Warm Writer"]
 ```
 
-The Motion Store keeps track of motion events. If there are several segments in sequence that have movements, they are considered a single motion event. We sample four frames from each event at 0/3, 1/3, 2/3 and 3/3. Using bounding boxes from the motion event, we crop the image to "zoom in" to the action before sending it to our vision model running in Ollama. Every detection the model returns is recorded — there is no learned suppression that could silently drop a real detection. To stop a persistently busy area (a tree, a road) from generating events, paint it into the per-camera ignore mask.
+The Motion Store keeps track of motion events. If there are several segments in sequence that have movements, they are considered a single motion event. We sample four frames from each event at 0/3, 1/3, 2/3 and 3/3. Using bounding boxes from the motion event, we crop the image to "zoom in" to the action, JPEG-encode the crops, and enqueue them as a job for a single global detection worker shared by all cameras. The worker is strictly serial — at most one in-flight Ollama request at any time — so a modest GPU is never hit with parallel load, and the analyzer never waits for the model: if the small queue is full the job is simply dropped with a warning (the motion event still records; only the object classification is lost).
+
+The model is asked for structured output: the request carries a JSON schema (via Ollama's `format` field) with the configured class list as an enum, so the response is machine-parseable JSON with per-detection class, confidence, and a normalized bounding box. Responses are validated — out-of-range confidences, garbage boxes, and unknown classes are dropped. Every valid detection is recorded — there is no learned suppression that could silently drop a real detection. To stop a persistently busy area (a tree, a road) from generating events, paint it into the per-camera ignore mask.
 
 We are still running in RAM, our 10 minute video buffer and some metadata stored in the motion and detection stores. At this stage we should have enough information to only save events that we care about on disk!
 
@@ -93,6 +96,8 @@ flowchart LR
 ```
 
 The moment a motion run ends (post-padding elapsed), the analyzer assembles the complete event — pre-padding, motion, and post-padding pulled straight from the hot buffer, plus metadata from the motion and detection stores — and hands it to the warm writer, which persists it to disk immediately. This way an event only stays at risk in RAM for seconds after it ends, not until its segments age out of the buffer. The writer also saves metadata and thumbnails that is used by the web UI. User can stream saved video events via HLS.
+
+Event writes never wait for the vision model. If an Ollama verdict arrives while the run is still open, it is picked up during assembly as before; if it arrives after the event is already on disk, the detection worker asks the warm writer to upgrade it post-hoc — the sidecar is rewritten with the detections and the files move from `movements/` to `objects/`, which switches the event to the longer object retention. All file mutations go through the warm writer, so writes and upgrades can never race. If a verdict lands in the tiny window while the event is being assembled, worst case the event simply stays movement-classified with the detections still visible in the detection store and API.
 
 ### Recording modes
 
@@ -168,13 +173,16 @@ enabled = true
 # Frame sample rate for analysis (default: 5)
 sample_fps = 5
 
-# Object detection via Ollama (requires analytics enabled)
+# Object detection via Ollama (requires analytics enabled).
+# One global worker serves all cameras, strictly serially (max one in-flight
+# request); events never wait for the model.
 [analytics.object_detection]
 # Enable object detection on motion segments (default: false)
 enabled = true
 # Minimum confidence threshold (default: 0.5)
 confidence_threshold = 0.5
-# Object classes to detect (default: person, car, truck, dog, cat)
+# Object classes to detect (default: person, car, truck, dog, cat).
+# Also constrains the model's structured JSON output.
 classes = ["person", "car", "truck", "dog", "cat"]
 
 [analytics.object_detection.ollama]
@@ -182,6 +190,9 @@ classes = ["person", "car", "truck", "dog", "cat"]
 url = "http://localhost:11434"
 # Vision model to use (default: gemma4:e4b)
 model = "gemma4:e4b"
+# Per-request timeout in seconds (default: 90). A timeout costs only that
+# event's object upgrade, never the footage.
+timeout_secs = 90
 
 # Optional fallback server if primary fails
 # [analytics.object_detection.ollama.fallback]

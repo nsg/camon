@@ -261,6 +261,28 @@ impl WarmEventIndex {
             .map(|i| entries[i].clone())
     }
 
+    /// Mutate the entry with the given start PTS in place (used by the
+    /// post-hoc movement→object upgrade; the sort key never changes).
+    /// Returns false when no such event is indexed.
+    pub fn update_event(
+        &self,
+        camera_id: &str,
+        start_pts_ns: u64,
+        f: impl FnOnce(&mut WarmEventEntry),
+    ) -> bool {
+        let Some(lock) = self.cameras.get(camera_id) else {
+            return false;
+        };
+        let mut entries = lock.write_recover();
+        match entries.binary_search_by_key(&start_pts_ns, |e| e.start_pts_ns) {
+            Ok(i) => {
+                f(&mut entries[i]);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
     pub fn resolve_file_path(&self, camera_id: &str, entry: &WarmEventEntry) -> PathBuf {
         let dir = self
             .data_dir
