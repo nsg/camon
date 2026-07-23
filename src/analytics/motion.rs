@@ -989,7 +989,7 @@ mod tests {
 
         // Center of frame
         let r = Rect::new(155, 115, 10, 10);
-        assert_eq!(contour_region(&r, 320, 240), 1 * REGION_COLS + 2); // row 1, col 2
+        assert_eq!(contour_region(&r, 320, 240), REGION_COLS + 2); // row 1, col 2
     }
 
     #[test]

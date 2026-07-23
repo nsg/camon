@@ -918,6 +918,19 @@ fn encode_jpeg(mat: &Mat) -> Option<Vec<u8>> {
     Some(buf.to_vec())
 }
 
+pub fn spawn_analyzer(
+    ctx: AnalyzerContext,
+    shutdown: Arc<AtomicBool>,
+) -> tokio::task::JoinHandle<()> {
+    let camera_id = ctx.camera_id.clone();
+    tokio::task::spawn_blocking(move || match MotionAnalyzer::new(ctx) {
+        Ok(analyzer) => analyzer.run(shutdown),
+        Err(e) => {
+            tracing::error!(camera = %camera_id, error = %e, "failed to create motion analyzer");
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1037,17 +1050,4 @@ mod tests {
         assert_eq!(cropped.cols(), 40);
         assert_eq!(cropped.rows(), 20);
     }
-}
-
-pub fn spawn_analyzer(
-    ctx: AnalyzerContext,
-    shutdown: Arc<AtomicBool>,
-) -> tokio::task::JoinHandle<()> {
-    let camera_id = ctx.camera_id.clone();
-    tokio::task::spawn_blocking(move || match MotionAnalyzer::new(ctx) {
-        Ok(analyzer) => analyzer.run(shutdown),
-        Err(e) => {
-            tracing::error!(camera = %camera_id, error = %e, "failed to create motion analyzer");
-        }
-    })
 }

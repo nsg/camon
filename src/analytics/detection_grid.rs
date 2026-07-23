@@ -341,7 +341,7 @@ mod tests {
         grid.decay("cam1");
 
         let response = grid.get_grid("cam1").unwrap();
-        for (_, cells) in &response.classes {
+        for cells in response.classes.values() {
             for &v in cells {
                 assert!(v >= 0.0, "cell value should not be negative");
             }
