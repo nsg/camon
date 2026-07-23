@@ -40,7 +40,8 @@ model = "gemma4:e4b"
 # model = "gemma3:4b"
 
 [storage]
-# Enable warm storage — flush motion events to disk (default: true)
+# Enable warm storage — write motion events to disk as they end (default: true)
+# Requires analytics to be enabled; without it, no events are recorded
 enabled = true
 # Directory for event files (default: /var/camon/storage)
 data_dir = "/var/camon/storage"

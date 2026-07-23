@@ -1,17 +1,9 @@
 use std::collections::VecDeque;
 use std::sync::{Arc, RwLock};
 
-use tokio::sync::mpsc;
-
 use super::GopSegment;
 
 const NANOS_PER_SEC: u64 = 1_000_000_000;
-
-pub struct EvictedSegment {
-    pub segment: GopSegment,
-    pub camera_id: String,
-    pub sequence: u64,
-}
 
 pub struct HotBuffer {
     segments: VecDeque<GopSegment>,
@@ -19,7 +11,6 @@ pub struct HotBuffer {
     current_duration_ns: u64,
     camera_id: String,
     first_sequence: u64,
-    eviction_tx: Option<mpsc::Sender<EvictedSegment>>,
 }
 
 impl HotBuffer {
@@ -30,7 +21,6 @@ impl HotBuffer {
             current_duration_ns: 0,
             camera_id,
             first_sequence: 0,
-            eviction_tx: None,
         }))
     }
 
@@ -49,10 +39,11 @@ impl HotBuffer {
         self.evict_old();
     }
 
+    /// Drop segments that aged out of the retention window. Events are
+    /// persisted the moment their motion run ends, so eviction only frees RAM.
     fn evict_old(&mut self) {
         while self.current_duration_ns > self.max_duration_ns {
             if let Some(old) = self.segments.pop_front() {
-                let evicted_sequence = self.first_sequence;
                 self.current_duration_ns = self.current_duration_ns.saturating_sub(old.duration_ns);
                 self.first_sequence += 1;
                 tracing::trace!(
@@ -61,30 +52,10 @@ impl HotBuffer {
                     first_sequence = self.first_sequence,
                     "evicted old segment"
                 );
-                if let Some(tx) = &self.eviction_tx {
-                    if let Err(mpsc::error::TrySendError::Full(_)) = tx.try_send(EvictedSegment {
-                        segment: old,
-                        camera_id: self.camera_id.clone(),
-                        sequence: evicted_sequence,
-                    }) {
-                        tracing::warn!(
-                            camera = %self.camera_id,
-                            "warm writer behind, dropping evicted segment"
-                        );
-                    }
-                }
             } else {
                 break;
             }
         }
-    }
-
-    pub fn set_eviction_sender(&mut self, tx: mpsc::Sender<EvictedSegment>) {
-        self.eviction_tx = Some(tx);
-    }
-
-    pub fn close_eviction_channel(&mut self) {
-        self.eviction_tx = None;
     }
 
     pub fn segment_count(&self) -> usize {
@@ -140,5 +111,48 @@ impl HotBuffer {
                 .map(|s| s.duration_ns)
                 .sum(),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::locks::LockExt;
+
+    const SEC: u64 = 1_000_000_000;
+
+    fn segment(start_pts: u64) -> GopSegment {
+        GopSegment {
+            start_pts,
+            duration_ns: SEC,
+            data: Arc::new(vec![0; 4]),
+            frame_count: 1,
+        }
+    }
+
+    #[test]
+    fn eviction_advances_first_sequence_and_frees_duration() {
+        let buffer = HotBuffer::new("cam".to_string(), 3);
+        let mut buf = buffer.write_recover();
+        for seq in 0..5u64 {
+            buf.push(segment(seq * SEC));
+        }
+        assert_eq!(buf.first_sequence(), 2);
+        assert_eq!(buf.last_sequence(), 5);
+        assert_eq!(buf.segment_count(), 3);
+        assert!(buf.current_duration_secs() <= 3.0);
+    }
+
+    #[test]
+    fn get_segment_by_sequence_accounts_for_eviction() {
+        let buffer = HotBuffer::new("cam".to_string(), 3);
+        let mut buf = buffer.write_recover();
+        for seq in 0..5u64 {
+            buf.push(segment(seq * SEC));
+        }
+        assert!(buf.get_segment_by_sequence(1).is_none());
+        assert_eq!(buf.get_segment_by_sequence(2).unwrap().start_pts, 2 * SEC);
+        assert_eq!(buf.get_segment_by_sequence(4).unwrap().start_pts, 4 * SEC);
+        assert!(buf.get_segment_by_sequence(5).is_none());
     }
 }

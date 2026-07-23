@@ -10,6 +10,7 @@ use opencv::imgcodecs;
 use opencv::prelude::*;
 
 use crate::analytics::detection_grid::DetectionGrid;
+use crate::buffer::warm::{assemble_event, FinishedEvent};
 use crate::buffer::HotBuffer;
 use crate::config::AnalyticsConfig;
 use crate::locks::LockExt;
@@ -20,6 +21,7 @@ use crate::storage::{
 use super::decoder::{CropDecoder, FrameDecoder};
 use super::motion::MotionDetector;
 use super::ollama::{DetectResult, Detection, OllamaDetector};
+use super::run_tracker::{ClosedRun, RunTracker};
 
 const ANALYSIS_WIDTH: i32 = 320;
 const ANALYSIS_HEIGHT: i32 = 240;
@@ -141,6 +143,11 @@ pub struct AnalyzerContext {
     pub config: AnalyticsConfig,
     pub detection_grid: Option<DetectionGrid>,
     pub data_dir: PathBuf,
+    /// Finished events go to the warm writer over this channel. `None` when
+    /// warm storage is disabled.
+    pub event_tx: Option<tokio::sync::mpsc::Sender<FinishedEvent>>,
+    pub pre_padding_ns: u64,
+    pub post_padding_ns: u64,
 }
 
 pub struct MotionAnalyzer {
@@ -159,6 +166,9 @@ pub struct MotionAnalyzer {
     segment_crops: HashMap<u64, NormalizedRect>,
     segment_motion_rects: HashMap<u64, Vec<NormalizedRect>>,
     last_run_motion_rects: Vec<(f32, f32, f32, f32)>,
+    run_tracker: RunTracker,
+    event_tx: Option<tokio::sync::mpsc::Sender<FinishedEvent>>,
+    pre_padding_ns: u64,
 }
 
 impl MotionAnalyzer {
@@ -188,6 +198,9 @@ impl MotionAnalyzer {
             segment_crops: HashMap::new(),
             segment_motion_rects: HashMap::new(),
             last_run_motion_rects: Vec::new(),
+            run_tracker: RunTracker::new(ctx.post_padding_ns),
+            event_tx: ctx.event_tx,
+            pre_padding_ns: ctx.pre_padding_ns,
         })
     }
 
@@ -211,6 +224,7 @@ impl MotionAnalyzer {
             thread::sleep(POLL_INTERVAL);
         }
 
+        self.flush_open_run();
         self.save_grid();
         tracing::info!(camera = %self.camera_id, "motion analyzer stopped");
     }
@@ -255,7 +269,7 @@ impl MotionAnalyzer {
 
         self.cleanup_old_data(first_seq);
         let segments = self.collect_pending_segments(last_seq)?;
-        let motion_segments = self.run_motion_analysis(segments)?;
+        let (motion_segments, closed_runs) = self.run_motion_analysis(segments)?;
 
         if let Err(e) = self.detector.maybe_tune() {
             tracing::warn!(camera = %self.camera_id, error = %e, "tuner update failed");
@@ -266,6 +280,12 @@ impl MotionAnalyzer {
 
         if !motion_segments.is_empty() {
             self.run_sampled_detections(motion_segments);
+        }
+
+        // Emit after detection so runs that close in the same batch as their
+        // motion segments still get object metadata.
+        for run in closed_runs {
+            self.emit_event(run);
         }
 
         Ok(())
@@ -310,18 +330,25 @@ impl MotionAnalyzer {
     fn run_motion_analysis(
         &mut self,
         segments: Vec<PendingSegment>,
-    ) -> Result<Vec<MotionSegment>, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<(Vec<MotionSegment>, Vec<ClosedRun>), Box<dyn std::error::Error + Send + Sync>>
+    {
         let has_detection = self.object_detector.is_some() && self.detection_store.is_some();
         let capture_frames = self.detection_store.is_some();
         let mut motion_segments = Vec::new();
         let mut motion_frames: Vec<(u64, Vec<u8>)> = Vec::new();
+        let mut closed_runs = Vec::new();
 
         for seg in segments {
             let (score, crop, motion_rects, frame_jpeg) =
                 self.analyze_segment(&seg.data, capture_frames)?;
             self.publish_debug_maps();
 
-            if score >= MOTION_THRESHOLD {
+            let has_motion = score >= MOTION_THRESHOLD;
+            if let Some(run) = self.run_tracker.observe(seg.seq, seg.start_pts, has_motion) {
+                closed_runs.push(run);
+            }
+
+            if has_motion {
                 self.record_motion(seg.seq, seg.start_pts, seg.duration_ns, score);
                 if let Some(jpeg) = frame_jpeg {
                     motion_frames.push((seg.seq, jpeg));
@@ -348,7 +375,58 @@ impl MotionAnalyzer {
             self.store_movement_filmstrips(motion_frames);
         }
 
-        Ok(motion_segments)
+        Ok((motion_segments, closed_runs))
+    }
+
+    /// Assemble and hand off a finished event the moment its run closes.
+    /// All segments in range are still hot and the metadata stores have not
+    /// been cleaned up for them yet, so everything is read fresh here.
+    fn emit_event(&self, run: ClosedRun) {
+        let tx = match self.event_tx {
+            Some(ref tx) => tx,
+            None => return,
+        };
+
+        let event = {
+            let buffer = self.buffer.read_recover();
+            assemble_event(
+                &buffer,
+                self.detection_store.as_ref(),
+                &self.camera_id,
+                run.first_motion_seq,
+                run.last_seq,
+                run.min_start_seq,
+                self.pre_padding_ns,
+            )
+        };
+        let event = match event {
+            Some(event) => event,
+            None => {
+                tracing::warn!(
+                    camera = %self.camera_id,
+                    first_motion_seq = run.first_motion_seq,
+                    "event segments no longer in hot buffer, skipping event"
+                );
+                return;
+            }
+        };
+
+        // Events are durability-critical: block this analyzer thread until
+        // the writer has room rather than dropping the event.
+        if tx.blocking_send(event).is_err() {
+            tracing::error!(camera = %self.camera_id, "warm writer gone, event lost");
+        }
+    }
+
+    fn flush_open_run(&mut self) {
+        if let Some(run) = self.run_tracker.flush() {
+            tracing::info!(
+                camera = %self.camera_id,
+                first_motion_seq = run.first_motion_seq,
+                "flushing open motion event at shutdown"
+            );
+            self.emit_event(run);
+        }
     }
 
     fn store_movement_filmstrips(&self, frames: Vec<(u64, Vec<u8>)>) {

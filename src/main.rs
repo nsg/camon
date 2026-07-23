@@ -16,7 +16,7 @@ mod update;
 
 use analytics::{AnalyzerContext, OllamaDetector};
 use api::AppState;
-use buffer::warm::WarmWriter;
+use buffer::warm::{FinishedEvent, WarmWriter};
 use buffer::HotBuffer;
 use camera::FfmpegPipeline;
 use config::Config;
@@ -146,10 +146,18 @@ fn create_object_detector(config: &Config) -> Option<OllamaDetector> {
     .ok()
 }
 
+/// Small bounded queue between each analyzer and its warm writer. Events are
+/// rare and written quickly; the analyzer blocks briefly if the writer falls
+/// behind rather than ever dropping an event.
+const EVENT_CHANNEL_CAPACITY: usize = 8;
+
 struct CameraHandles {
     pipeline_handles: Vec<(String, tokio::task::JoinHandle<()>, Arc<RwLock<HotBuffer>>)>,
     analyzer_handles: Vec<tokio::task::JoinHandle<()>>,
     warm_handles: Vec<tokio::task::JoinHandle<()>>,
+    /// Kept alive so warm writers keep running (prune tick) even without
+    /// analyzers; dropped during shutdown to let the writers drain and exit.
+    event_senders: Vec<tokio::sync::mpsc::Sender<FinishedEvent>>,
     buffers_map: HashMap<String, Arc<RwLock<HotBuffer>>>,
 }
 
@@ -169,6 +177,7 @@ fn spawn_cameras(ctx: &SpawnContext, cameras: Vec<config::CameraConfig>) -> Came
         pipeline_handles: Vec::new(),
         analyzer_handles: Vec::new(),
         warm_handles: Vec::new(),
+        event_senders: Vec::new(),
         buffers_map: HashMap::new(),
     };
 
@@ -176,19 +185,20 @@ fn spawn_cameras(ctx: &SpawnContext, cameras: Vec<config::CameraConfig>) -> Came
         let buffer = HotBuffer::new(cam_config.id.clone(), ctx.config.buffer.hot_duration_secs);
         let camera_id = cam_config.id.clone();
 
-        if ctx.config.storage.enabled {
-            let (tx, rx) = tokio::sync::mpsc::channel(64);
-            buffer.write_recover().set_eviction_sender(tx);
+        let event_tx = if ctx.config.storage.enabled {
+            let (tx, rx) = tokio::sync::mpsc::channel(EVENT_CHANNEL_CAPACITY);
             let writer = WarmWriter::new(
                 rx,
-                ctx.motion_store.clone(),
-                ctx.detection_store.clone(),
                 camera_id.clone(),
                 &ctx.config.storage,
                 ctx.warm_index.clone(),
             );
             handles.warm_handles.push(tokio::spawn(writer.run()));
-        }
+            handles.event_senders.push(tx.clone());
+            Some(tx)
+        } else {
+            None
+        };
 
         handles
             .buffers_map
@@ -227,6 +237,9 @@ fn spawn_cameras(ctx: &SpawnContext, cameras: Vec<config::CameraConfig>) -> Came
                     config: ctx.config.analytics.clone(),
                     detection_grid: ctx.detection_grid.clone(),
                     data_dir: std::path::PathBuf::from(&ctx.config.storage.data_dir),
+                    event_tx,
+                    pre_padding_ns: ctx.config.storage.pre_padding_secs * 1_000_000_000,
+                    post_padding_ns: ctx.config.storage.post_padding_secs * 1_000_000_000,
                 },
                 Arc::clone(ctx.shutdown),
             );
@@ -251,9 +264,11 @@ async fn wait_for_signal(shutdown: &AtomicBool) {
     shutdown.store(true, Ordering::Relaxed);
 }
 
-async fn graceful_shutdown(handles: CameraHandles, warm_handles: Vec<tokio::task::JoinHandle<()>>) {
+async fn graceful_shutdown(handles: CameraHandles) {
+    // Analyzers poll the shutdown flag every ~200ms and flush any open motion
+    // run as a complete event before exiting — join them, never abort.
     for handle in handles.analyzer_handles {
-        handle.abort();
+        let _ = handle.await;
     }
 
     let mut buffers_with_ids = Vec::new();
@@ -263,11 +278,10 @@ async fn graceful_shutdown(handles: CameraHandles, warm_handles: Vec<tokio::task
         buffers_with_ids.push((camera_id, buffer));
     }
 
-    for (_, buffer) in &buffers_with_ids {
-        buffer.write_recover().close_eviction_channel();
-    }
-
-    for handle in warm_handles {
+    // With all senders gone the warm writers drain their queues and exit;
+    // awaiting them guarantees every accepted event reached disk.
+    drop(handles.event_senders);
+    for handle in handles.warm_handles {
         let _ = handle.await;
     }
 
@@ -303,6 +317,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let warm_index = init_warm_index(&config, &camera_ids);
     let detection_grid = init_detection_grid(&config, &camera_ids);
 
+    if config.storage.enabled && !config.analytics.enabled {
+        tracing::warn!(
+            "storage is enabled but analytics is disabled — no events will be recorded \
+             (continuous recording is not implemented yet); retention pruning still runs"
+        );
+    }
+
     let shutdown = Arc::new(AtomicBool::new(false));
     let spawn_ctx = SpawnContext {
         config: &config,
@@ -334,17 +355,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     wait_for_signal(&shutdown).await;
     server_handle.abort();
 
-    let warm_handles = camera_handles.warm_handles;
-    graceful_shutdown(
-        CameraHandles {
-            pipeline_handles: camera_handles.pipeline_handles,
-            analyzer_handles: camera_handles.analyzer_handles,
-            warm_handles: Vec::new(),
-            buffers_map: HashMap::new(),
-        },
-        warm_handles,
-    )
-    .await;
+    graceful_shutdown(camera_handles).await;
 
     tracing::info!("shutdown complete");
     Ok(())

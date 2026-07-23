@@ -21,16 +21,14 @@ flowchart LR
   Camera -->|RTSP| KeyframeSegmenter("Keyframe Segmenter") --> HotBuffer[("Hot Buffer (10m)")]
 ```
 
-Each camera runs its own independent pipeline with its own buffer. From the buffer we feed clients (browsers watching the live stream) and the motion analyzer. As segments age out of the buffer, those marked with motion are written to disk.
+Each camera runs its own independent pipeline with its own buffer. From the buffer we feed clients (browsers watching the live stream) and the motion analyzer. When a motion event ends, the analyzer pulls the complete event from the buffer and hands it to the warm writer, which persists it to disk right away. Segments aging out of the buffer are simply freed.
 
 ```mermaid
 flowchart LR
   HotBuffer[("Hot Buffer (10m)")] -->|HLS| Clients
-  HotBuffer -.->|evicted| WW[("Warm Writer (disk)")]
   HotBuffer -->|keyframes| MA["Motion Analyzer"] --> MS[("Motion Store")]
   MA -->|Ollama| OD["Object Detection"] --> DS[("Detection Store")]
-  WW -.- MS
-  WW -.- DS
+  MA -->|finished events| WW[("Warm Writer (disk)")]
 ```
 
 Clients can stream the raw segments from the buffer directly, the only thing we need to do is to serve a playlist.m3u8 which is a simple text file to the player. Object Detection is heavy on the CPU (or GPU) so most "detections" are filtered in the Motion Analyzer stage.
@@ -67,9 +65,10 @@ We are still running in RAM, our 10 minute video buffer and some metadata stored
 
 ```mermaid
 flowchart LR
-  HotBuffer[("Hot Buffer (10m)")] -.->|evicted| WarmWriter["Warm Writer"]
-  MS[("Motion Store")] --> WarmWriter
-  DS[("Detection Store")] --> WarmWriter
+  HotBuffer[("Hot Buffer (10m)")] -->|segments| MA["Motion Analyzer"]
+  MS[("Motion Store")] --> MA
+  DS[("Detection Store")] --> MA
+  MA -->|event end| WarmWriter["Warm Writer"]
   WarmWriter --> DiskMovements
   WarmWriter --> DiskObjects
   WarmWriter --> Metadata
@@ -86,7 +85,7 @@ flowchart LR
   Prune -.-> Disc
 ```
 
-As segments age out of the hot buffer, the warm writer checks the motion and detection stores to decide what to keep. Events are written to disk with padding before and after motion for context. The writer also saves metadata and thumbnails that is used by the web UI. User can stream saved video events via HLS.
+The moment a motion run ends (post-padding elapsed), the analyzer assembles the complete event — pre-padding, motion, and post-padding pulled straight from the hot buffer, plus metadata from the motion and detection stores — and hands it to the warm writer, which persists it to disk immediately. This way an event only stays at risk in RAM for seconds after it ends, not until its segments age out of the buffer. The writer also saves metadata and thumbnails that is used by the web UI. User can stream saved video events via HLS.
 
 ## Quick Start
 
@@ -165,7 +164,8 @@ model = "gemma4:e4b"
 # model = "gemma3:4b"
 
 [storage]
-# Enable warm storage — flush motion events to disk (default: true)
+# Enable warm storage — write motion events to disk as they end (default: true)
+# Requires analytics to be enabled; without it, no events are recorded
 enabled = true
 # Directory for event files (default: /var/camon/storage)
 data_dir = "/var/camon/storage"

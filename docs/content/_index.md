@@ -4,11 +4,11 @@ title = "Camon"
 
 ## Storage Tiers
 
-Video is stored across three tiers. Hot and warm tiers store data as-is from the camera (H.264 passthrough) for performance — no transcoding overhead. Hot storage keeps ~10 minutes in RAM at full quality (1080p @ 30fps) for live playback, scrollback, and real-time analysis while minimizing disk writes. Warm storage flushes footage to disk for up to 2 days. Cold storage transcodes to lower resolution (480p @ 5fps) for long-term archival only (weeks–months).
+Video is stored across three tiers. Hot and warm tiers store data as-is from the camera (H.264 passthrough) for performance — no transcoding overhead. Hot storage keeps ~10 minutes in RAM at full quality (1080p @ 30fps) for live playback, scrollback, and real-time analysis while minimizing disk writes. Warm storage keeps motion events on disk for up to 2 days. Cold storage transcodes to lower resolution (480p @ 5fps) for long-term archival only (weeks–months).
 
-Hot flushes to warm in GOP-aligned segments (keyframe to keyframe). Motion-triggered events are written with configurable pre-padding (default 5s) and post-padding (default 10s) to capture context around the event. Typical GOP is 1-2 seconds (~750KB–1.5MB at 6 Mbps), though this depends on camera settings.
+Warm events are assembled from GOP-aligned segments (keyframe to keyframe) and written to disk the moment their motion run ends, with configurable pre-padding (default 5s) and post-padding (default 10s) to capture context around the event — an event is only at risk in RAM for seconds after it ends, not for the lifetime of the hot buffer. Typical GOP is 1-2 seconds (~750KB–1.5MB at 6 Mbps), though this depends on camera settings.
 
-When object detection identifies a person or vehicle, the system reaches back into the hot buffer to save preceding context (e.g., T-30s to T+10s), capturing what led up to the event.
+When a motion event ends, the system reaches back into the hot buffer for the preceding context (pre-padding before the first motion), capturing what led up to the event.
 
 Access is abstracted behind a unified interface — consumers request video by time offset, and the system transparently serves from the appropriate tier.
 
