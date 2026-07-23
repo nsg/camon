@@ -10,6 +10,7 @@ mod buffer;
 mod camera;
 mod config;
 mod install;
+mod locks;
 mod storage;
 mod update;
 
@@ -19,6 +20,7 @@ use buffer::warm::WarmWriter;
 use buffer::HotBuffer;
 use camera::FfmpegPipeline;
 use config::Config;
+use locks::LockExt;
 use storage::{DetectionDebugStore, DetectionStore, MotionStore, WarmEventIndex};
 
 fn dispatch_subcommand() -> bool {
@@ -176,7 +178,7 @@ fn spawn_cameras(ctx: &SpawnContext, cameras: Vec<config::CameraConfig>) -> Came
 
         if ctx.config.storage.enabled {
             let (tx, rx) = tokio::sync::mpsc::channel(64);
-            buffer.write().unwrap().set_eviction_sender(tx);
+            buffer.write_recover().set_eviction_sender(tx);
             let writer = WarmWriter::new(
                 rx,
                 ctx.motion_store.clone(),
@@ -262,9 +264,7 @@ async fn graceful_shutdown(handles: CameraHandles, warm_handles: Vec<tokio::task
     }
 
     for (_, buffer) in &buffers_with_ids {
-        if let Ok(mut buf) = buffer.write() {
-            buf.close_eviction_channel();
-        }
+        buffer.write_recover().close_eviction_channel();
     }
 
     for handle in warm_handles {
@@ -272,14 +272,13 @@ async fn graceful_shutdown(handles: CameraHandles, warm_handles: Vec<tokio::task
     }
 
     for (camera_id, buffer) in buffers_with_ids {
-        if let Ok(buf) = buffer.read() {
-            tracing::info!(
-                camera = %camera_id,
-                segments = buf.segment_count(),
-                duration_secs = format!("{:.1}", buf.current_duration_secs()),
-                "final buffer stats"
-            );
-        }
+        let buf = buffer.read_recover();
+        tracing::info!(
+            camera = %camera_id,
+            segments = buf.segment_count(),
+            duration_secs = format!("{:.1}", buf.current_duration_secs()),
+            "final buffer stats"
+        );
     }
 }
 
@@ -395,14 +394,13 @@ async fn run_camera(
         let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(30));
         while !shutdown_clone.load(Ordering::Relaxed) {
             interval.tick().await;
-            if let Ok(buf) = buffer_ref.read() {
-                tracing::info!(
-                    camera = %camera_id_clone,
-                    segments = buf.segment_count(),
-                    duration_secs = format!("{:.1}", buf.current_duration_secs()),
-                    "buffer stats"
-                );
-            }
+            let buf = buffer_ref.read_recover();
+            tracing::info!(
+                camera = %camera_id_clone,
+                segments = buf.segment_count(),
+                duration_secs = format!("{:.1}", buf.current_duration_secs()),
+                "buffer stats"
+            );
         }
     });
 

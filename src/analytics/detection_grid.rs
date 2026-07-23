@@ -5,6 +5,8 @@ use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 
+use crate::locks::LockExt;
+
 const GRID_COLS: usize = 16;
 const GRID_ROWS: usize = 12;
 const GRID_SIZE: usize = GRID_COLS * GRID_ROWS;
@@ -103,7 +105,7 @@ impl DetectionGrid {
             None => return true,
         };
 
-        let mut state = lock.write().unwrap();
+        let mut state = lock.write_recover();
         let class_grid = state
             .grid
             .classes
@@ -140,7 +142,7 @@ impl DetectionGrid {
             None => return,
         };
 
-        let mut state = lock.write().unwrap();
+        let mut state = lock.write_recover();
         let elapsed = state.last_decay.elapsed();
         if elapsed.as_secs() < DECAY_INTERVAL_SECS {
             return;
@@ -159,7 +161,7 @@ impl DetectionGrid {
     /// Get grid state for the API.
     pub fn get_grid(&self, camera_id: &str) -> Option<GridResponse> {
         let lock = self.cameras.get(camera_id)?;
-        let state = lock.read().unwrap();
+        let state = lock.read_recover();
         let classes: HashMap<String, Vec<f32>> = state
             .grid
             .classes
@@ -180,7 +182,7 @@ impl DetectionGrid {
             Some(l) => l,
             None => return,
         };
-        let state = lock.read().unwrap();
+        let state = lock.read_recover();
         let path = self.grid_path(camera_id);
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
@@ -312,7 +314,7 @@ mod tests {
         // Force the last_decay timestamp back to trigger decay
         {
             let lock = grid.cameras.get("cam1").unwrap();
-            let mut state = lock.write().unwrap();
+            let mut state = lock.write_recover();
             state.last_decay = Instant::now() - std::time::Duration::from_secs(120);
         }
 
@@ -335,7 +337,7 @@ mod tests {
         // Force a very long elapsed time
         {
             let lock = grid.cameras.get("cam1").unwrap();
-            let mut state = lock.write().unwrap();
+            let mut state = lock.write_recover();
             state.last_decay = Instant::now() - std::time::Duration::from_secs(86400);
         }
         grid.decay("cam1");
@@ -388,7 +390,7 @@ mod tests {
         // Force long elapsed time and decay
         {
             let lock = grid.cameras.get("cam1").unwrap();
-            let mut state = lock.write().unwrap();
+            let mut state = lock.write_recover();
             state.last_decay = Instant::now() - std::time::Duration::from_secs(86400);
         }
         grid.decay("cam1");

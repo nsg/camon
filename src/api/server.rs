@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::analytics::detection_grid::DetectionGrid;
 use crate::buffer::HotBuffer;
+use crate::locks::LockExt;
 use crate::storage::{DetectionDebugStore, DetectionStore, MotionStore, WarmEventIndex};
 
 use super::hls;
@@ -204,17 +205,15 @@ async fn playlist_handler(
         None
     };
     match state.buffers.get(&id) {
-        Some(buffer) => match buffer.read() {
-            Ok(buf) => {
-                let playlist = hls::generate_playlist(&buf, tail_count);
-                (
-                    [(header::CONTENT_TYPE, "application/vnd.apple.mpegurl")],
-                    playlist,
-                )
-                    .into_response()
-            }
-            Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "buffer lock error").into_response(),
-        },
+        Some(buffer) => {
+            let buf = buffer.read_recover();
+            let playlist = hls::generate_playlist(&buf, tail_count);
+            (
+                [(header::CONTENT_TYPE, "application/vnd.apple.mpegurl")],
+                playlist,
+            )
+                .into_response()
+        }
         None => (StatusCode::NOT_FOUND, "camera not found").into_response(),
     }
 }
@@ -224,13 +223,13 @@ async fn segment_handler(
     Path((id, n)): Path<(String, u64)>,
 ) -> Response {
     match state.buffers.get(&id) {
-        Some(buffer) => match buffer.read() {
-            Ok(buf) => match hls::generate_segment(&buf, n) {
+        Some(buffer) => {
+            let buf = buffer.read_recover();
+            match hls::generate_segment(&buf, n) {
                 Some(data) => ([(header::CONTENT_TYPE, "video/mp2t")], data).into_response(),
                 None => (StatusCode::NOT_FOUND, "segment not found").into_response(),
-            },
-            Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "buffer lock error").into_response(),
-        },
+            }
+        }
         None => (StatusCode::NOT_FOUND, "camera not found").into_response(),
     }
 }
@@ -255,9 +254,7 @@ fn read_buffer_context<'a>(
         .buffers
         .get(id)
         .ok_or_else(|| (StatusCode::NOT_FOUND, "camera not found").into_response())?;
-    let buf = buffer
-        .read()
-        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "buffer lock error").into_response())?;
+    let buf = buffer.read_recover();
     let ctx = BufferContext {
         first_sequence: buf.first_sequence(),
         total_duration: buf.total_duration_ns() as f64 / 1_000_000_000.0,

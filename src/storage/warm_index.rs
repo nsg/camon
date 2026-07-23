@@ -2,6 +2,8 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
+use crate::locks::LockExt;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EventType {
     Movement,
@@ -136,7 +138,7 @@ impl WarmEventIndex {
         for (camera_id, lock) in self.cameras.iter() {
             let entries = self.scan_camera(camera_id);
             let count = entries.len();
-            *lock.write().unwrap() = entries;
+            *lock.write_recover() = entries;
             total_events += count;
             if count > 0 {
                 tracing::info!(camera = %camera_id, events = count, "scanned warm events");
@@ -199,7 +201,7 @@ impl WarmEventIndex {
 
     pub fn insert(&self, camera_id: &str, entry: WarmEventEntry) {
         if let Some(lock) = self.cameras.get(camera_id) {
-            let mut entries = lock.write().unwrap();
+            let mut entries = lock.write_recover();
             let pos = entries
                 .binary_search_by_key(&entry.start_pts_ns, |e| e.start_pts_ns)
                 .unwrap_or_else(|p| p);
@@ -210,7 +212,7 @@ impl WarmEventIndex {
     pub fn query(&self, camera_id: &str, from_ns: u64, to_ns: u64) -> Vec<WarmEventEntry> {
         match self.cameras.get(camera_id) {
             Some(lock) => {
-                let entries = lock.read().unwrap();
+                let entries = lock.read_recover();
                 let start = entries.partition_point(|e| {
                     e.start_pts_ns + (e.duration_ms as u64) * 1_000_000 < from_ns
                 });
@@ -223,7 +225,7 @@ impl WarmEventIndex {
 
     pub fn find_event(&self, camera_id: &str, start_pts_ns: u64) -> Option<WarmEventEntry> {
         let lock = self.cameras.get(camera_id)?;
-        let entries = lock.read().unwrap();
+        let entries = lock.read_recover();
         entries
             .binary_search_by_key(&start_pts_ns, |e| e.start_pts_ns)
             .ok()
@@ -246,7 +248,7 @@ impl WarmEventIndex {
 
         for (camera_id, lock) in self.cameras.iter() {
             let expired: Vec<WarmEventEntry> = {
-                let entries = lock.read().unwrap();
+                let entries = lock.read_recover();
                 entries
                     .iter()
                     .filter(|e| {
@@ -294,7 +296,7 @@ impl WarmEventIndex {
             {
                 let cutoff_movement = now_ns.saturating_sub(movement_max_age_ns);
                 let cutoff_object = now_ns.saturating_sub(object_max_age_ns);
-                let mut entries = lock.write().unwrap();
+                let mut entries = lock.write_recover();
                 entries.retain(|e| match e.event_type {
                     EventType::Movement => e.start_pts_ns >= cutoff_movement,
                     EventType::Object => e.start_pts_ns >= cutoff_object,

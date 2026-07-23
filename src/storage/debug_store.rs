@@ -3,6 +3,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::locks::LockExt;
+
 const MAX_ENTRIES: usize = 50;
 
 pub struct DebugEntry {
@@ -65,7 +67,7 @@ impl DetectionDebugStore {
         ollama_rects: Vec<(String, f32, f32, f32, f32)>,
     ) {
         if let Some(lock) = self.cameras.get(camera_id) {
-            let mut entries = lock.write().unwrap();
+            let mut entries = lock.write_recover();
             let id = self.next_id.fetch_add(1, Ordering::Relaxed);
             let timestamp = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -92,7 +94,7 @@ impl DetectionDebugStore {
     pub fn list(&self, camera_id: &str) -> Vec<DebugSnapshot> {
         match self.cameras.get(camera_id) {
             Some(lock) => {
-                let entries = lock.read().unwrap();
+                let entries = lock.read_recover();
                 entries
                     .iter()
                     .map(|e| DebugSnapshot {
@@ -115,7 +117,7 @@ impl DetectionDebugStore {
 
     pub fn get_full_frame_jpeg(&self, camera_id: &str, id: u64) -> Option<Vec<u8>> {
         self.cameras.get(camera_id).and_then(|lock| {
-            let entries = lock.read().unwrap();
+            let entries = lock.read_recover();
             entries
                 .iter()
                 .find(|e| e.id == id)
@@ -125,7 +127,7 @@ impl DetectionDebugStore {
 
     pub fn get_frame_jpeg(&self, camera_id: &str, id: u64, frame_index: usize) -> Option<Vec<u8>> {
         self.cameras.get(camera_id).and_then(|lock| {
-            let entries = lock.read().unwrap();
+            let entries = lock.read_recover();
             entries
                 .iter()
                 .find(|e| e.id == id)

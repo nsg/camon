@@ -12,6 +12,7 @@ use opencv::prelude::*;
 use crate::analytics::detection_grid::DetectionGrid;
 use crate::buffer::HotBuffer;
 use crate::config::AnalyticsConfig;
+use crate::locks::LockExt;
 use crate::storage::{
     DetectionDebugStore, DetectionEntry, DetectionStore, MotionEntry, MotionStore,
 };
@@ -248,7 +249,7 @@ impl MotionAnalyzer {
 
     fn process_new_segments(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let (first_seq, last_seq) = {
-            let buffer = self.buffer.read().map_err(|_| "buffer lock poisoned")?;
+            let buffer = self.buffer.read_recover();
             (buffer.first_sequence(), buffer.last_sequence())
         };
 
@@ -291,7 +292,7 @@ impl MotionAnalyzer {
         let mut segments = Vec::new();
         for seq in self.last_processed..last_seq {
             let segment = {
-                let buffer = self.buffer.read().map_err(|_| "buffer lock poisoned")?;
+                let buffer = self.buffer.read_recover();
                 buffer.get_segment_by_sequence(seq).map(|s| PendingSegment {
                     seq,
                     data: s.data.clone(),
@@ -531,20 +532,19 @@ impl MotionAnalyzer {
         // Feed preceding segments to prime the decoder (no crop — not motion-positive)
         let first_seq = run[0].seq;
         if first_seq >= 3 {
-            if let Ok(buffer) = self.buffer.read() {
-                for prime_seq in (first_seq - 3)..first_seq {
-                    if let Some(seg) = buffer.get_segment_by_sequence(prime_seq) {
-                        let before = all_frames.len();
-                        decode_to_mats_tagged(
-                            crop_decoder,
-                            &seg.data,
-                            seg.duration_ns,
-                            height,
-                            None,
-                            &mut all_frames,
-                        );
-                        let _ = before; // priming frames have None crop
-                    }
+            let buffer = self.buffer.read_recover();
+            for prime_seq in (first_seq - 3)..first_seq {
+                if let Some(seg) = buffer.get_segment_by_sequence(prime_seq) {
+                    let before = all_frames.len();
+                    decode_to_mats_tagged(
+                        crop_decoder,
+                        &seg.data,
+                        seg.duration_ns,
+                        height,
+                        None,
+                        &mut all_frames,
+                    );
+                    let _ = before; // priming frames have None crop
                 }
             }
         }

@@ -2,6 +2,8 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
+use crate::locks::LockExt;
+
 type FilmstripMap = HashMap<u64, Arc<Vec<Vec<u8>>>>;
 
 pub struct DetectionEntry {
@@ -52,7 +54,7 @@ impl DetectionStore {
     pub fn insert(&self, camera_id: &str, entry: DetectionEntry) -> u64 {
         let id = entry.id;
         if let Some(lock) = self.cameras.get(camera_id) {
-            lock.write().unwrap().push_back(entry);
+            lock.write_recover().push_back(entry);
         }
         id
     }
@@ -63,20 +65,20 @@ impl DetectionStore {
 
     pub fn insert_filmstrip(&self, camera_id: &str, sequence: u64, frames: Arc<Vec<Vec<u8>>>) {
         if let Some(lock) = self.filmstrips.get(camera_id) {
-            lock.write().unwrap().insert(sequence, frames);
+            lock.write_recover().insert(sequence, frames);
         }
     }
 
     pub fn get_filmstrip(&self, camera_id: &str, sequence: u64) -> Option<Arc<Vec<Vec<u8>>>> {
         let lock = self.filmstrips.get(camera_id)?;
-        let map = lock.read().unwrap();
+        let map = lock.read_recover();
         map.get(&sequence).cloned()
     }
 
     pub fn get_detections(&self, camera_id: &str) -> Vec<DetectionSnapshot> {
         match self.cameras.get(camera_id) {
             Some(lock) => {
-                let entries = lock.read().unwrap();
+                let entries = lock.read_recover();
                 entries
                     .iter()
                     .map(|e| DetectionSnapshot {
@@ -93,7 +95,7 @@ impl DetectionStore {
 
     pub fn get_frame(&self, camera_id: &str, detection_id: u64) -> Option<Vec<u8>> {
         self.cameras.get(camera_id).and_then(|lock| {
-            let entries = lock.read().unwrap();
+            let entries = lock.read_recover();
             entries
                 .iter()
                 .find(|e| e.id == detection_id)
@@ -104,7 +106,7 @@ impl DetectionStore {
     pub fn get_detection_info(&self, camera_id: &str, segment_sequence: u64) -> Vec<DetectionInfo> {
         match self.cameras.get(camera_id) {
             Some(lock) => {
-                let entries = lock.read().unwrap();
+                let entries = lock.read_recover();
                 entries
                     .iter()
                     .filter(|e| e.segment_sequence == segment_sequence)
@@ -122,7 +124,7 @@ impl DetectionStore {
 
     pub fn cleanup(&self, camera_id: &str, min_sequence: u64) {
         if let Some(lock) = self.cameras.get(camera_id) {
-            let mut entries = lock.write().unwrap();
+            let mut entries = lock.write_recover();
             while let Some(front) = entries.front() {
                 if front.segment_sequence < min_sequence {
                     entries.pop_front();
@@ -132,7 +134,7 @@ impl DetectionStore {
             }
         }
         if let Some(lock) = self.filmstrips.get(camera_id) {
-            let mut map = lock.write().unwrap();
+            let mut map = lock.write_recover();
             map.retain(|&seq, _| seq >= min_sequence);
         }
     }

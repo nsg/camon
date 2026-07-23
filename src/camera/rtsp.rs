@@ -8,6 +8,7 @@ use thiserror::Error;
 
 use crate::buffer::{GopSegment, HotBuffer};
 use crate::config::CameraConfig;
+use crate::locks::LockExt;
 
 /// Reconnect if no bytes are read from ffmpeg for this long.
 const DATA_TIMEOUT_SECS: u64 = 30;
@@ -314,9 +315,7 @@ impl MpegTsSegmenter {
             );
             self.prev_media_pts = self.current_media_pts;
             if segment.frame_count > 0 {
-                if let Ok(mut hot) = self.buffer.write() {
-                    hot.push(segment);
-                }
+                self.buffer.write_recover().push(segment);
                 self.last_segment_at = Instant::now();
             }
         }

@@ -2,6 +2,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, RwLock};
 
 use crate::analytics::TunerStats;
+use crate::locks::LockExt;
 
 /// Number of recent motion entries to retain mask JPEGs for
 const MASK_RETAIN_COUNT: usize = 60;
@@ -55,14 +56,14 @@ impl MotionStore {
 
     pub fn insert(&self, camera_id: &str, entry: MotionEntry) {
         if let Some(lock) = self.cameras.get(camera_id) {
-            lock.write().unwrap().push_back(entry);
+            lock.write_recover().push_back(entry);
         }
     }
 
     pub fn get_motion(&self, camera_id: &str) -> Vec<MotionSnapshot> {
         match self.cameras.get(camera_id) {
             Some(lock) => {
-                let entries = lock.read().unwrap();
+                let entries = lock.read_recover();
                 entries
                     .iter()
                     .map(|e| MotionSnapshot {
@@ -78,7 +79,7 @@ impl MotionStore {
 
     pub fn get_mask(&self, camera_id: &str, segment_sequence: u64) -> Option<Vec<u8>> {
         let lock = self.cameras.get(camera_id)?;
-        let entries = lock.read().unwrap();
+        let entries = lock.read_recover();
         entries
             .iter()
             .find(|e| e.segment_sequence == segment_sequence)
@@ -87,7 +88,7 @@ impl MotionStore {
 
     pub fn cleanup(&self, camera_id: &str, min_sequence: u64) {
         if let Some(lock) = self.cameras.get(camera_id) {
-            let mut entries = lock.write().unwrap();
+            let mut entries = lock.write_recover();
             while let Some(front) = entries.front() {
                 if front.segment_sequence < min_sequence {
                     entries.pop_front();
@@ -108,7 +109,7 @@ impl MotionStore {
     pub fn has_motion(&self, camera_id: &str, segment_sequence: u64) -> bool {
         match self.cameras.get(camera_id) {
             Some(lock) => {
-                let entries = lock.read().unwrap();
+                let entries = lock.read_recover();
                 entries
                     .iter()
                     .any(|e| e.segment_sequence == segment_sequence && e.motion_score > 0.0)
@@ -119,75 +120,74 @@ impl MotionStore {
 
     pub fn set_stability_map(&self, camera_id: &str, jpeg: Vec<u8>) {
         if let Some(lock) = self.stability_maps.get(camera_id) {
-            *lock.write().unwrap() = Some(jpeg);
+            *lock.write_recover() = Some(jpeg);
         }
     }
 
     pub fn get_stability_map(&self, camera_id: &str) -> Option<Vec<u8>> {
         let lock = self.stability_maps.get(camera_id)?;
-        lock.read().unwrap().clone()
+        lock.read_recover().clone()
     }
 
     pub fn set_background_map(&self, camera_id: &str, jpeg: Vec<u8>) {
         if let Some(lock) = self.background_maps.get(camera_id) {
-            *lock.write().unwrap() = Some(jpeg);
+            *lock.write_recover() = Some(jpeg);
         }
     }
 
     pub fn get_background_map(&self, camera_id: &str) -> Option<Vec<u8>> {
         let lock = self.background_maps.get(camera_id)?;
-        lock.read().unwrap().clone()
+        lock.read_recover().clone()
     }
 
     pub fn set_tuner_stats(&self, camera_id: &str, stats: TunerStats) {
         if let Some(lock) = self.tuner_stats.get(camera_id) {
-            *lock.write().unwrap() = Some(stats);
+            *lock.write_recover() = Some(stats);
         }
     }
 
     pub fn get_tuner_stats(&self, camera_id: &str) -> Option<TunerStats> {
         let lock = self.tuner_stats.get(camera_id)?;
-        lock.read().unwrap().clone()
+        lock.read_recover().clone()
     }
 
     pub fn set_raw_mog2_map(&self, camera_id: &str, jpeg: Vec<u8>) {
         if let Some(lock) = self.raw_mog2_maps.get(camera_id) {
-            *lock.write().unwrap() = Some(jpeg);
+            *lock.write_recover() = Some(jpeg);
         }
     }
 
     pub fn get_raw_mog2_map(&self, camera_id: &str) -> Option<Vec<u8>> {
         let lock = self.raw_mog2_maps.get(camera_id)?;
-        lock.read().unwrap().clone()
+        lock.read_recover().clone()
     }
 
     pub fn set_no_shadow_map(&self, camera_id: &str, jpeg: Vec<u8>) {
         if let Some(lock) = self.no_shadow_maps.get(camera_id) {
-            *lock.write().unwrap() = Some(jpeg);
+            *lock.write_recover() = Some(jpeg);
         }
     }
 
     pub fn get_no_shadow_map(&self, camera_id: &str) -> Option<Vec<u8>> {
         let lock = self.no_shadow_maps.get(camera_id)?;
-        lock.read().unwrap().clone()
+        lock.read_recover().clone()
     }
 
     pub fn set_morph_map(&self, camera_id: &str, jpeg: Vec<u8>) {
         if let Some(lock) = self.morph_maps.get(camera_id) {
-            *lock.write().unwrap() = Some(jpeg);
+            *lock.write_recover() = Some(jpeg);
         }
     }
 
     pub fn get_morph_map(&self, camera_id: &str) -> Option<Vec<u8>> {
         let lock = self.morph_maps.get(camera_id)?;
-        lock.read().unwrap().clone()
+        lock.read_recover().clone()
     }
 
     pub fn last_sequence(&self, camera_id: &str) -> Option<u64> {
         self.cameras
             .get(camera_id)?
-            .read()
-            .unwrap()
+            .read_recover()
             .back()
             .map(|e| e.segment_sequence)
     }
