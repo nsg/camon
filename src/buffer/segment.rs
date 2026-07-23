@@ -1,8 +1,11 @@
+use std::sync::Arc;
+
 #[derive(Debug, Clone)]
 pub struct GopSegment {
     pub start_pts: u64,
     pub duration_ns: u64,
-    pub data: Vec<u8>,
+    /// Shared MPEG-TS bytes; cloning a segment only bumps the refcount.
+    pub data: Arc<Vec<u8>>,
     pub frame_count: u32,
 }
 
@@ -11,7 +14,7 @@ impl GopSegment {
         Self {
             start_pts,
             duration_ns: 0,
-            data: Vec::new(),
+            data: Arc::new(Vec::new()),
             frame_count: 0,
         }
     }

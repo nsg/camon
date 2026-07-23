@@ -224,9 +224,16 @@ async fn segment_handler(
 ) -> Response {
     match state.buffers.get(&id) {
         Some(buffer) => {
-            let buf = buffer.read_recover();
-            match hls::generate_segment(&buf, n) {
-                Some(data) => ([(header::CONTENT_TYPE, "video/mp2t")], data).into_response(),
+            // Clone the Arc under the lock; copy bytes for the response only
+            // after the guard is dropped so the ingest thread isn't blocked.
+            let data = {
+                let buf = buffer.read_recover();
+                hls::generate_segment(&buf, n)
+            };
+            match data {
+                Some(data) => {
+                    ([(header::CONTENT_TYPE, "video/mp2t")], (*data).clone()).into_response()
+                }
                 None => (StatusCode::NOT_FOUND, "segment not found").into_response(),
             }
         }

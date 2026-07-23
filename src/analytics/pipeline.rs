@@ -112,13 +112,13 @@ fn crop_mat(frame: &Mat, region: &NormalizedRect) -> Option<Mat> {
 
 struct MotionSegment {
     seq: u64,
-    data: Vec<u8>,
+    data: Arc<Vec<u8>>,
     duration_ns: u64,
 }
 
 struct PendingSegment {
     seq: u64,
-    data: Vec<u8>,
+    data: Arc<Vec<u8>>,
     start_pts: u64,
     duration_ns: u64,
 }
@@ -295,7 +295,7 @@ impl MotionAnalyzer {
                 let buffer = self.buffer.read_recover();
                 buffer.get_segment_by_sequence(seq).map(|s| PendingSegment {
                     seq,
-                    data: s.data.clone(),
+                    data: Arc::clone(&s.data),
                     start_pts: s.start_pts,
                     duration_ns: s.duration_ns,
                 })

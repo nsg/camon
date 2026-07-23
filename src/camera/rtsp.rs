@@ -154,6 +154,9 @@ struct MpegTsSegmenter {
     camera_id: String,
     buffer: Arc<RwLock<HotBuffer>>,
     current_segment: Option<GopSegment>,
+    /// Incremental byte buffer for the in-progress segment; wrapped in an Arc
+    /// once at finalize time so readers share it without copying.
+    current_data: Vec<u8>,
     video_pid: Option<u16>,
     audio_pid: Option<u16>,
     pat_packet: Option<[u8; 188]>,
@@ -171,6 +174,7 @@ impl MpegTsSegmenter {
             camera_id,
             buffer,
             current_segment: None,
+            current_data: Vec::new(),
             video_pid: None,
             audio_pid: None,
             pat_packet: None,
@@ -282,7 +286,7 @@ impl MpegTsSegmenter {
 
         // Append packet to current segment
         if let Some(ref mut segment) = self.current_segment {
-            segment.data.extend_from_slice(packet);
+            self.current_data.extend_from_slice(packet);
             if Some(pid) == self.video_pid {
                 segment.frame_count += 1;
             }
@@ -290,17 +294,17 @@ impl MpegTsSegmenter {
     }
 
     fn start_segment(&mut self, pts_ns: u64) {
-        let mut segment = GopSegment::new(pts_ns);
+        let segment = GopSegment::new(pts_ns);
 
         // Prepend PAT and PMT for segment independence
         // Reset continuity counters to 0 for clean segment start
         if let Some(mut pat) = self.pat_packet {
             pat[3] &= 0xF0; // Reset continuity counter to 0
-            segment.data.extend_from_slice(&pat);
+            self.current_data.extend_from_slice(&pat);
         }
         if let Some(mut pmt) = self.pmt_packet {
             pmt[3] &= 0xF0; // Reset continuity counter to 0
-            segment.data.extend_from_slice(&pmt);
+            self.current_data.extend_from_slice(&pmt);
         }
 
         self.current_segment = Some(segment);
@@ -314,6 +318,8 @@ impl MpegTsSegmenter {
                 self.prev_media_pts,
             );
             self.prev_media_pts = self.current_media_pts;
+            // Wrap the accumulated bytes once; readers share via Arc clone.
+            segment.data = Arc::new(std::mem::take(&mut self.current_data));
             if segment.frame_count > 0 {
                 self.buffer.write_recover().push(segment);
                 self.last_segment_at = Instant::now();

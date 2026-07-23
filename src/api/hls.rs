@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use crate::buffer::HotBuffer;
 
 const NANOS_PER_SEC: f64 = 1_000_000_000.0;
@@ -81,8 +83,30 @@ fn format_datetime(secs: i64, millis: u32) -> String {
     )
 }
 
-pub fn generate_segment(buffer: &HotBuffer, sequence: u64) -> Option<Vec<u8>> {
+pub fn generate_segment(buffer: &HotBuffer, sequence: u64) -> Option<Arc<Vec<u8>>> {
     let segment = buffer.get_segment_by_sequence(sequence)?;
-    // Return raw MPEG-TS data directly - already properly formatted with PAT/PMT
-    Some(segment.data.clone())
+    // Return raw MPEG-TS data directly - already properly formatted with PAT/PMT.
+    // Cloning the Arc shares the bytes, so the read lock drops without a byte copy.
+    Some(Arc::clone(&segment.data))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::buffer::GopSegment;
+
+    #[test]
+    fn generate_segment_shares_bytes_without_copying() {
+        let buffer = HotBuffer::new("cam".to_string(), 60);
+        let mut segment = GopSegment::new(0);
+        segment.data = Arc::new(vec![1, 2, 3, 4]);
+        segment.frame_count = 1;
+        segment.duration_ns = 1_000_000;
+        let stored = Arc::clone(&segment.data);
+        buffer.write().unwrap().push(segment);
+
+        let out = generate_segment(&buffer.read().unwrap(), 0).expect("segment present");
+        assert!(Arc::ptr_eq(&out, &stored));
+        assert_eq!(&*out, &[1, 2, 3, 4]);
+    }
 }
