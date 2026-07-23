@@ -140,7 +140,11 @@ Create a `config.toml` in the working directory. All sections are optional — d
 
 ```toml
 [update]
-# Auto-update from GitHub Releases on startup (default: true)
+# Auto-update from GitHub Releases on startup (default: true).
+# A downloaded binary is checked against the release's sha256sums.txt and
+# rejected on mismatch (corruption protection, not a security guarantee), and
+# must be a valid ELF before it replaces the running binary. Releases published
+# without a sha256sums.txt are applied unverified with a warning.
 enabled = true
 
 [buffer]

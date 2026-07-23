@@ -27,6 +27,7 @@ opencv = { version = "0.98.1", features = ["clang-runtime"] }
 reqwest = { version = "0.13.1", features = ["rustls-native-certs", "json"] }
 libc = "0.2"
 base64 = "0.22.1"
+sha2 = "0.10"
 
 [dev-dependencies]
 tempfile = "3.27.0"
