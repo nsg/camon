@@ -33,5 +33,11 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Run clippy
+        run: cargo clippy --all-targets -- -D warnings
+
       - name: Run tests
         run: cargo test
