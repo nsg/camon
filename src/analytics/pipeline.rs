@@ -19,7 +19,7 @@ use crate::storage::{
 };
 
 use super::decoder::{CropDecoder, FrameDecoder};
-use super::motion::MotionDetector;
+use super::motion::{MotionBox, MotionDetector};
 use super::ollama::{DetectResult, Detection, OllamaDetector};
 use super::run_tracker::{ClosedRun, RunTracker};
 
@@ -41,7 +41,7 @@ struct NormalizedRect {
     h: f32,
 }
 
-fn normalize_rect(r: Rect, frame_w: i32, frame_h: i32) -> NormalizedRect {
+fn normalize_rect(r: MotionBox, frame_w: i32, frame_h: i32) -> NormalizedRect {
     NormalizedRect {
         x: r.x as f32 / frame_w as f32,
         y: r.y as f32 / frame_h as f32,
@@ -178,7 +178,7 @@ pub struct MotionAnalyzer {
 
 impl MotionAnalyzer {
     fn new(ctx: AnalyzerContext) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        let detector = MotionDetector::new(&ctx.camera_id, &ctx.data_dir)?;
+        let detector = MotionDetector::new(&ctx.camera_id, &ctx.data_dir);
         let decoder = FrameDecoder::new()?;
 
         let last_processed = ctx
@@ -276,9 +276,7 @@ impl MotionAnalyzer {
         let segments = self.collect_pending_segments(last_seq)?;
         let (motion_segments, closed_runs) = self.run_motion_analysis(segments)?;
 
-        if let Err(e) = self.detector.maybe_tune() {
-            tracing::warn!(camera = %self.camera_id, error = %e, "tuner update failed");
-        }
+        self.detector.maybe_tune();
         if let Some(ref grid) = self.detection_grid {
             grid.decay(&self.camera_id);
         }
@@ -482,20 +480,30 @@ impl MotionAnalyzer {
         }
     }
 
+    /// Publish the detector's pipeline-stage views for the debug UI:
+    /// - stability: final motion mask (after opening + area filter)
+    /// - raw: raw MOG2 foreground mask
+    /// - no-shadow: alias of raw (the pure-Rust detector has no shadow class;
+    ///   the stage name is kept so the API/UI stay stable)
+    /// - morph: after morphological opening
+    /// - background: the learned MOG2 background model
     fn publish_debug_maps(&mut self) {
-        if let Some(jpeg) = self.detector.stability_map_jpeg() {
+        if let Some(jpeg) = self.detector.fg_mask().and_then(gray_jpeg) {
             self.motion_store.set_stability_map(&self.camera_id, jpeg);
         }
-        if let Some(jpeg) = self.detector.background_jpeg() {
-            self.motion_store.set_background_map(&self.camera_id, jpeg);
+        let mut bg = Vec::new();
+        if let Some((w, h)) = self.detector.background_into(&mut bg) {
+            if let Some(jpeg) = gray_jpeg((&bg, w, h)) {
+                self.motion_store.set_background_map(&self.camera_id, jpeg);
+            }
         }
-        if let Some(jpeg) = self.detector.raw_mog2_mask_jpeg() {
+        if let Some(jpeg) = self.detector.raw_mask().and_then(gray_jpeg) {
             self.motion_store.set_raw_mog2_map(&self.camera_id, jpeg);
         }
-        if let Some(jpeg) = self.detector.no_shadow_mask_jpeg() {
+        if let Some(jpeg) = self.detector.no_shadow_mask().and_then(gray_jpeg) {
             self.motion_store.set_no_shadow_map(&self.camera_id, jpeg);
         }
-        if let Some(jpeg) = self.detector.morph_mask_jpeg() {
+        if let Some(jpeg) = self.detector.morph_mask().and_then(gray_jpeg) {
             self.motion_store.set_morph_map(&self.camera_id, jpeg);
         }
         self.motion_store
@@ -503,10 +511,10 @@ impl MotionAnalyzer {
     }
 
     fn record_motion(&mut self, seq: u64, start_pts: u64, duration_ns: u64, score: f32) {
-        let bboxes = self.detector.motion_bboxes();
+        let bboxes = self.detector.motion_bboxes().to_vec();
         self.detector
             .report_motion_event(&bboxes, ANALYSIS_WIDTH, ANALYSIS_HEIGHT);
-        let mask_jpeg = self.detector.fg_mask_jpeg();
+        let mask_jpeg = self.detector.fg_mask().and_then(gray_jpeg);
         self.motion_store.insert(
             &self.camera_id,
             MotionEntry {
@@ -545,44 +553,27 @@ impl MotionAnalyzer {
             return Ok((0.0, None, Vec::new(), None));
         }
 
-        let height = self.decoder.height() as i32;
+        let (w, h) = (ANALYSIS_WIDTH as usize, ANALYSIS_HEIGHT as usize);
         let mut total_score = 0.0f32;
         let mut frame_count = 0u32;
         let mut all_rects = Vec::new();
-        let mut last_mat = None;
+        let mut last_frame: Option<&Vec<u8>> = None;
 
         for frame_data in &raw_frames {
-            let mat = Mat::from_slice(frame_data)?;
-            let mat = mat.reshape(1, height)?;
-
-            match self.detector.process_frame(&mat) {
-                Ok(score) => {
-                    total_score += score;
-                    frame_count += 1;
-                    for r in self.detector.motion_bboxes() {
-                        all_rects.push(normalize_rect(r, ANALYSIS_WIDTH, ANALYSIS_HEIGHT));
-                    }
-                    if capture_frame {
-                        last_mat = mat.try_clone().ok();
-                    }
-                }
-                Err(e) => {
-                    tracing::trace!(error = %e, "frame processing error");
-                }
+            let score = self.detector.process_frame(frame_data, w, h);
+            total_score += score;
+            frame_count += 1;
+            for &r in self.detector.motion_bboxes() {
+                all_rects.push(normalize_rect(r, ANALYSIS_WIDTH, ANALYSIS_HEIGHT));
+            }
+            if capture_frame {
+                last_frame = Some(frame_data);
             }
         }
 
         let crop = union_rects_padded(&all_rects, CROP_PADDING);
 
-        if frame_count == 0 {
-            return Ok((0.0, None, Vec::new(), None));
-        }
-
-        let frame_jpeg = if capture_frame {
-            last_mat.and_then(|m| encode_jpeg(&m))
-        } else {
-            None
-        };
+        let frame_jpeg = last_frame.and_then(|f| gray_jpeg((f.as_slice(), w, h)));
 
         Ok((
             total_score / frame_count as f32,
@@ -1009,6 +1000,21 @@ fn encode_jpeg(mat: &Mat) -> Option<Vec<u8>> {
     Some(buf.to_vec())
 }
 
+/// Encode an 8-bit grayscale buffer as JPEG. OpenCV serves purely as the JPEG
+/// encoder here — the motion path itself is pure Rust — and this helper goes
+/// away with the rest of this file's OpenCV usage in the Ollama rework.
+fn gray_jpeg((data, w, h): (&[u8], usize, usize)) -> Option<Vec<u8>> {
+    if h == 0 || data.len() != w * h {
+        return None;
+    }
+    let mat = Mat::from_slice(data).ok()?;
+    let mat = mat.reshape(1, h as i32).ok()?;
+    let mut buf = Vector::<u8>::new();
+    let params = Vector::<i32>::new();
+    imgcodecs::imencode(".jpg", &mat, &mut buf, &params).ok()?;
+    Some(buf.to_vec())
+}
+
 pub fn spawn_analyzer(
     ctx: AnalyzerContext,
     shutdown: Arc<AtomicBool>,
@@ -1028,7 +1034,12 @@ mod tests {
 
     #[test]
     fn normalize_rect_maps_to_unit_coords() {
-        let r = Rect::new(80, 60, 160, 120);
+        let r = MotionBox {
+            x: 80,
+            y: 60,
+            width: 160,
+            height: 120,
+        };
         let n = normalize_rect(r, 320, 240);
         assert!((n.x - 0.25).abs() < 0.01);
         assert!((n.y - 0.25).abs() < 0.01);

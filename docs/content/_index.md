@@ -32,7 +32,7 @@ Each camera has its own hot buffer using a single-producer, multi-consumer (SPMC
 
 ## Analytics Pipeline
 
-Cameras stream H.264 via RTSP into the hot buffer. Frames are sampled at 5fps for analysis. Motion detection (MOG2) produces scores and regions. Zones can be configured with different sensitivity — high sensitivity for doorways, normal for general areas, ignore for trees or busy roads. When motion is detected, object detection via Ollama vision LLM identifies objects from a configurable class list (default: person, car, truck, dog, cat). A 2x2 grid of frames from the motion event is sent to the model for classification. An optional fallback Ollama server can be configured for redundancy. Under heavy load, the pipeline gracefully degrades by reducing sample rate, then auto-recovers when load decreases.
+Cameras stream H.264 via RTSP into the hot buffer. Keyframes are sampled for analysis — with a 1-second GOP that is one frame per second. Motion detection (a built-in pure-Rust MOG2 background subtractor with a ~5 minute background memory, followed by morphological opening and connected-component filtering) produces scores and regions. Zones can be configured with different sensitivity — high sensitivity for doorways, normal for general areas, ignore for trees or busy roads. When motion is detected, object detection via Ollama vision LLM identifies objects from a configurable class list (default: person, car, truck, dog, cat). A 2x2 grid of frames from the motion event is sent to the model for classification. An optional fallback Ollama server can be configured for redundancy. Under heavy load, the pipeline gracefully degrades by reducing sample rate, then auto-recovers when load decreases.
 
 ## API
 

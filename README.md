@@ -40,13 +40,13 @@ flowchart LR
   MA --> MS[("Motion Store")]
 
 subgraph MA["Motion Analyzer"]
-   MOG2["Background Subtraction"] --> Shadow["Shadow Removal"] --> Morph["Morphological Opening"] --> Contour["Contour Filtering"]
+   MOG2["Background Subtraction"] --> Morph["Morphological Opening"] --> Components["Component Filtering"]
 end
 ```
 
-To make decoding as lightweight as possible, we only extract keyframes because they are self-contained and do not depend on surrounding frames. This also has the added bonus of reducing the framerate.
+To make decoding as lightweight as possible, we only extract keyframes because they are self-contained and do not depend on surrounding frames. With a 1-second GOP this means the analyzer effectively samples one frame per second.
 
-The Motion Analyzer uses OpenCV's MOG2 (Mixture of Gaussians) background subtractor to detect foreground motion, followed by shadow removal, morphological opening to eliminate noise, and contour filtering to discard small blobs. Several of these parameters are tuned automatically based on the camera's noise level to find an equilibrium between sensitivity and noise suppression.
+The Motion Analyzer uses a built-in pure-Rust implementation of the Zivkovic MOG2 (Mixture of Gaussians) background subtractor — validated bit-exact against OpenCV's — to detect foreground motion, followed by morphological opening to eliminate noise and connected-component filtering to discard small blobs. The background model spans about 5 minutes at the 1 fps analysis rate, so persistent motion like tree sway gets absorbed into the background. Several of these parameters are tuned automatically based on the camera's noise level to find an equilibrium between sensitivity and noise suppression.
 
 ```mermaid
 flowchart LR
@@ -231,9 +231,9 @@ url = "rtsp://admin:password@192.168.1.100:554/stream1"
 | `GET` | `/api/stream/{id}/segment/{n}` | Live HLS segment |
 | `GET` | `/api/cameras/{id}/motion` | Motion segments with timestamps |
 | `GET` | `/api/cameras/{id}/motion/{seq}/mask` | JPEG motion mask for a segment |
-| `GET` | `/api/cameras/{id}/motion/stability` | JPEG motion foreground mask |
-| `GET` | `/api/cameras/{id}/motion/stability/raw` | JPEG raw MOG2 output (with shadows) |
-| `GET` | `/api/cameras/{id}/motion/stability/no-shadow` | JPEG after shadow removal |
+| `GET` | `/api/cameras/{id}/motion/stability` | JPEG final motion mask (after component filtering) |
+| `GET` | `/api/cameras/{id}/motion/stability/raw` | JPEG raw MOG2 foreground mask |
+| `GET` | `/api/cameras/{id}/motion/stability/no-shadow` | JPEG alias of the raw mask (shadow stage removed) |
 | `GET` | `/api/cameras/{id}/motion/stability/morph` | JPEG after morphological opening |
 | `GET` | `/api/cameras/{id}/motion/background` | JPEG learned background model |
 | `GET` | `/api/cameras/{id}/motion/tuner` | Adaptive tuner stats (JSON) |

@@ -1,21 +1,24 @@
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use opencv::{
-    core::{Mat, Rect, Size, Vector, BORDER_CONSTANT},
-    imgcodecs, imgproc,
-    prelude::*,
-    video::{self, BackgroundSubtractorTrait},
-    Result as CvResult,
-};
+use super::ccl::{Component, ConnectedComponents};
+use super::mog2::Mog2;
+use super::morph::{self, StructuringElement};
 
-const WARMUP_FRAMES: u32 = 100;
+// The analyzer decodes keyframes only, and both production cameras emit a 1 s
+// GOP (measured 2026-07-23 with ffprobe: keyframes at exactly 1.000 s
+// intervals), so the effective sample rate of this detector is 1 frame per
+// second. All time constants below are scaled for 1 fps.
+
+// Frames to suppress after startup or a scene change while the background
+// model warms up. ~10 seconds at 1 fps.
+const WARMUP_FRAMES: u32 = 10;
 const SCENE_CHANGE_RATIO: f32 = 0.8;
 
 // MOG2 history: number of frames used to build the background model.
-// At ~30fps, 9000 frames ≈ 5 minutes. Persistent motion (tree sway)
-// gets absorbed into the background model over this window.
-const MOG2_HISTORY: i32 = 9000;
+// At 1 fps, 300 frames ≈ 5 minutes of background memory. Persistent motion
+// (tree sway) gets absorbed into the background model over this window.
+const MOG2_HISTORY: u32 = 300;
 
 // --- Adaptive parameter defaults, bounds, and per-cycle increments ---
 
@@ -23,6 +26,12 @@ const DEFAULT_VAR_THRESHOLD: f64 = 16.0;
 const VAR_THRESHOLD_MAX: f64 = 96.0;
 const VAR_THRESHOLD_INCREMENT: f64 = 4.0;
 
+// Learning rate (alpha) per analyzed frame. While the tuned rate stays at or
+// below the automatic floor of 1/MOG2_HISTORY (≈0.0033), the detector follows
+// OpenCV's auto schedule 1/min(2·t, history) — fast adaptation while the
+// model is young, settling at the 5-minute memory above. The tuner can raise
+// the rate above the floor to absorb persistent noise faster: 0.010 at 1 fps
+// shortens the background memory to ~100 s.
 const DEFAULT_LEARNING_RATE: f64 = 0.003;
 const LEARNING_RATE_MAX: f64 = 0.010;
 const LEARNING_RATE_INCREMENT: f64 = 0.00025;
@@ -33,6 +42,7 @@ const MORPH_KERNEL_INCREMENT: f64 = 0.66;
 
 // On a 320x240 analysis frame a person is ~4000px. Max 2000 leaves a
 // safe margin while filtering out wind/leaf blobs that are a few hundred px.
+// Area is the component's foreground pixel count.
 const DEFAULT_MIN_CONTOUR_AREA: f64 = 200.0;
 const MIN_CONTOUR_AREA_MAX: f64 = 2000.0;
 const MIN_CONTOUR_AREA_INCREMENT: f64 = 50.0;
@@ -54,6 +64,15 @@ const NOISE_EVENTS_PER_HOUR_HIGH: f32 = 10.0;
 // How many consecutive quiet windows (zero noise) before relaxing one step.
 // At 10-min eval windows, 6 windows = 1 hour of silence before relaxing.
 const RELAX_QUIET_WINDOWS: u32 = 6;
+
+/// Axis-aligned bounding box of a motion region, in analysis-frame pixels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MotionBox {
+    pub x: i32,
+    pub y: i32,
+    pub width: i32,
+    pub height: i32,
+}
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct TunerStats {
@@ -423,30 +442,41 @@ impl MotionTuner {
     }
 }
 
+/// Pure-Rust motion detector: Zivkovic MOG2 background subtraction →
+/// morphological opening → connected-component area filtering. Consumes plain
+/// grayscale frames (no OpenCV types anywhere in the motion path).
 pub struct MotionDetector {
-    mog2: opencv::core::Ptr<video::BackgroundSubtractorMOG2>,
-    fg_mask: Mat,
-    cleaned_mask: Mat,
-    morph_kernel: Mat,
+    mog2: Mog2,
     learning_rate: f64,
+    kernel: StructuringElement,
     region_min_contour_areas: [f64; REGION_COUNT],
     frames_since_stable: u32,
     tuner: MotionTuner,
-    raw_mog2_mask: Mat,
-    no_shadow_mask: Mat,
-    morph_mask: Mat,
+
+    width: usize,
+    height: usize,
+    /// Raw MOG2 foreground mask (0/255), refreshed every frame.
+    raw_mask: Vec<u8>,
+    /// After morphological opening. Stale during warmup.
+    morph_mask: Vec<u8>,
+    /// After component area filtering — the final motion mask. Stale during
+    /// warmup.
+    final_mask: Vec<u8>,
+    erode_buf: Vec<u8>,
+    ccl: ConnectedComponents,
+    components: Vec<Component>,
+    retained: Vec<bool>,
+    bboxes: Vec<MotionBox>,
 }
 
 impl MotionDetector {
-    pub fn new(camera_id: &str, data_dir: &Path) -> CvResult<Self> {
+    pub fn new(camera_id: &str, data_dir: &Path) -> Self {
         let tuner = MotionTuner::new(camera_id.to_string(), data_dir);
         let params = &tuner.params;
 
-        let mog2 =
-            video::create_background_subtractor_mog2(MOG2_HISTORY, params.var_threshold, true)?;
-        let fg_mask = Mat::default();
-        let cleaned_mask = Mat::default();
-        let morph_kernel = build_morph_kernel(params.morph_kernel_size())?;
+        let mog2 = Mog2::new(MOG2_HISTORY, params.var_threshold);
+        let kernel = StructuringElement::ellipse(params.morph_kernel_size());
+        let learning_rate = params.learning_rate;
 
         let mut region_areas = [DEFAULT_MIN_CONTOUR_AREA; REGION_COUNT];
         for (i, &v) in params.region_min_contour_areas.iter().enumerate() {
@@ -455,137 +485,129 @@ impl MotionDetector {
             }
         }
 
-        Ok(Self {
+        Self {
             mog2,
-            fg_mask,
-            cleaned_mask,
-            morph_kernel,
-            learning_rate: params.learning_rate,
+            learning_rate,
+            kernel,
             region_min_contour_areas: region_areas,
             frames_since_stable: 0,
             tuner,
-            raw_mog2_mask: Mat::default(),
-            no_shadow_mask: Mat::default(),
-            morph_mask: Mat::default(),
-        })
+            width: 0,
+            height: 0,
+            raw_mask: Vec::new(),
+            morph_mask: Vec::new(),
+            final_mask: Vec::new(),
+            erode_buf: Vec::new(),
+            ccl: ConnectedComponents::new(),
+            components: Vec::new(),
+            retained: Vec::new(),
+            bboxes: Vec::new(),
+        }
     }
 
-    pub fn process_frame(&mut self, frame: &impl opencv::core::ToInputArray) -> CvResult<f32> {
-        BackgroundSubtractorTrait::apply(
-            &mut self.mog2,
-            frame,
-            &mut self.fg_mask,
-            self.learning_rate,
-        )?;
-
-        let total_pixels = self.fg_mask.rows() * self.fg_mask.cols();
-        if total_pixels == 0 {
-            return Ok(0.0);
+    /// Process one grayscale analysis frame (row-major, `width * height`
+    /// bytes) and return the motion score in `0.0..=1.0`
+    /// (foreground ratio × 10, capped).
+    pub fn process_frame(&mut self, gray: &[u8], width: usize, height: usize) -> f32 {
+        let total_pixels = width * height;
+        if total_pixels == 0 || gray.len() < total_pixels {
+            return 0.0;
         }
+        self.width = width;
+        self.height = height;
+
+        let lr = self.effective_learning_rate();
+        self.mog2.apply(gray, width, height, lr, &mut self.raw_mask);
 
         // Raw ratio for scene-change detection (before cleanup).
-        let raw_fg = opencv::core::count_non_zero(&self.fg_mask)? as f32;
-        let raw_ratio = raw_fg / total_pixels as f32;
+        let raw_fg = self.raw_mask.iter().filter(|&&v| v != 0).count();
+        let raw_ratio = raw_fg as f32 / total_pixels as f32;
 
         if raw_ratio >= SCENE_CHANGE_RATIO {
             self.frames_since_stable = 0;
-            return Ok(0.0);
+            self.bboxes.clear();
+            return 0.0;
         }
 
         self.frames_since_stable += 1;
 
         if self.frames_since_stable < WARMUP_FRAMES {
-            return Ok(0.0);
+            self.bboxes.clear();
+            return 0.0;
         }
 
-        // Snapshot: raw MOG2 output (shadows=127, foreground=255).
-        self.raw_mog2_mask = self.fg_mask.clone();
+        // Morphological opening: erode then dilate to remove isolated noise
+        // pixels.
+        morph::open(
+            &self.raw_mask,
+            width,
+            height,
+            &self.kernel,
+            &mut self.erode_buf,
+            &mut self.morph_mask,
+        );
 
-        // MOG2 with shadow detection marks shadows as 127, foreground as 255.
-        // Threshold to keep only true foreground before cleanup.
-        imgproc::threshold(
-            &self.fg_mask.clone(),
-            &mut self.fg_mask,
-            200.0,
-            255.0,
-            imgproc::THRESH_BINARY,
-        )?;
-
-        // Snapshot: after shadow removal (only true foreground remains).
-        self.no_shadow_mask = self.fg_mask.clone();
-
-        // Morphological opening: erode then dilate to remove isolated noise pixels.
-        let anchor = opencv::core::Point::new(-1, -1);
-        imgproc::morphology_ex(
-            &self.fg_mask,
-            &mut self.cleaned_mask,
-            imgproc::MORPH_OPEN,
-            &self.morph_kernel,
-            anchor,
-            1,
-            BORDER_CONSTANT,
-            imgproc::morphology_default_border_value()?,
-        )?;
-
-        // Snapshot: after morphological opening.
-        self.morph_mask = self.cleaned_mask.clone();
-
-        // Contour area filter: zero out blobs smaller than min_contour_area.
-        let mut contours = Vector::<Vector<opencv::core::Point>>::new();
-        imgproc::find_contours(
-            &self.cleaned_mask.clone(),
-            &mut contours,
-            imgproc::RETR_EXTERNAL,
-            imgproc::CHAIN_APPROX_SIMPLE,
-            opencv::core::Point::new(0, 0),
-        )?;
-
-        let frame_w = self.fg_mask.cols();
-        let frame_h = self.fg_mask.rows();
-        let mut motion_mask = Mat::zeros(frame_h, frame_w, opencv::core::CV_8UC1)?.to_mat()?;
-        for i in 0..contours.len() {
-            let contour = contours.get(i)?;
-            let area = imgproc::contour_area(&contour, false)?;
-            let rect = imgproc::bounding_rect(&contour)?;
-            let region = contour_region(&rect, frame_w, frame_h);
-            let threshold = self.region_min_contour_areas[region];
-            if area >= threshold {
-                imgproc::draw_contours(
-                    &mut motion_mask,
-                    &contours,
-                    i as i32,
-                    opencv::core::Scalar::new(255.0, 0.0, 0.0, 0.0),
-                    imgproc::FILLED,
-                    imgproc::LINE_8,
-                    &opencv::core::no_array(),
-                    i32::MAX,
-                    opencv::core::Point::new(0, 0),
-                )?;
+        // Component area filter: drop blobs smaller than the (per-region)
+        // minimum area; keep bounding boxes of what remains.
+        self.ccl
+            .label(&self.morph_mask, width, height, &mut self.components);
+        self.retained.clear();
+        self.retained.resize(self.components.len(), false);
+        self.bboxes.clear();
+        for (i, c) in self.components.iter().enumerate() {
+            let bbox = MotionBox {
+                x: c.min_x as i32,
+                y: c.min_y as i32,
+                width: (c.max_x - c.min_x + 1) as i32,
+                height: (c.max_y - c.min_y + 1) as i32,
+            };
+            let region = contour_region(&bbox, width as i32, height as i32);
+            if f64::from(c.area) >= self.region_min_contour_areas[region] {
+                self.retained[i] = true;
+                self.bboxes.push(bbox);
             }
         }
 
-        // Swap cleaned result into fg_mask so downstream (bbox, debug JPEG) sees it.
-        std::mem::swap(&mut self.fg_mask, &mut motion_mask);
+        self.final_mask.clear();
+        self.final_mask.resize(total_pixels, 0);
+        let mut fg_pixels = 0u32;
+        for (out, &label) in self.final_mask.iter_mut().zip(self.ccl.labels()) {
+            if label != 0 && self.retained[(label - 1) as usize] {
+                *out = 255;
+                fg_pixels += 1;
+            }
+        }
 
-        let fg_pixels = opencv::core::count_non_zero(&self.fg_mask)? as f32;
-        let foreground_ratio = fg_pixels / total_pixels as f32;
+        let foreground_ratio = fg_pixels as f32 / total_pixels as f32;
+        (foreground_ratio * 10.0).min(1.0)
+    }
 
-        Ok((foreground_ratio * 10.0).min(1.0))
+    /// Learning rate for the upcoming frame. OpenCV's auto schedule
+    /// (`1/min(2·t, history)`) acts as a floor so the model initializes
+    /// quickly; a tuned rate above the floor takes over once the model is old
+    /// enough.
+    fn effective_learning_rate(&self) -> f64 {
+        let t = self.mog2.frame_count() + 1;
+        let auto = 1.0 / (2 * t).min(u64::from(MOG2_HISTORY)) as f64;
+        if self.learning_rate > auto {
+            self.learning_rate
+        } else {
+            -1.0 // negative → MOG2 auto schedule
+        }
     }
 
     /// Report a motion event for regions covered by the given bounding boxes
     /// (in analysis-frame pixel coordinates).
-    pub fn report_motion_event(&mut self, bboxes: &[Rect], frame_w: i32, frame_h: i32) {
+    pub fn report_motion_event(&mut self, bboxes: &[MotionBox], frame_w: i32, frame_h: i32) {
         let regions = unique_regions_from_rects(bboxes, frame_w, frame_h);
         self.tuner.record_motion_event(&regions);
     }
 
     /// Evaluate tuner — must be called every analysis cycle regardless of motion.
-    pub fn maybe_tune(&mut self) -> CvResult<()> {
+    pub fn maybe_tune(&mut self) {
         if self.tuner.maybe_tune() {
-            self.apply_tuned_params()?;
+            self.apply_tuned_params();
         }
-        Ok(())
     }
 
     /// An object detection confirmed this motion was real — subtract noise for
@@ -609,105 +631,74 @@ impl MotionDetector {
         }
     }
 
-    fn apply_tuned_params(&mut self) -> CvResult<()> {
+    fn apply_tuned_params(&mut self) {
         let p = &self.tuner.params;
-        self.mog2.set_var_threshold(p.var_threshold)?;
+        self.mog2.set_var_threshold(p.var_threshold);
         self.learning_rate = p.learning_rate;
         for (i, &v) in p.region_min_contour_areas.iter().enumerate() {
             if i < REGION_COUNT {
                 self.region_min_contour_areas[i] = v;
             }
         }
-        self.morph_kernel = build_morph_kernel(p.morph_kernel_size())?;
-        Ok(())
+        self.kernel = StructuringElement::ellipse(p.morph_kernel_size());
     }
 
-    /// Returns the current fg_mask as JPEG — shows what MOG2 considers foreground.
-    pub fn stability_map_jpeg(&self) -> Option<Vec<u8>> {
-        self.fg_mask_jpeg()
-    }
-
-    /// Returns MOG2's learned background model as JPEG.
-    pub fn background_jpeg(&self) -> Option<Vec<u8>> {
-        let mut bg = Mat::default();
-        self.mog2.get_background_image(&mut bg).ok()?;
-        if bg.empty() {
+    fn mask<'a>(&self, data: &'a [u8]) -> Option<(&'a [u8], usize, usize)> {
+        let npixels = self.width * self.height;
+        if npixels == 0 || data.len() != npixels {
             return None;
         }
-        let mut buf = Vector::<u8>::new();
-        let params = Vector::<i32>::new();
-        imgcodecs::imencode(".jpg", &bg, &mut buf, &params).ok()?;
-        Some(buf.to_vec())
+        Some((data, self.width, self.height))
     }
 
-    pub fn fg_mask_jpeg(&self) -> Option<Vec<u8>> {
-        Self::mat_to_jpeg(&self.fg_mask)
+    /// Final motion mask (after opening and component filtering) — what the
+    /// score and bounding boxes are computed from. `None` until the detector
+    /// has processed a frame past warmup.
+    pub fn fg_mask(&self) -> Option<(&[u8], usize, usize)> {
+        self.mask(&self.final_mask)
     }
 
-    /// Raw MOG2 output including shadow pixels.
-    pub fn raw_mog2_mask_jpeg(&self) -> Option<Vec<u8>> {
-        Self::mat_to_jpeg(&self.raw_mog2_mask)
+    /// Raw MOG2 foreground mask, refreshed every frame (including warmup).
+    /// The pure-Rust detector has no shadow class, so this is a plain 0/255
+    /// mask.
+    pub fn raw_mask(&self) -> Option<(&[u8], usize, usize)> {
+        self.mask(&self.raw_mask)
     }
 
-    /// After shadow removal, before morphological cleanup.
-    pub fn no_shadow_mask_jpeg(&self) -> Option<Vec<u8>> {
-        Self::mat_to_jpeg(&self.no_shadow_mask)
+    /// Historical "after shadow removal" stage. Shadow detection is gone
+    /// (chromaticity-based, meaningless on grayscale), so this is now an
+    /// alias for the raw MOG2 mask — kept so the debug API/UI stage names
+    /// stay stable.
+    pub fn no_shadow_mask(&self) -> Option<(&[u8], usize, usize)> {
+        self.raw_mask()
     }
 
-    /// After morphological opening, before contour area filtering.
-    pub fn morph_mask_jpeg(&self) -> Option<Vec<u8>> {
-        Self::mat_to_jpeg(&self.morph_mask)
+    /// Mask after morphological opening, before component area filtering.
+    pub fn morph_mask(&self) -> Option<(&[u8], usize, usize)> {
+        self.mask(&self.morph_mask)
     }
 
-    fn mat_to_jpeg(mat: &Mat) -> Option<Vec<u8>> {
-        if mat.empty() {
-            return None;
-        }
-        let mut buf = Vector::<u8>::new();
-        let params = Vector::<i32>::new();
-        imgcodecs::imencode(".jpg", mat, &mut buf, &params).ok()?;
-        Some(buf.to_vec())
+    /// Render the learned background model into `out`; returns dimensions.
+    pub fn background_into(&self, out: &mut Vec<u8>) -> Option<(usize, usize)> {
+        self.mog2.background_into(out)
     }
 
-    /// Returns bounding rects for ALL contours in the foreground mask.
-    /// The mask is already filtered to min_contour_area by process_frame().
-    pub fn motion_bboxes(&self) -> Vec<Rect> {
-        let mut contours = Vector::<Vector<opencv::core::Point>>::new();
-        if imgproc::find_contours(
-            &self.fg_mask.clone(),
-            &mut contours,
-            imgproc::RETR_EXTERNAL,
-            imgproc::CHAIN_APPROX_SIMPLE,
-            opencv::core::Point::new(0, 0),
-        )
-        .is_err()
-        {
-            return Vec::new();
-        }
+    /// Bounding boxes of the motion components retained by the area filter in
+    /// the last processed frame (empty during warmup / scene change).
+    pub fn motion_bboxes(&self) -> &[MotionBox] {
+        &self.bboxes
+    }
 
-        let mut rects = Vec::new();
-        for i in 0..contours.len() {
-            if let Ok(c) = contours.get(i) {
-                if let Ok(r) = imgproc::bounding_rect(&c) {
-                    if r.width > 0 && r.height > 0 {
-                        rects.push(r);
-                    }
-                }
-            }
-        }
-        rects
+    /// Whether the last frame was fully processed. False during model warmup
+    /// and right after a scene change, while scores are suppressed to 0 and
+    /// the final/morph masks are not refreshed.
+    #[allow(dead_code)] // used through the library crate root (examples/)
+    pub fn is_warmed_up(&self) -> bool {
+        self.frames_since_stable >= WARMUP_FRAMES
     }
 }
 
-fn build_morph_kernel(size: i32) -> CvResult<Mat> {
-    imgproc::get_structuring_element(
-        imgproc::MORPH_ELLIPSE,
-        Size::new(size, size),
-        opencv::core::Point::new(-1, -1),
-    )
-}
-
-fn contour_region(rect: &Rect, frame_w: i32, frame_h: i32) -> usize {
+fn contour_region(rect: &MotionBox, frame_w: i32, frame_h: i32) -> usize {
     let cx = rect.x + rect.width / 2;
     let cy = rect.y + rect.height / 2;
     let col = ((cx as usize) * REGION_COLS / frame_w.max(1) as usize).min(REGION_COLS - 1);
@@ -715,7 +706,7 @@ fn contour_region(rect: &Rect, frame_w: i32, frame_h: i32) -> usize {
     row * REGION_COLS + col
 }
 
-fn unique_regions_from_rects(rects: &[Rect], frame_w: i32, frame_h: i32) -> Vec<usize> {
+fn unique_regions_from_rects(rects: &[MotionBox], frame_w: i32, frame_h: i32) -> Vec<usize> {
     let mut seen = [false; REGION_COUNT];
     let mut result = Vec::new();
     for r in rects {
@@ -980,15 +971,30 @@ mod tests {
     #[test]
     fn contour_region_boundaries() {
         // Top-left corner
-        let r = Rect::new(0, 0, 10, 10);
+        let r = MotionBox {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
         assert_eq!(contour_region(&r, 320, 240), 0);
 
         // Bottom-right corner
-        let r = Rect::new(310, 230, 10, 10);
+        let r = MotionBox {
+            x: 310,
+            y: 230,
+            width: 10,
+            height: 10,
+        };
         assert_eq!(contour_region(&r, 320, 240), REGION_COUNT - 1);
 
         // Center of frame
-        let r = Rect::new(155, 115, 10, 10);
+        let r = MotionBox {
+            x: 155,
+            y: 115,
+            width: 10,
+            height: 10,
+        };
         assert_eq!(contour_region(&r, 320, 240), REGION_COLS + 2); // row 1, col 2
     }
 
@@ -1003,5 +1009,136 @@ mod tests {
         assert_eq!(regions.len(), 2);
         assert_eq!(regions[0], 0);
         assert_eq!(regions[1], REGION_COUNT - 1);
+    }
+
+    // --- End-to-end detector tests on synthetic frames ---
+
+    const W: usize = 320;
+    const H: usize = 240;
+
+    fn detector() -> (tempfile::TempDir, MotionDetector) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let det = MotionDetector::new("test", dir.path());
+        (dir, det)
+    }
+
+    fn static_frame() -> Vec<u8> {
+        vec![60u8; W * H]
+    }
+
+    fn frame_with_blob(x0: usize, y0: usize, size: usize) -> Vec<u8> {
+        let mut f = static_frame();
+        for y in y0..(y0 + size).min(H) {
+            for x in x0..(x0 + size).min(W) {
+                f[y * W + x] = 200;
+            }
+        }
+        f
+    }
+
+    /// Feed enough static frames to get past scene-change reset + warmup.
+    fn warm_up(det: &mut MotionDetector) {
+        let frame = static_frame();
+        // Frame 1 is all-foreground (fresh model) → scene-change reset, then
+        // WARMUP_FRAMES suppressed frames.
+        for _ in 0..(WARMUP_FRAMES as usize + 2) {
+            det.process_frame(&frame, W, H);
+        }
+    }
+
+    #[test]
+    fn detector_suppresses_scores_during_warmup() {
+        let (_dir, mut det) = detector();
+        let frame = static_frame();
+        for _ in 0..=WARMUP_FRAMES {
+            let score = det.process_frame(&frame, W, H);
+            assert_eq!(score, 0.0);
+            assert!(det.motion_bboxes().is_empty());
+        }
+    }
+
+    #[test]
+    fn detector_finds_moving_blob_with_correct_bbox() {
+        let (_dir, mut det) = detector();
+        warm_up(&mut det);
+
+        let score = det.process_frame(&frame_with_blob(100, 80, 24), W, H);
+        assert!(score > 0.0, "24x24 blob must score");
+        let bboxes = det.motion_bboxes();
+        assert_eq!(bboxes.len(), 1, "exactly one component");
+        assert_eq!(
+            bboxes[0],
+            MotionBox {
+                x: 100,
+                y: 80,
+                width: 24,
+                height: 24
+            }
+        );
+    }
+
+    #[test]
+    fn detector_area_filter_drops_small_blobs() {
+        let (_dir, mut det) = detector();
+        warm_up(&mut det);
+
+        // 12x12 = 144 px, < 200 after opening → filtered out.
+        let score = det.process_frame(&frame_with_blob(50, 50, 12), W, H);
+        assert_eq!(score, 0.0);
+        assert!(det.motion_bboxes().is_empty());
+    }
+
+    #[test]
+    fn detector_ignores_salt_noise() {
+        let (_dir, mut det) = detector();
+        warm_up(&mut det);
+
+        let mut frame = static_frame();
+        for i in 0..60 {
+            frame[(i * 1237 + 101) % (W * H)] = 220;
+        }
+        let score = det.process_frame(&frame, W, H);
+        assert_eq!(score, 0.0, "isolated pixels removed by opening");
+    }
+
+    #[test]
+    fn detector_scene_change_restarts_warmup() {
+        let (_dir, mut det) = detector();
+        warm_up(&mut det);
+
+        // Full-frame change → scene change, score 0.
+        let inverted = vec![210u8; W * H];
+        assert_eq!(det.process_frame(&inverted, W, H), 0.0);
+
+        // Back to the old scene: everything below warmup is suppressed, even
+        // an obvious blob.
+        for _ in 0..(WARMUP_FRAMES as usize - 1) {
+            let score = det.process_frame(&frame_with_blob(10, 10, 30), W, H);
+            assert_eq!(score, 0.0, "warmup after scene change");
+        }
+    }
+
+    #[test]
+    fn detector_masks_available_after_processing() {
+        let (_dir, mut det) = detector();
+        assert!(det.fg_mask().is_none());
+        assert!(det.raw_mask().is_none());
+        warm_up(&mut det);
+        det.process_frame(&frame_with_blob(100, 80, 24), W, H);
+
+        let (fg, w, h) = det.fg_mask().unwrap();
+        assert_eq!((w, h), (W, H));
+        // Opening rounds the blob's corners, so slightly under 24x24 pixels.
+        let area = fg.iter().filter(|&&v| v != 0).count();
+        assert!((540..=576).contains(&area), "final mask area {area}");
+        assert!(det.raw_mask().is_some());
+        assert!(det.morph_mask().is_some());
+        assert!(det.no_shadow_mask().is_some());
+
+        let mut bg = Vec::new();
+        let (w, h) = det.background_into(&mut bg).unwrap();
+        assert_eq!((w, h), (W, H));
+        // The background model should still show the static scene value.
+        assert!((bg[0] as i32 - 60).abs() <= 1);
     }
 }

@@ -827,11 +827,12 @@ document.addEventListener('DOMContentLoaded', async () => {
 
         // Paint layers bottom-to-top: each successive stage is a subset,
         // so later layers overwrite earlier ones where they overlap.
-        // Layer 1: Raw MOG2 (red) — largest area, low threshold to include shadow pixels (127)
+        // Layer 1: Raw MOG2 foreground mask (red) — largest area
         if (rawMog2Image) {
             recolorMask(rawMog2Image, w, h, 180, 60, 60, 150, 50);
         }
-        // Layer 2: After shadow removal (orange)
+        // Layer 2: "no-shadow" stage (orange) — now an alias of the raw mask
+        // (the pure-Rust detector has no shadow class), kept for continuity
         if (noShadowImage) {
             recolorMask(noShadowImage, w, h, 220, 140, 0, 160, 128);
         }

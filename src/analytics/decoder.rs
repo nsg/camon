@@ -144,10 +144,6 @@ impl FrameDecoder {
             .map(|c| c.try_wait().ok().flatten().is_none())
             .unwrap_or(false)
     }
-
-    pub fn height(&self) -> u32 {
-        ANALYSIS_HEIGHT
-    }
 }
 
 pub struct CropDecoder {
