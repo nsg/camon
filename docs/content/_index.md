@@ -38,7 +38,7 @@ Vanilla HTML/CSS/JS served from the Rust binary with video playback via Vidstack
 
 ## Error Handling
 
-Camera disconnections are handled with automatic reconnection after a 5-second delay. Cameras operate independently — one disconnecting doesn't affect others. Reconnected cameras resume immediately.
+Camera disconnections are handled with automatic reconnection using exponential backoff (5s, doubling up to a 60s cap, with jitter); the delay resets after a stream stays healthy. A data watchdog reconnects a stream that stops delivering bytes, and a tripwire reconnects one that delivers data but produces no keyframes. Cameras operate independently — one disconnecting doesn't affect others.
 
 ## System Dependencies
 

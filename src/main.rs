@@ -351,6 +351,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Base reconnect delay, and the value backoff resets to after a healthy run.
+const RECONNECT_BASE_SECS: u64 = 5;
+/// Upper bound on the reconnect backoff delay.
+const RECONNECT_MAX_SECS: u64 = 60;
+/// A pipeline run lasting at least this long is considered healthy and resets backoff.
+const HEALTHY_RUN_SECS: u64 = 60;
+
+/// Next delay in the exponential backoff progression (5 -> 10 -> 20 -> 40 -> cap).
+fn next_backoff_secs(current: u64) -> u64 {
+    (current * 2).min(RECONNECT_MAX_SECS)
+}
+
+/// Apply +/-20% jitter to a delay (in ms) using an externally supplied random value.
+fn apply_jitter(base_ms: u64, rand: u64) -> u64 {
+    if base_ms == 0 {
+        return 0;
+    }
+    let span = base_ms / 5; // 20%
+    let offset = (rand % (2 * span + 1)) as i64 - span as i64;
+    (base_ms as i64 + offset).max(0) as u64
+}
+
+/// A random-ish u64 from std only (RandomState is seeded per construction).
+fn jitter_source() -> u64 {
+    use std::collections::hash_map::RandomState;
+    use std::hash::{BuildHasher, Hasher};
+    RandomState::new().build_hasher().finish()
+}
+
 async fn run_camera(
     config: config::CameraConfig,
     buffer: Arc<RwLock<HotBuffer>>,
@@ -377,6 +406,8 @@ async fn run_camera(
         }
     });
 
+    let mut backoff_secs = RECONNECT_BASE_SECS;
+
     while !shutdown.load(Ordering::Relaxed) {
         tracing::info!(camera = %camera_id, url = %config.url, "connecting to camera");
 
@@ -384,15 +415,16 @@ async fn run_camera(
             Ok(p) => p,
             Err(e) => {
                 tracing::error!(camera = %camera_id, "failed to create pipeline: {}", e);
-                tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                tokio::time::sleep(tokio::time::Duration::from_secs(RECONNECT_BASE_SECS)).await;
                 continue;
             }
         };
 
         let shutdown_ref = Arc::clone(&shutdown);
-        let camera_id_ref = camera_id.clone();
 
+        let started = std::time::Instant::now();
         let result = tokio::task::spawn_blocking(move || pipeline.run(&shutdown_ref)).await;
+        let ran_for = started.elapsed();
 
         match result {
             Ok(Ok(())) => {
@@ -410,9 +442,51 @@ async fn run_camera(
             break;
         }
 
-        tracing::info!(camera = %camera_id_ref, "reconnecting in 5 seconds");
-        tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+        // A long healthy run resets the backoff to the base delay.
+        if ran_for >= std::time::Duration::from_secs(HEALTHY_RUN_SECS) {
+            backoff_secs = RECONNECT_BASE_SECS;
+        }
+
+        let delay_ms = apply_jitter(backoff_secs * 1000, jitter_source());
+        tracing::info!(
+            camera = %camera_id,
+            "reconnecting in {:.1} seconds",
+            delay_ms as f64 / 1000.0
+        );
+        tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
+
+        backoff_secs = next_backoff_secs(backoff_secs);
     }
 
     stats_handle.abort();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn backoff_progression_doubles_then_caps() {
+        assert_eq!(next_backoff_secs(5), 10);
+        assert_eq!(next_backoff_secs(10), 20);
+        assert_eq!(next_backoff_secs(20), 40);
+        assert_eq!(next_backoff_secs(40), 60);
+        assert_eq!(next_backoff_secs(60), 60);
+    }
+
+    #[test]
+    fn jitter_stays_within_twenty_percent() {
+        let base_ms = 20_000;
+        let span = base_ms / 5;
+        for rand in [0u64, 1, 7, 12345, u64::MAX] {
+            let out = apply_jitter(base_ms, rand);
+            assert!(out >= base_ms - span, "{out} below lower bound");
+            assert!(out <= base_ms + span, "{out} above upper bound");
+        }
+    }
+
+    #[test]
+    fn jitter_zero_base_is_zero() {
+        assert_eq!(apply_jitter(0, 999), 0);
+    }
 }

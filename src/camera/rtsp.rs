@@ -2,12 +2,17 @@ use std::io::{BufRead, BufReader, Read};
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, RwLock};
-use std::time::SystemTime;
+use std::time::{Duration, Instant, SystemTime};
 
 use thiserror::Error;
 
 use crate::buffer::{GopSegment, HotBuffer};
 use crate::config::CameraConfig;
+
+/// Reconnect if no bytes are read from ffmpeg for this long.
+const DATA_TIMEOUT_SECS: u64 = 30;
+/// Reconnect if bytes are flowing but no segment (keyframe) is produced for this long.
+const NO_SEGMENT_TIMEOUT_SECS: u64 = 60;
 
 #[derive(Debug, Error)]
 pub enum RtspError {
@@ -110,8 +115,21 @@ impl FfmpegPipeline {
         let mut segmenter = MpegTsSegmenter::new(self.camera_id.clone(), Arc::clone(&self.buffer));
         let mut buf = [0u8; 188 * 64];
         let fd = reader.as_raw_fd();
+        let mut last_data = Instant::now();
 
         while !shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+            // Data watchdog: no bytes at all for too long means the stream wedged.
+            if last_data.elapsed() >= Duration::from_secs(DATA_TIMEOUT_SECS) {
+                tracing::warn!(camera = %self.camera_id, "no data from ffmpeg for {DATA_TIMEOUT_SECS}s, reconnecting");
+                return Err(RtspError::FfmpegFailed("data watchdog timeout".to_string()));
+            }
+            // No-segment tripwire: bytes flowing but no keyframe-bounded segment produced.
+            if segmenter.last_segment_at().elapsed() >= Duration::from_secs(NO_SEGMENT_TIMEOUT_SECS)
+            {
+                tracing::error!(camera = %self.camera_id, "data flowing but no keyframes detected for {NO_SEGMENT_TIMEOUT_SECS}s, reconnecting");
+                return Err(RtspError::FfmpegFailed("no segments produced".to_string()));
+            }
+
             // Poll with timeout so we can check the shutdown flag
             if !poll_readable(fd, 500) {
                 continue;
@@ -121,6 +139,7 @@ impl FfmpegPipeline {
                 tracing::warn!(camera = %self.camera_id, "ffmpeg stream ended");
                 return Ok(());
             }
+            last_data = Instant::now();
             segmenter.process(&buf[..n]);
         }
 
@@ -142,6 +161,7 @@ struct MpegTsSegmenter {
     partial_packet: Vec<u8>,
     current_media_pts: Option<u64>,
     prev_media_pts: Option<u64>,
+    last_segment_at: Instant,
 }
 
 impl MpegTsSegmenter {
@@ -158,7 +178,13 @@ impl MpegTsSegmenter {
             partial_packet: Vec::with_capacity(188),
             current_media_pts: None,
             prev_media_pts: None,
+            last_segment_at: Instant::now(),
         }
+    }
+
+    /// When a segment was last actually pushed into the hot buffer.
+    fn last_segment_at(&self) -> Instant {
+        self.last_segment_at
     }
 
     fn process(&mut self, data: &[u8]) {
@@ -291,6 +317,7 @@ impl MpegTsSegmenter {
                 if let Ok(mut hot) = self.buffer.write() {
                     hot.push(segment);
                 }
+                self.last_segment_at = Instant::now();
             }
         }
     }
