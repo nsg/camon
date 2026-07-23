@@ -1,4 +1,4 @@
-use std::io::Read;
+use std::io::{BufRead, BufReader, Read};
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, RwLock};
@@ -40,12 +40,32 @@ impl FfmpegPipeline {
             "failed to capture stdout".to_string(),
         ))?;
 
+        // Drain stderr so the pipe never fills and blocks ffmpeg. Runs on a
+        // plain thread (this fn is inside spawn_blocking, no async runtime) and
+        // exits on EOF when the child is killed/exits below.
+        let stderr_thread = child.stderr.take().map(|stderr| {
+            let camera_id = self.camera_id.clone();
+            std::thread::spawn(move || {
+                let reader = BufReader::new(stderr);
+                for line in reader.lines() {
+                    match line {
+                        Ok(line) => tracing::debug!(camera = %camera_id, "ffmpeg: {}", line),
+                        Err(_) => break,
+                    }
+                }
+            })
+        });
+
         tracing::info!(camera = %self.camera_id, "ffmpeg pipeline started");
 
         let result = self.process_stream(stdout, shutdown);
 
         let _ = child.kill();
         let _ = child.wait();
+
+        if let Some(handle) = stderr_thread {
+            let _ = handle.join();
+        }
 
         result
     }
