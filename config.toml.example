@@ -65,6 +65,14 @@ object_retention_days = 14
 # Retention for continuous-recording chunks in days (default: 1). Kept short by
 # default because continuous recording is ~43 GB/day/camera at 4 Mbps.
 continuous_retention_days = 1
+# Minimum free space (bytes) to keep on the storage filesystem (default:
+# 2147483648 = 2 GiB). Before each event write, if free space is below this,
+# the oldest recordings are emergency-pruned — continuous first, then
+# movements, then objects (cheapest to lose first) — until space recovers.
+# 2 GiB is roughly an hour of footage at 4 Mbps, enough slack for the hourly
+# retention prune to catch up, and keeps the filesystem out of the near-full
+# regime where allocation degrades. 0 disables the guard.
+min_free_bytes = 2147483648
 
 # Camera definitions — add one [[cameras]] block per camera
 

@@ -9,7 +9,7 @@ use super::GopSegment;
 use crate::buffer::HotBuffer;
 use crate::config::WarmConfig;
 use crate::locks::LockExt;
-use crate::storage::warm_index::DetectionDetail;
+use crate::storage::warm_index::{free_space_bytes, should_emergency_prune, DetectionDetail};
 use crate::storage::{DetectionStore, EventType, WarmEventEntry, WarmEventIndex};
 
 const NANOS_PER_MS: u64 = 1_000_000;
@@ -285,6 +285,10 @@ pub struct WarmWriter {
     movement_retention_ns: u64,
     object_retention_ns: u64,
     continuous_retention_ns: u64,
+    /// Low-space guard threshold: before each event write, if the storage
+    /// filesystem has less free space than this, the oldest events are
+    /// emergency-pruned first. 0 disables the guard.
+    min_free_bytes: u64,
 }
 
 const PRUNE_INTERVAL_SECS: u64 = 3600;
@@ -305,6 +309,7 @@ impl WarmWriter {
             movement_retention_ns: warm_config.movement_retention_days * 86400 * NANOS_PER_SEC,
             object_retention_ns: warm_config.object_retention_days * 86400 * NANOS_PER_SEC,
             continuous_retention_ns: warm_config.continuous_retention_days * 86400 * NANOS_PER_SEC,
+            min_free_bytes: warm_config.min_free_bytes,
         }
     }
 
@@ -319,10 +324,7 @@ impl WarmWriter {
             tokio::select! {
                 event = self.receiver.recv() => {
                     match event {
-                        Some(event) => {
-                            write_event(&self.data_dir, &self.camera_id, event, self.warm_index.as_ref())
-                                .await;
-                        }
+                        Some(event) => self.handle_event(event).await,
                         None => break,
                     }
                 }
@@ -333,6 +335,98 @@ impl WarmWriter {
         }
 
         tracing::debug!(camera = %self.camera_id, "warm writer shutting down");
+    }
+
+    /// Write one event with the full durability ladder: low-space guard,
+    /// atomic write, and — should the disk fill up despite the guard — one
+    /// emergency-prune-and-retry. A still-failing write drops the event with
+    /// an error log; the writer task itself never crashes or wedges.
+    async fn handle_event(&self, event: FinishedEvent) {
+        self.guard_free_space().await;
+        match write_event(
+            &self.data_dir,
+            &self.camera_id,
+            &event,
+            self.warm_index.as_ref(),
+        )
+        .await
+        {
+            WriteOutcome::NoSpace => {
+                tracing::warn!(
+                    camera = %self.camera_id,
+                    "disk full while writing event despite guard, emergency pruning and retrying once"
+                );
+                self.emergency_prune().await;
+                let retry = write_event(
+                    &self.data_dir,
+                    &self.camera_id,
+                    &event,
+                    self.warm_index.as_ref(),
+                )
+                .await;
+                if retry != WriteOutcome::Written {
+                    tracing::error!(
+                        camera = %self.camera_id,
+                        first_pts = event.first_pts,
+                        bytes = event.total_bytes,
+                        "dropping event: write failed again after emergency prune"
+                    );
+                }
+            }
+            WriteOutcome::Written | WriteOutcome::Failed => {}
+        }
+    }
+
+    /// Low-space guard: before an event write, emergency-prune the oldest
+    /// events while free space is below `min_free_bytes`.
+    async fn guard_free_space(&self) {
+        if self.min_free_bytes == 0 || self.warm_index.is_none() {
+            return;
+        }
+        // data_dir may not exist before the first write; statvfs needs it.
+        let _ = tokio::fs::create_dir_all(&self.data_dir).await;
+        match free_space_bytes(&self.data_dir) {
+            Ok(free) if should_emergency_prune(free, self.min_free_bytes) => {
+                tracing::warn!(
+                    camera = %self.camera_id,
+                    free_bytes = free,
+                    min_free_bytes = self.min_free_bytes,
+                    "storage low on space, emergency-pruning oldest events"
+                );
+                self.emergency_prune().await;
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(camera = %self.camera_id, error = %e, "free-space check failed");
+            }
+        }
+    }
+
+    /// Delete oldest events (continuous → movements → objects) until free
+    /// space is back above the threshold or nothing is left to delete.
+    async fn emergency_prune(&self) {
+        let Some(ref index) = self.warm_index else {
+            return;
+        };
+        let data_dir = self.data_dir.clone();
+        let min_free = self.min_free_bytes;
+        let deleted = index
+            .emergency_prune(move || {
+                // Stop as soon as space recovers; a failing statvfs also stops
+                // the prune rather than deleting everything blindly.
+                free_space_bytes(&data_dir)
+                    .map(|free| !should_emergency_prune(free, min_free))
+                    .unwrap_or(true)
+            })
+            .await;
+        if deleted == 0 {
+            tracing::warn!(
+                camera = %self.camera_id,
+                "emergency prune freed nothing (no events left to delete)"
+            );
+        } else {
+            tracing::warn!(camera = %self.camera_id, deleted, "emergency prune complete");
+        }
     }
 
     async fn run_prune(&self) {
@@ -392,11 +486,47 @@ fn deduplicate_detections(details: &[DetectionDetail]) -> Vec<(String, f32)> {
     best.into_iter().collect()
 }
 
+/// Path of the staging file for an atomic write: `{file_name}.tmp` next to
+/// the final path. Startup orphan recovery keys off this exact convention.
+fn tmp_path(final_path: &std::path::Path) -> PathBuf {
+    let mut name = final_path.file_name().unwrap_or_default().to_os_string();
+    name.push(".tmp");
+    final_path.with_file_name(name)
+}
+
+fn is_no_space(e: &std::io::Error) -> bool {
+    e.raw_os_error() == Some(libc::ENOSPC)
+}
+
+/// Write `data` to `path`, fsyncing before returning so the bytes are durable
+/// (not just in the page cache) even across a power cut.
+async fn write_file_synced(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
+    use tokio::io::AsyncWriteExt;
+    let mut file = tokio::fs::File::create(path).await?;
+    file.write_all(data).await?;
+    file.sync_all().await?;
+    Ok(())
+}
+
+/// Atomically write a small metadata file (sidecar/thumbnail): stage as
+/// `.tmp`, then rename. No fsync — the one fsync per event is spent on the
+/// video; a metadata file lost to a power cut is acceptable, a torn one is
+/// not (and recovery deletes any leftover `.tmp`).
+async fn write_metadata_atomic(final_path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
+    let tmp = tmp_path(final_path);
+    tokio::fs::write(&tmp, data).await?;
+    if let Err(e) = tokio::fs::rename(&tmp, final_path).await {
+        let _ = tokio::fs::remove_file(&tmp).await;
+        return Err(e);
+    }
+    Ok(())
+}
+
 async fn write_filmstrip(camera_dir: &std::path::Path, stem: &str, frames: &[Vec<u8>]) -> bool {
     let mut wrote = false;
     for (i, jpeg) in frames.iter().enumerate() {
         let thumb_path = camera_dir.join(format!("{}_thumb_{}.jpg", stem, i));
-        if let Err(e) = tokio::fs::write(&thumb_path, jpeg).await {
+        if let Err(e) = write_metadata_atomic(&thumb_path, jpeg).await {
             tracing::warn!(error = %e, "failed to write filmstrip thumbnail");
         } else {
             wrote = true;
@@ -422,32 +552,99 @@ fn build_index_entry(
         detections: event.detection_details.clone(),
         has_filmstrip,
         continues: event.continues,
+        // Live writes are never recovered files; the flag only enters the
+        // index via startup orphan recovery + sidecar scan.
+        recovered: false,
     }
 }
 
+/// Result of a single event write attempt.
+#[derive(Debug, PartialEq, Eq)]
+enum WriteOutcome {
+    Written,
+    /// The write failed with ENOSPC — worth an emergency prune and one retry.
+    NoSpace,
+    /// The write failed for any other reason (already logged).
+    Failed,
+}
+
+/// Persist one event durably. Write order is deliberate:
+///
+/// 1. video bytes → `{stem}.ts.tmp`, then fsync — the footage is durable and
+///    recoverable (via startup orphan recovery) from this point on, before
+///    anything else is risked;
+/// 2. sidecar and thumbnails, each atomically under their final names;
+/// 3. rename `{stem}.ts.tmp` → `{stem}.ts` — the commit point. The index scan
+///    only ever looks at `.ts` files, so a crash at any earlier step leaves a
+///    recoverable `.tmp` (plus adoptable metadata), never a half-indexed
+///    event; a crash after the rename leaves a complete event.
 async fn write_event(
     data_dir: &std::path::Path,
     camera_id: &str,
-    event: FinishedEvent,
+    event: &FinishedEvent,
     warm_index: Option<&WarmEventIndex>,
-) {
+) -> WriteOutcome {
     let duration_ms = event.duration_ns() / NANOS_PER_MS;
     let segment_count = event.segments.len();
 
     let camera_dir = data_dir.join(camera_id).join(event.event_type().dir_name());
     if let Err(e) = tokio::fs::create_dir_all(&camera_dir).await {
         tracing::error!(camera = %camera_id, error = %e, "failed to create warm storage directory");
-        return;
+        return if is_no_space(&e) {
+            WriteOutcome::NoSpace
+        } else {
+            WriteOutcome::Failed
+        };
     }
 
     let stem = format!("{}_{}", event.first_pts, duration_ms);
     let file_path = camera_dir.join(format!("{}.ts", stem));
+    let staging_path = tmp_path(&file_path);
     let data = concatenate_segments(&event.segments, event.total_bytes);
     let file_size = data.len() as u64;
 
-    if let Err(e) = tokio::fs::write(&file_path, &data).await {
-        tracing::error!(camera = %camera_id, path = %file_path.display(), error = %e, "failed to write warm event file");
-        return;
+    // Step 1: footage first. Once this returns, the video survives a crash.
+    if let Err(e) = write_file_synced(&staging_path, &data).await {
+        // A partial staging file from a failed write is deleted rather than
+        // left for recovery: the disk is under pressure and the writer is
+        // about to either retry from scratch or drop the event knowingly.
+        let _ = tokio::fs::remove_file(&staging_path).await;
+        tracing::error!(camera = %camera_id, path = %staging_path.display(), error = %e,
+            "failed to write warm event file");
+        return if is_no_space(&e) {
+            WriteOutcome::NoSpace
+        } else {
+            WriteOutcome::Failed
+        };
+    }
+
+    // Step 2: metadata under final names, so a crash before the commit rename
+    // lets recovery adopt them. Failures here are non-fatal — the video wins.
+    // Object events always get a sidecar (detections); follow-on chunks get one
+    // too — even movement-only chunks — so `continues` survives a restart scan.
+    if event.has_objects || event.continues {
+        let meta_path = file_path.with_extension("json");
+        if let Err(e) =
+            write_metadata_atomic(&meta_path, build_sidecar_json(event).as_bytes()).await
+        {
+            tracing::warn!(error = %e, "failed to write event metadata");
+        }
+    }
+    let has_filmstrip = match event.filmstrip_frames {
+        Some(ref frames) => write_filmstrip(&camera_dir, &stem, frames).await,
+        None => false,
+    };
+
+    // Step 3: commit.
+    if let Err(e) = tokio::fs::rename(&staging_path, &file_path).await {
+        tracing::error!(camera = %camera_id, path = %file_path.display(), error = %e,
+            "failed to finalize warm event file");
+        let _ = tokio::fs::remove_file(&staging_path).await;
+        return if is_no_space(&e) {
+            WriteOutcome::NoSpace
+        } else {
+            WriteOutcome::Failed
+        };
     }
 
     tracing::info!(
@@ -459,26 +656,13 @@ async fn write_event(
         "wrote warm event file"
     );
 
-    // Object events always get a sidecar (detections); follow-on chunks get one
-    // too — even movement-only chunks — so `continues` survives a restart scan.
-    if event.has_objects || event.continues {
-        let meta_path = file_path.with_extension("json");
-        if let Err(e) = tokio::fs::write(&meta_path, build_sidecar_json(&event)).await {
-            tracing::warn!(error = %e, "failed to write event metadata");
-        }
-    }
-
-    let has_filmstrip = match event.filmstrip_frames {
-        Some(ref frames) => write_filmstrip(&camera_dir, &stem, frames).await,
-        None => false,
-    };
-
     if let Some(index) = warm_index {
         index.insert(
             camera_id,
-            build_index_entry(&event, duration_ms, file_size, has_filmstrip),
+            build_index_entry(event, duration_ms, file_size, has_filmstrip),
         );
     }
+    WriteOutcome::Written
 }
 
 #[cfg(test)]
@@ -627,7 +811,8 @@ mod tests {
 
         let index = WarmEventIndex::new(&["cam".to_string()], dir.path().to_path_buf());
         let first_pts = event.first_pts;
-        write_event(dir.path(), "cam", event, Some(&index)).await;
+        let outcome = write_event(dir.path(), "cam", &event, Some(&index)).await;
+        assert_eq!(outcome, WriteOutcome::Written);
 
         // 4 one-second segments (seq 4..=7) => stem "{first_pts}_{4000}".
         let stem = format!("{}_4000", first_pts);
@@ -637,6 +822,13 @@ mod tests {
         assert!(movements.join(format!("{}_thumb_1.jpg", stem)).exists());
         // Movement-only events have no sidecar.
         assert!(!movements.join(format!("{}.json", stem)).exists());
+        // Atomic pattern leaves no .tmp staging residue behind.
+        let leftovers: Vec<_> = std::fs::read_dir(&movements)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.path().to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "staging residue: {leftovers:?}");
 
         let entry = index.find_event("cam", first_pts).unwrap();
         assert_eq!(entry.duration_ms, 4000);
@@ -665,7 +857,7 @@ mod tests {
         let first_pts = event.first_pts;
 
         let index = WarmEventIndex::new(&["cam".to_string()], dir.path().to_path_buf());
-        write_event(dir.path(), "cam", event, Some(&index)).await;
+        write_event(dir.path(), "cam", &event, Some(&index)).await;
 
         let duration_ms = (7 - 5 + 1) * 1000;
         let stem = format!("{}_{}", first_pts, duration_ms);
@@ -762,7 +954,7 @@ mod tests {
             assemble_continuous_chunk(&buf, "cam", 0, 4, false).unwrap()
         };
         let first_pts = first.first_pts;
-        write_event(dir.path(), "cam", first, Some(&index)).await;
+        write_event(dir.path(), "cam", &first, Some(&index)).await;
 
         // Follow-on chunk: continues == true.
         let second = {
@@ -770,7 +962,7 @@ mod tests {
             assemble_continuous_chunk(&buf, "cam", 5, 9, true).unwrap()
         };
         let second_pts = second.first_pts;
-        write_event(dir.path(), "cam", second, Some(&index)).await;
+        write_event(dir.path(), "cam", &second, Some(&index)).await;
 
         let continuous = dir.path().join("cam").join("continuous");
         // Both chunks routed to continuous/.
@@ -807,7 +999,7 @@ mod tests {
                 let buf = buffer.read_recover();
                 assemble_continuous_chunk(&buf, "cam", start, last, continues).unwrap()
             };
-            write_event(dir.path(), "cam", event, Some(&writer_index)).await;
+            write_event(dir.path(), "cam", &event, Some(&writer_index)).await;
         }
 
         // A fresh index scanning the same dir must recover type + continues.

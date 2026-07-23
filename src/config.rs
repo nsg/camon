@@ -184,6 +184,14 @@ fn default_continuous_retention_days() -> u64 {
     1
 }
 
+/// 2 GiB. Roughly an hour of footage at a typical 4 Mbps camera bitrate —
+/// enough slack for the hourly retention prune to catch up before the disk
+/// actually fills — while also keeping the filesystem out of the near-full
+/// regime where allocation slows down and other services start failing.
+fn default_min_free_bytes() -> u64 {
+    2 * 1024 * 1024 * 1024
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct WarmConfig {
     #[serde(default = "default_warm_enabled")]
@@ -206,6 +214,12 @@ pub struct WarmConfig {
     /// short by default: continuous at ~4 Mbps is roughly 43 GB/day/camera.
     #[serde(default = "default_continuous_retention_days")]
     pub continuous_retention_days: u64,
+    /// Low-space guard: before each event write, if the storage filesystem
+    /// has less than this many bytes free, the oldest events are
+    /// emergency-pruned (continuous → movements → objects) until space
+    /// recovers. 0 disables the guard.
+    #[serde(default = "default_min_free_bytes")]
+    pub min_free_bytes: u64,
 }
 
 impl Default for WarmConfig {
@@ -219,6 +233,7 @@ impl Default for WarmConfig {
             movement_retention_days: default_movement_retention_days(),
             object_retention_days: default_object_retention_days(),
             continuous_retention_days: default_continuous_retention_days(),
+            min_free_bytes: default_min_free_bytes(),
         }
     }
 }

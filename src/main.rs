@@ -11,6 +11,7 @@ mod camera;
 mod config;
 mod install;
 mod locks;
+mod mpegts;
 mod storage;
 mod update;
 
@@ -108,10 +109,11 @@ fn init_warm_index(config: &Config, camera_ids: &[String]) -> Option<WarmEventIn
     if !config.storage.enabled {
         return None;
     }
-    let index = WarmEventIndex::new(
-        camera_ids,
-        std::path::PathBuf::from(&config.storage.data_dir),
-    );
+    let data_dir = std::path::PathBuf::from(&config.storage.data_dir);
+    // Salvage any event files orphaned mid-write by a crash or power cut
+    // BEFORE the scan, so recovered events are indexed like any other.
+    storage::recover_orphans(&data_dir, camera_ids);
+    let index = WarmEventIndex::new(camera_ids, data_dir);
     index.scan();
     Some(index)
 }

@@ -97,6 +97,10 @@ The `storage` and `analytics` flags together select what gets recorded:
 
 Both modes share the same warm writer, retention pruning, and HLS playback path; only the trigger differs.
 
+### Durability
+
+Event files are written atomically — staged as `.tmp`, fsynced, then renamed into place — so a crash or power cut never leaves a half-indexed event. On the next startup camon **recovers** interrupted writes instead of discarding them: an orphaned `.ts.tmp` (which may hold the footage of exactly the incident that cut the power) is trimmed to its last intact packet, its real duration recomputed from the stream timestamps, and indexed like any other event with a `"recovered": true` flag. If the disk runs low, a `min_free_bytes` guard emergency-prunes the oldest recordings (continuous first, then movements, then objects) so the writer keeps recording instead of failing.
+
 ## Quick Start
 
 Install FFmpeg and download the latest binary from [GitHub Releases](https://github.com/nsg/camon/releases):
@@ -197,6 +201,10 @@ object_retention_days = 14
 # Retention for continuous-recording chunks in days (default: 1). Short because
 # continuous recording is ~43 GB/day/camera at 4 Mbps.
 continuous_retention_days = 1
+# Minimum free space (bytes) on the storage filesystem (default: 2 GiB).
+# Below this, the oldest recordings are emergency-pruned (continuous →
+# movements → objects) before each write. 0 disables the guard.
+min_free_bytes = 2147483648
 
 # Add one [[cameras]] block per camera
 [[cameras]]

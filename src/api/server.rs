@@ -541,6 +541,10 @@ struct WarmEventResponse {
     /// (the run was split at the duration cap). Lets the UI stitch the chain.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     continues: bool,
+    /// True when this event was salvaged from an interrupted write at startup
+    /// (crash/power-cut recovery); its tail may be truncated.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    recovered: bool,
 }
 
 async fn warm_events_handler(
@@ -584,6 +588,7 @@ async fn warm_events_handler(
                 .collect(),
             has_filmstrip: e.has_filmstrip,
             continues: e.continues,
+            recovered: e.recovered,
         })
         .collect();
 
