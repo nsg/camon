@@ -173,6 +173,10 @@ data_dir = "/var/camon/storage"
 pre_padding_secs = 5
 # Seconds of context after last motion in an event (default: 10)
 post_padding_secs = 10
+# Cap on a single event's length in seconds (default: 120). Longer runs are
+# split into chained, independently playable chunks (follow-ons flagged
+# "continues"). 0 disables. Timing is monotonic, immune to camera PTS jumps.
+max_event_duration_secs = 120
 # Retention for movement-only events in days (default: 2)
 movement_retention_days = 2
 # Retention for object detection events in days (default: 14)

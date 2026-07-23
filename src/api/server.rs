@@ -537,6 +537,10 @@ struct WarmEventResponse {
     detections: Vec<ObjectClassResponse>,
     /// TODO(2026-04-26): remove — all events now generate filmstrips.
     has_filmstrip: bool,
+    /// True when this event continues a previous chunk of the same motion run
+    /// (the run was split at the duration cap). Lets the UI stitch the chain.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    continues: bool,
 }
 
 async fn warm_events_handler(
@@ -578,6 +582,7 @@ async fn warm_events_handler(
                 })
                 .collect(),
             has_filmstrip: e.has_filmstrip,
+            continues: e.continues,
         })
         .collect();
 

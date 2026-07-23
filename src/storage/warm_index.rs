@@ -39,6 +39,9 @@ pub struct WarmEventEntry {
     /// TODO(2026-04-26): remove — all events now generate filmstrips.
     /// Only needed for events saved before this change.
     pub has_filmstrip: bool,
+    /// True when this event is a follow-on chunk of a longer motion run split
+    /// at the duration cap (from the sidecar `"continues"` flag).
+    pub continues: bool,
 }
 
 #[derive(Clone)]
@@ -52,6 +55,7 @@ struct SidecarData {
     backend: Option<String>,
     model: Option<String>,
     detections: Vec<DetectionDetail>,
+    continues: bool,
 }
 
 fn parse_event_filename(stem: &str) -> Option<(u64, u32)> {
@@ -64,6 +68,8 @@ fn parse_event_filename(stem: &str) -> Option<(u64, u32)> {
 fn parse_sidecar_json(parsed: &serde_json::Value) -> SidecarData {
     let backend = parsed["backend"].as_str().map(String::from);
     let model = parsed["model"].as_str().map(String::from);
+    // Present only on follow-on chunks; absent (→ false) on every other sidecar.
+    let continues = parsed["continues"].as_bool().unwrap_or(false);
 
     // New format: {"backend": ..., "detections": [{class, confidence}]}
     if let Some(dets) = parsed["detections"].as_array() {
@@ -82,6 +88,7 @@ fn parse_sidecar_json(parsed: &serde_json::Value) -> SidecarData {
             backend,
             model,
             detections,
+            continues,
         };
     }
 
@@ -100,6 +107,7 @@ fn parse_sidecar_json(parsed: &serde_json::Value) -> SidecarData {
         backend,
         model,
         detections: Vec::new(),
+        continues,
     }
 }
 
@@ -109,6 +117,7 @@ fn load_sidecar(path: &std::path::Path) -> SidecarData {
         backend: None,
         model: None,
         detections: Vec::new(),
+        continues: false,
     };
     let data = match std::fs::read_to_string(path) {
         Ok(d) => d,
@@ -196,6 +205,7 @@ impl WarmEventIndex {
             model: sidecar.model,
             detections: sidecar.detections,
             has_filmstrip,
+            continues: sidecar.continues,
         })
     }
 
@@ -311,5 +321,85 @@ impl WarmEventIndex {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write_event_files(dir: &std::path::Path, subdir: &str, stem: &str, sidecar: Option<&str>) {
+        let d = dir.join("cam").join(subdir);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join(format!("{stem}.ts")), b"tsdata").unwrap();
+        if let Some(json) = sidecar {
+            std::fs::write(d.join(format!("{stem}.json")), json).unwrap();
+        }
+    }
+
+    fn entries(index: &WarmEventIndex) -> Vec<WarmEventEntry> {
+        index.query("cam", 0, u64::MAX)
+    }
+
+    #[test]
+    fn scan_round_trips_continues_and_keeps_type_from_directory() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // A movement-only follow-on chunk: minimal sidecar with just continues.
+        write_event_files(
+            dir.path(),
+            "movements",
+            "1000_5000",
+            Some(r#"{"detections":[],"continues":true}"#),
+        );
+        // A plain movement first chunk: no sidecar at all.
+        write_event_files(dir.path(), "movements", "2000_5000", None);
+        // An object follow-on chunk: detections plus continues.
+        write_event_files(
+            dir.path(),
+            "objects",
+            "3000_5000",
+            Some(
+                r#"{"backend":"ollama","model":"m","detections":[{"class":"person","confidence":0.9}],"continues":true}"#,
+            ),
+        );
+
+        let index = WarmEventIndex::new(&["cam".to_string()], dir.path().to_path_buf());
+        index.scan();
+        let events = entries(&index);
+        assert_eq!(events.len(), 3);
+
+        let movement_chunk = index.find_event("cam", 1000).unwrap();
+        // Type comes from the directory, not the sidecar presence.
+        assert_eq!(movement_chunk.event_type, EventType::Movement);
+        assert!(movement_chunk.continues);
+        assert!(movement_chunk.object_classes.is_empty());
+
+        let plain = index.find_event("cam", 2000).unwrap();
+        assert_eq!(plain.event_type, EventType::Movement);
+        assert!(!plain.continues);
+
+        let object_chunk = index.find_event("cam", 3000).unwrap();
+        assert_eq!(object_chunk.event_type, EventType::Object);
+        assert!(object_chunk.continues);
+        assert_eq!(object_chunk.detections.len(), 1);
+        assert_eq!(object_chunk.backend.as_deref(), Some("ollama"));
+    }
+
+    #[test]
+    fn scan_defaults_continues_false_for_legacy_sidecars() {
+        let dir = tempfile::tempdir().unwrap();
+        // Legacy object sidecar without a continues field.
+        write_event_files(
+            dir.path(),
+            "objects",
+            "1000_5000",
+            Some(r#"{"classes":["car"]}"#),
+        );
+        let index = WarmEventIndex::new(&["cam".to_string()], dir.path().to_path_buf());
+        index.scan();
+        let e = index.find_event("cam", 1000).unwrap();
+        assert!(!e.continues);
+        assert_eq!(e.object_classes, vec!["car".to_string()]);
     }
 }

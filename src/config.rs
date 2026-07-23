@@ -168,6 +168,10 @@ fn default_warm_post_padding_secs() -> u64 {
     10
 }
 
+fn default_max_event_duration_secs() -> u64 {
+    120
+}
+
 fn default_movement_retention_days() -> u64 {
     2
 }
@@ -186,6 +190,10 @@ pub struct WarmConfig {
     pub pre_padding_secs: u64,
     #[serde(default = "default_warm_post_padding_secs")]
     pub post_padding_secs: u64,
+    /// Cap on the wall-clock length of a single event. A run exceeding this is
+    /// split into chained, independently playable chunks. 0 disables the cap.
+    #[serde(default = "default_max_event_duration_secs")]
+    pub max_event_duration_secs: u64,
     #[serde(default = "default_movement_retention_days")]
     pub movement_retention_days: u64,
     #[serde(default = "default_object_retention_days")]
@@ -199,6 +207,7 @@ impl Default for WarmConfig {
             data_dir: default_warm_data_dir(),
             pre_padding_secs: default_warm_pre_padding_secs(),
             post_padding_secs: default_warm_post_padding_secs(),
+            max_event_duration_secs: default_max_event_duration_secs(),
             movement_retention_days: default_movement_retention_days(),
             object_retention_days: default_object_retention_days(),
         }

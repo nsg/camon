@@ -8,6 +8,8 @@ Video is stored across three tiers. Hot and warm tiers store data as-is from the
 
 Warm events are assembled from GOP-aligned segments (keyframe to keyframe) and written to disk the moment their motion run ends, with configurable pre-padding (default 5s) and post-padding (default 10s) to capture context around the event — an event is only at risk in RAM for seconds after it ends, not for the lifetime of the hot buffer. Typical GOP is 1-2 seconds (~750KB–1.5MB at 6 Mbps), though this depends on camera settings.
 
+A single event is capped at `max_event_duration_secs` (default 120s). Sustained motion past the cap is flushed as a complete, independently playable chunk and continues in a new one, keeping RAM and file sizes bounded and preventing gaps when a run outlives the hot buffer. Follow-on chunks carry no pre-padding and a `"continues"` sidecar flag so the UI can stitch the chain. All event-lifecycle timing — the post-padding countdown and the duration cap — runs on a monotonic clock rather than media PTS, so a camera timestamp jump or reset can't stall or prematurely close an event; media timing (segment durations, playlist math, filenames) stays on PTS.
+
 When a motion event ends, the system reaches back into the hot buffer for the preceding context (pre-padding before the first motion), capturing what led up to the event.
 
 Access is abstracted behind a unified interface — consumers request video by time offset, and the system transparently serves from the appropriate tier.

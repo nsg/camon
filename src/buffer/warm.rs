@@ -24,6 +24,10 @@ pub struct FinishedEvent {
     pub(crate) backend: Option<String>,
     pub(crate) model: Option<String>,
     pub(crate) detection_details: Vec<DetectionDetail>,
+    /// True when this event is a follow-on chunk of a longer motion run that
+    /// was split at the duration cap. Written to the sidecar as
+    /// `"continues": true` so a UI can stitch the chain back together.
+    pub(crate) continues: bool,
 }
 
 impl FinishedEvent {
@@ -43,6 +47,7 @@ impl FinishedEvent {
 ///
 /// Returns `None` if none of the requested segments are in the buffer any
 /// more (only possible for runs longer than the hot buffer itself).
+#[allow(clippy::too_many_arguments)]
 pub fn assemble_event(
     buffer: &HotBuffer,
     detection_store: Option<&DetectionStore>,
@@ -51,6 +56,7 @@ pub fn assemble_event(
     last_seq: u64,
     min_start_seq: u64,
     pre_padding_ns: u64,
+    continues: bool,
 ) -> Option<FinishedEvent> {
     // Walk backwards from the first motion segment to find the pre-padding
     // start, matching the old rolling-window semantics (total pre-padding
@@ -122,6 +128,7 @@ pub fn assemble_event(
         backend,
         model,
         detection_details,
+        continues,
     })
 }
 
@@ -219,6 +226,12 @@ fn build_sidecar_json(event: &FinishedEvent) -> String {
         .collect();
     meta.insert("detections".to_string(), serde_json::json!(detections));
 
+    // Only follow-on chunks carry `continues`; omit it otherwise so ordinary
+    // sidecars stay unchanged.
+    if event.continues {
+        meta.insert("continues".to_string(), serde_json::json!(true));
+    }
+
     serde_json::to_string(&meta).unwrap()
 }
 
@@ -266,6 +279,7 @@ fn build_index_entry(
         model: event.model.clone(),
         detections: event.detection_details.clone(),
         has_filmstrip,
+        continues: event.continues,
     }
 }
 
@@ -308,7 +322,9 @@ async fn write_event(
         "wrote warm event file"
     );
 
-    if event.has_objects {
+    // Object events always get a sidecar (detections); follow-on chunks get one
+    // too — even movement-only chunks — so `continues` survives a restart scan.
+    if event.has_objects || event.continues {
         let meta_path = file_path.with_extension("json");
         if let Err(e) = tokio::fs::write(&meta_path, build_sidecar_json(&event)).await {
             tracing::warn!(error = %e, "failed to write event metadata");
@@ -364,7 +380,7 @@ mod tests {
         let buffer = populated_buffer(10);
         let buf = buffer.read_recover();
         // Motion at seq 5, padding through seq 7, 2s of pre-padding.
-        let event = assemble_event(&buf, None, "cam", 5, 7, 0, 2 * SEC).unwrap();
+        let event = assemble_event(&buf, None, "cam", 5, 7, 0, 2 * SEC, false).unwrap();
         // Pre-padding reaches back to seq 3 (segments 3 and 4 fill 2s).
         assert_eq!(event.segments.len(), 5);
         assert_eq!(event.first_pts, 3 * SEC);
@@ -380,7 +396,7 @@ mod tests {
         let buffer = populated_buffer(10);
         let buf = buffer.read_recover();
         // Previous event ended at seq 4 — pre-padding must not reach past 5.
-        let event = assemble_event(&buf, None, "cam", 6, 8, 5, 30 * SEC).unwrap();
+        let event = assemble_event(&buf, None, "cam", 6, 8, 5, 30 * SEC, false).unwrap();
         assert_eq!(event.first_pts, 5 * SEC);
         assert_eq!(event.segments.len(), 4);
     }
@@ -398,7 +414,7 @@ mod tests {
         }
         let buf = buffer.read_recover();
         assert_eq!(buf.first_sequence(), 5);
-        let event = assemble_event(&buf, None, "cam", 7, 9, 0, 30 * SEC).unwrap();
+        let event = assemble_event(&buf, None, "cam", 7, 9, 0, 30 * SEC, false).unwrap();
         assert_eq!(event.first_pts, 5 * SEC);
         assert_eq!(event.segments.len(), 5);
     }
@@ -414,7 +430,7 @@ mod tests {
             }
         }
         let buf = buffer.read_recover();
-        assert!(assemble_event(&buf, None, "cam", 1, 3, 0, 0).is_none());
+        assert!(assemble_event(&buf, None, "cam", 1, 3, 0, 0, false).is_none());
     }
 
     #[test]
@@ -449,7 +465,7 @@ mod tests {
         store.insert_filmstrip("cam", 5, Arc::new(vec![vec![0xff]]));
 
         let buf = buffer.read_recover();
-        let event = assemble_event(&buf, Some(&store), "cam", 5, 7, 0, 0).unwrap();
+        let event = assemble_event(&buf, Some(&store), "cam", 5, 7, 0, 0, false).unwrap();
         assert!(event.has_objects);
         assert_eq!(event.object_classes, vec!["person".to_string()]);
         assert_eq!(event.backend.as_deref(), Some("ollama"));
@@ -468,7 +484,7 @@ mod tests {
         let buffer = populated_buffer(10);
         let mut event = {
             let buf = buffer.read_recover();
-            assemble_event(&buf, None, "cam", 5, 7, 0, SEC).unwrap()
+            assemble_event(&buf, None, "cam", 5, 7, 0, SEC, false).unwrap()
         };
         event.filmstrip_frames = Some(Arc::new(vec![vec![0xff], vec![0xfe]]));
 
@@ -494,5 +510,38 @@ mod tests {
             index.resolve_file_path("cam", &entry),
             movements.join(format!("{}.ts", stem))
         );
+    }
+
+    #[tokio::test]
+    async fn movement_follow_on_chunk_writes_continues_sidecar() {
+        use crate::locks::LockExt;
+        let dir = tempfile::tempdir().unwrap();
+        let buffer = populated_buffer(10);
+        // Follow-on chunk: no pre-padding (min_start_seq == first_motion_seq),
+        // movement-only, continues == true.
+        let event = {
+            let buf = buffer.read_recover();
+            assemble_event(&buf, None, "cam", 5, 7, 5, 0, true).unwrap()
+        };
+        assert!(!event.has_objects);
+        assert!(event.continues);
+        let first_pts = event.first_pts;
+
+        let index = WarmEventIndex::new(&["cam".to_string()], dir.path().to_path_buf());
+        write_event(dir.path(), "cam", event, Some(&index)).await;
+
+        let duration_ms = (7 - 5 + 1) * 1000;
+        let stem = format!("{}_{}", first_pts, duration_ms);
+        let movements = dir.path().join("cam").join("movements");
+        // A movement chunk that continues DOES get a sidecar, carrying the flag.
+        let sidecar = movements.join(format!("{}.json", stem));
+        assert!(sidecar.exists());
+        let json = std::fs::read_to_string(&sidecar).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["continues"], serde_json::json!(true));
+
+        let entry = index.find_event("cam", first_pts).unwrap();
+        assert_eq!(entry.event_type, EventType::Movement);
+        assert!(entry.continues);
     }
 }

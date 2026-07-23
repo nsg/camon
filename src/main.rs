@@ -239,7 +239,12 @@ fn spawn_cameras(ctx: &SpawnContext, cameras: Vec<config::CameraConfig>) -> Came
                     data_dir: std::path::PathBuf::from(&ctx.config.storage.data_dir),
                     event_tx,
                     pre_padding_ns: ctx.config.storage.pre_padding_secs * 1_000_000_000,
-                    post_padding_ns: ctx.config.storage.post_padding_secs * 1_000_000_000,
+                    post_padding: std::time::Duration::from_secs(
+                        ctx.config.storage.post_padding_secs,
+                    ),
+                    max_event_duration: std::time::Duration::from_secs(
+                        ctx.config.storage.max_event_duration_secs,
+                    ),
                 },
                 Arc::clone(ctx.shutdown),
             );

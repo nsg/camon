@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use opencv::core::{Mat, Rect, Vector};
 use opencv::imgcodecs;
@@ -146,8 +146,13 @@ pub struct AnalyzerContext {
     /// Finished events go to the warm writer over this channel. `None` when
     /// warm storage is disabled.
     pub event_tx: Option<tokio::sync::mpsc::Sender<FinishedEvent>>,
+    /// Pre-padding reach, in media PTS nanoseconds. Media timing — stays PTS.
     pub pre_padding_ns: u64,
-    pub post_padding_ns: u64,
+    /// Post-padding window, as monotonic wall time. Lifecycle timing — Instant.
+    pub post_padding: Duration,
+    /// Duration cap per event chunk, as monotonic wall time. `Duration::ZERO`
+    /// disables chunking. Lifecycle timing — Instant.
+    pub max_event_duration: Duration,
 }
 
 pub struct MotionAnalyzer {
@@ -198,7 +203,7 @@ impl MotionAnalyzer {
             segment_crops: HashMap::new(),
             segment_motion_rects: HashMap::new(),
             last_run_motion_rects: Vec::new(),
-            run_tracker: RunTracker::new(ctx.post_padding_ns),
+            run_tracker: RunTracker::new(ctx.post_padding, ctx.max_event_duration),
             event_tx: ctx.event_tx,
             pre_padding_ns: ctx.pre_padding_ns,
         })
@@ -338,13 +343,18 @@ impl MotionAnalyzer {
         let mut motion_frames: Vec<(u64, Vec<u8>)> = Vec::new();
         let mut closed_runs = Vec::new();
 
+        // Lifecycle timing is monotonic: the analyzer runs near real time, so
+        // the instant it observes a segment stands in for capture time. One
+        // reading per poll batch is enough — batches are ~one segment.
+        let now = Instant::now();
+
         for seg in segments {
             let (score, crop, motion_rects, frame_jpeg) =
                 self.analyze_segment(&seg.data, capture_frames)?;
             self.publish_debug_maps();
 
             let has_motion = score >= MOTION_THRESHOLD;
-            if let Some(run) = self.run_tracker.observe(seg.seq, seg.start_pts, has_motion) {
+            if let Some(run) = self.run_tracker.observe(seg.seq, has_motion, now) {
                 closed_runs.push(run);
             }
 
@@ -397,6 +407,7 @@ impl MotionAnalyzer {
                 run.last_seq,
                 run.min_start_seq,
                 self.pre_padding_ns,
+                run.continues,
             )
         };
         let event = match event {
