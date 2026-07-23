@@ -4,10 +4,6 @@ use std::sync::{Arc, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use opencv::core::{Mat, Rect, Vector};
-use opencv::imgcodecs;
-use opencv::prelude::*;
-
 use crate::analytics::motion_settings::{
     MotionSettingsStore, DEFAULT_MIN_CONTOUR_AREA, DEFAULT_VAR_THRESHOLD,
 };
@@ -85,29 +81,44 @@ fn union_two_rects(a: NormalizedRect, b: NormalizedRect) -> NormalizedRect {
     }
 }
 
-fn crop_mat(frame: &Mat, region: &NormalizedRect) -> Option<Mat> {
-    let cols = frame.cols();
-    let rows = frame.rows();
+/// A raw 8-bit RGB frame (3 bytes per pixel, row-major, no padding), as
+/// produced by the crop decoder's ffmpeg pipe.
+#[derive(Clone)]
+struct RgbFrame {
+    data: Vec<u8>,
+    width: usize,
+    height: usize,
+}
+
+/// Cut a normalized region out of a frame with pure row copying. The region
+/// is clamped to the frame bounds; a region that leaves no visible area
+/// yields `None`.
+fn crop_frame(frame: &RgbFrame, region: &NormalizedRect) -> Option<RgbFrame> {
+    let cols = frame.width as i32;
+    let rows = frame.height as i32;
     if cols == 0 || rows == 0 {
         return None;
     }
 
-    let x = (region.x * cols as f32) as i32;
-    let y = (region.y * rows as f32) as i32;
-    let w = (region.w * cols as f32) as i32;
-    let h = (region.h * rows as f32) as i32;
-
-    let roi = Rect::new(
-        x.max(0),
-        y.max(0),
-        w.min(cols - x.max(0)),
-        h.min(rows - y.max(0)),
-    );
-    if roi.width <= 0 || roi.height <= 0 {
+    let x = ((region.x * cols as f32) as i32).max(0);
+    let y = ((region.y * rows as f32) as i32).max(0);
+    let w = ((region.w * cols as f32) as i32).min(cols - x);
+    let h = ((region.h * rows as f32) as i32).min(rows - y);
+    if w <= 0 || h <= 0 {
         return None;
     }
 
-    Mat::roi(frame, roi).ok()?.try_clone().ok()
+    let (x, y, w, h) = (x as usize, y as usize, w as usize, h as usize);
+    let mut data = Vec::with_capacity(w * h * 3);
+    for row in y..y + h {
+        let start = (row * frame.width + x) * 3;
+        data.extend_from_slice(&frame.data[start..start + w * 3]);
+    }
+    Some(RgbFrame {
+        data,
+        width: w,
+        height: h,
+    })
 }
 
 struct MotionSegment {
@@ -616,10 +627,9 @@ impl MotionAnalyzer {
         &self,
         run: &[MotionSegment],
         crop_decoder: &CropDecoder,
-    ) -> Vec<(Mat, Option<NormalizedRect>)> {
+    ) -> Vec<(RgbFrame, Option<NormalizedRect>)> {
         let indices = sample_indices(run.len());
-        let height = crop_decoder.height() as i32;
-        let mut all_frames: Vec<(Mat, Option<NormalizedRect>)> = Vec::new();
+        let mut all_frames: Vec<(RgbFrame, Option<NormalizedRect>)> = Vec::new();
 
         // Feed preceding segments to prime the decoder (no crop — not motion-positive)
         let first_seq = run[0].seq;
@@ -627,16 +637,13 @@ impl MotionAnalyzer {
             let buffer = self.buffer.read_recover();
             for prime_seq in (first_seq - 3)..first_seq {
                 if let Some(seg) = buffer.get_segment_by_sequence(prime_seq) {
-                    let before = all_frames.len();
-                    decode_to_mats_tagged(
+                    decode_to_frames_tagged(
                         crop_decoder,
                         &seg.data,
                         seg.duration_ns,
-                        height,
                         None,
                         &mut all_frames,
                     );
-                    let _ = before; // priming frames have None crop
                 }
             }
         }
@@ -644,11 +651,10 @@ impl MotionAnalyzer {
         for &idx in &indices {
             let seg = &run[idx];
             let crop = self.segment_crops.get(&seg.seq).copied();
-            decode_to_mats_tagged(
+            decode_to_frames_tagged(
                 crop_decoder,
                 &seg.data,
                 seg.duration_ns,
-                height,
                 crop,
                 &mut all_frames,
             );
@@ -694,18 +700,18 @@ impl MotionAnalyzer {
         let full_frame_jpeg = tagged_frames
             .iter()
             .find(|(_, crop)| crop.is_some())
-            .and_then(|(frame, _)| encode_jpeg(frame));
+            .and_then(|(frame, _)| rgb_jpeg(frame));
 
         // Apply per-frame crops
-        let cropped: Vec<Mat> = tagged_frames
+        let cropped: Vec<RgbFrame> = tagged_frames
             .iter()
             .map(|(frame, crop)| {
-                crop.and_then(|r| crop_mat(frame, &r))
-                    .unwrap_or_else(|| frame.try_clone().unwrap_or_default())
+                crop.and_then(|r| crop_frame(frame, &r))
+                    .unwrap_or_else(|| frame.clone())
             })
             .collect();
 
-        let filmstrip_jpegs: Vec<Vec<u8>> = cropped.iter().filter_map(encode_jpeg).collect();
+        let filmstrip_jpegs: Vec<Vec<u8>> = cropped.iter().filter_map(rgb_jpeg).collect();
         self.store_filmstrip_for_run(&run, &filmstrip_jpegs);
 
         // Remove consumed segment data
@@ -747,38 +753,41 @@ fn sample_indices(len: usize) -> Vec<usize> {
     }
 }
 
-fn decode_to_mats_tagged(
+fn decode_to_frames_tagged(
     decoder: &CropDecoder,
     data: &[u8],
     duration_ns: u64,
-    height: i32,
     crop: Option<NormalizedRect>,
-    out: &mut Vec<(Mat, Option<NormalizedRect>)>,
+    out: &mut Vec<(RgbFrame, Option<NormalizedRect>)>,
 ) {
-    for frame_data in &decoder.decode_segment(data, duration_ns) {
-        if let Ok(mat) = Mat::from_slice(frame_data) {
-            if let Ok(reshaped) = mat.reshape(3, height) {
-                if let Ok(cloned) = reshaped.try_clone() {
-                    out.push((cloned, crop));
-                }
-            }
+    let width = decoder.width() as usize;
+    let height = decoder.height() as usize;
+    for frame_data in decoder.decode_segment(data, duration_ns) {
+        // The pipe delivers exact fixed-size frames; anything else is a
+        // torn read from a dying ffmpeg and gets skipped.
+        if frame_data.len() == width * height * 3 {
+            out.push((
+                RgbFrame {
+                    data: frame_data,
+                    width,
+                    height,
+                },
+                crop,
+            ));
         }
     }
 }
 
 fn subsample_tagged(
-    frames: Vec<(Mat, Option<NormalizedRect>)>,
-) -> Vec<(Mat, Option<NormalizedRect>)> {
+    frames: Vec<(RgbFrame, Option<NormalizedRect>)>,
+) -> Vec<(RgbFrame, Option<NormalizedRect>)> {
     if frames.len() <= 4 {
         return frames;
     }
     let n = frames.len();
     [0, n / 3, 2 * n / 3, n - 1]
         .iter()
-        .map(|&i| {
-            let (ref mat, crop) = frames[i];
-            (mat.try_clone().unwrap_or_default(), crop)
-        })
+        .map(|&i| frames[i].clone())
         .collect()
 }
 
@@ -804,26 +813,44 @@ fn group_contiguous_runs(segments: Vec<MotionSegment>) -> Vec<Vec<MotionSegment>
     runs
 }
 
-fn encode_jpeg(mat: &Mat) -> Option<Vec<u8>> {
-    let mut buf = Vector::<u8>::new();
-    let params = Vector::<i32>::new();
-    imgcodecs::imencode(".jpg", mat, &mut buf, &params).ok()?;
-    Some(buf.to_vec())
+/// JPEG quality for frames sent to the vision model and served to the UI.
+/// High enough that compression artifacts don't cost the model detections.
+const JPEG_QUALITY: u8 = 90;
+
+fn encode_jpeg_raw(
+    data: &[u8],
+    width: usize,
+    height: usize,
+    color: image::ExtendedColorType,
+) -> Option<Vec<u8>> {
+    let mut buf = Vec::new();
+    let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, JPEG_QUALITY);
+    encoder
+        .encode(data, width as u32, height as u32, color)
+        .ok()?;
+    Some(buf)
 }
 
-/// Encode an 8-bit grayscale buffer as JPEG. OpenCV serves purely as the JPEG
-/// encoder here — the motion path itself is pure Rust — and this helper goes
-/// away with the rest of this file's OpenCV usage in the Ollama rework.
-fn gray_jpeg((data, w, h): (&[u8], usize, usize)) -> Option<Vec<u8>> {
-    if h == 0 || data.len() != w * h {
+/// Encode a raw RGB frame as JPEG.
+fn rgb_jpeg(frame: &RgbFrame) -> Option<Vec<u8>> {
+    if frame.data.len() != frame.width * frame.height * 3 {
         return None;
     }
-    let mat = Mat::from_slice(data).ok()?;
-    let mat = mat.reshape(1, h as i32).ok()?;
-    let mut buf = Vector::<u8>::new();
-    let params = Vector::<i32>::new();
-    imgcodecs::imencode(".jpg", &mat, &mut buf, &params).ok()?;
-    Some(buf.to_vec())
+    encode_jpeg_raw(
+        &frame.data,
+        frame.width,
+        frame.height,
+        image::ExtendedColorType::Rgb8,
+    )
+}
+
+/// Encode an 8-bit grayscale buffer (detector masks, background model) as
+/// JPEG for the debug endpoints.
+fn gray_jpeg((data, w, h): (&[u8], usize, usize)) -> Option<Vec<u8>> {
+    if w == 0 || h == 0 || data.len() != w * h {
+        return None;
+    }
+    encode_jpeg_raw(data, w, h, image::ExtendedColorType::L8)
 }
 
 pub fn spawn_analyzer(
@@ -929,38 +956,122 @@ mod tests {
         assert!(u.h >= MIN_CROP_FRACTION);
     }
 
+    /// A 200x100 frame where each pixel encodes its own coordinates:
+    /// R = column % 256, G = row, B = 0. Makes copy errors visible.
+    fn coordinate_frame() -> RgbFrame {
+        let (width, height) = (200usize, 100usize);
+        let mut data = Vec::with_capacity(width * height * 3);
+        for row in 0..height {
+            for col in 0..width {
+                data.extend_from_slice(&[(col % 256) as u8, row as u8, 0]);
+            }
+        }
+        RgbFrame {
+            data,
+            width,
+            height,
+        }
+    }
+
     #[test]
-    fn crop_mat_extracts_region() {
-        let mat = Mat::zeros(100, 200, opencv::core::CV_8UC3)
-            .unwrap()
-            .to_mat()
-            .unwrap();
+    fn crop_frame_extracts_region() {
+        let frame = coordinate_frame();
         let region = NormalizedRect {
             x: 0.25,
             y: 0.25,
             w: 0.5,
             h: 0.5,
         };
-        let cropped = crop_mat(&mat, &region).unwrap();
-        assert_eq!(cropped.cols(), 100);
-        assert_eq!(cropped.rows(), 50);
+        let cropped = crop_frame(&frame, &region).unwrap();
+        assert_eq!(cropped.width, 100);
+        assert_eq!(cropped.height, 50);
+        assert_eq!(cropped.data.len(), 100 * 50 * 3);
+        // Top-left pixel of the crop is source pixel (col 50, row 25).
+        assert_eq!(&cropped.data[0..3], &[50, 25, 0]);
+        // Bottom-right pixel of the crop is source pixel (col 149, row 74).
+        let last = cropped.data.len() - 3;
+        assert_eq!(&cropped.data[last..], &[149, 74, 0]);
     }
 
     #[test]
-    fn crop_mat_clamps_at_edge() {
-        let mat = Mat::zeros(100, 200, opencv::core::CV_8UC3)
-            .unwrap()
-            .to_mat()
-            .unwrap();
+    fn crop_frame_clamps_at_edge() {
+        let frame = coordinate_frame();
         let region = NormalizedRect {
             x: 0.8,
             y: 0.8,
             w: 0.5,
             h: 0.5,
         };
-        let cropped = crop_mat(&mat, &region).unwrap();
+        let cropped = crop_frame(&frame, &region).unwrap();
         // Should clamp: x=160, w=min(100, 200-160)=40; y=80, h=min(50, 100-80)=20
-        assert_eq!(cropped.cols(), 40);
-        assert_eq!(cropped.rows(), 20);
+        assert_eq!(cropped.width, 40);
+        assert_eq!(cropped.height, 20);
+        assert_eq!(&cropped.data[0..3], &[160, 80, 0]);
+    }
+
+    #[test]
+    fn crop_frame_fully_outside_is_none() {
+        let frame = coordinate_frame();
+        let region = NormalizedRect {
+            x: 1.0,
+            y: 0.0,
+            w: 0.5,
+            h: 0.5,
+        };
+        assert!(crop_frame(&frame, &region).is_none());
+    }
+
+    #[test]
+    fn crop_frame_empty_frame_is_none() {
+        let frame = RgbFrame {
+            data: Vec::new(),
+            width: 0,
+            height: 0,
+        };
+        let region = NormalizedRect {
+            x: 0.0,
+            y: 0.0,
+            w: 1.0,
+            h: 1.0,
+        };
+        assert!(crop_frame(&frame, &region).is_none());
+    }
+
+    #[test]
+    fn rgb_jpeg_round_trips_through_image_crate() {
+        let frame = coordinate_frame();
+        let jpeg = rgb_jpeg(&frame).unwrap();
+        // JPEG magic bytes.
+        assert_eq!(&jpeg[0..2], &[0xff, 0xd8]);
+        let decoded = image::load_from_memory(&jpeg).unwrap();
+        assert_eq!(decoded.width(), 200);
+        assert_eq!(decoded.height(), 100);
+    }
+
+    #[test]
+    fn rgb_jpeg_rejects_mismatched_buffer() {
+        let frame = RgbFrame {
+            data: vec![0; 10],
+            width: 200,
+            height: 100,
+        };
+        assert!(rgb_jpeg(&frame).is_none());
+    }
+
+    #[test]
+    fn gray_jpeg_round_trips_through_image_crate() {
+        let (w, h) = (32usize, 16usize);
+        let data: Vec<u8> = (0..w * h).map(|i| (i % 256) as u8).collect();
+        let jpeg = gray_jpeg((&data, w, h)).unwrap();
+        assert_eq!(&jpeg[0..2], &[0xff, 0xd8]);
+        let decoded = image::load_from_memory(&jpeg).unwrap();
+        assert_eq!(decoded.width(), 32);
+        assert_eq!(decoded.height(), 16);
+    }
+
+    #[test]
+    fn gray_jpeg_rejects_bad_dimensions() {
+        assert!(gray_jpeg((&[0u8; 10], 3, 3)).is_none());
+        assert!(gray_jpeg((&[], 0, 0)).is_none());
     }
 }

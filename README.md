@@ -115,14 +115,10 @@ Event files are written atomically — staged as `.tmp`, fsynced, then renamed i
 
 ## Quick Start
 
-Install FFmpeg and download the latest binary from [GitHub Releases](https://github.com/nsg/camon/releases):
+Camon is a single self-contained binary — the only runtime dependency is FFmpeg. Install it and download the latest binary from [GitHub Releases](https://github.com/nsg/camon/releases):
 
 ```bash
-# Ubuntu 24.10+
-sudo apt install ffmpeg libopencv-contrib406t64
-
-# Other Ubuntu/Debian (pulls in extra -dev files)
-sudo apt install ffmpeg libopencv-dev
+sudo apt install ffmpeg
 
 curl -fLO https://github.com/nsg/camon/releases/latest/download/camon-linux-glibc
 chmod +x camon-linux-glibc
@@ -135,13 +131,10 @@ Camon loads `config.toml` from the current working directory.
 
 ### Building from Source
 
-Install system dependencies:
+Building needs nothing beyond a stable Rust toolchain (no OpenCV, no C++ toolchain — the vision code is pure Rust); ffmpeg is only needed at runtime:
 
 ```bash
-sudo apt install libopencv-dev clang libclang-dev cmake ffmpeg
-```
-
-```bash
+sudo apt install ffmpeg
 cargo build --release
 ./target/release/camon
 ```

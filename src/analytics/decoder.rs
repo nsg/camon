@@ -168,7 +168,7 @@ impl CropDecoder {
                 "-f",
                 "rawvideo",
                 "-pix_fmt",
-                "bgr24",
+                "rgb24",
                 "pipe:1",
             ],
             CROP_FRAME_SIZE,
@@ -193,6 +193,10 @@ impl CropDecoder {
             }
         }
         frames
+    }
+
+    pub fn width(&self) -> u32 {
+        CROP_WIDTH
     }
 
     pub fn height(&self) -> u32 {

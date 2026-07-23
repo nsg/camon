@@ -48,9 +48,9 @@ Camera disconnections are handled with automatic reconnection using exponential 
 
 ## System Dependencies
 
-Build requires OpenCV and Clang development headers. Runtime requires FFmpeg for RTSP ingestion, H.264 handling, and motion analysis frame decoding. On Ubuntu/Debian:
+Camon builds into a single self-contained binary with a plain stable Rust toolchain — no OpenCV, no C++ toolchain, no native vision libraries. The motion detector (MOG2, morphology, connected components) and all image handling (cropping, JPEG encoding via the pure-Rust `image` crate) are Rust. Runtime requires FFmpeg for RTSP ingestion, H.264 handling, and motion analysis frame decoding. On Ubuntu/Debian:
 
-**Build:** `libopencv-dev`, `clang`, `libclang-dev`, `cmake`
+**Build:** stable Rust only
 
 **Runtime:** `ffmpeg`
 
