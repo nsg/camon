@@ -180,6 +180,10 @@ fn default_object_retention_days() -> u64 {
     14
 }
 
+fn default_continuous_retention_days() -> u64 {
+    1
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct WarmConfig {
     #[serde(default = "default_warm_enabled")]
@@ -198,6 +202,10 @@ pub struct WarmConfig {
     pub movement_retention_days: u64,
     #[serde(default = "default_object_retention_days")]
     pub object_retention_days: u64,
+    /// Retention for continuous-recording chunks (analytics disabled). Kept
+    /// short by default: continuous at ~4 Mbps is roughly 43 GB/day/camera.
+    #[serde(default = "default_continuous_retention_days")]
+    pub continuous_retention_days: u64,
 }
 
 impl Default for WarmConfig {
@@ -210,6 +218,7 @@ impl Default for WarmConfig {
             max_event_duration_secs: default_max_event_duration_secs(),
             movement_retention_days: default_movement_retention_days(),
             object_retention_days: default_object_retention_days(),
+            continuous_retention_days: default_continuous_retention_days(),
         }
     }
 }

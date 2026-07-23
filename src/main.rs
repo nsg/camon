@@ -16,7 +16,7 @@ mod update;
 
 use analytics::{AnalyzerContext, OllamaDetector};
 use api::AppState;
-use buffer::warm::{FinishedEvent, WarmWriter};
+use buffer::warm::{run_continuous_recorder, FinishedEvent, WarmWriter};
 use buffer::HotBuffer;
 use camera::FfmpegPipeline;
 use config::Config;
@@ -154,6 +154,9 @@ const EVENT_CHANNEL_CAPACITY: usize = 8;
 struct CameraHandles {
     pipeline_handles: Vec<(String, tokio::task::JoinHandle<()>, Arc<RwLock<HotBuffer>>)>,
     analyzer_handles: Vec<tokio::task::JoinHandle<()>>,
+    /// Per-camera continuous-recording drivers (storage on + analytics off).
+    /// Empty in event mode. Flushed at shutdown before the writers' senders drop.
+    continuous_handles: Vec<tokio::task::JoinHandle<()>>,
     warm_handles: Vec<tokio::task::JoinHandle<()>>,
     /// Kept alive so warm writers keep running (prune tick) even without
     /// analyzers; dropped during shutdown to let the writers drain and exit.
@@ -176,6 +179,7 @@ fn spawn_cameras(ctx: &SpawnContext, cameras: Vec<config::CameraConfig>) -> Came
     let mut handles = CameraHandles {
         pipeline_handles: Vec::new(),
         analyzer_handles: Vec::new(),
+        continuous_handles: Vec::new(),
         warm_handles: Vec::new(),
         event_senders: Vec::new(),
         buffers_map: HashMap::new(),
@@ -212,6 +216,22 @@ fn spawn_cameras(ctx: &SpawnContext, cameras: Vec<config::CameraConfig>) -> Came
         handles
             .pipeline_handles
             .push((camera_id.clone(), handle, Arc::clone(&buffer)));
+
+        // Continuous recording: storage on, analytics off. With no analyzer to
+        // close motion runs, a dedicated task rolls fixed-length chunks straight
+        // from the hot buffer into the same warm writer.
+        if ctx.config.storage.enabled && !ctx.config.analytics.enabled {
+            if let Some(tx) = event_tx.clone() {
+                let recorder = run_continuous_recorder(
+                    camera_id.clone(),
+                    Arc::clone(&buffer),
+                    tx,
+                    std::time::Duration::from_secs(ctx.config.storage.max_event_duration_secs),
+                    Arc::clone(ctx.shutdown),
+                );
+                handles.continuous_handles.push(tokio::spawn(recorder));
+            }
+        }
 
         if ctx.config.analytics.enabled {
             let det_store = Some(ctx.detection_store.clone());
@@ -276,6 +296,13 @@ async fn graceful_shutdown(handles: CameraHandles) {
         let _ = handle.await;
     }
 
+    // Continuous recorders watch the same shutdown flag; each flushes its
+    // partial chunk to the writer and exits. Awaited here — before the senders
+    // are dropped below — so the final chunk is guaranteed accepted.
+    for handle in handles.continuous_handles {
+        let _ = handle.await;
+    }
+
     let mut buffers_with_ids = Vec::new();
     for (camera_id, handle, buffer) in handles.pipeline_handles {
         let _ = handle.await;
@@ -322,11 +349,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let warm_index = init_warm_index(&config, &camera_ids);
     let detection_grid = init_detection_grid(&config, &camera_ids);
 
-    if config.storage.enabled && !config.analytics.enabled {
-        tracing::warn!(
-            "storage is enabled but analytics is disabled — no events will be recorded \
-             (continuous recording is not implemented yet); retention pruning still runs"
-        );
+    if config.storage.enabled {
+        if config.analytics.enabled {
+            tracing::info!("event recording mode: motion and object events saved to disk");
+        } else {
+            tracing::info!(
+                retention_days = config.storage.continuous_retention_days,
+                "continuous recording mode (analytics disabled): every segment saved to \
+                 continuous/, roughly 43 GB/day/camera at 4 Mbps"
+            );
+        }
     }
 
     let shutdown = Arc::new(AtomicBool::new(false));

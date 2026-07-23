@@ -569,6 +569,7 @@ async fn warm_events_handler(
             event_type: match e.event_type {
                 crate::storage::EventType::Movement => "movement".to_string(),
                 crate::storage::EventType::Object => "object".to_string(),
+                crate::storage::EventType::Continuous => "continuous".to_string(),
             },
             object_classes: e.object_classes.clone(),
             backend: e.backend.clone(),

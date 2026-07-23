@@ -87,6 +87,16 @@ flowchart LR
 
 The moment a motion run ends (post-padding elapsed), the analyzer assembles the complete event — pre-padding, motion, and post-padding pulled straight from the hot buffer, plus metadata from the motion and detection stores — and hands it to the warm writer, which persists it to disk immediately. This way an event only stays at risk in RAM for seconds after it ends, not until its segments age out of the buffer. The writer also saves metadata and thumbnails that is used by the web UI. User can stream saved video events via HLS.
 
+### Recording modes
+
+The `storage` and `analytics` flags together select what gets recorded:
+
+- **Event recording** (`storage.enabled = true`, `analytics.enabled = true`) — the default. Only motion and object events are saved, into `movements/` and `objects/`. Storage is proportional to activity.
+- **Continuous recording** (`storage.enabled = true`, `analytics.enabled = false`) — "dumb NVR" mode. With no analyzer to gate on motion, a per-camera recorder rolls every segment from the hot buffer to disk in fixed-length chunks (each `max_event_duration_secs` long) under `continuous/`. Every chunk is a whole-GOP `.ts` that decodes on its own, and successive chunks carry a `"continues"` flag so the timeline stitches seamlessly. This is heavy — roughly **43 GB/day/camera at 4 Mbps** — so `continuous_retention_days` defaults to 1.
+- **No recording** (`storage.enabled = false`) — live view only; nothing hits disk.
+
+Both modes share the same warm writer, retention pruning, and HLS playback path; only the trigger differs.
+
 ## Quick Start
 
 Install FFmpeg and download the latest binary from [GitHub Releases](https://github.com/nsg/camon/releases):
@@ -164,8 +174,10 @@ model = "gemma4:e4b"
 # model = "gemma3:4b"
 
 [storage]
-# Enable warm storage — write motion events to disk as they end (default: true)
-# Requires analytics to be enabled; without it, no events are recorded
+# Enable warm storage — write video to disk (default: true).
+# With analytics enabled this is EVENT recording (motion/object events only).
+# With analytics DISABLED it becomes CONTINUOUS recording ("dumb NVR"): every
+# segment is saved — roughly 43 GB/day/camera at 4 Mbps.
 enabled = true
 # Directory for event files (default: /var/camon/storage)
 data_dir = "/var/camon/storage"
@@ -175,12 +187,16 @@ pre_padding_secs = 5
 post_padding_secs = 10
 # Cap on a single event's length in seconds (default: 120). Longer runs are
 # split into chained, independently playable chunks (follow-ons flagged
-# "continues"). 0 disables. Timing is monotonic, immune to camera PTS jumps.
+# "continues"). In continuous mode this is the length of each chunk. 0 disables.
+# Timing is monotonic, immune to camera PTS jumps.
 max_event_duration_secs = 120
 # Retention for movement-only events in days (default: 2)
 movement_retention_days = 2
 # Retention for object detection events in days (default: 14)
 object_retention_days = 14
+# Retention for continuous-recording chunks in days (default: 1). Short because
+# continuous recording is ~43 GB/day/camera at 4 Mbps.
+continuous_retention_days = 1
 
 # Add one [[cameras]] block per camera
 [[cameras]]
@@ -227,7 +243,7 @@ url = "rtsp://admin:password@192.168.1.100:554/stream1"
 | Tier | Medium | Retention | Quality | Purpose |
 |---|---|---|---|---|
 | Hot | RAM | ~10 minutes | 1080p @ 30fps | Live playback and real-time analysis |
-| Warm | Disk | 2 days (movement) / 14 days (objects) | Original quality | Motion-triggered event recordings |
+| Warm | Disk | 2 days (movement) / 14 days (objects) / 1 day (continuous) | Original quality | Motion-triggered events, or gapless continuous recording when analytics is off |
 
 ## License
 

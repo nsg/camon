@@ -40,8 +40,11 @@ model = "gemma4:e4b"
 # model = "gemma3:4b"
 
 [storage]
-# Enable warm storage — write motion events to disk as they end (default: true)
-# Requires analytics to be enabled; without it, no events are recorded
+# Enable warm storage — write video to disk (default: true).
+# With analytics enabled this is EVENT recording: only motion/object events are
+# saved (to movements/ and objects/). With analytics DISABLED it becomes
+# CONTINUOUS recording ("dumb NVR"): every segment is saved, chunked into
+# continuous/. Continuous is heavy — roughly 43 GB/day/camera at 4 Mbps.
 enabled = true
 # Directory for event files (default: /var/camon/storage)
 data_dir = "/var/camon/storage"
@@ -51,13 +54,17 @@ pre_padding_secs = 5
 post_padding_secs = 10
 # Cap on a single event's length in seconds (default: 120). A run longer than
 # this is split into chained, independently playable chunks — the follow-on
-# chunks are flagged "continues" in their sidecar. 0 disables the cap. Timing
-# is monotonic (wall clock), so a camera PTS jump can't stall it.
+# chunks are flagged "continues" in their sidecar. In continuous mode this is
+# also the length of each recording chunk. 0 disables the cap. Timing is
+# monotonic (wall clock), so a camera PTS jump can't stall it.
 max_event_duration_secs = 120
 # Retention for movement-only events in days (default: 2)
 movement_retention_days = 2
 # Retention for object detection events in days (default: 14)
 object_retention_days = 14
+# Retention for continuous-recording chunks in days (default: 1). Kept short by
+# default because continuous recording is ~43 GB/day/camera at 4 Mbps.
+continuous_retention_days = 1
 
 # Camera definitions — add one [[cameras]] block per camera
 

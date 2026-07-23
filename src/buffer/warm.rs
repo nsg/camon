@@ -1,11 +1,14 @@
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
 use tokio::sync::mpsc;
 
 use super::GopSegment;
 use crate::buffer::HotBuffer;
 use crate::config::WarmConfig;
+use crate::locks::LockExt;
 use crate::storage::warm_index::DetectionDetail;
 use crate::storage::{DetectionStore, EventType, WarmEventEntry, WarmEventIndex};
 
@@ -28,11 +31,26 @@ pub struct FinishedEvent {
     /// was split at the duration cap. Written to the sidecar as
     /// `"continues": true` so a UI can stitch the chain back together.
     pub(crate) continues: bool,
+    /// True when this is a continuous-recording chunk (analytics disabled), as
+    /// opposed to a motion event. Routes the file to the `continuous/` dir.
+    pub(crate) is_continuous: bool,
 }
 
 impl FinishedEvent {
     fn duration_ns(&self) -> u64 {
         self.segments.iter().map(|s| s.duration_ns).sum()
+    }
+
+    /// Storage classification: object detections win, then continuous
+    /// recording, otherwise a plain movement event.
+    fn event_type(&self) -> EventType {
+        if self.has_objects {
+            EventType::Object
+        } else if self.is_continuous {
+            EventType::Continuous
+        } else {
+            EventType::Movement
+        }
     }
 }
 
@@ -129,7 +147,129 @@ pub fn assemble_event(
         model,
         detection_details,
         continues,
+        is_continuous: false,
     })
+}
+
+/// Assemble a continuous-recording chunk from the hot buffer.
+///
+/// Reuses [`assemble_event`] with no detection store and no pre-padding: a
+/// continuous chunk is simply the raw segment range `[start_seq..=last_seq]`,
+/// GOP-aligned so each `.ts` decodes on its own. `continues` chains successive
+/// chunks (false only for the first chunk after startup).
+pub fn assemble_continuous_chunk(
+    buffer: &HotBuffer,
+    camera_id: &str,
+    start_seq: u64,
+    last_seq: u64,
+    continues: bool,
+) -> Option<FinishedEvent> {
+    // min_start_seq == start_seq and pre_padding_ns == 0 suppress any reach-back.
+    let mut event = assemble_event(
+        buffer, None, camera_id, start_seq, last_seq, start_seq, 0, continues,
+    )?;
+    event.is_continuous = true;
+    Some(event)
+}
+
+/// How often the continuous recorder wakes to check whether a chunk is due.
+/// Finer than any sane cap, so chunks land within a second of the cap; the
+/// wakeup itself is cheap (a lock, a subtraction).
+const CONTINUOUS_CHECK_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Decide whether to roll a continuous chunk now, and over which inclusive
+/// sequence range.
+///
+/// Pure so the boundary logic is unit-testable. `next_seq` is the first
+/// not-yet-written sequence; `last_sequence_exclusive` is the hot buffer's
+/// `last_sequence()` (one past the newest resident segment);
+/// `pending_duration_ns` is the summed duration of `[next_seq, last_sequence)`.
+/// A chunk rolls once the pending footage reaches `cap_ns`, or immediately when
+/// `force` is set (shutdown flush of whatever remains). A zero cap only rolls on
+/// `force`. Returns the inclusive `(start, last)` range, or `None`.
+fn plan_continuous_roll(
+    next_seq: u64,
+    last_sequence_exclusive: u64,
+    pending_duration_ns: u64,
+    cap_ns: u64,
+    force: bool,
+) -> Option<(u64, u64)> {
+    if last_sequence_exclusive <= next_seq {
+        return None; // nothing pending
+    }
+    let should_roll = force || (cap_ns > 0 && pending_duration_ns >= cap_ns);
+    should_roll.then_some((next_seq, last_sequence_exclusive - 1))
+}
+
+/// Per-camera continuous-recording driver (analytics-disabled "dumb NVR" mode).
+///
+/// With no analyzer to close motion runs, this task owns the roll loop: it
+/// tracks the first not-yet-written sequence and, on each tick, rolls a chunk
+/// once `max_event_duration` of footage has accumulated in the hot buffer (or
+/// flushes whatever remains at shutdown). Chunks are assembled as `Arc` clones
+/// and handed to the same per-camera [`WarmWriter`] over the existing channel;
+/// `send().await` never drops a chunk. Successive chunks are flagged
+/// `continues` (all but the first after startup) so a UI can stitch the chain.
+///
+/// Chunk-boundary timing is lifecycle, so tick-based monotonic timing is used;
+/// segment content and PTS are untouched.
+pub async fn run_continuous_recorder(
+    camera_id: String,
+    buffer: Arc<RwLock<HotBuffer>>,
+    tx: mpsc::Sender<FinishedEvent>,
+    max_event_duration: Duration,
+    shutdown: Arc<AtomicBool>,
+) {
+    let cap_ns = max_event_duration.as_nanos() as u64;
+    let mut next_seq: u64 = 0;
+    let mut first_chunk = true;
+    let mut interval = tokio::time::interval(CONTINUOUS_CHECK_INTERVAL);
+    tracing::info!(camera = %camera_id, "continuous recorder started");
+
+    loop {
+        interval.tick().await;
+        let force = shutdown.load(Ordering::Relaxed);
+
+        // Plan + assemble under the read lock; release it before awaiting send.
+        let planned = {
+            let buf = buffer.read_recover();
+            // The cap is always < hot_duration, so pending segments are still
+            // resident. If eviction ever outran us, warn and skip the gap.
+            if buf.first_sequence() > next_seq {
+                tracing::warn!(
+                    camera = %camera_id,
+                    first_sequence = buf.first_sequence(),
+                    next_seq,
+                    "continuous recorder fell behind eviction, chunk will have a gap"
+                );
+                next_seq = buf.first_sequence();
+            }
+            let pending_ns = buf
+                .total_duration_ns()
+                .saturating_sub(buf.sequence_to_offset_ns(next_seq).unwrap_or(0));
+            plan_continuous_roll(next_seq, buf.last_sequence(), pending_ns, cap_ns, force).and_then(
+                |(start, last)| {
+                    assemble_continuous_chunk(&buf, &camera_id, start, last, !first_chunk)
+                        .map(|ev| (ev, last))
+                },
+            )
+        };
+
+        if let Some((event, last)) = planned {
+            if tx.send(event).await.is_err() {
+                tracing::error!(camera = %camera_id, "warm writer gone, continuous chunk lost");
+                return;
+            }
+            next_seq = last + 1;
+            first_chunk = false;
+        }
+
+        if force {
+            break;
+        }
+    }
+
+    tracing::info!(camera = %camera_id, "continuous recorder stopped");
 }
 
 /// Persists finished events to warm storage and prunes expired ones.
@@ -144,6 +284,7 @@ pub struct WarmWriter {
     warm_index: Option<WarmEventIndex>,
     movement_retention_ns: u64,
     object_retention_ns: u64,
+    continuous_retention_ns: u64,
 }
 
 const PRUNE_INTERVAL_SECS: u64 = 3600;
@@ -163,6 +304,7 @@ impl WarmWriter {
             warm_index,
             movement_retention_ns: warm_config.movement_retention_days * 86400 * NANOS_PER_SEC,
             object_retention_ns: warm_config.object_retention_days * 86400 * NANOS_PER_SEC,
+            continuous_retention_ns: warm_config.continuous_retention_days * 86400 * NANOS_PER_SEC,
         }
     }
 
@@ -196,7 +338,11 @@ impl WarmWriter {
     async fn run_prune(&self) {
         if let Some(ref index) = self.warm_index {
             index
-                .prune(self.movement_retention_ns, self.object_retention_ns)
+                .prune(
+                    self.movement_retention_ns,
+                    self.object_retention_ns,
+                    self.continuous_retention_ns,
+                )
                 .await;
         }
     }
@@ -268,11 +414,7 @@ fn build_index_entry(
     WarmEventEntry {
         start_pts_ns: event.first_pts,
         duration_ms: duration_ms as u32,
-        event_type: if event.has_objects {
-            EventType::Object
-        } else {
-            EventType::Movement
-        },
+        event_type: event.event_type(),
         file_size,
         object_classes: event.object_classes.clone(),
         backend: event.backend.clone(),
@@ -292,12 +434,7 @@ async fn write_event(
     let duration_ms = event.duration_ns() / NANOS_PER_MS;
     let segment_count = event.segments.len();
 
-    let subdir = if event.has_objects {
-        "objects"
-    } else {
-        "movements"
-    };
-    let camera_dir = data_dir.join(camera_id).join(subdir);
+    let camera_dir = data_dir.join(camera_id).join(event.event_type().dir_name());
     if let Err(e) = tokio::fs::create_dir_all(&camera_dir).await {
         tracing::error!(camera = %camera_id, error = %e, "failed to create warm storage directory");
         return;
@@ -543,5 +680,143 @@ mod tests {
         let entry = index.find_event("cam", first_pts).unwrap();
         assert_eq!(entry.event_type, EventType::Movement);
         assert!(entry.continues);
+    }
+
+    // ---- Continuous recording (analytics disabled) ----
+
+    #[test]
+    fn plan_roll_waits_until_cap_reached() {
+        // 3s pending, cap 5s: not yet.
+        assert_eq!(plan_continuous_roll(0, 3, 3 * SEC, 5 * SEC, false), None);
+        // 5s pending, cap 5s: rolls [0..=4].
+        assert_eq!(
+            plan_continuous_roll(0, 5, 5 * SEC, 5 * SEC, false),
+            Some((0, 4))
+        );
+        // Over the cap rolls everything pending.
+        assert_eq!(
+            plan_continuous_roll(0, 7, 7 * SEC, 5 * SEC, false),
+            Some((0, 6))
+        );
+    }
+
+    #[test]
+    fn plan_roll_resumes_from_next_seq() {
+        // Already wrote through seq 4; pending [5..=9] is 5s at cap 5s.
+        assert_eq!(
+            plan_continuous_roll(5, 10, 5 * SEC, 5 * SEC, false),
+            Some((5, 9))
+        );
+    }
+
+    #[test]
+    fn plan_roll_nothing_pending_is_none() {
+        assert_eq!(plan_continuous_roll(5, 5, 0, 5 * SEC, false), None);
+        // Even forced, an empty range yields nothing to flush.
+        assert_eq!(plan_continuous_roll(5, 5, 0, 5 * SEC, true), None);
+    }
+
+    #[test]
+    fn plan_roll_force_flushes_partial_chunk() {
+        // Below the cap, but shutdown forces the remaining 2s out.
+        assert_eq!(
+            plan_continuous_roll(0, 2, 2 * SEC, 5 * SEC, true),
+            Some((0, 1))
+        );
+    }
+
+    #[test]
+    fn plan_roll_zero_cap_only_rolls_on_force() {
+        assert_eq!(plan_continuous_roll(0, 4, 4 * SEC, 0, false), None);
+        assert_eq!(plan_continuous_roll(0, 4, 4 * SEC, 0, true), Some((0, 3)));
+    }
+
+    #[test]
+    fn continuous_chunk_has_no_detections_and_no_pre_padding() {
+        use crate::locks::LockExt;
+        let buffer = populated_buffer(10);
+        let buf = buffer.read_recover();
+        // Roll [2..=6] with no detection store at all.
+        let event = assemble_continuous_chunk(&buf, "cam", 2, 6, false).unwrap();
+        assert!(event.is_continuous);
+        assert!(!event.has_objects);
+        assert!(!event.continues);
+        assert!(event.detection_details.is_empty());
+        assert!(event.filmstrip_frames.is_none());
+        // No pre-padding: starts exactly at the requested seq.
+        assert_eq!(event.first_pts, 2 * SEC);
+        assert_eq!(event.segments.len(), 5);
+        assert_eq!(event.event_type(), EventType::Continuous);
+    }
+
+    #[tokio::test]
+    async fn continuous_first_chunk_no_continues_then_follow_on_continues() {
+        use crate::locks::LockExt;
+        let dir = tempfile::tempdir().unwrap();
+        let buffer = populated_buffer(20);
+        let index = WarmEventIndex::new(&["cam".to_string()], dir.path().to_path_buf());
+
+        // First chunk after startup: continues == false.
+        let first = {
+            let buf = buffer.read_recover();
+            assemble_continuous_chunk(&buf, "cam", 0, 4, false).unwrap()
+        };
+        let first_pts = first.first_pts;
+        write_event(dir.path(), "cam", first, Some(&index)).await;
+
+        // Follow-on chunk: continues == true.
+        let second = {
+            let buf = buffer.read_recover();
+            assemble_continuous_chunk(&buf, "cam", 5, 9, true).unwrap()
+        };
+        let second_pts = second.first_pts;
+        write_event(dir.path(), "cam", second, Some(&index)).await;
+
+        let continuous = dir.path().join("cam").join("continuous");
+        // Both chunks routed to continuous/.
+        assert!(continuous.join(format!("{}_5000.ts", first_pts)).exists());
+        assert!(continuous.join(format!("{}_5000.ts", second_pts)).exists());
+        // First chunk: no sidecar (nothing to persist). Follow-on: continues sidecar.
+        assert!(!continuous.join(format!("{}_5000.json", first_pts)).exists());
+        assert!(continuous
+            .join(format!("{}_5000.json", second_pts))
+            .exists());
+
+        let e1 = index.find_event("cam", first_pts).unwrap();
+        assert_eq!(e1.event_type, EventType::Continuous);
+        assert!(!e1.continues);
+        let e2 = index.find_event("cam", second_pts).unwrap();
+        assert_eq!(e2.event_type, EventType::Continuous);
+        assert!(e2.continues);
+        assert_eq!(
+            index.resolve_file_path("cam", &e2),
+            continuous.join(format!("{}_5000.ts", second_pts))
+        );
+    }
+
+    #[tokio::test]
+    async fn continuous_chunks_round_trip_through_scan() {
+        use crate::locks::LockExt;
+        let dir = tempfile::tempdir().unwrap();
+        let buffer = populated_buffer(20);
+
+        // Write a first + follow-on continuous chunk with the real writer.
+        let writer_index = WarmEventIndex::new(&["cam".to_string()], dir.path().to_path_buf());
+        for (start, last, continues) in [(0u64, 4u64, false), (5, 9, true)] {
+            let event = {
+                let buf = buffer.read_recover();
+                assemble_continuous_chunk(&buf, "cam", start, last, continues).unwrap()
+            };
+            write_event(dir.path(), "cam", event, Some(&writer_index)).await;
+        }
+
+        // A fresh index scanning the same dir must recover type + continues.
+        let scanned = WarmEventIndex::new(&["cam".to_string()], dir.path().to_path_buf());
+        scanned.scan();
+        let events = scanned.query("cam", 0, u64::MAX);
+        assert_eq!(events.len(), 2);
+        assert!(events.iter().all(|e| e.event_type == EventType::Continuous));
+        assert!(!events[0].continues);
+        assert!(events[1].continues);
     }
 }

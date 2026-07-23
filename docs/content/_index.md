@@ -12,6 +12,10 @@ A single event is capped at `max_event_duration_secs` (default 120s). Sustained 
 
 When a motion event ends, the system reaches back into the hot buffer for the preceding context (pre-padding before the first motion), capturing what led up to the event.
 
+### Recording modes
+
+What warm storage records depends on the `storage` and `analytics` flags together. With analytics enabled it is **event recording**: only motion and object events land on disk, in `movements/` and `objects/`. With analytics disabled the same combination becomes **continuous recording** — a "dumb NVR" mode. Without an analyzer to gate on motion, a per-camera recorder rolls every hot-buffer segment to disk in fixed-length chunks (each `max_event_duration_secs` long) under `continuous/`, flagging successive chunks `"continues"` so the timeline stitches together. Because chunks split on whole GOP segments, each `.ts` starts with PAT/PMT and a keyframe and plays on its own. Continuous recording is heavy — roughly 43 GB/day/camera at 4 Mbps — so `continuous_retention_days` defaults to 1, far shorter than event retention. Both modes share the same warm writer, retention pruning, and HLS playback; only the trigger differs. Disabling storage entirely leaves live view only.
+
 Access is abstracted behind a unified interface — consumers request video by time offset, and the system transparently serves from the appropriate tier.
 
 ## Camera Pipeline
@@ -56,4 +60,4 @@ Object detection requires a running [Ollama](https://ollama.com/) server with a 
 
 Metadata is stored in memory. Video files are stored on disk.
 
-Warm video files are stored per camera as `{data_dir}/{camera_id}/{movements|objects}/{timestamp}_{duration_ms}.ts`, where `data_dir` defaults to `/var/camon/storage`. Cold archives are organized by date as `cold/{year}/{month}/{event_id}_{timestamp}.mp4` (planned).
+Warm video files are stored per camera as `{data_dir}/{camera_id}/{movements|objects|continuous}/{timestamp}_{duration_ms}.ts`, where `data_dir` defaults to `/var/camon/storage`. The `continuous/` subdirectory holds chunks written in continuous-recording mode; `movements/` and `objects/` hold motion and object events. Cold archives are organized by date as `cold/{year}/{month}/{event_id}_{timestamp}.mp4` (planned).

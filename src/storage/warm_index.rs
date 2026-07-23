@@ -8,13 +8,17 @@ use crate::locks::LockExt;
 pub enum EventType {
     Movement,
     Object,
+    /// A chunk of gapless continuous recording (analytics disabled — "dumb NVR"
+    /// mode). Not motion-gated; every segment reaches disk.
+    Continuous,
 }
 
 impl EventType {
-    fn dir_name(self) -> &'static str {
+    pub(crate) fn dir_name(self) -> &'static str {
         match self {
             EventType::Movement => "movements",
             EventType::Object => "objects",
+            EventType::Continuous => "continuous",
         }
     }
 }
@@ -162,7 +166,11 @@ impl WarmEventIndex {
 
     fn scan_camera(&self, camera_id: &str) -> Vec<WarmEventEntry> {
         let mut entries = Vec::new();
-        for event_type in &[EventType::Movement, EventType::Object] {
+        for event_type in &[
+            EventType::Movement,
+            EventType::Object,
+            EventType::Continuous,
+        ] {
             let dir = self.data_dir.join(camera_id).join(event_type.dir_name());
             let read_dir = match std::fs::read_dir(&dir) {
                 Ok(rd) => rd,
@@ -250,24 +258,29 @@ impl WarmEventIndex {
         dir.join(format!("{}_{}.ts", entry.start_pts_ns, entry.duration_ms))
     }
 
-    pub async fn prune(&self, movement_max_age_ns: u64, object_max_age_ns: u64) {
+    pub async fn prune(
+        &self,
+        movement_max_age_ns: u64,
+        object_max_age_ns: u64,
+        continuous_max_age_ns: u64,
+    ) {
         let now_ns = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos() as u64;
+
+        let max_age = |t: EventType| match t {
+            EventType::Movement => movement_max_age_ns,
+            EventType::Object => object_max_age_ns,
+            EventType::Continuous => continuous_max_age_ns,
+        };
 
         for (camera_id, lock) in self.cameras.iter() {
             let expired: Vec<WarmEventEntry> = {
                 let entries = lock.read_recover();
                 entries
                     .iter()
-                    .filter(|e| {
-                        let max_age = match e.event_type {
-                            EventType::Movement => movement_max_age_ns,
-                            EventType::Object => object_max_age_ns,
-                        };
-                        now_ns.saturating_sub(e.start_pts_ns) > max_age
-                    })
+                    .filter(|e| now_ns.saturating_sub(e.start_pts_ns) > max_age(e.event_type))
                     .cloned()
                     .collect()
             };
@@ -304,13 +317,8 @@ impl WarmEventIndex {
             }
 
             {
-                let cutoff_movement = now_ns.saturating_sub(movement_max_age_ns);
-                let cutoff_object = now_ns.saturating_sub(object_max_age_ns);
                 let mut entries = lock.write_recover();
-                entries.retain(|e| match e.event_type {
-                    EventType::Movement => e.start_pts_ns >= cutoff_movement,
-                    EventType::Object => e.start_pts_ns >= cutoff_object,
-                });
+                entries.retain(|e| e.start_pts_ns >= now_ns.saturating_sub(max_age(e.event_type)));
             }
 
             if deleted > 0 {
@@ -384,6 +392,84 @@ mod tests {
         assert!(object_chunk.continues);
         assert_eq!(object_chunk.detections.len(), 1);
         assert_eq!(object_chunk.backend.as_deref(), Some("ollama"));
+    }
+
+    #[test]
+    fn scan_picks_up_continuous_chunks_from_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        // First continuous chunk: no sidecar. Follow-on: continues sidecar.
+        write_event_files(dir.path(), "continuous", "1000_5000", None);
+        write_event_files(
+            dir.path(),
+            "continuous",
+            "2000_5000",
+            Some(r#"{"detections":[],"continues":true}"#),
+        );
+
+        let index = WarmEventIndex::new(&["cam".to_string()], dir.path().to_path_buf());
+        index.scan();
+
+        let first = index.find_event("cam", 1000).unwrap();
+        assert_eq!(first.event_type, EventType::Continuous);
+        assert!(!first.continues);
+        let follow = index.find_event("cam", 2000).unwrap();
+        assert_eq!(follow.event_type, EventType::Continuous);
+        assert!(follow.continues);
+        // Continuous chunks resolve back into continuous/.
+        assert_eq!(
+            index.resolve_file_path("cam", &follow),
+            dir.path()
+                .join("cam")
+                .join("continuous")
+                .join("2000_5000.ts")
+        );
+    }
+
+    #[tokio::test]
+    async fn prune_honors_the_continuous_retention() {
+        let dir = tempfile::tempdir().unwrap();
+        let now_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as u64;
+        let day_ns = 86_400 * 1_000_000_000u64;
+
+        // A movement event 3 days old and a continuous chunk 2 days old, both
+        // named with real wall-clock start times so prune's now-based age works.
+        let movement_pts = now_ns - 3 * day_ns;
+        let continuous_pts = now_ns - 2 * day_ns;
+        write_event_files(
+            dir.path(),
+            "movements",
+            &format!("{movement_pts}_5000"),
+            None,
+        );
+        write_event_files(
+            dir.path(),
+            "continuous",
+            &format!("{continuous_pts}_5000"),
+            None,
+        );
+
+        let index = WarmEventIndex::new(&["cam".to_string()], dir.path().to_path_buf());
+        index.scan();
+        assert_eq!(entries(&index).len(), 2);
+
+        // Movement retention 7d (keep the 3d-old movement), continuous 1d (drop
+        // the 2d-old chunk). Object retention irrelevant here.
+        index.prune(7 * day_ns, 14 * day_ns, day_ns).await;
+
+        let remaining = entries(&index);
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].event_type, EventType::Movement);
+        // The continuous file and its in-memory entry are both gone.
+        assert!(index.find_event("cam", continuous_pts).is_none());
+        assert!(!dir
+            .path()
+            .join("cam")
+            .join("continuous")
+            .join(format!("{continuous_pts}_5000.ts"))
+            .exists());
     }
 
     #[test]
