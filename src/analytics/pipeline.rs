@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::thread;
@@ -9,7 +8,9 @@ use opencv::core::{Mat, Rect, Vector};
 use opencv::imgcodecs;
 use opencv::prelude::*;
 
-use crate::analytics::detection_grid::DetectionGrid;
+use crate::analytics::motion_settings::{
+    MotionSettingsStore, DEFAULT_MIN_CONTOUR_AREA, DEFAULT_VAR_THRESHOLD,
+};
 use crate::buffer::warm::{assemble_event, FinishedEvent};
 use crate::buffer::HotBuffer;
 use crate::config::AnalyticsConfig;
@@ -29,7 +30,6 @@ const ANALYSIS_HEIGHT: i32 = 240;
 const MOTION_THRESHOLD: f32 = 0.05;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
-const GRID_SAVE_INTERVAL: u32 = 1500; // ~5 minutes at 200ms poll interval
 const CROP_PADDING: f32 = 0.2;
 const MIN_CROP_FRACTION: f32 = 0.15;
 
@@ -128,8 +128,6 @@ struct PendingSegment {
 struct SegmentDetectionResult {
     classes: Vec<String>,
     confidences: Vec<f32>,
-    /// Per-class bounding rects in full-frame normalized coordinates.
-    class_rects: Vec<Vec<(f32, f32, f32, f32)>>,
     frame_jpeg: Arc<Vec<u8>>,
 }
 
@@ -141,8 +139,9 @@ pub struct AnalyzerContext {
     pub debug_store: Option<DetectionDebugStore>,
     pub object_detector: Option<OllamaDetector>,
     pub config: AnalyticsConfig,
-    pub detection_grid: Option<DetectionGrid>,
-    pub data_dir: PathBuf,
+    /// Deterministic per-camera motion settings (sensitivity, min object size,
+    /// ignore mask). Shared so live edits apply without a restart.
+    pub motion_settings: MotionSettingsStore,
     /// Finished events go to the warm writer over this channel. `None` when
     /// warm storage is disabled.
     pub event_tx: Option<tokio::sync::mpsc::Sender<FinishedEvent>>,
@@ -166,11 +165,9 @@ pub struct MotionAnalyzer {
     decoder: FrameDecoder,
     object_detector: Option<OllamaDetector>,
     last_processed: u64,
-    detection_grid: Option<DetectionGrid>,
-    grid_save_counter: u32,
+    motion_settings: MotionSettingsStore,
     segment_crops: HashMap<u64, NormalizedRect>,
     segment_motion_rects: HashMap<u64, Vec<NormalizedRect>>,
-    last_run_motion_rects: Vec<(f32, f32, f32, f32)>,
     run_tracker: RunTracker,
     event_tx: Option<tokio::sync::mpsc::Sender<FinishedEvent>>,
     pre_padding_ns: u64,
@@ -178,7 +175,17 @@ pub struct MotionAnalyzer {
 
 impl MotionAnalyzer {
     fn new(ctx: AnalyzerContext) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        let detector = MotionDetector::new(&ctx.camera_id, &ctx.data_dir);
+        // Seed the detector from the persisted (or default) per-camera settings;
+        // subsequent live edits are picked up each tick in `sync_settings`.
+        let settings = ctx.motion_settings.get(&ctx.camera_id);
+        let (var_threshold, min_contour_area) = settings
+            .as_ref()
+            .map(|s| (s.var_threshold, s.min_contour_area))
+            .unwrap_or((DEFAULT_VAR_THRESHOLD, DEFAULT_MIN_CONTOUR_AREA));
+        let mut detector = MotionDetector::new(var_threshold, min_contour_area);
+        if let Some(s) = settings.as_ref() {
+            detector.set_mask(&s.mask);
+        }
         let decoder = FrameDecoder::new()?;
 
         let last_processed = ctx
@@ -198,11 +205,9 @@ impl MotionAnalyzer {
             decoder,
             object_detector: ctx.object_detector,
             last_processed,
-            detection_grid: ctx.detection_grid,
-            grid_save_counter: 0,
+            motion_settings: ctx.motion_settings,
             segment_crops: HashMap::new(),
             segment_motion_rects: HashMap::new(),
-            last_run_motion_rects: Vec::new(),
             run_tracker: RunTracker::new(ctx.post_padding, ctx.max_event_duration),
             event_tx: ctx.event_tx,
             pre_padding_ns: ctx.pre_padding_ns,
@@ -225,12 +230,10 @@ impl MotionAnalyzer {
                 );
             }
 
-            self.maybe_save_grid();
             thread::sleep(POLL_INTERVAL);
         }
 
         self.flush_open_run();
-        self.save_grid();
         tracing::info!(camera = %self.camera_id, "motion analyzer stopped");
     }
 
@@ -252,21 +255,20 @@ impl MotionAnalyzer {
         }
     }
 
-    fn maybe_save_grid(&mut self) {
-        self.grid_save_counter += 1;
-        if self.grid_save_counter >= GRID_SAVE_INTERVAL {
-            self.grid_save_counter = 0;
-            self.save_grid();
-        }
-    }
-
-    fn save_grid(&self) {
-        if let Some(ref grid) = self.detection_grid {
-            grid.save(&self.camera_id);
+    /// Pull the latest deterministic settings from the shared store and apply
+    /// them to the detector. Cheap (a lock read + a 192-byte mask copy), run
+    /// every tick so slider/mask edits take effect without a restart.
+    fn sync_settings(&mut self) {
+        if let Some(s) = self.motion_settings.get(&self.camera_id) {
+            self.detector.set_var_threshold(s.var_threshold);
+            self.detector.set_min_contour_area(s.min_contour_area);
+            self.detector.set_mask(&s.mask);
         }
     }
 
     fn process_new_segments(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.sync_settings();
+
         let (first_seq, last_seq) = {
             let buffer = self.buffer.read_recover();
             (buffer.first_sequence(), buffer.last_sequence())
@@ -275,11 +277,6 @@ impl MotionAnalyzer {
         self.cleanup_old_data(first_seq);
         let segments = self.collect_pending_segments(last_seq)?;
         let (motion_segments, closed_runs) = self.run_motion_analysis(segments)?;
-
-        self.detector.maybe_tune();
-        if let Some(ref grid) = self.detection_grid {
-            grid.decay(&self.camera_id);
-        }
 
         if !motion_segments.is_empty() {
             self.run_sampled_detections(motion_segments);
@@ -506,14 +503,9 @@ impl MotionAnalyzer {
         if let Some(jpeg) = self.detector.morph_mask().and_then(gray_jpeg) {
             self.motion_store.set_morph_map(&self.camera_id, jpeg);
         }
-        self.motion_store
-            .set_tuner_stats(&self.camera_id, self.detector.tuner_stats());
     }
 
     fn record_motion(&mut self, seq: u64, start_pts: u64, duration_ns: u64, score: f32) {
-        let bboxes = self.detector.motion_bboxes().to_vec();
-        self.detector
-            .report_motion_event(&bboxes, ANALYSIS_WIDTH, ANALYSIS_HEIGHT);
         let mask_jpeg = self.detector.fg_mask().and_then(gray_jpeg);
         self.motion_store.insert(
             &self.camera_id,
@@ -704,9 +696,7 @@ impl MotionAnalyzer {
             return;
         }
 
-        self.last_run_motion_rects = all_motion_rects;
-        let result =
-            build_detection_result(&detections, &filmstrip_jpegs, best_frame_idx, run_crop);
+        let result = build_detection_result(&detections, &filmstrip_jpegs, best_frame_idx);
         self.propagate_detection(&run, &result);
     }
 
@@ -729,7 +719,6 @@ impl MotionAnalyzer {
             let propagated = SegmentDetectionResult {
                 classes: result.classes.clone(),
                 confidences: result.confidences.clone(),
-                class_rects: result.class_rects.clone(),
                 frame_jpeg: Arc::clone(&result.frame_jpeg),
             };
             self.store_detection_result(seg.seq, &propagated);
@@ -820,21 +809,10 @@ impl MotionAnalyzer {
             .map(|d| ("ollama".to_string(), d.model().to_string()))
             .unwrap_or_else(|| ("unknown".to_string(), "unknown".to_string()));
 
-        let mut stored_any = false;
-        for (i, (class, &confidence)) in result.classes.iter().zip(&result.confidences).enumerate()
-        {
-            let rects = &result.class_rects[i];
-            if let Some(ref grid) = self.detection_grid {
-                if !grid.record_rects(&self.camera_id, class, rects) {
-                    tracing::trace!(
-                        camera = %self.camera_id,
-                        class = %class,
-                        "detection suppressed (absorbed by grid)"
-                    );
-                    continue;
-                }
-            }
-
+        // Every detection is reported. There is no learned suppression: MOG2's
+        // (user-tuned) verdict is the sole gate on what footage persists, and a
+        // false negative here would be unrecoverable.
+        for (class, &confidence) in result.classes.iter().zip(&result.confidences) {
             detection_store.insert(
                 &self.camera_id,
                 DetectionEntry {
@@ -847,7 +825,6 @@ impl MotionAnalyzer {
                     model: model.clone(),
                 },
             );
-            stored_any = true;
 
             tracing::debug!(
                 camera = %self.camera_id,
@@ -857,11 +834,6 @@ impl MotionAnalyzer {
                 "object detected"
             );
         }
-
-        if stored_any {
-            self.detector
-                .report_positive_detection(&self.last_run_motion_rects);
-        }
     }
 }
 
@@ -869,7 +841,6 @@ fn build_detection_result(
     detections: &[Detection],
     filmstrip_jpegs: &[Vec<u8>],
     best_frame_idx: usize,
-    crop: Option<NormalizedRect>,
 ) -> SegmentDetectionResult {
     let frame_jpeg = Arc::new(
         filmstrip_jpegs
@@ -879,12 +850,8 @@ fn build_detection_result(
             .unwrap_or_default(),
     );
 
-    // Deduplicate by class — keep highest confidence per class,
-    // and collect all bboxes for each class.
+    // Deduplicate by class — keep the highest confidence per class.
     let mut best_conf: std::collections::HashMap<&str, f32> = std::collections::HashMap::new();
-    let mut class_bboxes: std::collections::HashMap<&str, Vec<(f32, f32, f32, f32)>> =
-        std::collections::HashMap::new();
-
     for d in detections {
         best_conf
             .entry(d.class_name.as_str())
@@ -894,36 +861,14 @@ fn build_detection_result(
                 }
             })
             .or_insert(d.confidence);
-
-        // Map Ollama bbox from crop space to full-frame space.
-        // If no bbox from Ollama, fall back to the crop rect.
-        let rect = match (d.bbox, crop) {
-            (Some((bx, by, bw, bh)), Some(c)) => {
-                // Ollama bbox is in cropped image coords → map to full frame
-                (c.x + bx * c.w, c.y + by * c.h, bw * c.w, bh * c.h)
-            }
-            (Some(b), None) => b, // No crop, bbox is already in full frame
-            (None, Some(c)) => (c.x, c.y, c.w, c.h), // No bbox, use crop
-            (None, None) => continue, // No location info at all
-        };
-
-        class_bboxes
-            .entry(d.class_name.as_str())
-            .or_default()
-            .push(rect);
     }
 
     let classes: Vec<String> = best_conf.keys().map(|k| k.to_string()).collect();
     let confidences: Vec<f32> = classes.iter().map(|c| best_conf[c.as_str()]).collect();
-    let class_rects: Vec<Vec<(f32, f32, f32, f32)>> = classes
-        .iter()
-        .map(|c| class_bboxes.remove(c.as_str()).unwrap_or_default())
-        .collect();
 
     SegmentDetectionResult {
         classes,
         confidences,
-        class_rects,
         frame_jpeg,
     }
 }

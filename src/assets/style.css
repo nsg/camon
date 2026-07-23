@@ -215,9 +215,8 @@ main {
 #live-view[hidden] { display: none; }
 
 #bg-overlay,
-#detection-grid-overlay,
 #stability-overlay,
-#tuner-stats-overlay {
+#mask-overlay {
     position: absolute;
     top: 0;
     left: 0;
@@ -228,13 +227,77 @@ main {
 
 #bg-overlay { z-index: 1; }
 #stability-overlay { z-index: 2; }
-#detection-grid-overlay { z-index: 3; }
-#tuner-stats-overlay { z-index: 4; }
+/* The ignore-mask editor sits on top and captures pointer events (enabled
+   from JS) only while mask-edit mode is active. */
+#mask-overlay { z-index: 3; }
+#mask-overlay.editing { pointer-events: auto; cursor: crosshair; }
 
 #bg-overlay[hidden],
-#detection-grid-overlay[hidden],
 #stability-overlay[hidden],
-#tuner-stats-overlay[hidden] { display: none; }
+#mask-overlay[hidden] { display: none; }
+
+/* === Motion settings panel === */
+#motion-settings-panel {
+    display: flex;
+    flex-direction: column;
+    gap: 0.6rem;
+    padding: 0.75rem 1rem;
+    margin: 0 1rem 0.5rem;
+    background: rgba(255, 255, 255, 0.04);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: 6px;
+}
+
+#motion-settings-panel[hidden] { display: none; }
+
+.setting-row {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    flex-wrap: wrap;
+}
+
+.setting-row label {
+    min-width: 9.5rem;
+    font-size: 0.85rem;
+    color: #ccc;
+}
+
+.setting-row input[type="range"] {
+    flex: 1;
+    min-width: 120px;
+}
+
+.setting-value {
+    font-family: monospace;
+    font-size: 0.85rem;
+    color: var(--color-cream);
+    min-width: 3.5em;
+    text-align: right;
+}
+
+.setting-hint {
+    font-size: 0.75rem;
+    color: #888;
+}
+
+.settings-action-btn {
+    background: transparent;
+    color: #ccc;
+    border: 1px solid rgba(255, 255, 255, 0.2);
+    padding: 0.4rem 0.8rem;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 0.85rem;
+    transition: color 0.2s, border-color 0.2s, background 0.2s;
+}
+
+.settings-action-btn:hover { color: #fff; border-color: rgba(255, 255, 255, 0.4); }
+.settings-action-btn.active {
+    color: var(--color-cream);
+    border-color: var(--color-cream);
+    background: rgba(255, 255, 255, 0.06);
+}
 
 .live-scrubber-bar {
     display: flex;

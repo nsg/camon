@@ -132,12 +132,47 @@ impl Default for ObjectDetectionConfig {
     }
 }
 
+// Deterministic motion-detection defaults. These seed a camera's
+// motion_settings.json the first time it is seen; thereafter the per-camera
+// file (edited live from the web UI) wins. Ranges must match the clamps in
+// `analytics::motion_settings`.
+fn default_motion_var_threshold() -> f64 {
+    16.0 // sensitivity; range 4..=96, higher = less sensitive
+}
+
+fn default_motion_min_contour_area() -> f64 {
+    200.0 // min object size in foreground pixels; range 50..=2000
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct MotionConfig {
+    /// MOG2 var_threshold. Higher = less sensitive.
+    #[serde(default = "default_motion_var_threshold")]
+    pub var_threshold: f64,
+    /// Minimum connected-component area (foreground pixels) to count as motion.
+    #[serde(default = "default_motion_min_contour_area")]
+    pub min_contour_area: f64,
+}
+
+impl Default for MotionConfig {
+    fn default() -> Self {
+        Self {
+            var_threshold: default_motion_var_threshold(),
+            min_contour_area: default_motion_min_contour_area(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct AnalyticsConfig {
     #[serde(default)]
     pub enabled: bool,
     #[serde(default = "default_sample_fps")]
     pub sample_fps: u32,
+    /// Global default motion-detection settings (deterministic, user-tunable
+    /// per camera at runtime).
+    #[serde(default)]
+    pub motion: MotionConfig,
     #[serde(default)]
     pub object_detection: ObjectDetectionConfig,
 }
@@ -147,6 +182,7 @@ impl Default for AnalyticsConfig {
         Self {
             enabled: false,
             sample_fps: default_sample_fps(),
+            motion: MotionConfig::default(),
             object_detection: ObjectDetectionConfig::default(),
         }
     }

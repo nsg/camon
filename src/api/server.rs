@@ -5,11 +5,15 @@ use axum::extract::{Path, Query, State};
 use axum::http::{header, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
-use axum::Router;
+use axum::{Json, Router};
 use rust_embed::Embed;
 use serde::{Deserialize, Serialize};
 
-use crate::analytics::detection_grid::DetectionGrid;
+use crate::analytics::motion_settings::{
+    MotionSettings, MASK_COLS, MASK_ROWS, MIN_CONTOUR_AREA_MAX, MIN_CONTOUR_AREA_MIN,
+    VAR_THRESHOLD_MAX, VAR_THRESHOLD_MIN,
+};
+use crate::analytics::{MotionSettingsStore, SettingsUpdate};
 use crate::buffer::HotBuffer;
 use crate::locks::LockExt;
 use crate::storage::{DetectionDebugStore, DetectionStore, MotionStore, WarmEventIndex};
@@ -27,7 +31,8 @@ pub struct AppState {
     pub detection_store: DetectionStore,
     pub debug_store: DetectionDebugStore,
     pub warm_index: Option<WarmEventIndex>,
-    pub detection_grid: Option<DetectionGrid>,
+    /// Per-camera deterministic motion settings. `None` when analytics is off.
+    pub motion_settings: Option<MotionSettingsStore>,
 }
 
 impl AppState {
@@ -37,7 +42,7 @@ impl AppState {
         detection_store: DetectionStore,
         debug_store: DetectionDebugStore,
         warm_index: Option<WarmEventIndex>,
-        detection_grid: Option<DetectionGrid>,
+        motion_settings: Option<MotionSettingsStore>,
     ) -> Self {
         Self {
             buffers: Arc::new(buffers),
@@ -45,7 +50,7 @@ impl AppState {
             detection_store,
             debug_store,
             warm_index,
-            detection_grid,
+            motion_settings,
         }
     }
 }
@@ -113,10 +118,9 @@ pub async fn start_server(state: AppState, port: u16) -> Result<(), std::io::Err
             "/api/cameras/{id}/motion/stability/morph",
             get(morph_map_handler),
         )
-        .route("/api/cameras/{id}/motion/tuner", get(tuner_stats_handler))
         .route(
-            "/api/cameras/{id}/detection/grid",
-            get(detection_grid_handler),
+            "/api/cameras/{id}/motion/settings",
+            get(motion_settings_get_handler).put(motion_settings_put_handler),
         )
         .route("/api/cameras/{id}/detections", get(detections_handler))
         .route(
@@ -393,28 +397,64 @@ async fn morph_map_handler(State(state): State<AppState>, Path(id): Path<String>
     }
 }
 
-async fn tuner_stats_handler(State(state): State<AppState>, Path(id): Path<String>) -> Response {
-    if !state.buffers.contains_key(&id) {
-        return (StatusCode::NOT_FOUND, "camera not found").into_response();
-    }
+/// JSON shape for the motion-settings endpoints. Carries the current values,
+/// the ignore-mask grid geometry, and the slider bounds so the UI can build its
+/// controls without hard-coding them.
+#[derive(Serialize)]
+struct MotionSettingsResponse {
+    var_threshold: f64,
+    min_contour_area: f64,
+    mask_cols: usize,
+    mask_rows: usize,
+    mask: Vec<bool>,
+    var_threshold_min: f64,
+    var_threshold_max: f64,
+    min_contour_area_min: f64,
+    min_contour_area_max: f64,
+}
 
-    match state.motion_store.get_tuner_stats(&id) {
-        Some(stats) => axum::Json(stats).into_response(),
-        None => (StatusCode::NOT_FOUND, "tuner stats not available yet").into_response(),
+impl From<MotionSettings> for MotionSettingsResponse {
+    fn from(s: MotionSettings) -> Self {
+        Self {
+            var_threshold: s.var_threshold,
+            min_contour_area: s.min_contour_area,
+            mask_cols: MASK_COLS,
+            mask_rows: MASK_ROWS,
+            mask: s.mask,
+            var_threshold_min: VAR_THRESHOLD_MIN,
+            var_threshold_max: VAR_THRESHOLD_MAX,
+            min_contour_area_min: MIN_CONTOUR_AREA_MIN,
+            min_contour_area_max: MIN_CONTOUR_AREA_MAX,
+        }
     }
 }
 
-async fn detection_grid_handler(State(state): State<AppState>, Path(id): Path<String>) -> Response {
-    if !state.buffers.contains_key(&id) {
-        return (StatusCode::NOT_FOUND, "camera not found").into_response();
+async fn motion_settings_get_handler(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Response {
+    let store = match &state.motion_settings {
+        Some(s) => s,
+        None => return (StatusCode::NOT_FOUND, "motion settings not enabled").into_response(),
+    };
+    match store.get(&id) {
+        Some(s) => axum::Json(MotionSettingsResponse::from(s)).into_response(),
+        None => (StatusCode::NOT_FOUND, "camera not found").into_response(),
     }
+}
 
-    match &state.detection_grid {
-        Some(grid) => match grid.get_grid(&id) {
-            Some(data) => axum::Json(data).into_response(),
-            None => (StatusCode::NOT_FOUND, "no grid data").into_response(),
-        },
-        None => (StatusCode::NOT_FOUND, "detection grid not enabled").into_response(),
+async fn motion_settings_put_handler(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(update): Json<SettingsUpdate>,
+) -> Response {
+    let store = match &state.motion_settings {
+        Some(s) => s,
+        None => return (StatusCode::NOT_FOUND, "motion settings not enabled").into_response(),
+    };
+    match store.update(&id, update) {
+        Some(s) => axum::Json(MotionSettingsResponse::from(s)).into_response(),
+        None => (StatusCode::NOT_FOUND, "camera not found").into_response(),
     }
 }
 

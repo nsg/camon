@@ -118,16 +118,19 @@ fn init_warm_index(config: &Config, camera_ids: &[String]) -> Option<WarmEventIn
     Some(index)
 }
 
-fn init_detection_grid(
+fn init_motion_settings(
     config: &Config,
     camera_ids: &[String],
-) -> Option<analytics::detection_grid::DetectionGrid> {
-    if !config.analytics.enabled || !config.analytics.object_detection.enabled {
+) -> Option<analytics::MotionSettingsStore> {
+    if !config.analytics.enabled {
         return None;
     }
-    Some(analytics::detection_grid::DetectionGrid::new(
+    let data_dir = std::path::PathBuf::from(&config.storage.data_dir);
+    Some(analytics::MotionSettingsStore::new(
         camera_ids,
-        std::path::PathBuf::from(&config.storage.data_dir),
+        &data_dir,
+        config.analytics.motion.var_threshold,
+        config.analytics.motion.min_contour_area,
     ))
 }
 
@@ -172,7 +175,7 @@ struct SpawnContext<'a> {
     detection_store: &'a DetectionStore,
     debug_store: &'a DetectionDebugStore,
     warm_index: &'a Option<WarmEventIndex>,
-    detection_grid: &'a Option<analytics::detection_grid::DetectionGrid>,
+    motion_settings: &'a Option<analytics::MotionSettingsStore>,
     object_detection_ready: bool,
     shutdown: &'a Arc<AtomicBool>,
 }
@@ -257,8 +260,10 @@ fn spawn_cameras(ctx: &SpawnContext, cameras: Vec<config::CameraConfig>) -> Came
                     debug_store: dbg_store,
                     object_detector: obj_det,
                     config: ctx.config.analytics.clone(),
-                    detection_grid: ctx.detection_grid.clone(),
-                    data_dir: std::path::PathBuf::from(&ctx.config.storage.data_dir),
+                    motion_settings: ctx
+                        .motion_settings
+                        .clone()
+                        .expect("motion settings initialized when analytics enabled"),
                     event_tx,
                     pre_padding_ns: ctx.config.storage.pre_padding_secs * 1_000_000_000,
                     post_padding: std::time::Duration::from_secs(
@@ -349,7 +354,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let debug_store = DetectionDebugStore::new(&camera_ids);
     let object_detection_ready = log_object_detection_config(&config);
     let warm_index = init_warm_index(&config, &camera_ids);
-    let detection_grid = init_detection_grid(&config, &camera_ids);
+    let motion_settings = init_motion_settings(&config, &camera_ids);
 
     if config.storage.enabled {
         if config.analytics.enabled {
@@ -370,7 +375,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         detection_store: &detection_store,
         debug_store: &debug_store,
         warm_index: &warm_index,
-        detection_grid: &detection_grid,
+        motion_settings: &motion_settings,
         object_detection_ready,
         shutdown: &shutdown,
     };
@@ -382,7 +387,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         detection_store,
         debug_store,
         warm_index,
-        detection_grid,
+        motion_settings,
     );
     let http_port = config.http.port;
     let server_handle = tokio::spawn(async move {

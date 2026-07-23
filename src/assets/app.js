@@ -15,7 +15,6 @@ document.addEventListener('DOMContentLoaded', async () => {
     const muteToggleBtn = document.getElementById('mute-toggle-btn');
     const maskToggleBtn = document.getElementById('mask-toggle-btn');
     const bgToggleBtn = document.getElementById('bg-toggle-btn');
-    const gridToggleBtn = document.getElementById('grid-toggle-btn');
     const detectionGallery = document.getElementById('detection-gallery');
     const hotEventsStrip = document.getElementById('hot-events-strip');
     const eventsSummaryBtn = document.getElementById('events-summary-btn');
@@ -27,11 +26,16 @@ document.addEventListener('DOMContentLoaded', async () => {
     const stabilityCtx = stabilityOverlay.getContext('2d');
     const bgOverlay = document.getElementById('bg-overlay');
     const bgCtx = bgOverlay.getContext('2d');
-    const gridOverlay = document.getElementById('detection-grid-overlay');
-    const gridCtx = gridOverlay.getContext('2d');
-    const tunerToggleBtn = document.getElementById('tuner-toggle-btn');
-    const tunerOverlay = document.getElementById('tuner-stats-overlay');
-    const tunerCtx = tunerOverlay.getContext('2d');
+    const maskOverlay = document.getElementById('mask-overlay');
+    const maskCtx = maskOverlay.getContext('2d');
+    // Motion settings panel
+    const settingsBtn = document.getElementById('settings-btn');
+    const settingsPanel = document.getElementById('motion-settings-panel');
+    const sensitivitySlider = document.getElementById('sensitivity-slider');
+    const sensitivityValue = document.getElementById('sensitivity-value');
+    const minsizeSlider = document.getElementById('minsize-slider');
+    const minsizeValue = document.getElementById('minsize-value');
+    const maskEditBtn = document.getElementById('mask-edit-btn');
     const liveScrubber = document.getElementById('live-scrubber');
     const liveProgressFill = document.getElementById('live-progress-fill');
     const liveCurrentTime = document.getElementById('live-current-time');
@@ -97,10 +101,14 @@ document.addEventListener('DOMContentLoaded', async () => {
     let morphImage = null;
     let bgOverlayEnabled = false;
     let bgImage = null;
-    let gridOverlayEnabled = false;
-    let gridData = null;
-    let tunerOverlayEnabled = false;
-    let tunerData = null;
+    // Motion settings + ignore-mask editor
+    let motionSettings = null;
+    let maskEditEnabled = false;
+    let maskCells = [];
+    let maskCols = 16;
+    let maskRows = 12;
+    let maskPainting = false;
+    let maskPaintValue = true;
     let overlayAnimationId = null;
     let isLiveScrubbing = false;
     let isAtLiveEdge = true;
@@ -113,19 +121,6 @@ document.addEventListener('DOMContentLoaded', async () => {
     let currentPlaybackPts = null;
     let playbackAnimationId = null;
     let isScrubbing = false;
-
-    const GRID_CLASS_COLORS = {
-        person: 'rgba(50, 100, 255, 0.5)',
-        car: 'rgba(220, 50, 50, 0.5)',
-        truck: 'rgba(255, 140, 0, 0.5)',
-        dog: 'rgba(50, 180, 50, 0.5)',
-        cat: 'rgba(160, 50, 200, 0.5)',
-    };
-    const GRID_FALLBACK_COLORS = [
-        'rgba(0, 200, 200, 0.5)',
-        'rgba(200, 200, 0, 0.5)',
-        'rgba(200, 0, 200, 0.5)',
-    ];
 
     // === View Transition Helper ===
     function withViewTransition(callback, isBack = false) {
@@ -284,29 +279,63 @@ document.addEventListener('DOMContentLoaded', async () => {
         }
     });
 
-    gridToggleBtn.addEventListener('click', () => {
-        gridOverlayEnabled = !gridOverlayEnabled;
-        gridToggleBtn.classList.toggle('active', gridOverlayEnabled);
-        gridOverlay.hidden = !gridOverlayEnabled;
-        if (!gridOverlayEnabled) {
-            gridCtx.clearRect(0, 0, gridOverlay.width, gridOverlay.height);
-            gridData = null;
-        } else {
-            fetchDetectionGrid();
+    // === Motion settings panel ===
+
+    settingsBtn.addEventListener('click', () => {
+        const show = settingsPanel.hidden;
+        settingsPanel.hidden = !show;
+        settingsBtn.classList.toggle('active', show);
+        if (!show && maskEditEnabled) {
+            // Collapsing the panel exits mask-edit mode.
+            setMaskEditEnabled(false);
         }
     });
 
-    tunerToggleBtn.addEventListener('click', () => {
-        tunerOverlayEnabled = !tunerOverlayEnabled;
-        tunerToggleBtn.classList.toggle('active', tunerOverlayEnabled);
-        tunerOverlay.hidden = !tunerOverlayEnabled;
-        if (!tunerOverlayEnabled) {
-            tunerCtx.clearRect(0, 0, tunerOverlay.width, tunerOverlay.height);
-            tunerData = null;
-        } else {
-            fetchTunerStats();
+    sensitivitySlider.addEventListener('input', () => {
+        sensitivityValue.textContent = sensitivitySlider.value;
+    });
+    sensitivitySlider.addEventListener('change', () => {
+        putMotionSettings({ var_threshold: Number(sensitivitySlider.value) });
+    });
+
+    minsizeSlider.addEventListener('input', () => {
+        minsizeValue.textContent = minsizeSlider.value;
+    });
+    minsizeSlider.addEventListener('change', () => {
+        putMotionSettings({ min_contour_area: Number(minsizeSlider.value) });
+    });
+
+    maskEditBtn.addEventListener('click', () => {
+        setMaskEditEnabled(!maskEditEnabled);
+    });
+
+    maskOverlay.addEventListener('pointerdown', (e) => {
+        if (!maskEditEnabled) return;
+        const idx = maskCellFromEvent(e);
+        if (idx < 0) return;
+        maskPainting = true;
+        maskPaintValue = !maskCells[idx];
+        maskCells[idx] = maskPaintValue;
+        drawMask();
+        maskOverlay.setPointerCapture(e.pointerId);
+        e.preventDefault();
+    });
+    maskOverlay.addEventListener('pointermove', (e) => {
+        if (!maskEditEnabled || !maskPainting) return;
+        const idx = maskCellFromEvent(e);
+        if (idx < 0) return;
+        if (maskCells[idx] !== maskPaintValue) {
+            maskCells[idx] = maskPaintValue;
+            drawMask();
         }
     });
+    function endMaskPaint() {
+        if (!maskPainting) return;
+        maskPainting = false;
+        putMotionSettings({ mask: maskCells.slice() });
+    }
+    maskOverlay.addEventListener('pointerup', endMaskPaint);
+    maskOverlay.addEventListener('pointercancel', endMaskPaint);
 
     liveScrubber.addEventListener('input', () => {
         isLiveScrubbing = true;
@@ -421,8 +450,8 @@ document.addEventListener('DOMContentLoaded', async () => {
     // Resize handler for overlays
     window.addEventListener('resize', () => {
         drawBackground();
-        drawDetectionGrid();
         drawStability();
+        drawMask();
     });
 
     // === View Functions ===
@@ -473,13 +502,10 @@ document.addEventListener('DOMContentLoaded', async () => {
             detailLoading.hidden = false;
             stabilityOverlay.hidden = !stabilityOverlayEnabled;
             bgOverlay.hidden = !bgOverlayEnabled;
-            gridOverlay.hidden = !gridOverlayEnabled;
-            tunerOverlay.hidden = !tunerOverlayEnabled;
 
             if (stabilityOverlayEnabled) fetchStabilityMap();
             if (bgOverlayEnabled) fetchBackgroundMap();
-            if (gridOverlayEnabled) fetchDetectionGrid();
-            if (tunerOverlayEnabled) fetchTunerStats();
+            fetchMotionSettings(cameraId);
 
             loadDetailCamera(cameraId);
             fetchWarmEvents(cameraId);
@@ -575,17 +601,12 @@ document.addEventListener('DOMContentLoaded', async () => {
         bgToggleBtn.classList.remove('active');
         bgCtx.clearRect(0, 0, bgOverlay.width, bgOverlay.height);
 
-        gridData = null;
-        gridOverlay.hidden = true;
-        gridOverlayEnabled = false;
-        gridToggleBtn.classList.remove('active');
-        gridCtx.clearRect(0, 0, gridOverlay.width, gridOverlay.height);
-
-        tunerData = null;
-        tunerOverlay.hidden = true;
-        tunerOverlayEnabled = false;
-        tunerToggleBtn.classList.remove('active');
-        tunerCtx.clearRect(0, 0, tunerOverlay.width, tunerOverlay.height);
+        setMaskEditEnabled(false);
+        maskCtx.clearRect(0, 0, maskOverlay.width, maskOverlay.height);
+        motionSettings = null;
+        maskCells = [];
+        settingsPanel.hidden = true;
+        settingsBtn.classList.remove('active');
 
         isLiveScrubbing = false;
         setLiveEdge(true);
@@ -756,6 +777,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         function update() {
             drawBackground();
             drawStability();
+            drawMask();
             updateLiveScrubber();
             overlayAnimationId = requestAnimationFrame(update);
         }
@@ -890,253 +912,111 @@ document.addEventListener('DOMContentLoaded', async () => {
         bgCtx.drawImage(bgImage, 0, 0, w, h);
     }
 
-    function fetchDetectionGrid() {
-        if (!gridOverlayEnabled || !currentDetailCameraId) return;
-        fetch(`/api/cameras/${encodeURIComponent(currentDetailCameraId)}/detection/grid`)
+    // === Live Monitor: Motion Settings + Ignore Mask ===
+
+    function fetchMotionSettings(cameraId) {
+        fetch(`/api/cameras/${encodeURIComponent(cameraId)}/motion/settings`)
             .then(r => r.ok ? r.json() : null)
             .then(data => {
-                if (data) { gridData = data; drawDetectionGrid(); }
+                if (!data || currentDetailCameraId !== cameraId) return;
+                applyMotionSettings(data);
             })
             .catch(() => {});
     }
 
-    function drawDetectionGrid() {
-        if (!gridData) return;
+    function applyMotionSettings(data) {
+        motionSettings = data;
+        maskCols = data.mask_cols;
+        maskRows = data.mask_rows;
+        maskCells = Array.isArray(data.mask) ? data.mask.slice() : [];
+
+        sensitivitySlider.min = data.var_threshold_min;
+        sensitivitySlider.max = data.var_threshold_max;
+        sensitivitySlider.value = data.var_threshold;
+        sensitivityValue.textContent = String(Math.round(data.var_threshold));
+
+        minsizeSlider.min = data.min_contour_area_min;
+        minsizeSlider.max = data.min_contour_area_max;
+        minsizeSlider.value = data.min_contour_area;
+        minsizeValue.textContent = String(Math.round(data.min_contour_area));
+
+        if (maskEditEnabled) drawMask();
+    }
+
+    function putMotionSettings(partial) {
+        if (!currentDetailCameraId) return;
+        fetch(`/api/cameras/${encodeURIComponent(currentDetailCameraId)}/motion/settings`, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(partial),
+        })
+            .then(r => r.ok ? r.json() : null)
+            .then(data => { if (data) applyMotionSettings(data); })
+            .catch(err => console.error('Failed to update motion settings:', err));
+    }
+
+    function setMaskEditEnabled(enabled) {
+        maskEditEnabled = enabled;
+        maskOverlay.hidden = !enabled;
+        maskOverlay.classList.toggle('editing', enabled);
+        maskEditBtn.classList.toggle('active', enabled);
+        maskEditBtn.textContent = enabled ? 'Done editing mask' : 'Edit ignore mask';
+        if (enabled) {
+            drawMask();
+        } else {
+            maskPainting = false;
+            maskCtx.clearRect(0, 0, maskOverlay.width, maskOverlay.height);
+        }
+    }
+
+    function maskCellFromEvent(e) {
+        const rect = maskOverlay.getBoundingClientRect();
+        if (rect.width === 0 || rect.height === 0) return -1;
+        const col = Math.floor((e.clientX - rect.left) / rect.width * maskCols);
+        const row = Math.floor((e.clientY - rect.top) / rect.height * maskRows);
+        if (col < 0 || col >= maskCols || row < 0 || row >= maskRows) return -1;
+        return row * maskCols + col;
+    }
+
+    function drawMask() {
+        if (!maskEditEnabled) return;
         const w = detailVideo.clientWidth;
         const h = detailVideo.clientHeight;
         if (w === 0 || h === 0) return;
-        if (gridOverlay.width !== w || gridOverlay.height !== h) {
-            gridOverlay.width = w;
-            gridOverlay.height = h;
+        if (maskOverlay.width !== w || maskOverlay.height !== h) {
+            maskOverlay.width = w;
+            maskOverlay.height = h;
         }
-        gridCtx.clearRect(0, 0, w, h);
+        maskCtx.clearRect(0, 0, w, h);
 
-        const cols = gridData.cols;
-        const rows = gridData.rows;
-        const cellW = w / cols;
-        const cellH = h / rows;
+        const cellW = w / maskCols;
+        const cellH = h / maskRows;
 
-        // Draw grid lines
-        gridCtx.strokeStyle = 'rgba(255, 255, 255, 0.2)';
-        gridCtx.lineWidth = 1;
-        for (let c = 1; c < cols; c++) {
+        // Masked (ignored) cells filled red.
+        maskCtx.fillStyle = 'rgba(220, 50, 50, 0.4)';
+        for (let i = 0; i < maskCells.length; i++) {
+            if (!maskCells[i]) continue;
+            const col = i % maskCols;
+            const row = Math.floor(i / maskCols);
+            maskCtx.fillRect(col * cellW, row * cellH, cellW, cellH);
+        }
+
+        // Grid lines.
+        maskCtx.strokeStyle = 'rgba(255, 255, 255, 0.25)';
+        maskCtx.lineWidth = 1;
+        for (let c = 1; c < maskCols; c++) {
             const x = Math.round(c * cellW) + 0.5;
-            gridCtx.beginPath();
-            gridCtx.moveTo(x, 0);
-            gridCtx.lineTo(x, h);
-            gridCtx.stroke();
+            maskCtx.beginPath();
+            maskCtx.moveTo(x, 0);
+            maskCtx.lineTo(x, h);
+            maskCtx.stroke();
         }
-        for (let r = 1; r < rows; r++) {
+        for (let r = 1; r < maskRows; r++) {
             const y = Math.round(r * cellH) + 0.5;
-            gridCtx.beginPath();
-            gridCtx.moveTo(0, y);
-            gridCtx.lineTo(w, y);
-            gridCtx.stroke();
-        }
-
-        // Build per-cell max value across all classes for value labels
-        const cellMax = new Float32Array(cols * rows);
-        let fallbackIdx = 0;
-        const legendEntries = [];
-
-        for (const [className, cells] of Object.entries(gridData.classes)) {
-            let color = GRID_CLASS_COLORS[className];
-            if (!color) {
-                color = GRID_FALLBACK_COLORS[fallbackIdx % GRID_FALLBACK_COLORS.length];
-                fallbackIdx++;
-            }
-            let hasVisible = false;
-
-            for (let i = 0; i < cells.length; i++) {
-                if (cells[i] > cellMax[i]) cellMax[i] = cells[i];
-                if (cells[i] <= 0.01) continue;
-                const col = i % cols;
-                const row = Math.floor(i / cols);
-                const x = col * cellW;
-                const y = row * cellH;
-
-                const baseColor = color.replace(/[\d.]+\)$/, `${cells[i] * 0.8})`);
-                gridCtx.fillStyle = baseColor;
-                gridCtx.fillRect(x, y, cellW, cellH);
-
-                if (cells[i] >= 0.6) {
-                    gridCtx.strokeStyle = color.replace(/[\d.]+\)$/, '0.9)');
-                    gridCtx.lineWidth = 2;
-                    gridCtx.strokeRect(x + 1, y + 1, cellW - 2, cellH - 2);
-                }
-                hasVisible = true;
-            }
-
-            if (hasVisible) legendEntries.push({ className, color });
-        }
-
-        // Draw cell values if cells are large enough
-        const fontSize = Math.min(Math.floor(cellH * 0.35), Math.floor(cellW * 0.3), 14);
-        if (fontSize >= 8) {
-            gridCtx.font = `${fontSize}px monospace`;
-            gridCtx.textAlign = 'center';
-            gridCtx.textBaseline = 'middle';
-            for (let i = 0; i < cellMax.length; i++) {
-                if (cellMax[i] <= 0.01) continue;
-                const col = i % cols;
-                const row = Math.floor(i / cols);
-                const cx = col * cellW + cellW / 2;
-                const cy = row * cellH + cellH / 2;
-                gridCtx.fillStyle = 'rgba(0, 0, 0, 0.6)';
-                const label = cellMax[i].toFixed(2);
-                const tw = gridCtx.measureText(label).width;
-                gridCtx.fillRect(cx - tw / 2 - 2, cy - fontSize / 2 - 1, tw + 4, fontSize + 2);
-                gridCtx.fillStyle = '#fff';
-                gridCtx.fillText(label, cx, cy);
-            }
-        }
-
-        if (legendEntries.length > 0) {
-            const lFontSize = 12;
-            const padding = 6;
-            const lineHeight = lFontSize + 4;
-            const legendH = legendEntries.length * lineHeight + padding * 2;
-            const legendW = 100;
-            const lx = w - legendW - 8;
-            const ly = 8;
-
-            gridCtx.fillStyle = 'rgba(0, 0, 0, 0.7)';
-            gridCtx.fillRect(lx, ly, legendW, legendH);
-            gridCtx.font = `${lFontSize}px sans-serif`;
-            gridCtx.textAlign = 'left';
-            gridCtx.textBaseline = 'alphabetic';
-
-            legendEntries.forEach((entry, i) => {
-                const ey = ly + padding + i * lineHeight + lFontSize;
-                gridCtx.fillStyle = entry.color.replace(/[\d.]+\)$/, '1)');
-                gridCtx.fillRect(lx + padding, ey - lFontSize + 2, lFontSize, lFontSize);
-                gridCtx.fillStyle = '#fff';
-                gridCtx.fillText(entry.className, lx + padding + lFontSize + 4, ey);
-            });
-        }
-    }
-
-    function fetchTunerStats() {
-        if (!tunerOverlayEnabled || !currentDetailCameraId) return;
-        fetch(`/api/cameras/${encodeURIComponent(currentDetailCameraId)}/motion/tuner`)
-            .then(r => r.ok ? r.json() : null)
-            .then(data => {
-                if (data) { tunerData = data; drawTunerStats(); }
-            })
-            .catch(() => {});
-    }
-
-    function drawTunerStats() {
-        if (!tunerData) return;
-        const w = detailVideo.clientWidth;
-        const h = detailVideo.clientHeight;
-        if (w === 0 || h === 0) return;
-        if (tunerOverlay.width !== w || tunerOverlay.height !== h) {
-            tunerOverlay.width = w;
-            tunerOverlay.height = h;
-        }
-        const ctx = tunerCtx;
-        ctx.clearRect(0, 0, w, h);
-
-        const d = tunerData;
-        const defaults = { var_threshold: 16, learning_rate: 0.003, morph_kernel: 5 };
-        const lines = [
-            { label: 'var_threshold', value: d.var_threshold, def: defaults.var_threshold, fmt: v => v.toFixed(1) },
-            { label: 'learning_rate', value: d.learning_rate, def: defaults.learning_rate, fmt: v => v.toFixed(4) },
-            { label: 'morph_kernel', value: d.morph_kernel, def: defaults.morph_kernel, fmt: v => v.toFixed(1) },
-            { label: 'noise_events', value: d.noise_events, def: null, fmt: v => `${v}` },
-            { label: 'quiet_windows', value: d.quiet_windows, def: null, fmt: v => `${v}` },
-        ];
-
-        const fontSize = Math.max(14, Math.min(18, w / 40));
-        const lineHeight = fontSize * 1.4;
-        const padding = 12;
-        const boxWidth = fontSize * 20;
-
-        // Region heatmap dimensions
-        const regionCols = d.region_cols || 4;
-        const regionRows = d.region_rows || 3;
-        const regions = d.region_min_contour_areas || [];
-        const gridCellW = (boxWidth - padding * 2) / regionCols;
-        const gridCellH = gridCellW * 0.75;
-        const gridHeight = regions.length > 0 ? regionRows * gridCellH + lineHeight + 4 : 0;
-
-        const boxHeight = lines.length * lineHeight + padding * 2 + gridHeight;
-        const x = w - boxWidth - padding;
-        const y = h - boxHeight - padding;
-
-        ctx.fillStyle = 'rgba(0, 0, 0, 0.7)';
-        ctx.beginPath();
-        ctx.roundRect(x, y, boxWidth, boxHeight, 6);
-        ctx.fill();
-
-        ctx.textBaseline = 'top';
-
-        for (let i = 0; i < lines.length; i++) {
-            const line = lines[i];
-            const changed = line.def !== null && line.value !== line.def;
-            const labelText = line.label + ': ';
-            const valueText = line.fmt(line.value);
-            const defText = line.def !== null ? ` (${line.fmt(line.def)})` : '';
-            const ty = y + padding + i * lineHeight;
-
-            ctx.fillStyle = 'rgba(255, 255, 255, 0.6)';
-            ctx.font = `${fontSize}px monospace`;
-            ctx.fillText(labelText, x + padding, ty);
-            const labelW = ctx.measureText(labelText).width;
-
-            ctx.fillStyle = changed ? '#f1c40f' : '#fff';
-            ctx.font = changed ? `bold ${fontSize}px monospace` : `${fontSize}px monospace`;
-            ctx.fillText(valueText, x + padding + labelW, ty);
-            const valueW = ctx.measureText(valueText).width;
-
-            if (defText) {
-                ctx.fillStyle = 'rgba(255, 255, 255, 0.35)';
-                ctx.font = `${fontSize}px monospace`;
-                ctx.fillText(defText, x + padding + labelW + valueW, ty);
-            }
-        }
-
-        // Draw region min_contour_area heatmap
-        if (regions.length > 0) {
-            const gridY = y + padding + lines.length * lineHeight + 4;
-
-            // Label
-            ctx.fillStyle = 'rgba(255, 255, 255, 0.6)';
-            ctx.font = `${fontSize}px monospace`;
-            ctx.textAlign = 'left';
-            ctx.fillText('min_contour_area:', x + padding, gridY);
-
-            const cellsY = gridY + lineHeight;
-            const cellFontSize = Math.max(10, fontSize * 0.6);
-
-            for (let r = 0; r < regionRows; r++) {
-                for (let c = 0; c < regionCols; c++) {
-                    const idx = r * regionCols + c;
-                    const val = regions[idx] || 200;
-                    const t = Math.min(1, (val - 200) / (2000 - 200));
-
-                    // Green (default) → yellow → red (max)
-                    const red = Math.round(t < 0.5 ? t * 2 * 255 : 255);
-                    const green = Math.round(t < 0.5 ? 255 : (1 - (t - 0.5) * 2) * 255);
-                    const alpha = val === 200 ? 0.25 : 0.7;
-                    ctx.fillStyle = `rgba(${red},${green},50,${alpha})`;
-
-                    const cx = x + padding + c * gridCellW;
-                    const cy = cellsY + r * gridCellH;
-                    ctx.fillRect(cx, cy, gridCellW - 1, gridCellH - 1);
-
-                    // Value label
-                    ctx.fillStyle = val === 200 ? 'rgba(255,255,255,0.4)' : '#fff';
-                    ctx.font = `${cellFontSize}px monospace`;
-                    ctx.textAlign = 'center';
-                    ctx.textBaseline = 'middle';
-                    ctx.fillText(val.toFixed(0), cx + gridCellW / 2, cy + gridCellH / 2);
-                }
-            }
-
-            ctx.textAlign = 'left';
-            ctx.textBaseline = 'top';
+            maskCtx.beginPath();
+            maskCtx.moveTo(0, y);
+            maskCtx.lineTo(w, y);
+            maskCtx.stroke();
         }
     }
 
@@ -1166,8 +1046,6 @@ document.addEventListener('DOMContentLoaded', async () => {
         stabilityPollInterval = setInterval(() => {
             fetchStabilityMap();
             fetchBackgroundMap();
-            fetchDetectionGrid();
-            fetchTunerStats();
         }, 5000);
     }
 

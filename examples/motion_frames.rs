@@ -15,6 +15,7 @@ use std::fs::File;
 use std::io::Write;
 use std::path::PathBuf;
 
+use camon::analytics::motion_settings::{DEFAULT_MIN_CONTOUR_AREA, DEFAULT_VAR_THRESHOLD};
 use camon::analytics::MotionDetector;
 
 fn main() {
@@ -60,10 +61,9 @@ fn main() {
     let nframes = data.len() / frame_size;
     eprintln!("{nframes} frames of {width}x{height}");
 
-    // Detector state (tuner params) goes to a throwaway directory.
-    let state_dir =
-        std::env::temp_dir().join(format!("camon-motion-frames-{}", std::process::id()));
-    let mut detector = MotionDetector::new("frames", &state_dir);
+    // Deterministic detector at the default sensitivity / min object size and
+    // an empty ignore mask — matches an untouched camera.
+    let mut detector = MotionDetector::new(DEFAULT_VAR_THRESHOLD, DEFAULT_MIN_CONTOUR_AREA);
 
     let zeros = vec![0u8; frame_size];
     let write_mask =
@@ -87,6 +87,4 @@ fn main() {
         write_mask(&mut raw_masks, detector.raw_mask(), true);
         write_mask(&mut morph_masks, detector.morph_mask(), processed);
     }
-
-    let _ = std::fs::remove_dir_all(&state_dir);
 }

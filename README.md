@@ -46,20 +46,27 @@ end
 
 To make decoding as lightweight as possible, we only extract keyframes because they are self-contained and do not depend on surrounding frames. With a 1-second GOP this means the analyzer effectively samples one frame per second.
 
-The Motion Analyzer uses a built-in pure-Rust implementation of the Zivkovic MOG2 (Mixture of Gaussians) background subtractor — validated bit-exact against OpenCV's — to detect foreground motion, followed by morphological opening to eliminate noise and connected-component filtering to discard small blobs. The background model spans about 5 minutes at the 1 fps analysis rate, so persistent motion like tree sway gets absorbed into the background. Several of these parameters are tuned automatically based on the camera's noise level to find an equilibrium between sensitivity and noise suppression.
+The Motion Analyzer uses a built-in pure-Rust implementation of the Zivkovic MOG2 (Mixture of Gaussians) background subtractor — validated bit-exact against OpenCV's — to detect foreground motion, followed by morphological opening to eliminate noise and connected-component filtering to discard small blobs. The background model spans about 5 minutes at the 1 fps analysis rate, so persistent motion like tree sway gets absorbed into the background.
+
+Motion detection is governed by three deterministic, per-camera controls, editable live from the web UI and persisted to `{data_dir}/{camera}/motion_settings.json`:
+
+- **Sensitivity** — the MOG2 `var_threshold` (range 4–96, default 16; higher = less sensitive).
+- **Min object size** — the minimum connected-component area in foreground pixels (range 50–2000, default 200), which discards small blobs like blowing leaves.
+- **Ignore mask** — a 16×12 grid of cells painted over the camera view; masked cells are zeroed in the MOG2 foreground mask before morphology and connected-component labeling, so they are excluded from detection deterministically.
+
+There is no automatic tuning and no learned suppression: MOG2's verdict is the sole gate on what footage persists, so the settings only ever change when a human moves them. Config defaults for the two sliders can be set under `[analytics.motion]`; the per-camera file wins once a camera has been adjusted.
 
 ```mermaid
 flowchart LR
   HotBuffer[("Hot Buffer (10m)")] -->|motion event| Sub["Subsample 4 Frames"]
   MA[("Motion Store")] -->|bounding boxes| Sub
-  Sub --> Crop1["Crop"] --> Ollama1["Ollama"] --> Grid["Detection Grid (16x12)"]
-  Sub --> Crop2["Crop"] --> Ollama2["Ollama"] --> Grid
-  Sub --> Crop3["Crop"] --> Ollama3["Ollama"] --> Grid
-  Sub --> Crop4["Crop"] --> Ollama4["Ollama"] --> Grid
-  Grid --> DS[("Detection Store")]
+  Sub --> Crop1["Crop"] --> Ollama1["Ollama"] --> DS[("Detection Store")]
+  Sub --> Crop2["Crop"] --> Ollama2["Ollama"] --> DS
+  Sub --> Crop3["Crop"] --> Ollama3["Ollama"] --> DS
+  Sub --> Crop4["Crop"] --> Ollama4["Ollama"] --> DS
 ```
 
-The Motion Store keeps track of motion events. If there are several segments in sequence that have movements, they are considered a single motion event. We sample four frames from each event at 0/3, 1/3, 2/3 and 3/3. Using bounding boxes from the motion event, we crop the image to "zoom in" to the action before sending it to our vision model running in Ollama. We keep track of where in the frame the object was detected and record it in a detection grid. If there are many detections of a specific class of objects in that area, the detection is suppressed (dropped). For example, this prevents repeated detections for a parked car.
+The Motion Store keeps track of motion events. If there are several segments in sequence that have movements, they are considered a single motion event. We sample four frames from each event at 0/3, 1/3, 2/3 and 3/3. Using bounding boxes from the motion event, we crop the image to "zoom in" to the action before sending it to our vision model running in Ollama. Every detection the model returns is recorded — there is no learned suppression that could silently drop a real detection. To stop a persistently busy area (a tree, a road) from generating events, paint it into the per-camera ignore mask.
 
 We are still running in RAM, our 10 minute video buffer and some metadata stored in the motion and detection stores. At this stage we should have enough information to only save events that we care about on disk!
 
@@ -236,8 +243,8 @@ url = "rtsp://admin:password@192.168.1.100:554/stream1"
 | `GET` | `/api/cameras/{id}/motion/stability/no-shadow` | JPEG alias of the raw mask (shadow stage removed) |
 | `GET` | `/api/cameras/{id}/motion/stability/morph` | JPEG after morphological opening |
 | `GET` | `/api/cameras/{id}/motion/background` | JPEG learned background model |
-| `GET` | `/api/cameras/{id}/motion/tuner` | Adaptive tuner stats (JSON) |
-| `GET` | `/api/cameras/{id}/detection/grid` | Detection heatmap grid (JSON) |
+| `GET` | `/api/cameras/{id}/motion/settings` | Motion settings: sensitivity, min object size, ignore mask (JSON) |
+| `PUT` | `/api/cameras/{id}/motion/settings` | Update motion settings (partial JSON: `var_threshold`, `min_contour_area`, `mask`) |
 | `GET` | `/api/cameras/{id}/detections` | Detected objects with confidence |
 | `GET` | `/api/cameras/{id}/detections/{id}/frame` | JPEG frame of detection |
 | `GET` | `/api/cameras/{id}/hot-events` | Hot buffer motion events |

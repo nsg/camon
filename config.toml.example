@@ -14,10 +14,20 @@ port = 8080
 
 [analytics]
 # Enable MOG2 motion detection (default: false)
-# Motion threshold is automatically tuned using percentile-based adaptive thresholding
 enabled = true
 # Frame sample rate for analysis (default: 5)
 sample_fps = 5
+
+# Default motion-detection settings. These seed each camera's
+# motion_settings.json the first time it is seen; after that the per-camera
+# file — edited live from the web UI (sensitivity slider, min-object-size
+# slider, paintable ignore mask) — takes over. Detection is fully
+# deterministic: there is no auto-tuning.
+[analytics.motion]
+# MOG2 var_threshold. Higher = less sensitive. Range 4-96 (default: 16).
+var_threshold = 16
+# Minimum object size in foreground pixels. Range 50-2000 (default: 200).
+min_contour_area = 200
 
 # Object detection via Ollama (requires analytics enabled)
 [analytics.object_detection]
