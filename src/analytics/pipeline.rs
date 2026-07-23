@@ -128,7 +128,7 @@ struct SegmentDetectionResult {
     confidences: Vec<f32>,
     /// Per-class bounding rects in full-frame normalized coordinates.
     class_rects: Vec<Vec<(f32, f32, f32, f32)>>,
-    frame_jpeg: Vec<u8>,
+    frame_jpeg: Arc<Vec<u8>>,
 }
 
 pub struct AnalyzerContext {
@@ -650,7 +650,7 @@ impl MotionAnalyzer {
                 classes: result.classes.clone(),
                 confidences: result.confidences.clone(),
                 class_rects: result.class_rects.clone(),
-                frame_jpeg: result.frame_jpeg.clone(),
+                frame_jpeg: Arc::clone(&result.frame_jpeg),
             };
             self.store_detection_result(seg.seq, &propagated);
         }
@@ -702,11 +702,11 @@ impl MotionAnalyzer {
                 let crop_tuple = run_crop.map(|c| (c.x, c.y, c.w, c.h));
                 debug_store.insert(
                     &self.camera_id,
-                    result.frame_jpegs,
+                    result.frame_jpegs.into_iter().map(Arc::new).collect(),
                     result.raw_responses,
                     result.model,
                     result.detections.len(),
-                    full_frame_jpeg,
+                    full_frame_jpeg.map(Arc::new),
                     motion_rects.to_vec(),
                     crop_tuple,
                     ollama_rects,
@@ -762,7 +762,7 @@ impl MotionAnalyzer {
                     segment_sequence: seq,
                     object_class: class.clone(),
                     confidence,
-                    frame_jpeg: result.frame_jpeg.clone(),
+                    frame_jpeg: Arc::clone(&result.frame_jpeg),
                     backend: backend.clone(),
                     model: model.clone(),
                 },
@@ -791,11 +791,13 @@ fn build_detection_result(
     best_frame_idx: usize,
     crop: Option<NormalizedRect>,
 ) -> SegmentDetectionResult {
-    let frame_jpeg = filmstrip_jpegs
-        .get(best_frame_idx)
-        .cloned()
-        .or_else(|| filmstrip_jpegs.first().cloned())
-        .unwrap_or_default();
+    let frame_jpeg = Arc::new(
+        filmstrip_jpegs
+            .get(best_frame_idx)
+            .cloned()
+            .or_else(|| filmstrip_jpegs.first().cloned())
+            .unwrap_or_default(),
+    );
 
     // Deduplicate by class — keep highest confidence per class,
     // and collect all bboxes for each class.

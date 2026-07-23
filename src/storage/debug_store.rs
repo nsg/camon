@@ -10,11 +10,11 @@ const MAX_ENTRIES: usize = 50;
 pub struct DebugEntry {
     pub id: u64,
     pub timestamp: u64,
-    pub frame_jpegs: Vec<Vec<u8>>,
+    pub frame_jpegs: Vec<Arc<Vec<u8>>>,
     pub raw_responses: Vec<String>,
     pub model: String,
     pub detection_count: usize,
-    pub full_frame_jpeg: Option<Vec<u8>>,
+    pub full_frame_jpeg: Option<Arc<Vec<u8>>>,
     /// Individual motion bounding boxes in normalized coords (x, y, w, h).
     pub motion_rects: Vec<(f32, f32, f32, f32)>,
     /// Union crop region sent to Ollama in normalized coords.
@@ -57,11 +57,11 @@ impl DetectionDebugStore {
     pub fn insert(
         &self,
         camera_id: &str,
-        frame_jpegs: Vec<Vec<u8>>,
+        frame_jpegs: Vec<Arc<Vec<u8>>>,
         raw_responses: Vec<String>,
         model: String,
         detection_count: usize,
-        full_frame_jpeg: Option<Vec<u8>>,
+        full_frame_jpeg: Option<Arc<Vec<u8>>>,
         motion_rects: Vec<(f32, f32, f32, f32)>,
         crop_rect: Option<(f32, f32, f32, f32)>,
         ollama_rects: Vec<(String, f32, f32, f32, f32)>,
@@ -115,7 +115,7 @@ impl DetectionDebugStore {
         }
     }
 
-    pub fn get_full_frame_jpeg(&self, camera_id: &str, id: u64) -> Option<Vec<u8>> {
+    pub fn get_full_frame_jpeg(&self, camera_id: &str, id: u64) -> Option<Arc<Vec<u8>>> {
         self.cameras.get(camera_id).and_then(|lock| {
             let entries = lock.read_recover();
             entries
@@ -125,7 +125,12 @@ impl DetectionDebugStore {
         })
     }
 
-    pub fn get_frame_jpeg(&self, camera_id: &str, id: u64, frame_index: usize) -> Option<Vec<u8>> {
+    pub fn get_frame_jpeg(
+        &self,
+        camera_id: &str,
+        id: u64,
+        frame_index: usize,
+    ) -> Option<Arc<Vec<u8>>> {
         self.cameras.get(camera_id).and_then(|lock| {
             let entries = lock.read_recover();
             entries

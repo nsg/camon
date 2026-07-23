@@ -11,7 +11,7 @@ pub struct DetectionEntry {
     pub segment_sequence: u64,
     pub object_class: String,
     pub confidence: f32,
-    pub frame_jpeg: Vec<u8>,
+    pub frame_jpeg: Arc<Vec<u8>>,
     pub backend: String,
     pub model: String,
 }
@@ -93,13 +93,13 @@ impl DetectionStore {
         }
     }
 
-    pub fn get_frame(&self, camera_id: &str, detection_id: u64) -> Option<Vec<u8>> {
+    pub fn get_frame(&self, camera_id: &str, detection_id: u64) -> Option<Arc<Vec<u8>>> {
         self.cameras.get(camera_id).and_then(|lock| {
             let entries = lock.read_recover();
             entries
                 .iter()
                 .find(|e| e.id == detection_id)
-                .map(|e| e.frame_jpeg.clone())
+                .map(|e| Arc::clone(&e.frame_jpeg))
         })
     }
 

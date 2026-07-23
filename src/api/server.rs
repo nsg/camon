@@ -420,7 +420,7 @@ async fn detection_frame_handler(
     }
 
     match state.detection_store.get_frame(&id, detection_id) {
-        Some(frame) => ([(header::CONTENT_TYPE, "image/jpeg")], frame).into_response(),
+        Some(frame) => ([(header::CONTENT_TYPE, "image/jpeg")], (*frame).clone()).into_response(),
         None => (StatusCode::NOT_FOUND, "detection not found").into_response(),
     }
 }
@@ -778,7 +778,7 @@ async fn detection_debug_frame_handler(
     }
 
     match state.debug_store.get_frame_jpeg(&id, debug_id, frame_index) {
-        Some(jpeg) => ([(header::CONTENT_TYPE, "image/jpeg")], jpeg).into_response(),
+        Some(jpeg) => ([(header::CONTENT_TYPE, "image/jpeg")], (*jpeg).clone()).into_response(),
         None => (StatusCode::NOT_FOUND, "debug frame not found").into_response(),
     }
 }
@@ -792,7 +792,7 @@ async fn detection_debug_full_frame_handler(
     }
 
     match state.debug_store.get_full_frame_jpeg(&id, debug_id) {
-        Some(jpeg) => ([(header::CONTENT_TYPE, "image/jpeg")], jpeg).into_response(),
+        Some(jpeg) => ([(header::CONTENT_TYPE, "image/jpeg")], (*jpeg).clone()).into_response(),
         None => (StatusCode::NOT_FOUND, "full frame not found").into_response(),
     }
 }
