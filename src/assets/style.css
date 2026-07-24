@@ -257,6 +257,8 @@ main {
     flex-wrap: wrap;
 }
 
+.setting-row[hidden] { display: none; }
+
 .setting-row label {
     min-width: 9.5rem;
     font-size: 0.85rem;
@@ -297,6 +299,38 @@ main {
     color: var(--color-cream);
     border-color: var(--color-cream);
     background: rgba(255, 255, 255, 0.06);
+}
+
+/* Mask-layer selector: two segmented buttons choosing which mask painting
+   targets. Each active state carries its layer's overlay color (movement =
+   red, detection = orange) so the button matches what appears on the video. */
+.mask-layer-toggle {
+    display: inline-flex;
+    gap: 0;
+    border-radius: 4px;
+    overflow: hidden;
+}
+.mask-layer-btn {
+    background: transparent;
+    color: #ccc;
+    border: 1px solid rgba(255, 255, 255, 0.2);
+    padding: 0.4rem 0.8rem;
+    cursor: pointer;
+    font-size: 0.85rem;
+    transition: color 0.2s, border-color 0.2s, background 0.2s;
+}
+.mask-layer-btn:first-child { border-radius: 4px 0 0 4px; }
+.mask-layer-btn:last-child { border-radius: 0 4px 4px 0; border-left: none; }
+.mask-layer-btn:hover { color: #fff; }
+#layer-movement-btn.active {
+    color: #fff;
+    border-color: rgba(220, 50, 50, 0.9);
+    background: rgba(220, 50, 50, 0.35);
+}
+#layer-detection-btn.active {
+    color: #fff;
+    border-color: rgba(255, 140, 0, 0.9);
+    background: rgba(255, 140, 0, 0.35);
 }
 
 .live-scrubber-bar {

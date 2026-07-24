@@ -100,8 +100,15 @@
                     <span class="setting-hint">foreground pixels</span>
                 </div>
                 <div class="setting-row">
-                    <button id="mask-edit-btn" class="settings-action-btn">Edit ignore mask</button>
-                    <span class="setting-hint">Click or drag cells on the video to ignore motion there.</span>
+                    <button id="mask-edit-btn" class="settings-action-btn">Edit masks</button>
+                    <span class="setting-hint">Paint cells on the video for the active mask below.</span>
+                </div>
+                <div class="setting-row" id="mask-layer-row" hidden>
+                    <div id="mask-layer-toggle" class="mask-layer-toggle" role="group" aria-label="Mask layer">
+                        <button id="layer-movement-btn" class="mask-layer-btn active" data-layer="movement">Movement mask</button>
+                        <button id="layer-detection-btn" class="mask-layer-btn" data-layer="detection">Detection mask</button>
+                    </div>
+                    <span class="setting-hint" id="mask-layer-hint">Movement mask: nothing ever moves here (ignored by motion detection).</span>
                 </div>
             </div>
             <div id="detection-gallery"></div>

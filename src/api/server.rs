@@ -398,8 +398,8 @@ async fn morph_map_handler(State(state): State<AppState>, Path(id): Path<String>
 }
 
 /// JSON shape for the motion-settings endpoints. Carries the current values,
-/// the ignore-mask grid geometry, and the slider bounds so the UI can build its
-/// controls without hard-coding them.
+/// the mask grid geometry (shared by the movement and detection masks), and the
+/// slider bounds so the UI can build its controls without hard-coding them.
 #[derive(Serialize)]
 struct MotionSettingsResponse {
     var_threshold: f64,
@@ -407,6 +407,7 @@ struct MotionSettingsResponse {
     mask_cols: usize,
     mask_rows: usize,
     mask: Vec<bool>,
+    detection_mask: Vec<bool>,
     var_threshold_min: f64,
     var_threshold_max: f64,
     min_contour_area_min: f64,
@@ -421,6 +422,7 @@ impl From<MotionSettings> for MotionSettingsResponse {
             mask_cols: MASK_COLS,
             mask_rows: MASK_ROWS,
             mask: s.mask,
+            detection_mask: s.detection_mask,
             var_threshold_min: VAR_THRESHOLD_MIN,
             var_threshold_max: VAR_THRESHOLD_MAX,
             min_contour_area_min: MIN_CONTOUR_AREA_MIN,

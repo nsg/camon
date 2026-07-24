@@ -53,9 +53,11 @@ Motion detection is governed by three deterministic, per-camera controls, editab
 
 - **Sensitivity** — the MOG2 `var_threshold` (range 4–96, default 16; higher = less sensitive).
 - **Min object size** — the minimum connected-component area in foreground pixels (range 50–2000, default 200), which discards small blobs like blowing leaves.
-- **Ignore mask** — a 16×12 grid of cells painted over the camera view; masked cells are zeroed in the MOG2 foreground mask before morphology and connected-component labeling, so they are excluded from detection deterministically.
+- **Movement mask** — a 16×12 grid of cells painted over the camera view; masked cells are zeroed in the MOG2 foreground mask before morphology and connected-component labeling, so they are excluded from detection deterministically. Read it as "nothing ever moves here": paint a busy road or a swaying tree to keep it from producing motion events.
 
 There is no automatic tuning and no learned suppression: MOG2's verdict is the sole gate on what footage persists, so the settings only ever change when a human moves them. Config defaults for the two sliders can be set under `[analytics.motion]`; the per-camera file wins once a camera has been adjusted.
+
+A fourth per-camera control, the **detection mask**, is painted on the same 16×12 grid but works one stage later and independently of motion detection. Its cells read as "the vision model never sees these pixels": every cell painted here is blacked out of every frame handed to the Ollama vision model before JPEG encoding, in the crop's own coordinate space (the cell rectangle is intersected with each crop and translated, so masked pixels are removed no matter how the frame was cropped — including the full-frame crop a lighting change can force). Motion detection is untouched; only classification is suppressed. Use it for a stationary nuisance object — a parked car that would otherwise be reported as "car" whenever a full-frame crop briefly includes it. The web UI's mask editor paints both layers on one grid, switching between the movement mask (red) and detection mask (orange) with a layer toggle. The detection mask defaults to all-off and is persisted alongside the other settings in `motion_settings.json`.
 
 ```mermaid
 flowchart LR
@@ -69,7 +71,7 @@ flowchart LR
 
 The Motion Store keeps track of motion events. If there are several segments in sequence that have movements, they are considered a single motion event. We sample four frames from each event at 0/3, 1/3, 2/3 and 3/3. Using bounding boxes from the motion event, we crop the image to "zoom in" to the action, JPEG-encode the crops, and enqueue them as a job for a single global detection worker shared by all cameras. The worker is strictly serial — at most one in-flight Ollama request at any time — so a modest GPU is never hit with parallel load, and the analyzer never waits for the model: if the small queue is full the job is simply dropped with a warning (the motion event still records; only the object classification is lost).
 
-The model is asked for structured output: the request carries a JSON schema (via Ollama's `format` field) with the configured class list as an enum, so the response is machine-parseable JSON with per-detection class, confidence, and a normalized bounding box. Responses are validated — out-of-range confidences, garbage boxes, and unknown classes are dropped. Every valid detection is recorded — there is no learned suppression that could silently drop a real detection. To stop a persistently busy area (a tree, a road) from generating events, paint it into the per-camera ignore mask.
+The model is asked for structured output: the request carries a JSON schema (via Ollama's `format` field) with the configured class list as an enum, so the response is machine-parseable JSON with per-detection class, confidence, and a normalized bounding box. Responses are validated — out-of-range confidences, garbage boxes, and unknown classes are dropped. Every valid detection is recorded — there is no learned suppression that could silently drop a real detection. To stop a persistently busy area (a tree, a road) from generating events, paint it into the per-camera movement mask; to stop a stationary object (a parked car) from being classified without suppressing motion there, paint it into the per-camera detection mask, which blacks those cells out of every frame sent to the vision model.
 
 We are still running in RAM, our 10 minute video buffer and some metadata stored in the motion and detection stores. At this stage we should have enough information to only save events that we care about on disk!
 
@@ -247,8 +249,8 @@ url = "rtsp://admin:password@192.168.1.100:554/stream1"
 | `GET` | `/api/cameras/{id}/motion/stability/no-shadow` | JPEG alias of the raw mask (shadow stage removed) |
 | `GET` | `/api/cameras/{id}/motion/stability/morph` | JPEG after morphological opening |
 | `GET` | `/api/cameras/{id}/motion/background` | JPEG learned background model |
-| `GET` | `/api/cameras/{id}/motion/settings` | Motion settings: sensitivity, min object size, ignore mask (JSON) |
-| `PUT` | `/api/cameras/{id}/motion/settings` | Update motion settings (partial JSON: `var_threshold`, `min_contour_area`, `mask`) |
+| `GET` | `/api/cameras/{id}/motion/settings` | Motion settings: sensitivity, min object size, movement mask, detection mask (JSON) |
+| `PUT` | `/api/cameras/{id}/motion/settings` | Update motion settings (partial JSON: `var_threshold`, `min_contour_area`, `mask`, `detection_mask`) |
 | `GET` | `/api/cameras/{id}/detections` | Detected objects with confidence |
 | `GET` | `/api/cameras/{id}/detections/{id}/frame` | JPEG frame of detection |
 | `GET` | `/api/cameras/{id}/hot-events` | Hot buffer motion events |

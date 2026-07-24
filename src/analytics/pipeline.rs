@@ -5,7 +5,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::analytics::motion_settings::{
-    MotionSettingsStore, DEFAULT_MIN_CONTOUR_AREA, DEFAULT_VAR_THRESHOLD,
+    MotionSettingsStore, DEFAULT_MIN_CONTOUR_AREA, DEFAULT_VAR_THRESHOLD, MASK_CELLS, MASK_COLS,
+    MASK_ROWS,
 };
 use crate::buffer::warm::{assemble_event, WriterMessage};
 use crate::buffer::HotBuffer;
@@ -34,6 +35,16 @@ struct NormalizedRect {
     w: f32,
     h: f32,
 }
+
+/// The whole frame in normalized coordinates. Used as the crop region for the
+/// full-frame fallback (a frame with no motion crop, or a lighting-driven crop
+/// that spans the entire frame) so the detection mask is applied consistently.
+const FULL_FRAME: NormalizedRect = NormalizedRect {
+    x: 0.0,
+    y: 0.0,
+    w: 1.0,
+    h: 1.0,
+};
 
 fn normalize_rect(r: MotionBox, frame_w: i32, frame_h: i32) -> NormalizedRect {
     NormalizedRect {
@@ -121,6 +132,66 @@ fn crop_frame(frame: &RgbFrame, region: &NormalizedRect) -> Option<RgbFrame> {
     })
 }
 
+/// Black out (set to RGB black) every pixel of `frame` that belongs to a
+/// painted detection-mask cell. `frame` is a crop covering the normalized
+/// full-frame region `crop`; the 16x12 detection mask is defined over the full
+/// frame, so each painted cell's rectangle is intersected with the crop and
+/// translated into the crop's own pixel space. Cells that fall entirely
+/// outside the crop contribute nothing.
+///
+/// The vision model must never see a masked pixel regardless of crop geometry,
+/// so intersections are rounded outward (start floored, end ceiled): a painted
+/// cell is always fully covered even when its edges land between pixels.
+fn apply_detection_mask(frame: &mut RgbFrame, crop: NormalizedRect, mask: &[bool]) {
+    if mask.len() != MASK_CELLS
+        || mask.iter().all(|&m| !m)
+        || crop.w <= 0.0
+        || crop.h <= 0.0
+        || frame.width == 0
+        || frame.height == 0
+    {
+        return;
+    }
+    let fw = frame.width as f32;
+    let fh = frame.height as f32;
+    for row in 0..MASK_ROWS {
+        for col in 0..MASK_COLS {
+            if !mask[row * MASK_COLS + col] {
+                continue;
+            }
+            // Cell rectangle in full-frame normalized coordinates.
+            let cx0 = col as f32 / MASK_COLS as f32;
+            let cx1 = (col + 1) as f32 / MASK_COLS as f32;
+            let cy0 = row as f32 / MASK_ROWS as f32;
+            let cy1 = (row + 1) as f32 / MASK_ROWS as f32;
+            // Intersect with the crop region.
+            let ix0 = cx0.max(crop.x);
+            let ix1 = cx1.min(crop.x + crop.w);
+            let iy0 = cy0.max(crop.y);
+            let iy1 = cy1.min(crop.y + crop.h);
+            if ix1 <= ix0 || iy1 <= iy0 {
+                continue;
+            }
+            // Translate into crop-local pixel coordinates, rounding outward.
+            let px0 = ((((ix0 - crop.x) / crop.w) * fw).floor() as i64).clamp(0, frame.width as i64)
+                as usize;
+            let px1 = ((((ix1 - crop.x) / crop.w) * fw).ceil() as i64).clamp(0, frame.width as i64)
+                as usize;
+            let py0 = ((((iy0 - crop.y) / crop.h) * fh).floor() as i64)
+                .clamp(0, frame.height as i64) as usize;
+            let py1 = ((((iy1 - crop.y) / crop.h) * fh).ceil() as i64).clamp(0, frame.height as i64)
+                as usize;
+            for py in py0..py1 {
+                let start = (py * frame.width + px0) * 3;
+                let end = (py * frame.width + px1) * 3;
+                for b in &mut frame.data[start..end] {
+                    *b = 0;
+                }
+            }
+        }
+    }
+}
+
 struct MotionSegment {
     seq: u64,
     data: Arc<Vec<u8>>,
@@ -174,6 +245,11 @@ pub struct MotionAnalyzer {
     event_registry: Option<EventRegistry>,
     last_processed: u64,
     motion_settings: MotionSettingsStore,
+    /// Per-camera "detection mask": 16x12 row-major cells, `true` = blacked
+    /// out of every frame sent to the vision model. Refreshed each tick in
+    /// `sync_settings` so paint edits apply live, exactly like the movement
+    /// mask and the sliders.
+    detection_mask: Vec<bool>,
     segment_crops: HashMap<u64, NormalizedRect>,
     segment_motion_rects: HashMap<u64, Vec<NormalizedRect>>,
     run_tracker: RunTracker,
@@ -194,6 +270,10 @@ impl MotionAnalyzer {
         if let Some(s) = settings.as_ref() {
             detector.set_mask(&s.mask);
         }
+        let detection_mask = settings
+            .as_ref()
+            .map(|s| s.detection_mask.clone())
+            .unwrap_or_else(|| vec![false; MASK_CELLS]);
         let decoder = FrameDecoder::new()?;
 
         let last_processed = ctx
@@ -214,6 +294,7 @@ impl MotionAnalyzer {
             event_registry: ctx.event_registry,
             last_processed,
             motion_settings: ctx.motion_settings,
+            detection_mask,
             segment_crops: HashMap::new(),
             segment_motion_rects: HashMap::new(),
             run_tracker: RunTracker::new(ctx.post_padding, ctx.max_event_duration),
@@ -271,6 +352,7 @@ impl MotionAnalyzer {
             self.detector.set_var_threshold(s.var_threshold);
             self.detector.set_min_contour_area(s.min_contour_area);
             self.detector.set_mask(&s.mask);
+            self.detection_mask = s.detection_mask;
         }
     }
 
@@ -695,19 +777,37 @@ impl MotionAnalyzer {
             }
         }
 
-        // Encode a full (uncropped) frame for debug overlay.
-        // Pick the first tagged frame that has a crop (i.e. had motion).
+        // Encode a full (uncropped) frame for debug overlay. Pick the first
+        // tagged frame that has a crop (i.e. had motion). The detection mask
+        // is blacked out here too so the debug UI shows exactly what the model
+        // could not see.
         let full_frame_jpeg = tagged_frames
             .iter()
             .find(|(_, crop)| crop.is_some())
-            .and_then(|(frame, _)| rgb_jpeg(frame));
+            .and_then(|(frame, _)| {
+                let mut f = frame.clone();
+                apply_detection_mask(&mut f, FULL_FRAME, &self.detection_mask);
+                rgb_jpeg(&f)
+            });
 
-        // Apply per-frame crops
+        // Apply per-frame crops, then black out any painted detection-mask
+        // cells so the model never sees masked pixels. A frame with no crop
+        // falls back to the whole frame (region [0,0,1,1]); the mask is
+        // applied in that region's coordinate space either way.
         let cropped: Vec<RgbFrame> = tagged_frames
             .iter()
             .map(|(frame, crop)| {
-                crop.and_then(|r| crop_frame(frame, &r))
-                    .unwrap_or_else(|| frame.clone())
+                let region = crop.unwrap_or(FULL_FRAME);
+                // If the crop degenerates to nothing the full frame is used
+                // instead, so the mask must be applied in full-frame space —
+                // never a smaller region's — or the blackout lands on the
+                // wrong pixels.
+                let (mut out, region) = match crop_frame(frame, &region) {
+                    Some(cropped) => (cropped, region),
+                    None => (frame.clone(), FULL_FRAME),
+                };
+                apply_detection_mask(&mut out, region, &self.detection_mask);
+                out
             })
             .collect();
 
@@ -1073,5 +1173,112 @@ mod tests {
     fn gray_jpeg_rejects_bad_dimensions() {
         assert!(gray_jpeg((&[0u8; 10], 3, 3)).is_none());
         assert!(gray_jpeg((&[], 0, 0)).is_none());
+    }
+
+    /// A solid white frame whose dimensions are an exact multiple of the mask
+    /// grid, so each 16x12 cell maps to a clean integer pixel block.
+    fn white_frame(width: usize, height: usize) -> RgbFrame {
+        RgbFrame {
+            data: vec![255u8; width * height * 3],
+            width,
+            height,
+        }
+    }
+
+    fn empty_mask() -> Vec<bool> {
+        vec![false; MASK_CELLS]
+    }
+
+    /// True if the pixel at (col, row) is pure black.
+    fn is_black(frame: &RgbFrame, col: usize, row: usize) -> bool {
+        let i = (row * frame.width + col) * 3;
+        frame.data[i] == 0 && frame.data[i + 1] == 0 && frame.data[i + 2] == 0
+    }
+
+    #[test]
+    fn detection_mask_noop_when_empty() {
+        let mut frame = white_frame(160, 120);
+        apply_detection_mask(&mut frame, FULL_FRAME, &empty_mask());
+        assert!(frame.data.iter().all(|&b| b == 255), "frame untouched");
+    }
+
+    #[test]
+    fn detection_mask_full_frame_blacks_exact_cell() {
+        // 160x120 => each of the 16x12 cells is a 10x10 pixel block.
+        let mut frame = white_frame(160, 120);
+        let mut mask = empty_mask();
+        // Paint the top-left cell (col 0, row 0) and an interior cell (col 3,
+        // row 2).
+        mask[0] = true;
+        mask[2 * MASK_COLS + 3] = true;
+        apply_detection_mask(&mut frame, FULL_FRAME, &mask);
+
+        // Top-left 10x10 block is black; the pixel just past it is not.
+        assert!(is_black(&frame, 0, 0));
+        assert!(is_black(&frame, 9, 9));
+        assert!(!is_black(&frame, 10, 0));
+        assert!(!is_black(&frame, 0, 10));
+
+        // Interior cell (col 3, row 2) covers pixels x=30..40, y=20..30.
+        assert!(is_black(&frame, 30, 20));
+        assert!(is_black(&frame, 39, 29));
+        assert!(!is_black(&frame, 29, 20));
+        assert!(!is_black(&frame, 40, 20));
+        assert!(!is_black(&frame, 30, 19));
+    }
+
+    #[test]
+    fn detection_mask_intersects_partial_crop() {
+        // Crop the right half of the full frame: x in [0.5,1.0]. The crop
+        // frame is 80x120 covering full-frame columns 8..16.
+        let crop = NormalizedRect {
+            x: 0.5,
+            y: 0.0,
+            w: 0.5,
+            h: 1.0,
+        };
+        let mut frame = white_frame(80, 120);
+        let mut mask = empty_mask();
+        // Cell (col 0, row 0) is entirely OUTSIDE the crop -> no effect.
+        mask[0] = true;
+        // Cell (col 8, row 0) is the first column INSIDE the crop; it maps to
+        // crop-local x=0..10.
+        mask[8] = true;
+        apply_detection_mask(&mut frame, crop, &mask);
+
+        // The out-of-crop cell painted nothing.
+        // The in-crop cell blacked the leftmost 10px column of the crop.
+        assert!(is_black(&frame, 0, 0));
+        assert!(is_black(&frame, 9, 0));
+        assert!(!is_black(&frame, 10, 0));
+        // A cell far to the right of column 8 stays white.
+        assert!(!is_black(&frame, 79, 0));
+    }
+
+    #[test]
+    fn detection_mask_full_frame_crop_matches_uncropped() {
+        // A lighting-driven crop that spans the whole frame ([0,0,1,1]) must
+        // black the same pixels as the FULL_FRAME fallback.
+        let mut frame = white_frame(160, 120);
+        let mut mask = empty_mask();
+        mask[MASK_COLS + 1] = true; // col 1, row 1 => x=10..20, y=10..20
+        let spanning = NormalizedRect {
+            x: 0.0,
+            y: 0.0,
+            w: 1.0,
+            h: 1.0,
+        };
+        apply_detection_mask(&mut frame, spanning, &mask);
+        assert!(is_black(&frame, 10, 10));
+        assert!(is_black(&frame, 19, 19));
+        assert!(!is_black(&frame, 9, 10));
+        assert!(!is_black(&frame, 20, 20));
+    }
+
+    #[test]
+    fn detection_mask_ignores_wrong_length() {
+        let mut frame = white_frame(160, 120);
+        apply_detection_mask(&mut frame, FULL_FRAME, &[true, false, true]);
+        assert!(frame.data.iter().all(|&b| b == 255));
     }
 }

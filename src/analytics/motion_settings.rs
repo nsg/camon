@@ -54,9 +54,18 @@ pub struct MotionSettings {
     #[serde(default = "default_min_contour_area")]
     pub min_contour_area: f64,
     /// One bool per 16x12 cell, row-major. `true` = ignored: the cell is
-    /// excluded from motion detection deterministically.
+    /// excluded from motion detection deterministically. This is the
+    /// "movement mask": nothing ever moves here.
     #[serde(default = "default_mask")]
     pub mask: Vec<bool>,
+    /// One bool per 16x12 cell, row-major. `true` = blacked out: the cell's
+    /// pixels are set to black in every frame handed to the vision model, so
+    /// stationary nuisance objects never reach classification. This is the
+    /// "detection mask": the model never sees these pixels. It has no effect
+    /// on motion detection. Defaults to all-false so pre-existing
+    /// `motion_settings.json` files load unchanged.
+    #[serde(default = "default_mask")]
+    pub detection_mask: Vec<bool>,
 }
 
 impl Default for MotionSettings {
@@ -65,6 +74,7 @@ impl Default for MotionSettings {
             var_threshold: DEFAULT_VAR_THRESHOLD,
             min_contour_area: DEFAULT_MIN_CONTOUR_AREA,
             mask: default_mask(),
+            detection_mask: default_mask(),
         }
     }
 }
@@ -76,6 +86,7 @@ impl MotionSettings {
             var_threshold,
             min_contour_area,
             mask: default_mask(),
+            detection_mask: default_mask(),
         };
         s.clamp();
         s
@@ -94,6 +105,9 @@ impl MotionSettings {
         if self.mask.len() != MASK_CELLS {
             self.mask.resize(MASK_CELLS, false);
         }
+        if self.detection_mask.len() != MASK_CELLS {
+            self.detection_mask.resize(MASK_CELLS, false);
+        }
     }
 }
 
@@ -104,6 +118,7 @@ pub struct SettingsUpdate {
     pub var_threshold: Option<f64>,
     pub min_contour_area: Option<f64>,
     pub mask: Option<Vec<bool>>,
+    pub detection_mask: Option<Vec<bool>>,
 }
 
 struct CameraSettings {
@@ -163,6 +178,9 @@ impl MotionSettingsStore {
             }
             if let Some(m) = update.mask {
                 cam.settings.mask = m;
+            }
+            if let Some(m) = update.detection_mask {
+                cam.settings.detection_mask = m;
             }
             cam.settings.clamp();
             (cam.path.clone(), cam.settings.clone())
@@ -242,6 +260,7 @@ mod tests {
             var_threshold: 1000.0,
             min_contour_area: 0.0,
             mask: vec![true; 3],
+            detection_mask: vec![true; 5],
         };
         s.clamp();
         assert_eq!(s.var_threshold, VAR_THRESHOLD_MAX);
@@ -250,11 +269,16 @@ mod tests {
         assert_eq!(s.mask.len(), MASK_CELLS);
         assert!(s.mask[0] && s.mask[1] && s.mask[2]);
         assert!(!s.mask[3]);
+        // Detection mask is normalized independently.
+        assert_eq!(s.detection_mask.len(), MASK_CELLS);
+        assert!(s.detection_mask[0] && s.detection_mask[4]);
+        assert!(!s.detection_mask[5]);
 
         let mut low = MotionSettings {
             var_threshold: -5.0,
             min_contour_area: 99999.0,
             mask: default_mask(),
+            detection_mask: default_mask(),
         };
         low.clamp();
         assert_eq!(low.var_threshold, VAR_THRESHOLD_MIN);
@@ -267,14 +291,79 @@ mod tests {
             var_threshold: 24.0,
             min_contour_area: 350.0,
             mask: default_mask(),
+            detection_mask: default_mask(),
         };
         s.mask[5] = true;
         s.mask[MASK_CELLS - 1] = true;
+        s.detection_mask[7] = true;
 
         let json = serde_json::to_string(&s).unwrap();
         let back: MotionSettings = serde_json::from_str(&json).unwrap();
         assert_eq!(s, back);
         assert!(back.mask[5] && back.mask[MASK_CELLS - 1]);
+        assert!(back.detection_mask[7] && !back.detection_mask[5]);
+    }
+
+    #[test]
+    fn detection_mask_defaults_when_absent() {
+        // A `motion_settings.json` written before the detection mask existed
+        // has no `detection_mask` field; it must load with an all-false mask.
+        let json = r#"{
+            "var_threshold": 20.0,
+            "min_contour_area": 300.0,
+            "mask": [true, false, true]
+        }"#;
+        let mut s: MotionSettings = serde_json::from_str(json).unwrap();
+        s.clamp();
+        assert_eq!(s.detection_mask.len(), MASK_CELLS);
+        assert!(s.detection_mask.iter().all(|&m| !m));
+        // The movement mask still loads and is length-normalized.
+        assert_eq!(s.mask.len(), MASK_CELLS);
+        assert!(s.mask[0] && s.mask[2]);
+    }
+
+    #[test]
+    fn update_detection_mask_independent_of_movement_mask() {
+        let dir = TempDir::new().unwrap();
+        let ids = vec!["cam1".to_string()];
+        let store = MotionSettingsStore::new(&ids, dir.path(), 16.0, 200.0);
+
+        // Paint a movement-mask cell first.
+        let mut movement = default_mask();
+        movement[1] = true;
+        store
+            .update(
+                "cam1",
+                SettingsUpdate {
+                    mask: Some(movement),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        // A partial update touching only the detection mask must leave the
+        // movement mask untouched.
+        let mut detection = default_mask();
+        detection[2] = true;
+        let updated = store
+            .update(
+                "cam1",
+                SettingsUpdate {
+                    detection_mask: Some(detection),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(updated.mask[1], "movement mask preserved");
+        assert!(updated.detection_mask[2], "detection mask applied");
+        assert!(!updated.detection_mask[1]);
+        assert!(!updated.mask[2]);
+
+        // Persisted and reloaded independently.
+        let store2 = MotionSettingsStore::new(&ids, dir.path(), 16.0, 200.0);
+        let loaded = store2.get("cam1").unwrap();
+        assert!(loaded.mask[1]);
+        assert!(loaded.detection_mask[2]);
     }
 
     #[test]
@@ -292,6 +381,7 @@ mod tests {
                     var_threshold: Some(48.0),
                     min_contour_area: Some(500.0),
                     mask: Some(mask),
+                    detection_mask: None,
                 },
             )
             .unwrap();
@@ -318,6 +408,7 @@ mod tests {
                     var_threshold: Some(9999.0),
                     min_contour_area: Some(1.0),
                     mask: None,
+                    detection_mask: None,
                 },
             )
             .unwrap();

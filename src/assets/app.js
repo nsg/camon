@@ -36,6 +36,10 @@ document.addEventListener('DOMContentLoaded', async () => {
     const minsizeSlider = document.getElementById('minsize-slider');
     const minsizeValue = document.getElementById('minsize-value');
     const maskEditBtn = document.getElementById('mask-edit-btn');
+    const maskLayerRow = document.getElementById('mask-layer-row');
+    const maskLayerHint = document.getElementById('mask-layer-hint');
+    const layerMovementBtn = document.getElementById('layer-movement-btn');
+    const layerDetectionBtn = document.getElementById('layer-detection-btn');
     const liveScrubber = document.getElementById('live-scrubber');
     const liveProgressFill = document.getElementById('live-progress-fill');
     const liveCurrentTime = document.getElementById('live-current-time');
@@ -101,10 +105,15 @@ document.addEventListener('DOMContentLoaded', async () => {
     let morphImage = null;
     let bgOverlayEnabled = false;
     let bgImage = null;
-    // Motion settings + ignore-mask editor
+    // Motion settings + mask editor. Two painted layers share the same 16x12
+    // grid: the movement mask (suppresses motion detection) and the detection
+    // mask (blacks pixels out of frames sent to the vision model). Painting
+    // targets the active layer; both render at once in distinct colors.
     let motionSettings = null;
     let maskEditEnabled = false;
     let maskCells = [];
+    let detectionCells = [];
+    let activeMaskLayer = 'movement'; // 'movement' | 'detection'
     let maskCols = 16;
     let maskRows = 12;
     let maskPainting = false;
@@ -309,13 +318,22 @@ document.addEventListener('DOMContentLoaded', async () => {
         setMaskEditEnabled(!maskEditEnabled);
     });
 
+    layerMovementBtn.addEventListener('click', () => setActiveMaskLayer('movement'));
+    layerDetectionBtn.addEventListener('click', () => setActiveMaskLayer('detection'));
+
+    // The cells array for the layer currently being painted.
+    function activeCells() {
+        return activeMaskLayer === 'detection' ? detectionCells : maskCells;
+    }
+
     maskOverlay.addEventListener('pointerdown', (e) => {
         if (!maskEditEnabled) return;
         const idx = maskCellFromEvent(e);
         if (idx < 0) return;
+        const cells = activeCells();
         maskPainting = true;
-        maskPaintValue = !maskCells[idx];
-        maskCells[idx] = maskPaintValue;
+        maskPaintValue = !cells[idx];
+        cells[idx] = maskPaintValue;
         drawMask();
         maskOverlay.setPointerCapture(e.pointerId);
         e.preventDefault();
@@ -324,15 +342,21 @@ document.addEventListener('DOMContentLoaded', async () => {
         if (!maskEditEnabled || !maskPainting) return;
         const idx = maskCellFromEvent(e);
         if (idx < 0) return;
-        if (maskCells[idx] !== maskPaintValue) {
-            maskCells[idx] = maskPaintValue;
+        const cells = activeCells();
+        if (cells[idx] !== maskPaintValue) {
+            cells[idx] = maskPaintValue;
             drawMask();
         }
     });
     function endMaskPaint() {
         if (!maskPainting) return;
         maskPainting = false;
-        putMotionSettings({ mask: maskCells.slice() });
+        // Persist only the layer that was painted, as a partial update.
+        if (activeMaskLayer === 'detection') {
+            putMotionSettings({ detection_mask: detectionCells.slice() });
+        } else {
+            putMotionSettings({ mask: maskCells.slice() });
+        }
     }
     maskOverlay.addEventListener('pointerup', endMaskPaint);
     maskOverlay.addEventListener('pointercancel', endMaskPaint);
@@ -602,9 +626,11 @@ document.addEventListener('DOMContentLoaded', async () => {
         bgCtx.clearRect(0, 0, bgOverlay.width, bgOverlay.height);
 
         setMaskEditEnabled(false);
+        setActiveMaskLayer('movement');
         maskCtx.clearRect(0, 0, maskOverlay.width, maskOverlay.height);
         motionSettings = null;
         maskCells = [];
+        detectionCells = [];
         settingsPanel.hidden = true;
         settingsBtn.classList.remove('active');
 
@@ -929,6 +955,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         maskCols = data.mask_cols;
         maskRows = data.mask_rows;
         maskCells = Array.isArray(data.mask) ? data.mask.slice() : [];
+        detectionCells = Array.isArray(data.detection_mask) ? data.detection_mask.slice() : [];
 
         sensitivitySlider.min = data.var_threshold_min;
         sensitivitySlider.max = data.var_threshold_max;
@@ -960,7 +987,8 @@ document.addEventListener('DOMContentLoaded', async () => {
         maskOverlay.hidden = !enabled;
         maskOverlay.classList.toggle('editing', enabled);
         maskEditBtn.classList.toggle('active', enabled);
-        maskEditBtn.textContent = enabled ? 'Done editing mask' : 'Edit ignore mask';
+        maskEditBtn.textContent = enabled ? 'Done editing masks' : 'Edit masks';
+        maskLayerRow.hidden = !enabled;
         if (enabled) {
             // The edit button sits below the video, so activating from there can
             // leave the paintable canvas scrolled partly above the viewport —
@@ -971,6 +999,16 @@ document.addEventListener('DOMContentLoaded', async () => {
             maskPainting = false;
             maskCtx.clearRect(0, 0, maskOverlay.width, maskOverlay.height);
         }
+    }
+
+    function setActiveMaskLayer(layer) {
+        activeMaskLayer = layer;
+        const detection = layer === 'detection';
+        layerMovementBtn.classList.toggle('active', !detection);
+        layerDetectionBtn.classList.toggle('active', detection);
+        maskLayerHint.textContent = detection
+            ? 'Detection mask: the vision model never sees these pixels (classification only).'
+            : 'Movement mask: nothing ever moves here (ignored by motion detection).';
     }
 
     function maskCellFromEvent(e) {
@@ -996,14 +1034,20 @@ document.addEventListener('DOMContentLoaded', async () => {
         const cellW = w / maskCols;
         const cellH = h / maskRows;
 
-        // Masked (ignored) cells filled red.
-        maskCtx.fillStyle = 'rgba(220, 50, 50, 0.4)';
-        for (let i = 0; i < maskCells.length; i++) {
-            if (!maskCells[i]) continue;
-            const col = i % maskCols;
-            const row = Math.floor(i / maskCols);
-            maskCtx.fillRect(col * cellW, row * cellH, cellW, cellH);
-        }
+        // Both layers render at once in distinct colors so overlaps are visible:
+        // movement mask (ignored motion) in red, detection mask (blacked out of
+        // the vision model) in orange. Overlapping cells simply blend.
+        const fillLayer = (cells, color) => {
+            maskCtx.fillStyle = color;
+            for (let i = 0; i < cells.length; i++) {
+                if (!cells[i]) continue;
+                const col = i % maskCols;
+                const row = Math.floor(i / maskCols);
+                maskCtx.fillRect(col * cellW, row * cellH, cellW, cellH);
+            }
+        };
+        fillLayer(maskCells, 'rgba(220, 50, 50, 0.4)');
+        fillLayer(detectionCells, 'rgba(255, 140, 0, 0.45)');
 
         // Grid lines.
         maskCtx.strokeStyle = 'rgba(255, 255, 255, 0.25)';
