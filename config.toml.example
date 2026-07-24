@@ -94,8 +94,36 @@ continuous_retention_days = 1
 # movements, then objects (cheapest to lose first) — until space recovers.
 # 2 GiB is roughly an hour of footage at 4 Mbps, enough slack for the hourly
 # retention prune to catch up, and keeps the filesystem out of the near-full
-# regime where allocation degrades. 0 disables the guard.
+# regime where allocation degrades. 0 disables the guard. (Ignored by the
+# remote stathost backend below, which measures against max_stored_bytes.)
 min_free_bytes = 2147483648
+
+# --- Remote warm-storage backend (optional) --------------------------------
+# By default warm events go to the local data_dir above. Add a
+# [storage.stathost] section to send them to a remote stathost static file host
+# (github.com/nsg/stathost) instead. Analytics, motion settings, and the hot
+# buffer always stay local; only the warm event store moves. Time-based
+# retention (the *_retention_days above) still applies, via DELETE.
+#
+# NOTE: stathost does not yet have atomic PUT — an interrupted upload can leave
+# a partial object. camon uploads the video first and the sidecar/thumbnails
+# after, so the worst case is a video with no sidecar (indexed as a plain
+# movement event); a zero-byte video is warned about on the next scan.
+#
+# [storage.stathost]
+# # Base URL of the host.
+# url = "https://files.example.com"
+# # Bucket events are written into.
+# bucket = "camon"
+# # Per-bucket bearer token (sent as "Authorization: Bearer <token>").
+# token = "s3cr3t-token"
+# # Client-side storage budget in bytes (default: 0 = unlimited). The client
+# # can't see the server's disk, so retention-by-space becomes a budget: when
+# # tracked usage exceeds this, the oldest events are pruned (continuous →
+# # movements → objects). 0 relies on time-based retention alone.
+# max_stored_bytes = 0
+# # Set false to keep this section but fall back to local-disk storage.
+# enabled = true
 
 # Camera definitions — add one [[cameras]] block per camera
 

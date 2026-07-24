@@ -21,6 +21,26 @@ impl EventType {
             EventType::Continuous => "continuous",
         }
     }
+
+    /// Wire name used by the remote (stathost) backend's sidecar, which carries
+    /// the event type in JSON rather than in a directory name.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            EventType::Movement => "movement",
+            EventType::Object => "object",
+            EventType::Continuous => "continuous",
+        }
+    }
+
+    /// Parse a wire name back into an [`EventType`]; unknown strings yield `None`.
+    pub(crate) fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "movement" => Some(EventType::Movement),
+            "object" => Some(EventType::Object),
+            "continuous" => Some(EventType::Continuous),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -59,29 +79,36 @@ pub struct WarmEventIndex {
     data_dir: PathBuf,
 }
 
-struct SidecarData {
-    classes: Vec<String>,
-    backend: Option<String>,
-    model: Option<String>,
-    detections: Vec<DetectionDetail>,
-    continues: bool,
-    recovered: bool,
+pub(crate) struct SidecarData {
+    pub(crate) classes: Vec<String>,
+    pub(crate) backend: Option<String>,
+    pub(crate) model: Option<String>,
+    pub(crate) detections: Vec<DetectionDetail>,
+    pub(crate) continues: bool,
+    pub(crate) recovered: bool,
+    /// Event type carried in the sidecar. Local mode leaves this `None` and
+    /// derives the type from the on-disk directory; the remote (stathost)
+    /// backend, which has no directories, reads it from here.
+    pub(crate) event_type: Option<EventType>,
 }
 
-fn parse_event_filename(stem: &str) -> Option<(u64, u32)> {
+pub(crate) fn parse_event_filename(stem: &str) -> Option<(u64, u32)> {
     let (start_str, dur_str) = stem.split_once('_')?;
     let start_pts_ns: u64 = start_str.parse().ok()?;
     let duration_ms: u32 = dur_str.parse().ok()?;
     Some((start_pts_ns, duration_ms))
 }
 
-fn parse_sidecar_json(parsed: &serde_json::Value) -> SidecarData {
+pub(crate) fn parse_sidecar_json(parsed: &serde_json::Value) -> SidecarData {
     let backend = parsed["backend"].as_str().map(String::from);
     let model = parsed["model"].as_str().map(String::from);
     // Present only on follow-on chunks; absent (→ false) on every other sidecar.
     let continues = parsed["continues"].as_bool().unwrap_or(false);
     // Present only on events salvaged by startup orphan recovery.
     let recovered = parsed["recovered"].as_bool().unwrap_or(false);
+    // Present only on remote (stathost) sidecars, which have no directory to
+    // carry the type; unknown/absent → None (local mode ignores it entirely).
+    let event_type = parsed["event_type"].as_str().and_then(EventType::from_str);
 
     // New format: {"backend": ..., "detections": [{class, confidence}]}
     if let Some(dets) = parsed["detections"].as_array() {
@@ -102,6 +129,7 @@ fn parse_sidecar_json(parsed: &serde_json::Value) -> SidecarData {
             detections,
             continues,
             recovered,
+            event_type,
         };
     }
 
@@ -122,6 +150,7 @@ fn parse_sidecar_json(parsed: &serde_json::Value) -> SidecarData {
         detections: Vec::new(),
         continues,
         recovered,
+        event_type,
     }
 }
 
@@ -133,6 +162,7 @@ fn load_sidecar(path: &std::path::Path) -> SidecarData {
         detections: Vec::new(),
         continues: false,
         recovered: false,
+        event_type: None,
     };
     let data = match std::fs::read_to_string(path) {
         Ok(d) => d,

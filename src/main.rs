@@ -26,7 +26,7 @@ use config::Config;
 use locks::LockExt;
 use storage::{
     DetectionDebugStore, DetectionStore, EventRegistry, LocalDiskBackend, MotionStore,
-    WarmStorageBackend,
+    StathostBackend, WarmStorageBackend,
 };
 
 fn dispatch_subcommand() -> bool {
@@ -110,16 +110,34 @@ fn log_object_detection_config(config: &Config) -> bool {
     true
 }
 
-fn init_storage(config: &Config, camera_ids: &[String]) -> Option<Arc<dyn WarmStorageBackend>> {
+async fn init_storage(
+    config: &Config,
+    camera_ids: &[String],
+) -> Option<Arc<dyn WarmStorageBackend>> {
     if !config.storage.enabled {
         return None;
     }
+
+    // A configured (and enabled) [storage.stathost] section switches the warm
+    // backend from local disk to the remote host. Local disk is the default.
+    if let Some(stathost) = config.storage.stathost.as_ref().filter(|s| s.enabled) {
+        tracing::info!(
+            url = %stathost.url,
+            bucket = %stathost.bucket,
+            "using remote stathost warm-storage backend"
+        );
+        let backend = StathostBackend::new(stathost, camera_ids);
+        backend.recover_orphans();
+        backend.scan().await;
+        return Some(Arc::new(backend));
+    }
+
     let data_dir = std::path::PathBuf::from(&config.storage.data_dir);
     let backend = LocalDiskBackend::new(data_dir, camera_ids);
     // Salvage any event files orphaned mid-write by a crash or power cut
     // BEFORE the scan, so recovered events are indexed like any other.
     backend.recover_orphans();
-    backend.scan();
+    backend.scan().await;
     Some(Arc::new(backend))
 }
 
@@ -375,7 +393,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let detection_store = DetectionStore::new(&camera_ids);
     let debug_store = DetectionDebugStore::new(&camera_ids);
     let object_detection_ready = log_object_detection_config(&config);
-    let storage = init_storage(&config, &camera_ids);
+    let storage = init_storage(&config, &camera_ids).await;
     let motion_settings = init_motion_settings(&config, &camera_ids);
 
     if config.storage.enabled {

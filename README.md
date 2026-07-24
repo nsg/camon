@@ -115,6 +115,24 @@ Both modes share the same warm writer, retention pruning, and HLS playback path;
 
 Event files are written atomically — staged as `.tmp`, fsynced, then renamed into place — so a crash or power cut never leaves a half-indexed event. On the next startup camon **recovers** interrupted writes instead of discarding them: an orphaned `.ts.tmp` (which may hold the footage of exactly the incident that cut the power) is trimmed to its last intact packet, its real duration recomputed from the stream timestamps, and indexed like any other event with a `"recovered": true` flag. If the disk runs low, a `min_free_bytes` guard emergency-prunes the oldest recordings (continuous first, then movements, then objects) so the writer keeps recording instead of failing.
 
+### Storage backends
+
+The warm event store sits behind a backend seam, so *where* events live is a config choice — analytics, motion settings, and the in-RAM hot buffer always stay local regardless.
+
+- **Local disk** (default) — the `data_dir` on the machine running camon, with the atomic write ladder, crash recovery, and `min_free_bytes` free-space guard described above.
+- **Remote stathost** — a [stathost](https://github.com/nsg/stathost) static file host, selected by adding a `[storage.stathost]` section. Each event becomes three sibling objects under `{camera}/` on the host — the `.ts` video, a `.json` sidecar (which here also carries the event **type**, since there are no `movements/`/`objects/`/`continuous/` directories), and eager `{stem}_thumb_{i}.jpg` filmstrip frames. Time-based retention still applies via `DELETE`; because the client can't see the server's disk, retention-by-space becomes a client-side **budget** (`max_stored_bytes`) that prunes the oldest events (continuous → movements → objects) when tracked usage exceeds it. Post-hoc movement→object upgrades just rewrite the sidecar in place — no object is ever renamed or moved.
+
+  Use stathost **0.2.0 or later**: it has atomic uploads (readers never see a partially uploaded object), the detailed listing camon prefers for accurate storage accounting (`?detail=true`; camon falls back to the plain listing on older servers), and HTTP Range support. camon uploads the video first and the sidecar/thumbnails after, so an interruption at worst leaves a video with no sidecar (indexed as a plain movement event on the next scan). `read_video` currently buffers the whole event in RAM; a streaming/Range pass may follow.
+
+  ```toml
+  [storage.stathost]
+  url = "https://files.example.com"
+  bucket = "camon"
+  token = "s3cr3t-token"
+  max_stored_bytes = 0   # 0 = unlimited; rely on time-based retention
+  # enabled = true       # set false to keep this section but use local disk
+  ```
+
 ## Quick Start
 
 Camon is a single self-contained binary — the only runtime dependency is FFmpeg. Install it and download the latest binary from [GitHub Releases](https://github.com/nsg/camon/releases):
@@ -222,6 +240,15 @@ continuous_retention_days = 1
 # Below this, the oldest recordings are emergency-pruned (continuous →
 # movements → objects) before each write. 0 disables the guard.
 min_free_bytes = 2147483648
+
+# Optional: send warm events to a remote stathost host instead of data_dir.
+# See "Storage backends" above. When present and enabled, min_free_bytes is
+# ignored in favour of the max_stored_bytes budget.
+# [storage.stathost]
+# url = "https://files.example.com"
+# bucket = "camon"
+# token = "s3cr3t-token"
+# max_stored_bytes = 0
 
 # Add one [[cameras]] block per camera
 [[cameras]]

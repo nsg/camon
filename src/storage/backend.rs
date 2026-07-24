@@ -106,8 +106,10 @@ pub trait WarmStorageBackend: Send + Sync {
 
     // ---- startup ----
 
-    /// Rebuild the in-RAM index from durable storage.
-    fn scan(&self);
+    /// Rebuild the in-RAM index from durable storage. Async because a remote
+    /// backend rebuilds its index over HTTP (list + sidecar fetches);
+    /// LocalDisk's body is synchronous filesystem work.
+    async fn scan(&self);
 
     /// Salvage writes interrupted by a crash or power cut, before the scan.
     fn recover_orphans(&self);
@@ -238,7 +240,7 @@ impl WarmStorageBackend for LocalDiskBackend {
         free_space_bytes(&self.data_dir)
     }
 
-    fn scan(&self) {
+    async fn scan(&self) {
         self.index.scan();
     }
 

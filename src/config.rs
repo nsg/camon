@@ -240,12 +240,43 @@ fn default_min_free_bytes() -> u64 {
     2 * 1024 * 1024 * 1024
 }
 
+fn default_stathost_enabled() -> bool {
+    true
+}
+
+/// Remote "stathost" warm-storage backend (github.com/nsg/stathost). Presence
+/// of a `[storage.stathost]` section — with `enabled` left at its default of
+/// `true` — switches the warm backend from local disk to this static file host.
+/// Analytics, motion settings, and the hot buffer always stay local.
+#[derive(Debug, Clone, Deserialize)]
+pub struct StathostConfig {
+    /// Base URL of the host, e.g. `https://files.example.com`.
+    pub url: String,
+    /// Bucket that events are written into.
+    pub bucket: String,
+    /// Per-bucket bearer token, sent as `Authorization: Bearer <token>`.
+    pub token: String,
+    /// Client-side storage budget in bytes. The client can't see the server's
+    /// disk, so retention-by-space becomes a budget: when tracked usage exceeds
+    /// it, the oldest events are pruned (continuous → movements → objects).
+    /// 0 (the default) means unlimited — rely on time-based retention only.
+    #[serde(default)]
+    pub max_stored_bytes: u64,
+    /// Set to `false` to keep the section but fall back to local-disk storage.
+    #[serde(default = "default_stathost_enabled")]
+    pub enabled: bool,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct WarmConfig {
     #[serde(default = "default_warm_enabled")]
     pub enabled: bool,
     #[serde(default = "default_warm_data_dir")]
     pub data_dir: String,
+    /// When present (and `enabled`), warm events go to this remote host instead
+    /// of the local `data_dir`. See [`StathostConfig`].
+    #[serde(default)]
+    pub stathost: Option<StathostConfig>,
     #[serde(default = "default_warm_pre_padding_secs")]
     pub pre_padding_secs: u64,
     #[serde(default = "default_warm_post_padding_secs")]
@@ -275,6 +306,7 @@ impl Default for WarmConfig {
         Self {
             enabled: default_warm_enabled(),
             data_dir: default_warm_data_dir(),
+            stathost: None,
             pre_padding_secs: default_warm_pre_padding_secs(),
             post_padding_secs: default_warm_post_padding_secs(),
             max_event_duration_secs: default_max_event_duration_secs(),
