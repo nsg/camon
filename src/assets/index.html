@@ -4,7 +4,12 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Camon - Live View</title>
-    <link rel="stylesheet" href="/assets/style.css">
+    <!-- All sub-resource and API URLs in this app are RELATIVE (no leading
+         slash) so the UI works both at the server root and behind an arbitrary
+         path prefix, e.g. the Home Assistant ingress path. Hash routing
+         (#/camera/x) leaves the document path unchanged, so relative URLs keep
+         resolving against the ingress base. -->
+    <link rel="stylesheet" href="assets/style.css">
 </head>
 <body>
     <header>
@@ -215,7 +220,7 @@
         </div>
     </main>
     <footer>__VERSION__</footer>
-    <script src="/assets/hls.min.js"></script>
-    <script src="/assets/app.js"></script>
+    <script src="assets/hls.min.js"></script>
+    <script src="assets/app.js"></script>
 </body>
 </html>

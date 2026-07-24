@@ -297,6 +297,14 @@ url = "rtsp://admin:password@192.168.1.100:554/stream1"
 | Hot | RAM | ~10 minutes | 1080p @ 30fps | Live playback and real-time analysis |
 | Warm | Disk | 2 days (movement) / 14 days (objects) / 1 day (continuous) | Original quality | Motion-triggered events, or gapless continuous recording when analytics is off |
 
+## Home Assistant add-on
+
+This repository is also a valid [Home Assistant add-on repository](https://developers.home-assistant.io/docs/add-ons/repository), so Camon can be installed as an add-on with its web UI embedded in the Home Assistant sidebar (via ingress).
+
+[![Add repository to my Home Assistant](https://my.home-assistant.io/badges/supervisor_add_addon_repository.svg)](https://my.home-assistant.io/redirect/supervisor_add_addon_repository/?repository_url=https%3A%2F%2Fgithub.com%2Fnsg%2Fcamon)
+
+See [HOMEASSISTANT.md](HOMEASSISTANT.md) for install steps, ingress notes, the options mapping, and the amd64-only caveat.
+
 ## License
 
 MIT — see [LICENSE.md](LICENSE.md).

@@ -1,0 +1,60 @@
+# Home Assistant add-on manifest for Camon.
+# Schema: https://developers.home-assistant.io/docs/add-ons/configuration
+#
+# amd64 only, on purpose: Camon spawns ffmpeg/ffprobe and is only tested on
+# x86_64 here. ARM is deliberately deferred (see HOMEASSISTANT.md).
+name: Camon
+slug: camon
+version: "0.2.9"
+description: Multi-camera NVR with real-time motion/object analytics and tiered storage
+url: https://github.com/nsg/camon
+arch:
+  - amd64
+# `application` waits for Home Assistant + Supervisor to be up before start.
+startup: application
+boot: auto
+# We build from a plain Debian runtime (no s6-overlay), so let Docker's own
+# init stay out of the way and run our CMD as PID 1 for direct SIGTERM.
+init: false
+
+# --- Ingress: embed the Camon web UI in the Home Assistant sidebar ----------
+# Home Assistant proxies the ingress path to this internal port and strips the
+# path prefix, so Camon's HTTP server (which serves the UI at "/") needs no
+# awareness of the prefix — the web assets use relative URLs.
+ingress: true
+ingress_port: 8080
+panel_icon: mdi:cctv
+panel_title: Camon
+panel_admin: true
+
+# No `map:` needed: /data is the add-on's own persistent volume, always mounted
+# and preserved across restarts/updates. The run script points Camon's
+# storage.data_dir at /data/storage, so recordings persist there automatically.
+# (`map` is only for Home Assistant's shared folders — config, media, share, …)
+
+# User-facing options. The run script (run.sh) translates these into the JSON
+# config Camon reads, forcing update.enabled=false and data_dir=/data/storage.
+# Note: there is no http_port option — the add-on is reached exclusively
+# through ingress, which is pinned to internal port 8080 (ingress_port above);
+# a configurable port would only break that wiring.
+options:
+  analytics: true
+  object_detection: false
+  ollama_url: "http://homeassistant.local:11434"
+  ollama_model: "gemma4:e4b"
+  storage: true
+  cameras:
+    - id: front-door
+      url: "rtsp://user:pass@192.168.1.100:554/stream1"
+schema:
+  analytics: bool
+  object_detection: bool
+  ollama_url: url
+  ollama_model: str
+  storage: bool
+  stathost_url: "url?"
+  stathost_bucket: "str?"
+  stathost_token: "password?"
+  cameras:
+    - id: str
+      url: str

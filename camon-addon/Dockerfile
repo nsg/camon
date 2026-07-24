@@ -1,0 +1,49 @@
+# Camon Home Assistant add-on image.
+#
+# Build approach: compile Camon from source (keeps the add-on self-contained —
+# no dependency on a published GitHub release binary), then run it on a slim
+# Debian runtime with ffmpeg installed (Camon spawns ffmpeg/ffprobe).
+#
+# We deliberately do NOT use a Home Assistant base image here. The HA base
+# images are Alpine/musl, whereas the Rust toolchain image below is glibc; a
+# glibc binary won't run on musl. Debian bookworm on both the build and run
+# stages keeps them ABI-compatible and gives us a well-supported ffmpeg. Home
+# Assistant is happy to build any Dockerfile; with `init: false` in config.yaml
+# our CMD runs as PID 1 and receives SIGTERM directly (Camon shuts down
+# gracefully on SIGTERM). amd64 only — see config.yaml `arch`.
+
+# ---- Build stage -----------------------------------------------------------
+FROM rust:1-bookworm AS builder
+# The Home Assistant supervisor builds with THIS DIRECTORY (camon-addon/) as
+# the Docker context, so the Rust source is not in the context at all. Clone
+# the repository at the version tag matching config.yaml instead — pinned, so
+# the add-on always builds the exact released source.
+ARG CAMON_VERSION=v0.2.9
+RUN git clone --depth 1 --branch ${CAMON_VERSION} https://github.com/nsg/camon /src
+WORKDIR /src
+RUN cargo build --release --locked --bin camon
+
+# ---- Runtime stage ---------------------------------------------------------
+FROM debian:bookworm-slim
+
+# ffmpeg/ffprobe are spawned by Camon; ca-certificates for HTTPS (Ollama,
+# stathost, update checks); jq to translate /data/options.json in run.sh.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ffmpeg \
+        ca-certificates \
+        jq \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /src/target/release/camon /usr/local/bin/camon
+# Context is camon-addon/, so run.sh sits at the context root.
+COPY run.sh /run.sh
+RUN chmod a+x /run.sh
+
+LABEL \
+    org.opencontainers.image.title="Camon" \
+    org.opencontainers.image.description="Multi-camera NVR with real-time analytics and tiered storage" \
+    org.opencontainers.image.source="https://github.com/nsg/camon" \
+    org.opencontainers.image.licenses="MIT"
+
+CMD [ "/run.sh" ]

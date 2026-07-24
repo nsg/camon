@@ -147,7 +147,7 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     // === Initialize ===
     try {
-        const response = await fetch('/api/cameras');
+        const response = await fetch('api/cameras');
         cameras = await response.json();
 
         if (cameras.length === 0) {
@@ -679,7 +679,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     // === HLS Loading ===
 
     function loadGridCamera(cameraId, video) {
-        const src = `/api/stream/${cameraId}/playlist.m3u8?live=true`;
+        const src = `api/stream/${cameraId}/playlist.m3u8?live=true`;
         const loading = video.parentElement.querySelector('.loading');
 
         if (typeof Hls !== 'undefined' && Hls.isSupported()) {
@@ -717,7 +717,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
 
     function loadDetailCamera(cameraId) {
-        const src = `/api/stream/${cameraId}/playlist.m3u8`;
+        const src = `api/stream/${cameraId}/playlist.m3u8`;
 
         if (typeof Hls !== 'undefined' && Hls.isSupported()) {
             detailHls = new Hls({
@@ -764,7 +764,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
 
     function loadPlaybackVideo(cameraId, pts) {
-        const src = `/api/cameras/${encodeURIComponent(cameraId)}/events/${pts}/playlist.m3u8`;
+        const src = `api/cameras/${encodeURIComponent(cameraId)}/events/${pts}/playlist.m3u8`;
 
         if (playbackHls) { playbackHls.destroy(); playbackHls = null; }
         playbackLoading.hidden = false;
@@ -845,22 +845,22 @@ document.addEventListener('DOMContentLoaded', async () => {
         const img = new Image();
         img.onload = () => { stabilityImage = img; drawStability(); };
         img.onerror = () => {};
-        img.src = `/api/cameras/${cam}/motion/stability?t=${t}`;
+        img.src = `api/cameras/${cam}/motion/stability?t=${t}`;
 
         const raw = new Image();
         raw.onload = () => { rawMog2Image = raw; drawStability(); };
         raw.onerror = () => {};
-        raw.src = `/api/cameras/${cam}/motion/stability/raw?t=${t}`;
+        raw.src = `api/cameras/${cam}/motion/stability/raw?t=${t}`;
 
         const noShadow = new Image();
         noShadow.onload = () => { noShadowImage = noShadow; drawStability(); };
         noShadow.onerror = () => {};
-        noShadow.src = `/api/cameras/${cam}/motion/stability/no-shadow?t=${t}`;
+        noShadow.src = `api/cameras/${cam}/motion/stability/no-shadow?t=${t}`;
 
         const morph = new Image();
         morph.onload = () => { morphImage = morph; drawStability(); };
         morph.onerror = () => {};
-        morph.src = `/api/cameras/${cam}/motion/stability/morph?t=${t}`;
+        morph.src = `api/cameras/${cam}/motion/stability/morph?t=${t}`;
     }
 
     function drawStability() {
@@ -922,7 +922,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         const img = new Image();
         img.onload = () => { bgImage = img; drawBackground(); };
         img.onerror = () => {};
-        img.src = `/api/cameras/${encodeURIComponent(currentDetailCameraId)}/motion/background?t=${Date.now()}`;
+        img.src = `api/cameras/${encodeURIComponent(currentDetailCameraId)}/motion/background?t=${Date.now()}`;
     }
 
     function drawBackground() {
@@ -941,7 +941,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     // === Live Monitor: Motion Settings + Ignore Mask ===
 
     function fetchMotionSettings(cameraId) {
-        fetch(`/api/cameras/${encodeURIComponent(cameraId)}/motion/settings`)
+        fetch(`api/cameras/${encodeURIComponent(cameraId)}/motion/settings`)
             .then(r => r.ok ? r.json() : null)
             .then(data => {
                 if (!data || currentDetailCameraId !== cameraId) return;
@@ -972,7 +972,7 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     function putMotionSettings(partial) {
         if (!currentDetailCameraId) return;
-        fetch(`/api/cameras/${encodeURIComponent(currentDetailCameraId)}/motion/settings`, {
+        fetch(`api/cameras/${encodeURIComponent(currentDetailCameraId)}/motion/settings`, {
             method: 'PUT',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(partial),
@@ -1075,7 +1075,7 @@ document.addEventListener('DOMContentLoaded', async () => {
 
         async function poll() {
             try {
-                const response = await fetch(`/api/cameras/${encodeURIComponent(cameraId)}/motion`);
+                const response = await fetch(`api/cameras/${encodeURIComponent(cameraId)}/motion`);
                 if (response.ok) {
                     const data = await response.json();
                     if (data.total_duration > 0) {
@@ -1102,7 +1102,7 @@ document.addEventListener('DOMContentLoaded', async () => {
 
         async function poll() {
             try {
-                const response = await fetch(`/api/cameras/${encodeURIComponent(cameraId)}/detections`);
+                const response = await fetch(`api/cameras/${encodeURIComponent(cameraId)}/detections`);
                 if (response.ok) {
                     const data = await response.json();
                     currentDetections = data.detections || [];
@@ -1125,7 +1125,7 @@ document.addEventListener('DOMContentLoaded', async () => {
 
         async function poll() {
             try {
-                const response = await fetch(`/api/cameras/${encodeURIComponent(cameraId)}/events`);
+                const response = await fetch(`api/cameras/${encodeURIComponent(cameraId)}/events`);
                 if (currentDetailCameraId !== cameraId) return;
                 if (response.ok) {
                     const raw = await response.json();
@@ -1155,7 +1155,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         currentDetections.forEach(det => {
             const card = document.createElement('div');
             card.className = 'detection-card';
-            const imgSrc = `/api/cameras/${encodeURIComponent(currentDetailCameraId)}/detections/${det.id}/frame`;
+            const imgSrc = `api/cameras/${encodeURIComponent(currentDetailCameraId)}/detections/${det.id}/frame`;
             card.innerHTML = `
                 <img src="${imgSrc}" loading="lazy" alt="${det.object_class}">
                 <div class="det-label">${det.object_class} (${Math.round(det.confidence * 100)}%)</div>
@@ -1175,7 +1175,7 @@ document.addEventListener('DOMContentLoaded', async () => {
 
         async function poll() {
             try {
-                const response = await fetch(`/api/cameras/${encodeURIComponent(cameraId)}/hot-events`);
+                const response = await fetch(`api/cameras/${encodeURIComponent(cameraId)}/hot-events`);
                 if (currentDetailCameraId !== cameraId) return;
                 if (response.ok) {
                     const events = await response.json();
@@ -1263,7 +1263,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
 
     function showTooltip(x, y, detection) {
-        tooltipImage.src = `/api/cameras/${encodeURIComponent(currentDetailCameraId)}/detections/${detection.id}/frame`;
+        tooltipImage.src = `api/cameras/${encodeURIComponent(currentDetailCameraId)}/detections/${detection.id}/frame`;
         tooltipLabel.textContent = `${detection.object_class} (${Math.round(detection.confidence * 100)}%)`;
         detectionTooltip.style.left = `${x + 10}px`;
         detectionTooltip.style.top = `${y - 170}px`;
@@ -1326,7 +1326,7 @@ document.addEventListener('DOMContentLoaded', async () => {
                 const item = document.createElement('div');
                 item.className = 'event-list-item';
 
-                const thumbSrc = `/api/cameras/${encodeURIComponent(currentDetailCameraId)}/events/${ev.start_pts_ns}/thumbnail`;
+                const thumbSrc = `api/cameras/${encodeURIComponent(currentDetailCameraId)}/events/${ev.start_pts_ns}/thumbnail`;
                 const evDate = new Date(ev.start_ms);
                 const timeStr = evDate.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
                 const durSec = (ev.duration_ms / 1000).toFixed(1);
@@ -1348,7 +1348,7 @@ document.addEventListener('DOMContentLoaded', async () => {
                 if (ev.filmstrip_frames > 0) {
                     const cid = encodeURIComponent(currentDetailCameraId);
                     thumbHtml = `<div class="event-filmstrip">` +
-                        Array.from({ length: ev.filmstrip_frames }, (_, i) => `<img class="filmstrip-frame" src="/api/cameras/${cid}/events/${ev.start_pts_ns}/filmstrip/${i}" loading="lazy" alt="" onerror="this.style.display='none'">`).join('') +
+                        Array.from({ length: ev.filmstrip_frames }, (_, i) => `<img class="filmstrip-frame" src="api/cameras/${cid}/events/${ev.start_pts_ns}/filmstrip/${i}" loading="lazy" alt="" onerror="this.style.display='none'">`).join('') +
                         `</div>`;
                 } else {
                     thumbHtml = `<img class="event-list-thumb" src="${thumbSrc}" loading="lazy" alt="">`;
@@ -1420,7 +1420,7 @@ document.addEventListener('DOMContentLoaded', async () => {
             prevEventBtn.hidden = false;
             const prevDate = new Date(nav.prev.start_ms);
             prevEventText.textContent = prevDate.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-            prevEventThumb.src = `/api/cameras/${encodeURIComponent(currentDetailCameraId)}/events/${nav.prev.start_pts_ns}/thumbnail`;
+            prevEventThumb.src = `api/cameras/${encodeURIComponent(currentDetailCameraId)}/events/${nav.prev.start_pts_ns}/thumbnail`;
         } else {
             prevEventBtn.hidden = true;
         }
@@ -1429,7 +1429,7 @@ document.addEventListener('DOMContentLoaded', async () => {
             nextEventBtn.hidden = false;
             const nextDate = new Date(nav.next.start_ms);
             nextEventText.textContent = nextDate.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-            nextEventThumb.src = `/api/cameras/${encodeURIComponent(currentDetailCameraId)}/events/${nav.next.start_pts_ns}/thumbnail`;
+            nextEventThumb.src = `api/cameras/${encodeURIComponent(currentDetailCameraId)}/events/${nav.next.start_pts_ns}/thumbnail`;
         } else {
             nextEventBtn.hidden = true;
         }
@@ -1466,7 +1466,7 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     async function fetchDebugEntries(cameraId) {
         try {
-            const res = await fetch(`/api/cameras/${encodeURIComponent(cameraId)}/detection-debug`);
+            const res = await fetch(`api/cameras/${encodeURIComponent(cameraId)}/detection-debug`);
             if (!res.ok) return;
             const entries = await res.json();
             renderDebugList(cameraId, entries);
@@ -1497,7 +1497,7 @@ document.addEventListener('DOMContentLoaded', async () => {
             const fullFrameHtml = entry.has_full_frame
                 ? `<div class="debug-full-frame-container">
                     <div class="debug-full-frame-wrap">
-                        <img class="debug-full-frame-image" data-entry-id="${entry.id}" src="/api/cameras/${encodedId}/detection-debug/${entry.id}/full-frame" alt="Full frame" loading="lazy">
+                        <img class="debug-full-frame-image" data-entry-id="${entry.id}" src="api/cameras/${encodedId}/detection-debug/${entry.id}/full-frame" alt="Full frame" loading="lazy">
                         <canvas class="debug-overlay-canvas" data-entry-id="${entry.id}"></canvas>
                     </div>
                     <div class="debug-overlay-legend">
@@ -1514,7 +1514,7 @@ document.addEventListener('DOMContentLoaded', async () => {
                     .replace(/</g, '&lt;')
                     .replace(/>/g, '&gt;');
                 return `<div class="debug-frame-pair">
-                    <img class="debug-frame-image" src="/api/cameras/${encodedId}/detection-debug/${entry.id}/frame/${i}" alt="Frame ${i + 1}" loading="lazy">
+                    <img class="debug-frame-image" src="api/cameras/${encodedId}/detection-debug/${entry.id}/frame/${i}" alt="Frame ${i + 1}" loading="lazy">
                     <pre class="debug-raw-response">${response}</pre>
                 </div>`;
             }).join('');
