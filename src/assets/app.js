@@ -962,6 +962,10 @@ document.addEventListener('DOMContentLoaded', async () => {
         maskEditBtn.classList.toggle('active', enabled);
         maskEditBtn.textContent = enabled ? 'Done editing mask' : 'Edit ignore mask';
         if (enabled) {
+            // The edit button sits below the video, so activating from there can
+            // leave the paintable canvas scrolled partly above the viewport —
+            // bring the whole video wrapper into view so every mask row is reachable.
+            detailVideo.parentElement.scrollIntoView({ block: 'start', behavior: 'smooth' });
             drawMask();
         } else {
             maskPainting = false;
