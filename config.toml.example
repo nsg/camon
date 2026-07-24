@@ -110,10 +110,10 @@ min_free_bytes = 2147483648
 # buffer always stay local; only the warm event store moves. Time-based
 # retention (the *_retention_days above) still applies, via DELETE.
 #
-# NOTE: stathost does not yet have atomic PUT — an interrupted upload can leave
-# a partial object. camon uploads the video first and the sidecar/thumbnails
-# after, so the worst case is a video with no sidecar (indexed as a plain
-# movement event); a zero-byte video is warned about on the next scan.
+# Requires stathost 0.2.0 or later (atomic uploads, detailed listing, Range
+# requests); there is no fallback for older servers. camon uploads the video
+# first and the sidecar/thumbnails after, so an interruption at worst leaves a
+# video with no sidecar (indexed as a plain movement event on the next scan).
 #
 # [storage.stathost]
 # # Base URL of the host.

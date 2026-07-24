@@ -2,7 +2,7 @@
 # Schema: https://developers.home-assistant.io/docs/add-ons/configuration
 #
 # amd64 only, on purpose: Camon spawns ffmpeg/ffprobe and is only tested on
-# x86_64 here. ARM is deliberately deferred (see HOMEASSISTANT.md).
+# x86_64 here. ARM is deliberately deferred (see DOCS.md).
 name: Camon
 slug: camon
 version: "0.3.1"
@@ -38,6 +38,6 @@ panel_admin: true
 # under /data/storage). addon_config mounts the add-on's user folder
 # (/addon_configs/..._camon) at /config read-write, where the user creates
 # camon.toml; run.sh seeds a commented camon.toml.example there on first start
-# (see run.sh and HOMEASSISTANT.md).
+# (see run.sh and DOCS.md).
 map:
   - addon_config:rw

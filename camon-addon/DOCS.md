@@ -1,10 +1,16 @@
 # Camon as a Home Assistant add-on
 
+> **This file documents the Home Assistant add-on only.** (It is named
+> `DOCS.md` because Home Assistant requires that exact filename for the add-on
+> Documentation tab.) If you are not running Home Assistant, this file is not
+> for you — see the main [README](https://github.com/nsg/camon#readme) for the
+> native installation.
+
 This repository doubles as a [Home Assistant add-on repository](https://developers.home-assistant.io/docs/add-ons/repository).
 Home Assistant is not the primary way Camon is meant to run — it is a native
-Linux service first (see the main [README](README.md)) — but if you run Home
-Assistant OS or Supervised, you can install Camon as an add-on and get its web
-UI embedded directly in the Home Assistant sidebar via **ingress**.
+Linux service first — but if you run Home Assistant OS or Supervised, you can
+install Camon as an add-on and get its web UI embedded directly in the Home
+Assistant sidebar via **ingress**.
 
 > **amd64 only.** The add-on builds and runs on `amd64` (x86_64) only. ARM
 > (`aarch64`) is deliberately deferred and not offered in `config.yaml`'s
@@ -66,7 +72,7 @@ install) or under `…/api/hassio_ingress/<token>/` (add-on).
 
 The add-on has **no options UI**. It is configured by a `camon.toml` file with
 the **exact same format as a native install**, so everything Camon supports is
-available — see [`config.toml.example`](config.toml.example) for the full,
+available — see [`config.toml.example`](https://github.com/nsg/camon/blob/master/config.toml.example) for the full,
 commented field reference.
 
 Create the file in the add-on's config folder:
