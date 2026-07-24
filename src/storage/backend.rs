@@ -16,13 +16,18 @@
 //!   ([`read_thumbnail`](WarmStorageBackend::read_thumbnail)) — LocalDisk keeps
 //!   today's lazy ffmpeg generation + on-disk caching, a remote backend fetches
 //!   a pre-rendered image;
-//! * video is returned as *bytes*
+//! * video is returned as a *stream*
 //!   ([`read_video`](WarmStorageBackend::read_video)) — callers never see a
-//!   `PathBuf`, so a remote backend can stream the response.
+//!   `PathBuf` or a fully-buffered `Vec<u8>`; the body is an async byte stream
+//!   with HTTP Range support, so a 10-60 MB event never lands whole in RAM.
 
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 
 use async_trait::async_trait;
+use bytes::Bytes;
+use futures_core::Stream;
+use tokio_util::io::ReaderStream;
 
 use crate::buffer::warm::{EventUpgrade, FinishedEvent};
 use crate::buffer::GopSegment;
@@ -60,6 +65,88 @@ impl ThumbnailError {
             ThumbnailError::ProcessError => "ffmpeg process error",
             ThumbnailError::GenerationFailed => "thumbnail generation failed",
             ThumbnailError::ReadFailed => "failed to read thumbnail",
+        }
+    }
+}
+
+/// A boxed async byte stream of a (possibly partial) video body. Boxed so both
+/// backends can return their own concrete stream (a local file reader, a remote
+/// HTTP body) behind one type.
+pub type VideoByteStream = Pin<Box<dyn Stream<Item = std::io::Result<Bytes>> + Send>>;
+
+/// A single-range request parsed from an HTTP `Range` header. Only single
+/// ranges are modeled; multi-range requests are declined upstream and served in
+/// full. Mirrors the three RFC 7233 byte-range-spec forms.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RangeRequest {
+    /// `bytes=a-b` (both bounds) or `bytes=a-` (open-ended); `end` is inclusive.
+    FromTo { start: u64, end: Option<u64> },
+    /// `bytes=-n`: the final `n` bytes of the object.
+    Suffix(u64),
+}
+
+impl RangeRequest {
+    /// Render back to a request `Range` header value, for forwarding to a
+    /// Range-capable remote backend.
+    pub fn header_value(&self) -> String {
+        match self {
+            RangeRequest::FromTo {
+                start,
+                end: Some(end),
+            } => format!("bytes={start}-{end}"),
+            RangeRequest::FromTo { start, end: None } => format!("bytes={start}-"),
+            RangeRequest::Suffix(n) => format!("bytes=-{n}"),
+        }
+    }
+}
+
+/// How a [`read_video`](WarmStorageBackend::read_video) call resolved the
+/// (optional) requested range — the handler maps this straight onto a status
+/// line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServedRange {
+    /// The whole object is being streamed — respond `200` + `Accept-Ranges`.
+    Full,
+    /// A satisfied partial range `[start, end]` inclusive — respond `206`.
+    Partial { start: u64, end: u64 },
+    /// The requested range fell outside the object — respond `416`
+    /// (`Content-Range: bytes */total`). The stream is empty.
+    Unsatisfiable,
+}
+
+/// A streamed video read: the async body, the total object size, and how the
+/// requested range was resolved. The body is never fully buffered in RAM.
+pub struct VideoStream {
+    pub stream: VideoByteStream,
+    pub total_size: u64,
+    pub range: ServedRange,
+}
+
+/// Resolve a requested range against an object's total size, returning the
+/// satisfied inclusive `[start, end]` or `None` when unsatisfiable (RFC 7233):
+/// a `bytes=a-` / `bytes=a-b` whose `a >= total`, or an empty `bytes=-0`
+/// suffix. An open or over-long upper bound is clamped to the last byte.
+fn resolve_range(req: RangeRequest, total: u64) -> Option<(u64, u64)> {
+    if total == 0 {
+        return None;
+    }
+    match req {
+        RangeRequest::FromTo { start, end } => {
+            if start >= total {
+                return None;
+            }
+            let end = end.unwrap_or(total - 1).min(total - 1);
+            if end < start {
+                return None;
+            }
+            Some((start, end))
+        }
+        RangeRequest::Suffix(n) => {
+            if n == 0 {
+                return None;
+            }
+            let n = n.min(total);
+            Some((total - n, total - 1))
         }
     }
 }
@@ -122,9 +209,16 @@ pub trait WarmStorageBackend: Send + Sync {
     /// The event with exactly this start PTS, if indexed.
     fn find_event(&self, camera_id: &str, start_pts_ns: u64) -> Option<WarmEventEntry>;
 
-    /// Read a stored event's video as bytes (callers never see a path).
-    async fn read_video(&self, camera_id: &str, entry: &WarmEventEntry)
-        -> std::io::Result<Vec<u8>>;
+    /// Stream a stored event's video (callers never see a path, and the body is
+    /// never fully buffered). `range` carries an optional single HTTP range; the
+    /// returned [`VideoStream`] reports the total size and how the range was
+    /// resolved (full / partial / unsatisfiable).
+    async fn read_video(
+        &self,
+        camera_id: &str,
+        entry: &WarmEventEntry,
+        range: Option<RangeRequest>,
+    ) -> std::io::Result<VideoStream>;
 
     /// Acquire the event's poster thumbnail. LocalDisk lazily generates it from
     /// the stored video via ffmpeg on first request and caches the result.
@@ -260,9 +354,40 @@ impl WarmStorageBackend for LocalDiskBackend {
         &self,
         camera_id: &str,
         entry: &WarmEventEntry,
-    ) -> std::io::Result<Vec<u8>> {
+        range: Option<RangeRequest>,
+    ) -> std::io::Result<VideoStream> {
+        use tokio::io::{AsyncReadExt, AsyncSeekExt};
+
         let path = self.index.resolve_file_path(camera_id, entry);
-        tokio::fs::read(&path).await
+        let mut file = tokio::fs::File::open(&path).await?;
+        let total_size = file.metadata().await?.len();
+
+        let Some(req) = range else {
+            return Ok(VideoStream {
+                stream: Box::pin(ReaderStream::new(file)),
+                total_size,
+                range: ServedRange::Full,
+            });
+        };
+
+        match resolve_range(req, total_size) {
+            Some((start, end)) => {
+                file.seek(std::io::SeekFrom::Start(start)).await?;
+                // `+ 1` because the range is inclusive on both ends.
+                let limited = file.take(end - start + 1);
+                Ok(VideoStream {
+                    stream: Box::pin(ReaderStream::new(limited)),
+                    total_size,
+                    range: ServedRange::Partial { start, end },
+                })
+            }
+            None => Ok(VideoStream {
+                // Empty body: the handler answers 416 with a short text message.
+                stream: Box::pin(ReaderStream::new(tokio::io::empty())),
+                total_size,
+                range: ServedRange::Unsatisfiable,
+            }),
+        }
     }
 
     async fn read_thumbnail(
@@ -668,6 +793,17 @@ mod tests {
 
     const SEC: u64 = 1_000_000_000;
 
+    /// Drain a [`VideoStream`] body to bytes (test-only; real callers stream).
+    async fn drain(vs: VideoStream) -> Vec<u8> {
+        use futures_util::StreamExt;
+        let mut buf = Vec::new();
+        let mut stream = vs.stream;
+        while let Some(chunk) = stream.next().await {
+            buf.extend_from_slice(&chunk.unwrap());
+        }
+        buf
+    }
+
     fn segment(start_pts: u64, duration_ns: u64, byte: u8) -> GopSegment {
         GopSegment {
             start_pts,
@@ -986,8 +1122,8 @@ mod tests {
         assert_eq!(entry.event_type, EventType::Movement);
         assert_eq!(backend.query("cam", 0, u64::MAX).len(), 1);
 
-        // Video comes back as bytes, not a path.
-        let video = backend.read_video("cam", &entry).await.unwrap();
+        // Video comes back as a stream, not a path or a Vec.
+        let video = drain(backend.read_video("cam", &entry, None).await.unwrap()).await;
         assert_eq!(video.len(), 16);
 
         // Filmstrip frames are readable through the backend.
@@ -999,5 +1135,271 @@ mod tests {
         let upgraded = backend.find_event("cam", first_pts).unwrap();
         assert_eq!(upgraded.event_type, EventType::Object);
         assert_eq!(upgraded.object_classes, vec!["person".to_string()]);
+    }
+
+    // ---- range resolution --------------------------------------------------
+
+    #[test]
+    fn resolve_range_covers_every_form() {
+        let total = 100;
+        // bytes=10-19  → the middle window.
+        assert_eq!(
+            resolve_range(
+                RangeRequest::FromTo {
+                    start: 10,
+                    end: Some(19)
+                },
+                total
+            ),
+            Some((10, 19))
+        );
+        // bytes=50-    → from an offset to EOF.
+        assert_eq!(
+            resolve_range(
+                RangeRequest::FromTo {
+                    start: 50,
+                    end: None
+                },
+                total
+            ),
+            Some((50, 99))
+        );
+        // bytes=0-     → the whole object, as a partial.
+        assert_eq!(
+            resolve_range(
+                RangeRequest::FromTo {
+                    start: 0,
+                    end: None
+                },
+                total
+            ),
+            Some((0, 99))
+        );
+        // bytes=-20    → the suffix.
+        assert_eq!(
+            resolve_range(RangeRequest::Suffix(20), total),
+            Some((80, 99))
+        );
+        // Upper bound past EOF is clamped to the last byte.
+        assert_eq!(
+            resolve_range(
+                RangeRequest::FromTo {
+                    start: 90,
+                    end: Some(500)
+                },
+                total
+            ),
+            Some((90, 99))
+        );
+        // A suffix longer than the object clamps to the whole object.
+        assert_eq!(
+            resolve_range(RangeRequest::Suffix(500), total),
+            Some((0, 99))
+        );
+    }
+
+    #[test]
+    fn resolve_range_rejects_unsatisfiable() {
+        let total = 100;
+        // start at or past EOF.
+        assert_eq!(
+            resolve_range(
+                RangeRequest::FromTo {
+                    start: 100,
+                    end: None
+                },
+                total
+            ),
+            None
+        );
+        assert_eq!(
+            resolve_range(
+                RangeRequest::FromTo {
+                    start: 200,
+                    end: Some(300)
+                },
+                total
+            ),
+            None
+        );
+        // bytes=-0 is an empty, unsatisfiable suffix.
+        assert_eq!(resolve_range(RangeRequest::Suffix(0), total), None);
+        // Any range against a zero-length object is unsatisfiable.
+        assert_eq!(
+            resolve_range(
+                RangeRequest::FromTo {
+                    start: 0,
+                    end: None
+                },
+                0
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn range_request_renders_header_value() {
+        assert_eq!(
+            RangeRequest::FromTo {
+                start: 10,
+                end: Some(19)
+            }
+            .header_value(),
+            "bytes=10-19"
+        );
+        assert_eq!(
+            RangeRequest::FromTo {
+                start: 50,
+                end: None
+            }
+            .header_value(),
+            "bytes=50-"
+        );
+        assert_eq!(RangeRequest::Suffix(20).header_value(), "bytes=-20");
+    }
+
+    // ---- LocalDisk streamed range reads ------------------------------------
+
+    /// A backend holding one 16-byte movement event; returns (backend, entry).
+    async fn backend_with_event() -> (LocalDiskBackend, WarmEventEntry, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let buffer = populated_buffer(10);
+        let event = {
+            let buf = buffer.read_recover();
+            assemble_event(&buf, None, "cam", 5, 7, 0, SEC, false).unwrap()
+        };
+        let first_pts = event.first_pts;
+        let backend = LocalDiskBackend::new(dir.path().to_path_buf(), &["cam".to_string()]);
+        assert_eq!(
+            backend.write_event("cam", &event).await,
+            WriteOutcome::Written
+        );
+        let entry = backend.find_event("cam", first_pts).unwrap();
+        (backend, entry, dir)
+    }
+
+    #[tokio::test]
+    async fn local_disk_full_read_reports_size() {
+        let (backend, entry, _dir) = backend_with_event().await;
+        let vs = backend.read_video("cam", &entry, None).await.unwrap();
+        assert_eq!(vs.total_size, 16);
+        assert!(matches!(vs.range, ServedRange::Full));
+        assert_eq!(drain(vs).await.len(), 16);
+    }
+
+    #[tokio::test]
+    async fn local_disk_range_reads_start_middle_suffix() {
+        // The 16-byte body is four 4-byte segments: [4;4][5;4][6;4][7;4].
+        let (backend, entry, _dir) = backend_with_event().await;
+
+        // Start window: bytes 0-3 → the first segment (all 4s).
+        let vs = backend
+            .read_video(
+                "cam",
+                &entry,
+                Some(RangeRequest::FromTo {
+                    start: 0,
+                    end: Some(3),
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            vs.range,
+            ServedRange::Partial { start: 0, end: 3 }
+        ));
+        assert_eq!(vs.total_size, 16);
+        assert_eq!(drain(vs).await, vec![4u8; 4]);
+
+        // Middle window: bytes 4-11 spans the 5s and 6s segments.
+        let vs = backend
+            .read_video(
+                "cam",
+                &entry,
+                Some(RangeRequest::FromTo {
+                    start: 4,
+                    end: Some(11),
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            vs.range,
+            ServedRange::Partial { start: 4, end: 11 }
+        ));
+        let mut expected = vec![5u8; 4];
+        expected.extend_from_slice(&[6u8; 4]);
+        assert_eq!(drain(vs).await, expected);
+
+        // Suffix: last 4 bytes → the final segment (all 7s).
+        let vs = backend
+            .read_video("cam", &entry, Some(RangeRequest::Suffix(4)))
+            .await
+            .unwrap();
+        assert!(matches!(
+            vs.range,
+            ServedRange::Partial { start: 12, end: 15 }
+        ));
+        assert_eq!(drain(vs).await, vec![7u8; 4]);
+    }
+
+    #[tokio::test]
+    async fn local_disk_open_ended_range_clamps_to_eof() {
+        let (backend, entry, _dir) = backend_with_event().await;
+        // bytes=12- → from offset 12 to EOF (clamped end = 15).
+        let vs = backend
+            .read_video(
+                "cam",
+                &entry,
+                Some(RangeRequest::FromTo {
+                    start: 12,
+                    end: None,
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            vs.range,
+            ServedRange::Partial { start: 12, end: 15 }
+        ));
+        assert_eq!(drain(vs).await, vec![7u8; 4]);
+
+        // An upper bound past EOF is clamped rather than rejected.
+        let vs = backend
+            .read_video(
+                "cam",
+                &entry,
+                Some(RangeRequest::FromTo {
+                    start: 8,
+                    end: Some(999),
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            vs.range,
+            ServedRange::Partial { start: 8, end: 15 }
+        ));
+        assert_eq!(drain(vs).await.len(), 8);
+    }
+
+    #[tokio::test]
+    async fn local_disk_unsatisfiable_range_is_reported() {
+        let (backend, entry, _dir) = backend_with_event().await;
+        // start == total → unsatisfiable, empty body, size still reported.
+        let vs = backend
+            .read_video(
+                "cam",
+                &entry,
+                Some(RangeRequest::FromTo {
+                    start: 16,
+                    end: None,
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(vs.range, ServedRange::Unsatisfiable));
+        assert_eq!(vs.total_size, 16);
+        assert!(drain(vs).await.is_empty());
     }
 }

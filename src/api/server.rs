@@ -1,8 +1,9 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
+use axum::body::Body;
 use axum::extract::{Path, Query, State};
-use axum::http::{header, StatusCode};
+use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
@@ -17,7 +18,8 @@ use crate::analytics::{MotionSettingsStore, SettingsUpdate};
 use crate::buffer::HotBuffer;
 use crate::locks::LockExt;
 use crate::storage::{
-    DetectionDebugStore, DetectionStore, MotionStore, ThumbnailError, WarmStorageBackend,
+    DetectionDebugStore, DetectionStore, MotionStore, RangeRequest, ServedRange, ThumbnailError,
+    VideoStream, WarmStorageBackend,
 };
 
 use super::hls;
@@ -682,9 +684,44 @@ async fn warm_playlist_handler(
         .into_response()
 }
 
+/// Parse an incoming single-range HTTP `Range` header into a [`RangeRequest`].
+///
+/// Returns `None` — meaning "serve the whole object (200)" — for an absent
+/// header, a non-`bytes` unit, syntactic garbage, a reversed range, or a
+/// multi-range request (`a-b,c-d`): we do not implement `multipart/byteranges`,
+/// so we deliberately fall back to the full body rather than erroring.
+fn parse_range_header(value: &str) -> Option<RangeRequest> {
+    let spec = value.trim().strip_prefix("bytes=")?;
+    // Multi-range → decline; the caller serves the full body.
+    if spec.contains(',') {
+        return None;
+    }
+    let (start, end) = spec.split_once('-')?;
+    let (start, end) = (start.trim(), end.trim());
+    if start.is_empty() {
+        // bytes=-n (suffix): the final n bytes.
+        return Some(RangeRequest::Suffix(end.parse().ok()?));
+    }
+    let start: u64 = start.parse().ok()?;
+    if end.is_empty() {
+        // bytes=a-
+        return Some(RangeRequest::FromTo { start, end: None });
+    }
+    let end: u64 = end.parse().ok()?;
+    if end < start {
+        // Reversed range is invalid syntax → ignore, serve full.
+        return None;
+    }
+    Some(RangeRequest::FromTo {
+        start,
+        end: Some(end),
+    })
+}
+
 async fn warm_segment_handler(
     State(state): State<AppState>,
     Path((id, start_pts_str)): Path<(String, String)>,
+    headers: HeaderMap,
 ) -> Response {
     let backend = match &state.storage {
         Some(b) => b,
@@ -701,9 +738,56 @@ async fn warm_segment_handler(
         None => return (StatusCode::NOT_FOUND, "event not found").into_response(),
     };
 
-    match backend.read_video(&id, &entry).await {
-        Ok(data) => ([(header::CONTENT_TYPE, "video/mp2t")], data).into_response(),
+    let range = headers
+        .get(header::RANGE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(parse_range_header);
+
+    match backend.read_video(&id, &entry, range).await {
+        Ok(video) => video_stream_response(video),
         Err(_) => (StatusCode::NOT_FOUND, "event file not found").into_response(),
+    }
+}
+
+/// Turn a streamed [`VideoStream`] into an HTTP response: `206` for a satisfied
+/// range, `200` + `Accept-Ranges` for a full body, `416` for an unsatisfiable
+/// range. The body streams straight from the backend — never buffered whole.
+fn video_stream_response(video: VideoStream) -> Response {
+    let VideoStream {
+        stream,
+        total_size,
+        range,
+    } = video;
+    match range {
+        ServedRange::Unsatisfiable => (
+            StatusCode::RANGE_NOT_SATISFIABLE,
+            [(header::CONTENT_RANGE, format!("bytes */{total_size}"))],
+            "range not satisfiable",
+        )
+            .into_response(),
+        ServedRange::Full => (
+            [
+                (header::CONTENT_TYPE, "video/mp2t".to_string()),
+                (header::ACCEPT_RANGES, "bytes".to_string()),
+                (header::CONTENT_LENGTH, total_size.to_string()),
+            ],
+            Body::from_stream(stream),
+        )
+            .into_response(),
+        ServedRange::Partial { start, end } => (
+            StatusCode::PARTIAL_CONTENT,
+            [
+                (header::CONTENT_TYPE, "video/mp2t".to_string()),
+                (header::ACCEPT_RANGES, "bytes".to_string()),
+                (
+                    header::CONTENT_RANGE,
+                    format!("bytes {start}-{end}/{total_size}"),
+                ),
+                (header::CONTENT_LENGTH, (end - start + 1).to_string()),
+            ],
+            Body::from_stream(stream),
+        )
+            .into_response(),
     }
 }
 
@@ -859,5 +943,55 @@ async fn warm_filmstrip_handler(
         )
             .into_response(),
         Err(_) => (StatusCode::NOT_FOUND, "filmstrip frame not found").into_response(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_range_header_accepts_every_single_range_form() {
+        assert_eq!(
+            parse_range_header("bytes=0-99"),
+            Some(RangeRequest::FromTo {
+                start: 0,
+                end: Some(99)
+            })
+        );
+        assert_eq!(
+            parse_range_header("bytes=500-"),
+            Some(RangeRequest::FromTo {
+                start: 500,
+                end: None
+            })
+        );
+        assert_eq!(
+            parse_range_header("bytes=-200"),
+            Some(RangeRequest::Suffix(200))
+        );
+        // Whitespace around the value is tolerated.
+        assert_eq!(
+            parse_range_header("bytes= 10-20 "),
+            Some(RangeRequest::FromTo {
+                start: 10,
+                end: Some(20)
+            })
+        );
+    }
+
+    #[test]
+    fn parse_range_header_declines_garbage_and_multi_range() {
+        // Not a byte range at all.
+        assert_eq!(parse_range_header("bytes=abc"), None);
+        assert_eq!(parse_range_header("items=0-1"), None);
+        assert_eq!(parse_range_header("bytes=10"), None);
+        assert_eq!(parse_range_header("bytes="), None);
+        assert_eq!(parse_range_header("bytes=-"), None);
+        assert_eq!(parse_range_header("garbage"), None);
+        // Reversed range is invalid → decline (serve full).
+        assert_eq!(parse_range_header("bytes=20-10"), None);
+        // Multi-range is unsupported → decline (serve full).
+        assert_eq!(parse_range_header("bytes=0-10,20-30"), None);
     }
 }

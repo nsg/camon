@@ -31,15 +31,18 @@
 //!   sidecar — indexed as a plain movement event on the next scan. (Until
 //!   stathost ships atomic PUT, a `.ts` can also land truncated; a zero-byte
 //!   `.ts` is warned about at scan time.)
-//! * **`read_video` buffers the whole object in RAM.** Acceptable for 10–60 MB
-//!   events today; a future pass should stream (stathost has no Range support
-//!   yet either).
+//! * **`read_video` streams the object with Range support.** The body is never
+//!   fully buffered; a forwarded `Range` header yields a `206` from stathost
+//!   (>=0.2.0). If an older server ignores the header and answers `200`, the
+//!   read degrades to streaming the full body (a legal response to a range
+//!   request — the client replays from the start).
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
 
 use async_trait::async_trait;
+use futures_util::TryStreamExt;
 use serde::Deserialize;
 
 use crate::buffer::warm::{EventUpgrade, FinishedEvent};
@@ -47,7 +50,8 @@ use crate::buffer::GopSegment;
 use crate::config::StathostConfig;
 use crate::locks::LockExt;
 use crate::storage::backend::{
-    deduplicate_detections, ThumbnailError, WarmStorageBackend, WriteOutcome,
+    deduplicate_detections, RangeRequest, ServedRange, ThumbnailError, VideoStream,
+    WarmStorageBackend, WriteOutcome,
 };
 use crate::storage::warm_index::{parse_event_filename, parse_sidecar_json, DetectionDetail};
 use crate::storage::{EventType, WarmEventEntry};
@@ -534,13 +538,64 @@ impl WarmStorageBackend for StathostBackend {
         &self,
         camera_id: &str,
         entry: &WarmEventEntry,
-    ) -> std::io::Result<Vec<u8>> {
-        // NOTE: buffers the whole object in RAM. Fine for 10–60 MB events;
-        // revisit with a streaming/Range pass once stathost supports Range.
-        self.http
-            .get(&Self::ts_key(camera_id, entry))
+        range: Option<RangeRequest>,
+    ) -> std::io::Result<VideoStream> {
+        let key = Self::ts_key(camera_id, entry);
+        let resp = self
+            .http
+            .get_ranged(&key, range)
             .await
-            .map_err(reqwest_io)
+            .map_err(reqwest_io)?;
+        let status = resp.status();
+
+        // The server understood the range and declined it.
+        if status == reqwest::StatusCode::RANGE_NOT_SATISFIABLE {
+            let total = resp
+                .headers()
+                .get(reqwest::header::CONTENT_RANGE)
+                .and_then(|v| v.to_str().ok())
+                .and_then(parse_content_range_total)
+                .unwrap_or(entry.file_size);
+            return Ok(VideoStream {
+                stream: Box::pin(futures_util::stream::empty()),
+                total_size: total,
+                range: ServedRange::Unsatisfiable,
+            });
+        }
+
+        if let Err(e) = resp.error_for_status_ref() {
+            return Err(reqwest_io(e));
+        }
+
+        // 206 → a satisfied partial range; anything else (200, or a server that
+        // ignored the header) degrades to streaming the full body.
+        let (served, total_size) = if status == reqwest::StatusCode::PARTIAL_CONTENT {
+            match resp
+                .headers()
+                .get(reqwest::header::CONTENT_RANGE)
+                .and_then(|v| v.to_str().ok())
+                .and_then(parse_content_range)
+            {
+                Some((start, end, total)) => (ServedRange::Partial { start, end }, total),
+                // 206 without a parseable Content-Range: treat the body as full.
+                None => (
+                    ServedRange::Full,
+                    resp.content_length().unwrap_or(entry.file_size),
+                ),
+            }
+        } else {
+            (
+                ServedRange::Full,
+                resp.content_length().unwrap_or(entry.file_size),
+            )
+        };
+
+        let stream = resp.bytes_stream().map_err(reqwest_io);
+        Ok(VideoStream {
+            stream: Box::pin(stream),
+            total_size,
+            range: served,
+        })
     }
 
     async fn read_thumbnail(
@@ -641,6 +696,21 @@ impl Http {
             .await?
             .error_for_status()?;
         Ok(resp.bytes().await?.to_vec())
+    }
+
+    /// Start a streamed GET, optionally forwarding a single `Range`. The raw
+    /// response is returned unvalidated so the caller can distinguish `206`
+    /// (partial), `200` (full / range-ignored) and `416` (unsatisfiable).
+    async fn get_ranged(
+        &self,
+        path: &str,
+        range: Option<RangeRequest>,
+    ) -> Result<reqwest::Response, reqwest::Error> {
+        let mut req = self.client.get(self.url(path)).bearer_auth(&self.token);
+        if let Some(range) = range {
+            req = req.header(reqwest::header::RANGE, range.header_value());
+        }
+        req.send().await
     }
 
     /// List every object in the bucket, preferring the detailed variant and
@@ -761,6 +831,23 @@ fn reqwest_io(e: reqwest::Error) -> std::io::Error {
     std::io::Error::other(e)
 }
 
+/// Parse a `206` `Content-Range: bytes start-end/total` into its three numbers.
+fn parse_content_range(value: &str) -> Option<(u64, u64, u64)> {
+    let rest = value.trim().strip_prefix("bytes ")?;
+    let (range, total) = rest.split_once('/')?;
+    let total: u64 = total.trim().parse().ok()?;
+    let (start, end) = range.split_once('-')?;
+    let start: u64 = start.trim().parse().ok()?;
+    let end: u64 = end.trim().parse().ok()?;
+    Some((start, end, total))
+}
+
+/// Parse the total size out of a `416` `Content-Range: bytes */total`.
+fn parse_content_range_total(value: &str) -> Option<u64> {
+    let (_, total) = value.trim().strip_prefix("bytes ")?.split_once('/')?;
+    total.trim().parse().ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -792,6 +879,52 @@ mod tests {
         token: String,
         mode: ListMode,
         fail_writes: Arc<AtomicBool>,
+        /// When set, GET ignores an incoming `Range` and answers a full `200`,
+        /// modeling a pre-0.2.0 stathost with no Range support.
+        ignore_range: Arc<AtomicBool>,
+    }
+
+    /// Drain a [`VideoStream`] body to bytes (test-only).
+    async fn drain(vs: VideoStream) -> Vec<u8> {
+        use futures_util::StreamExt;
+        let mut buf = Vec::new();
+        let mut stream = vs.stream;
+        while let Some(chunk) = stream.next().await {
+            buf.extend_from_slice(&chunk.unwrap());
+        }
+        buf
+    }
+
+    /// Resolve a single-range `Range` header against `total`, mirroring real
+    /// stathost semantics: `Some((start, end))` inclusive, or `None` for a
+    /// `416`-worthy unsatisfiable range.
+    fn parse_stub_range(header: &str, total: u64) -> Option<(u64, u64)> {
+        let spec = header.trim().strip_prefix("bytes=")?;
+        if spec.contains(',') {
+            return None;
+        }
+        let (s, e) = spec.split_once('-')?;
+        if s.is_empty() {
+            let n: u64 = e.trim().parse().ok()?;
+            if n == 0 || total == 0 {
+                return None;
+            }
+            let n = n.min(total);
+            return Some((total - n, total - 1));
+        }
+        let start: u64 = s.trim().parse().ok()?;
+        if start >= total {
+            return None;
+        }
+        let end = if e.trim().is_empty() {
+            total - 1
+        } else {
+            e.trim().parse::<u64>().ok()?.min(total - 1)
+        };
+        if end < start {
+            return None;
+        }
+        Some((start, end))
     }
 
     fn authorized(headers: &HeaderMap, token: &str) -> bool {
@@ -855,11 +988,50 @@ mod tests {
                 }
             }
             // GET is public.
-            _ => match stub.files.lock().unwrap().get(&path) {
-                Some(bytes) => bytes.clone().into_response(),
-                None => StatusCode::NOT_FOUND.into_response(),
-            },
+            _ => {
+                let bytes = match stub.files.lock().unwrap().get(&path) {
+                    Some(bytes) => bytes.clone(),
+                    None => return StatusCode::NOT_FOUND.into_response(),
+                };
+                let total = bytes.len() as u64;
+                let range = headers.get("range").and_then(|v| v.to_str().ok());
+                match range {
+                    // A pre-0.2.0 server ignores the header and answers 200.
+                    Some(_) if stub.ignore_range.load(Ordering::Relaxed) => full_200(bytes),
+                    Some(r) => match parse_stub_range(r, total) {
+                        Some((start, end)) => {
+                            let slice = bytes[start as usize..=end as usize].to_vec();
+                            let mut resp = (StatusCode::PARTIAL_CONTENT, slice).into_response();
+                            resp.headers_mut().insert(
+                                "content-range",
+                                format!("bytes {start}-{end}/{total}").parse().unwrap(),
+                            );
+                            resp.headers_mut()
+                                .insert("accept-ranges", "bytes".parse().unwrap());
+                            resp
+                        }
+                        None => {
+                            let mut resp = StatusCode::RANGE_NOT_SATISFIABLE.into_response();
+                            resp.headers_mut().insert(
+                                "content-range",
+                                format!("bytes */{total}").parse().unwrap(),
+                            );
+                            resp
+                        }
+                    },
+                    None => full_200(bytes),
+                }
+            }
         }
+    }
+
+    /// A `200 OK` full body advertising `Accept-Ranges: bytes`.
+    fn full_200(bytes: Vec<u8>) -> axum::response::Response {
+        use axum::response::IntoResponse;
+        let mut resp = bytes.into_response();
+        resp.headers_mut()
+            .insert("accept-ranges", "bytes".parse().unwrap());
+        resp
     }
 
     async fn spawn_stub(mode: ListMode, token: &str) -> (String, Stub) {
@@ -868,6 +1040,7 @@ mod tests {
             token: token.to_string(),
             mode,
             fail_writes: Arc::new(AtomicBool::new(false)),
+            ignore_range: Arc::new(AtomicBool::new(false)),
         };
         let app = Router::new()
             .route("/{bucket}/{*path}", any(handler))
@@ -961,8 +1134,11 @@ mod tests {
         assert_eq!(entry.file_size, 40);
         assert_eq!(entry.filmstrip_frames, 2);
 
-        // Video and thumbnails come back through the trait.
-        assert_eq!(backend.read_video("cam", &entry).await.unwrap().len(), 40);
+        // Video and thumbnails come back through the trait (streamed).
+        let vs = backend.read_video("cam", &entry, None).await.unwrap();
+        assert!(matches!(vs.range, ServedRange::Full));
+        assert_eq!(vs.total_size, 40);
+        assert_eq!(drain(vs).await.len(), 40);
         assert_eq!(
             backend.read_thumbnail("cam", &entry).await.unwrap(),
             vec![0x01, 0x02]
@@ -1155,5 +1331,92 @@ mod tests {
         backend.write_event("cam", &event).await;
         let entry = backend.find_event("cam", 7_000).unwrap();
         assert!(backend.read_thumbnail("cam", &entry).await.is_err());
+    }
+
+    // ---- streamed Range playback ------------------------------------------
+
+    #[tokio::test]
+    async fn read_video_serves_partial_and_suffix_ranges() {
+        let (url, _stub) = spawn_stub(ListMode::Detail, "secret").await;
+        let backend = backend_for(&url, "secret", 0);
+        // A 40-byte movement event (body is 40 × 0xab).
+        backend.write_event("cam", &movement_event(8_000, 40)).await;
+        let entry = backend.find_event("cam", 8_000).unwrap();
+
+        // bytes=10-19 → a 206 with a 10-byte body and the right Content-Range.
+        let vs = backend
+            .read_video(
+                "cam",
+                &entry,
+                Some(RangeRequest::FromTo {
+                    start: 10,
+                    end: Some(19),
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(vs.range, ServedRange::Partial { start: 10, end: 19 });
+        assert_eq!(vs.total_size, 40);
+        assert_eq!(drain(vs).await, vec![0xab; 10]);
+
+        // bytes=-5 → the last five bytes.
+        let vs = backend
+            .read_video("cam", &entry, Some(RangeRequest::Suffix(5)))
+            .await
+            .unwrap();
+        assert_eq!(vs.range, ServedRange::Partial { start: 35, end: 39 });
+        assert_eq!(drain(vs).await, vec![0xab; 5]);
+    }
+
+    #[tokio::test]
+    async fn read_video_reports_unsatisfiable_range() {
+        let (url, _stub) = spawn_stub(ListMode::Detail, "secret").await;
+        let backend = backend_for(&url, "secret", 0);
+        backend.write_event("cam", &movement_event(9_000, 40)).await;
+        let entry = backend.find_event("cam", 9_000).unwrap();
+
+        // start past EOF → the stub answers 416; we surface Unsatisfiable + size.
+        let vs = backend
+            .read_video(
+                "cam",
+                &entry,
+                Some(RangeRequest::FromTo {
+                    start: 100,
+                    end: None,
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(vs.range, ServedRange::Unsatisfiable);
+        assert_eq!(vs.total_size, 40);
+        assert!(drain(vs).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn read_video_degrades_to_full_when_server_ignores_range() {
+        let (url, stub) = spawn_stub(ListMode::Detail, "secret").await;
+        // Model a pre-0.2.0 stathost that ignores Range and answers 200.
+        stub.ignore_range.store(true, Ordering::Relaxed);
+        let backend = backend_for(&url, "secret", 0);
+        backend
+            .write_event("cam", &movement_event(10_000, 40))
+            .await;
+        let entry = backend.find_event("cam", 10_000).unwrap();
+
+        // A range was requested, but the full body comes back as a 200.
+        let vs = backend
+            .read_video(
+                "cam",
+                &entry,
+                Some(RangeRequest::FromTo {
+                    start: 10,
+                    end: Some(19),
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(vs.range, ServedRange::Full);
+        assert_eq!(vs.total_size, 40);
+        assert_eq!(drain(vs).await.len(), 40);
     }
 }

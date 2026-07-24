@@ -7,7 +7,9 @@ pub mod stathost;
 mod store;
 pub mod warm_index;
 
-pub use backend::{LocalDiskBackend, ThumbnailError, WarmStorageBackend};
+pub use backend::{
+    LocalDiskBackend, RangeRequest, ServedRange, ThumbnailError, VideoStream, WarmStorageBackend,
+};
 pub use debug_store::DetectionDebugStore;
 pub use detection_store::{DetectionEntry, DetectionStore};
 pub use event_registry::{EventRecord, EventRegistry};
