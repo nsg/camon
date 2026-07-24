@@ -1285,13 +1285,16 @@ document.addEventListener('DOMContentLoaded', async () => {
                 const typeLabel = ev.event_type === 'object' ? 'Object detected' : 'Movement';
                 const typeClass = ev.event_type === 'object' ? 'object' : 'movement';
 
-                // TODO(2026-04-26): remove has_filmstrip check — all events now generate filmstrips.
-                // The fallback branch only exists for events saved before this change.
+                // A motion run is subsampled to at most 4 filmstrip thumbs, and
+                // short runs yield fewer — render exactly the frames that exist so
+                // we never request a missing index (which 404s to a broken glyph).
+                // The onerror handler hides any frame that still fails to load
+                // (e.g. pre-count events or a partial write).
                 let thumbHtml;
-                if (ev.has_filmstrip) {
+                if (ev.filmstrip_frames > 0) {
                     const cid = encodeURIComponent(currentDetailCameraId);
                     thumbHtml = `<div class="event-filmstrip">` +
-                        [0,1,2,3].map(i => `<img class="filmstrip-frame" src="/api/cameras/${cid}/events/${ev.start_pts_ns}/filmstrip/${i}" loading="lazy" alt="">`).join('') +
+                        Array.from({ length: ev.filmstrip_frames }, (_, i) => `<img class="filmstrip-frame" src="/api/cameras/${cid}/events/${ev.start_pts_ns}/filmstrip/${i}" loading="lazy" alt="" onerror="this.style.display='none'">`).join('') +
                         `</div>`;
                 } else {
                     thumbHtml = `<img class="event-list-thumb" src="${thumbSrc}" loading="lazy" alt="">`;

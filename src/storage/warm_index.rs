@@ -40,9 +40,10 @@ pub struct WarmEventEntry {
     pub backend: Option<String>,
     pub model: Option<String>,
     pub detections: Vec<DetectionDetail>,
-    /// TODO(2026-04-26): remove — all events now generate filmstrips.
-    /// Only needed for events saved before this change.
-    pub has_filmstrip: bool,
+    /// Number of filmstrip thumbnail frames on disk for this event
+    /// (`{stem}_thumb_{0..n-1}.jpg`). A motion run is subsampled to at most 4
+    /// frames, and short runs yield fewer — the UI renders exactly this many.
+    pub filmstrip_frames: usize,
     /// True when this event is a follow-on chunk of a longer motion run split
     /// at the duration cap (from the sidecar `"continues"` flag).
     pub continues: bool,
@@ -209,9 +210,15 @@ impl WarmEventIndex {
         let (start_pts_ns, duration_ms) = parse_event_filename(stem)?;
         let file_size = entry.metadata().map(|m| m.len()).unwrap_or(0);
         let sidecar = load_sidecar(&path.with_extension("json"));
-        let has_filmstrip = path
-            .with_file_name(format!("{}_thumb_0.jpg", stem))
-            .exists();
+        // Filmstrip frames are numbered contiguously from 0; count until the
+        // first gap. The pipeline writes at most 4.
+        let mut filmstrip_frames = 0;
+        while path
+            .with_file_name(format!("{}_thumb_{}.jpg", stem, filmstrip_frames))
+            .exists()
+        {
+            filmstrip_frames += 1;
+        }
 
         Some(WarmEventEntry {
             start_pts_ns,
@@ -222,7 +229,7 @@ impl WarmEventIndex {
             backend: sidecar.backend,
             model: sidecar.model,
             detections: sidecar.detections,
-            has_filmstrip,
+            filmstrip_frames,
             continues: sidecar.continues,
             recovered: sidecar.recovered,
         })

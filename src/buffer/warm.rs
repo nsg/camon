@@ -585,14 +585,17 @@ async fn write_metadata_atomic(final_path: &std::path::Path, data: &[u8]) -> std
     Ok(())
 }
 
-async fn write_filmstrip(camera_dir: &std::path::Path, stem: &str, frames: &[Vec<u8>]) -> bool {
-    let mut wrote = false;
+/// Write the filmstrip thumbnails and return how many landed on disk. Frames
+/// are numbered contiguously from 0, so a mid-run failure would truncate the
+/// visible strip; in practice these small writes rarely fail.
+async fn write_filmstrip(camera_dir: &std::path::Path, stem: &str, frames: &[Vec<u8>]) -> usize {
+    let mut wrote = 0;
     for (i, jpeg) in frames.iter().enumerate() {
         let thumb_path = camera_dir.join(format!("{}_thumb_{}.jpg", stem, i));
         if let Err(e) = write_metadata_atomic(&thumb_path, jpeg).await {
             tracing::warn!(error = %e, "failed to write filmstrip thumbnail");
         } else {
-            wrote = true;
+            wrote += 1;
         }
     }
     wrote
@@ -602,7 +605,7 @@ fn build_index_entry(
     event: &FinishedEvent,
     duration_ms: u64,
     file_size: u64,
-    has_filmstrip: bool,
+    filmstrip_frames: usize,
 ) -> WarmEventEntry {
     WarmEventEntry {
         start_pts_ns: event.first_pts,
@@ -613,7 +616,7 @@ fn build_index_entry(
         backend: event.backend.clone(),
         model: event.model.clone(),
         detections: event.detection_details.clone(),
-        has_filmstrip,
+        filmstrip_frames,
         continues: event.continues,
         // Live writes are never recovered files; the flag only enters the
         // index via startup orphan recovery + sidecar scan.
@@ -693,9 +696,9 @@ async fn write_event(
             tracing::warn!(error = %e, "failed to write event metadata");
         }
     }
-    let has_filmstrip = match event.filmstrip_frames {
+    let filmstrip_frames = match event.filmstrip_frames {
         Some(ref frames) => write_filmstrip(&camera_dir, &stem, frames).await,
-        None => false,
+        None => 0,
     };
 
     // Step 3: commit.
@@ -722,7 +725,7 @@ async fn write_event(
     if let Some(index) = warm_index {
         index.insert(
             camera_id,
-            build_index_entry(event, duration_ms, file_size, has_filmstrip),
+            build_index_entry(event, duration_ms, file_size, filmstrip_frames),
         );
     }
     WriteOutcome::Written
@@ -993,7 +996,7 @@ mod tests {
         assert_eq!(entry.duration_ms, 4000);
         assert_eq!(entry.event_type, EventType::Movement);
         assert_eq!(entry.file_size, 16);
-        assert!(entry.has_filmstrip);
+        assert_eq!(entry.filmstrip_frames, 2);
         assert_eq!(
             index.resolve_file_path("cam", &entry),
             movements.join(format!("{}.ts", stem))

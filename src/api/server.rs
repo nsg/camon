@@ -575,8 +575,10 @@ struct WarmEventResponse {
     model: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     detections: Vec<ObjectClassResponse>,
-    /// TODO(2026-04-26): remove — all events now generate filmstrips.
-    has_filmstrip: bool,
+    /// Number of filmstrip thumbnail frames available for this event (0..=4).
+    /// The UI requests `filmstrip/{i}` for `i in 0..filmstrip_frames`; older
+    /// events with no filmstrip report 0 and fall back to the single thumbnail.
+    filmstrip_frames: usize,
     /// True when this event continues a previous chunk of the same motion run
     /// (the run was split at the duration cap). Lets the UI stitch the chain.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
@@ -626,7 +628,7 @@ async fn warm_events_handler(
                     confidence: d.confidence,
                 })
                 .collect(),
-            has_filmstrip: e.has_filmstrip,
+            filmstrip_frames: e.filmstrip_frames,
             continues: e.continues,
             recovered: e.recovered,
         })
