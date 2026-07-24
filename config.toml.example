@@ -1,10 +1,9 @@
 # Camon Configuration
 #
-# Camon loads this file as ./config.toml by default. It also accepts a JSON
-# config with the SAME schema — the format is chosen by file extension. With no
-# --config flag it looks for ./config.toml first, then ./config.json. Point it
-# anywhere with:  camon --config /path/to/config.{toml,json}
-# (The Home Assistant add-on uses the JSON form; see HOMEASSISTANT.md.)
+# Camon loads this file as ./config.toml by default. Point it anywhere with
+# --config, and override individual values at startup with --set:
+#   camon --config /path/to/config.toml --set http.port=9090
+# (The Home Assistant add-on uses both; see HOMEASSISTANT.md.)
 
 [update]
 # Auto-update from GitHub Releases on startup (default: true)

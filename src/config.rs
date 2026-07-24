@@ -2,22 +2,89 @@ use serde::Deserialize;
 use std::path::Path;
 use thiserror::Error;
 
-/// Config files searched, in order, when no explicit `--config` path is given.
-/// TOML stays the canonical/default format; JSON is the fallback so the Home
-/// Assistant add-on can point camon straight at a config derived from
-/// `/data/options.json` (see HOMEASSISTANT.md) without a separate flag.
-const DEFAULT_CONFIG_PATHS: [&str; 2] = ["config.toml", "config.json"];
+const DEFAULT_CONFIG_PATH: &str = "config.toml";
 
 #[derive(Debug, Error)]
 pub enum ConfigError {
     #[error("failed to read config file: {0}")]
     Io(#[from] std::io::Error),
-    #[error("failed to parse TOML config: {0}")]
+    #[error("failed to parse config: {0}")]
     Parse(#[from] toml::de::Error),
-    #[error("failed to parse JSON config: {0}")]
-    Json(#[from] serde_json::Error),
     #[error("no cameras configured")]
     NoCameras,
+}
+
+/// A single `--set <dotted.path>=<value>` startup override, applied to the
+/// parsed config tree before it is deserialized into [`Config`]. Overrides win
+/// over the file's values and can create missing intermediate tables.
+#[derive(Debug, Clone)]
+pub struct Override {
+    path: Vec<String>,
+    value: toml::Value,
+}
+
+impl Override {
+    /// Parse a `dotted.path=value` argument. Splits on the first `=`; the value
+    /// is coerced to the first TOML scalar that accepts it — bool, then
+    /// integer, then float, otherwise a plain string. An argument without `=`,
+    /// with an empty key, or with an empty path segment is rejected.
+    pub fn parse(arg: &str) -> Result<Self, String> {
+        let (path, raw) = arg
+            .split_once('=')
+            .ok_or_else(|| format!("invalid --set {arg:?}: expected <dotted.path>=<value>"))?;
+        if path.is_empty() {
+            return Err(format!("invalid --set {arg:?}: empty key before '='"));
+        }
+        let segments: Vec<String> = path.split('.').map(str::to_string).collect();
+        if segments.iter().any(String::is_empty) {
+            return Err(format!("invalid --set {arg:?}: empty path segment"));
+        }
+        Ok(Self {
+            path: segments,
+            value: parse_scalar(raw),
+        })
+    }
+
+    /// Apply this override into `root`, walking the dotted path and creating
+    /// (or replacing non-table) intermediate tables as needed.
+    fn apply(&self, root: &mut toml::Value) {
+        let (last, parents) = self
+            .path
+            .split_last()
+            .expect("Override::parse guarantees a non-empty path");
+        let mut current = root;
+        for segment in parents {
+            if !current.is_table() {
+                *current = toml::Value::Table(toml::map::Map::new());
+            }
+            current = current
+                .as_table_mut()
+                .expect("just ensured a table")
+                .entry(segment.clone())
+                .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
+        }
+        if !current.is_table() {
+            *current = toml::Value::Table(toml::map::Map::new());
+        }
+        current
+            .as_table_mut()
+            .expect("just ensured a table")
+            .insert(last.clone(), self.value.clone());
+    }
+}
+
+/// Coerce a raw `--set` value to a TOML scalar: bool, then integer, then float,
+/// otherwise a string.
+fn parse_scalar(raw: &str) -> toml::Value {
+    if let Ok(b) = raw.parse::<bool>() {
+        toml::Value::Boolean(b)
+    } else if let Ok(i) = raw.parse::<i64>() {
+        toml::Value::Integer(i)
+    } else if let Ok(f) = raw.parse::<f64>() {
+        toml::Value::Float(f)
+    } else {
+        toml::Value::String(raw.to_string())
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -359,44 +426,29 @@ pub struct Config {
 }
 
 impl Config {
-    /// Load from the first of [`DEFAULT_CONFIG_PATHS`] that exists (TOML first,
-    /// then JSON). If none exist, the primary path is still attempted so the
-    /// caller gets a clear "file not found" error naming `config.toml`.
-    pub fn load() -> Result<Self, ConfigError> {
-        let path = DEFAULT_CONFIG_PATHS
-            .iter()
-            .find(|p| Path::new(p).exists())
-            .copied()
-            .unwrap_or(DEFAULT_CONFIG_PATHS[0]);
-        Self::load_from(path)
+    /// Load from the default `config.toml` in the current working directory.
+    pub fn load(overrides: &[Override]) -> Result<Self, ConfigError> {
+        Self::load_from_with_overrides(DEFAULT_CONFIG_PATH, overrides)
     }
 
-    /// Load from an explicit path, choosing the parser by file extension:
-    /// `.json` is parsed as JSON, everything else as TOML. Both formats share
-    /// the exact same schema — they deserialize into this one struct.
-    pub fn load_from<P: AsRef<Path>>(path: P) -> Result<Self, ConfigError> {
-        let path = path.as_ref();
+    /// Load from an explicit TOML path, applying each `--set` override into the
+    /// parsed value tree before deserializing. Overrides win over file values.
+    pub fn load_from_with_overrides<P: AsRef<Path>>(
+        path: P,
+        overrides: &[Override],
+    ) -> Result<Self, ConfigError> {
         let content = std::fs::read_to_string(path)?;
-        let config = Self::parse(path, &content)?;
+        let mut value: toml::Value = toml::from_str(&content)?;
+        for ov in overrides {
+            ov.apply(&mut value);
+        }
+        let config: Config = value.try_into()?;
 
         if config.cameras.is_empty() {
             return Err(ConfigError::NoCameras);
         }
 
         Ok(config)
-    }
-
-    fn parse(path: &Path, content: &str) -> Result<Self, ConfigError> {
-        let is_json = path
-            .extension()
-            .and_then(|ext| ext.to_str())
-            .is_some_and(|ext| ext.eq_ignore_ascii_case("json"));
-
-        if is_json {
-            Ok(serde_json::from_str(content)?)
-        } else {
-            Ok(toml::from_str(content)?)
-        }
     }
 }
 
@@ -432,25 +484,6 @@ id = "yard"
 url = "rtsp://user:pass@10.0.0.6:554/stream1"
 "#;
 
-    // Same schema, JSON encoding.
-    const JSON_SAMPLE: &str = r#"
-{
-  "http": { "port": 9090 },
-  "analytics": {
-    "enabled": true,
-    "object_detection": {
-      "enabled": true,
-      "ollama": { "url": "http://ollama.local:11434", "model": "gemma4:e4b" }
-    }
-  },
-  "storage": { "enabled": true, "data_dir": "/data/storage" },
-  "cameras": [
-    { "id": "front-door", "url": "rtsp://user:pass@10.0.0.5:554/stream1" },
-    { "id": "yard", "url": "rtsp://user:pass@10.0.0.6:554/stream1" }
-  ]
-}
-"#;
-
     fn write_temp(name: &str, content: &str) -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
         let mut file = std::fs::File::create(dir.path().join(name)).unwrap();
@@ -477,44 +510,82 @@ url = "rtsp://user:pass@10.0.0.6:554/stream1"
     }
 
     #[test]
-    fn toml_and_json_produce_the_same_config() {
-        let toml_dir = write_temp("config.toml", TOML_SAMPLE);
-        let json_dir = write_temp("config.json", JSON_SAMPLE);
-
-        let from_toml = Config::load_from(toml_dir.path().join("config.toml")).unwrap();
-        let from_json = Config::load_from(json_dir.path().join("config.json")).unwrap();
-
-        assert_matches_sample(&from_toml);
-        assert_matches_sample(&from_json);
-    }
-
-    #[test]
-    fn extension_selects_the_parser() {
-        // JSON content in a .json file parses; the same content in a .toml file
-        // is fed to the TOML parser and fails — proving selection is by extension.
-        let ok = write_temp("config.json", JSON_SAMPLE);
-        assert!(Config::load_from(ok.path().join("config.json")).is_ok());
-
-        let wrong = write_temp("config.toml", JSON_SAMPLE);
-        let err = Config::load_from(wrong.path().join("config.toml")).unwrap_err();
-        assert!(matches!(err, ConfigError::Parse(_)), "got {err:?}");
-
-        // And TOML content behind a .json extension hits the JSON parser.
-        let wrong_json = write_temp("config.json", TOML_SAMPLE);
-        let err = Config::load_from(wrong_json.path().join("config.json")).unwrap_err();
-        assert!(matches!(err, ConfigError::Json(_)), "got {err:?}");
+    fn loads_a_toml_config() {
+        let dir = write_temp("config.toml", TOML_SAMPLE);
+        let config = Config::load_from_with_overrides(dir.path().join("config.toml"), &[]).unwrap();
+        assert_matches_sample(&config);
     }
 
     #[test]
     fn missing_file_is_an_io_error() {
-        let err = Config::load_from("/nonexistent/camon/config.toml").unwrap_err();
+        let err =
+            Config::load_from_with_overrides("/nonexistent/camon/config.toml", &[]).unwrap_err();
         assert!(matches!(err, ConfigError::Io(_)), "got {err:?}");
     }
 
     #[test]
     fn empty_cameras_is_rejected() {
         let dir = write_temp("config.toml", "[http]\nport = 8080\n");
-        let err = Config::load_from(dir.path().join("config.toml")).unwrap_err();
+        let err =
+            Config::load_from_with_overrides(dir.path().join("config.toml"), &[]).unwrap_err();
         assert!(matches!(err, ConfigError::NoCameras), "got {err:?}");
+    }
+
+    #[test]
+    fn override_sets_a_bool() {
+        let mut v: toml::Value = toml::from_str("[update]\nenabled = true\n").unwrap();
+        Override::parse("update.enabled=false")
+            .unwrap()
+            .apply(&mut v);
+        assert_eq!(v["update"]["enabled"].as_bool(), Some(false));
+    }
+
+    #[test]
+    fn override_sets_an_integer() {
+        let mut v: toml::Value = toml::from_str("[http]\nport = 8080\n").unwrap();
+        Override::parse("http.port=22666").unwrap().apply(&mut v);
+        assert_eq!(v["http"]["port"].as_integer(), Some(22666));
+    }
+
+    #[test]
+    fn override_sets_a_string() {
+        let mut v: toml::Value = toml::from_str("[storage]\ndata_dir = \"/var/camon\"\n").unwrap();
+        Override::parse("storage.data_dir=/data/storage")
+            .unwrap()
+            .apply(&mut v);
+        assert_eq!(v["storage"]["data_dir"].as_str(), Some("/data/storage"));
+    }
+
+    #[test]
+    fn override_creates_missing_intermediate_tables() {
+        let mut v: toml::Value = toml::from_str("").unwrap();
+        Override::parse("analytics.object_detection.enabled=true")
+            .unwrap()
+            .apply(&mut v);
+        assert_eq!(
+            v["analytics"]["object_detection"]["enabled"].as_bool(),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn malformed_override_is_rejected() {
+        assert!(Override::parse("no-equals-sign").is_err());
+        assert!(Override::parse("=value").is_err());
+        assert!(Override::parse("a..b=1").is_err());
+    }
+
+    #[test]
+    fn overrides_win_over_file_values() {
+        let dir = write_temp("config.toml", TOML_SAMPLE);
+        let overrides = [
+            Override::parse("http.port=22666").unwrap(),
+            Override::parse("update.enabled=false").unwrap(),
+        ];
+        let config =
+            Config::load_from_with_overrides(dir.path().join("config.toml"), &overrides).unwrap();
+        // File said 9090 / default-true; the overrides win.
+        assert_eq!(config.http.port, 22666);
+        assert!(!config.update.enabled);
     }
 }

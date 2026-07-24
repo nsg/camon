@@ -32,7 +32,7 @@ use storage::{
 fn dispatch_subcommand() -> bool {
     let args: Vec<String> = std::env::args().skip(1).collect();
     // Nothing to dispatch, or the first argument is a flag (e.g. `--config`) —
-    // leave it to normal startup / `parse_config_arg`.
+    // leave it to normal startup / `parse_cli_args`.
     match args.first() {
         None => return false,
         Some(first) if first.starts_with('-') => return false,
@@ -53,36 +53,74 @@ fn dispatch_subcommand() -> bool {
         }
         other => {
             eprintln!("unknown command: {other}");
-            eprintln!("usage: camon [--config <path>] [install service]");
+            eprintln!(
+                "usage: camon [--config <path>] [--set <dotted.path>=<value>]... [install service]"
+            );
             std::process::exit(1);
         }
     }
 }
 
-/// Minimal `--config <path>` / `--config=<path>` parser. Kept deliberately
-/// tiny (no clap): camon takes at most this one flag. Returns `None` when the
-/// flag is absent, letting `Config::load` fall back to ./config.toml then
-/// ./config.json.
-fn parse_config_arg() -> Option<String> {
+/// Parsed command-line arguments. Kept deliberately tiny (no clap): camon takes
+/// at most `--config <path>` and any number of `--set <dotted.path>=<value>`
+/// overrides.
+struct CliArgs {
+    /// Explicit config path from `--config`; `None` falls back to `config.toml`.
+    config: Option<String>,
+    /// `--set` overrides, in the order given (later wins on a repeated key).
+    overrides: Vec<config::Override>,
+}
+
+/// Hand-rolled `--config` / `--set` parser (both `--flag value` and
+/// `--flag=value` forms). Unknown arguments are ignored here so subcommands and
+/// future flags keep working; a malformed `--set` is a hard startup error.
+fn parse_cli_args() -> CliArgs {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut config = None;
+    let mut overrides = Vec::new();
     let mut i = 0;
     while i < args.len() {
         let arg = &args[i];
         if let Some(path) = arg.strip_prefix("--config=") {
-            return Some(path.to_string());
-        }
-        if arg == "--config" {
+            config = Some(path.to_string());
+        } else if arg == "--config" {
             match args.get(i + 1) {
-                Some(path) => return Some(path.clone()),
+                Some(path) => {
+                    config = Some(path.clone());
+                    i += 1;
+                }
                 None => {
                     eprintln!("error: --config requires a path argument");
+                    std::process::exit(1);
+                }
+            }
+        } else if let Some(spec) = arg.strip_prefix("--set=") {
+            overrides.push(parse_override_or_exit(spec));
+        } else if arg == "--set" {
+            match args.get(i + 1) {
+                Some(spec) => {
+                    overrides.push(parse_override_or_exit(spec));
+                    i += 1;
+                }
+                None => {
+                    eprintln!("error: --set requires a <dotted.path>=<value> argument");
                     std::process::exit(1);
                 }
             }
         }
         i += 1;
     }
-    None
+    CliArgs { config, overrides }
+}
+
+fn parse_override_or_exit(spec: &str) -> config::Override {
+    match config::Override::parse(spec) {
+        Ok(ov) => ov,
+        Err(e) => {
+            eprintln!("error: {e}");
+            std::process::exit(1);
+        }
+    }
 }
 
 async fn run_update_check_loop() {
@@ -413,9 +451,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_env_filter(EnvFilter::from_default_env().add_directive("camon=debug".parse()?))
         .init();
 
-    let config = match parse_config_arg() {
-        Some(path) => Config::load_from(path)?,
-        None => Config::load()?,
+    let args = parse_cli_args();
+    let config = match args.config {
+        Some(path) => Config::load_from_with_overrides(path, &args.overrides)?,
+        None => Config::load(&args.overrides)?,
     };
     check_for_updates(&config).await;
 
