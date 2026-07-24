@@ -335,8 +335,11 @@ async fn graceful_shutdown(
     }
 
     // With all senders gone the warm writers drain their queues and exit;
-    // awaiting them guarantees every accepted event reached disk.
+    // awaiting them guarantees every accepted event reached disk. BOTH sender
+    // holders must drop — the map's clones alone keep the channels open, which
+    // deadlocked shutdown here until 2026-07-24.
     drop(handles.event_senders);
+    drop(handles.event_sender_map);
     for handle in handles.warm_handles {
         let _ = handle.await;
     }
