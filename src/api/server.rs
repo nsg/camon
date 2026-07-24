@@ -16,7 +16,9 @@ use crate::analytics::motion_settings::{
 use crate::analytics::{MotionSettingsStore, SettingsUpdate};
 use crate::buffer::HotBuffer;
 use crate::locks::LockExt;
-use crate::storage::{DetectionDebugStore, DetectionStore, MotionStore, WarmEventIndex};
+use crate::storage::{
+    DetectionDebugStore, DetectionStore, MotionStore, ThumbnailError, WarmStorageBackend,
+};
 
 use super::hls;
 
@@ -30,7 +32,8 @@ pub struct AppState {
     pub motion_store: MotionStore,
     pub detection_store: DetectionStore,
     pub debug_store: DetectionDebugStore,
-    pub warm_index: Option<WarmEventIndex>,
+    /// Warm storage backend (local disk today). `None` when storage is disabled.
+    pub storage: Option<Arc<dyn WarmStorageBackend>>,
     /// Per-camera deterministic motion settings. `None` when analytics is off.
     pub motion_settings: Option<MotionSettingsStore>,
 }
@@ -41,7 +44,7 @@ impl AppState {
         motion_store: MotionStore,
         detection_store: DetectionStore,
         debug_store: DetectionDebugStore,
-        warm_index: Option<WarmEventIndex>,
+        storage: Option<Arc<dyn WarmStorageBackend>>,
         motion_settings: Option<MotionSettingsStore>,
     ) -> Self {
         Self {
@@ -49,7 +52,7 @@ impl AppState {
             motion_store,
             detection_store,
             debug_store,
-            warm_index,
+            storage,
             motion_settings,
         }
     }
@@ -596,8 +599,8 @@ async fn warm_events_handler(
     Path(id): Path<String>,
     Query(query): Query<EventsQuery>,
 ) -> Response {
-    let index = match &state.warm_index {
-        Some(idx) => idx,
+    let backend = match &state.storage {
+        Some(b) => b,
         None => return (StatusCode::NOT_FOUND, "warm storage not enabled").into_response(),
     };
 
@@ -607,7 +610,7 @@ async fn warm_events_handler(
 
     let from = query.from.unwrap_or(0);
     let to = query.to.unwrap_or(u64::MAX);
-    let events = index.query(&id, from, to);
+    let events = backend.query(&id, from, to);
 
     let response: Vec<WarmEventResponse> = events
         .iter()
@@ -643,8 +646,8 @@ async fn warm_playlist_handler(
     State(state): State<AppState>,
     Path((id, start_pts_str)): Path<(String, String)>,
 ) -> Response {
-    let index = match &state.warm_index {
-        Some(idx) => idx,
+    let backend = match &state.storage {
+        Some(b) => b,
         None => return (StatusCode::NOT_FOUND, "warm storage not enabled").into_response(),
     };
 
@@ -653,7 +656,7 @@ async fn warm_playlist_handler(
         Err(_) => return (StatusCode::BAD_REQUEST, "invalid start_pts").into_response(),
     };
 
-    let entry = match index.find_event(&id, start_pts) {
+    let entry = match backend.find_event(&id, start_pts) {
         Some(e) => e,
         None => return (StatusCode::NOT_FOUND, "event not found").into_response(),
     };
@@ -683,8 +686,8 @@ async fn warm_segment_handler(
     State(state): State<AppState>,
     Path((id, start_pts_str)): Path<(String, String)>,
 ) -> Response {
-    let index = match &state.warm_index {
-        Some(idx) => idx,
+    let backend = match &state.storage {
+        Some(b) => b,
         None => return (StatusCode::NOT_FOUND, "warm storage not enabled").into_response(),
     };
 
@@ -693,14 +696,12 @@ async fn warm_segment_handler(
         Err(_) => return (StatusCode::BAD_REQUEST, "invalid start_pts").into_response(),
     };
 
-    let entry = match index.find_event(&id, start_pts) {
+    let entry = match backend.find_event(&id, start_pts) {
         Some(e) => e,
         None => return (StatusCode::NOT_FOUND, "event not found").into_response(),
     };
 
-    let file_path = index.resolve_file_path(&id, &entry);
-
-    match tokio::fs::read(&file_path).await {
+    match backend.read_video(&id, &entry).await {
         Ok(data) => ([(header::CONTENT_TYPE, "video/mp2t")], data).into_response(),
         Err(_) => (StatusCode::NOT_FOUND, "event file not found").into_response(),
     }
@@ -717,41 +718,12 @@ fn jpeg_response(data: Vec<u8>) -> Response {
         .into_response()
 }
 
-async fn generate_thumbnail(
-    ts_path: &std::path::Path,
-    thumb_path: &std::path::Path,
-) -> Result<(), (StatusCode, &'static str)> {
-    let mut child = tokio::process::Command::new("ffmpeg")
-        .args(["-hide_banner", "-loglevel", "error", "-i"])
-        .arg(ts_path)
-        .args(["-frames:v", "1", "-vf", "scale=320:-1", "-q:v", "5", "-y"])
-        .arg(thumb_path)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .kill_on_drop(true)
-        .spawn()
-        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "failed to spawn ffmpeg"))?;
-
-    let status = child
-        .wait()
-        .await
-        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "ffmpeg process error"))?;
-
-    if !status.success() {
-        return Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "thumbnail generation failed",
-        ));
-    }
-    Ok(())
-}
-
 async fn warm_thumbnail_handler(
     State(state): State<AppState>,
     Path((id, start_pts_str)): Path<(String, String)>,
 ) -> Response {
-    let index = match &state.warm_index {
-        Some(idx) => idx,
+    let backend = match &state.storage {
+        Some(b) => b,
         None => return (StatusCode::NOT_FOUND, "warm storage not enabled").into_response(),
     };
 
@@ -760,30 +732,21 @@ async fn warm_thumbnail_handler(
         Err(_) => return (StatusCode::BAD_REQUEST, "invalid start_pts").into_response(),
     };
 
-    let entry = match index.find_event(&id, start_pts) {
+    let entry = match backend.find_event(&id, start_pts) {
         Some(e) => e,
         None => return (StatusCode::NOT_FOUND, "event not found").into_response(),
     };
 
-    let ts_path = index.resolve_file_path(&id, &entry);
-    let thumb_path = ts_path.with_extension("jpg");
-
-    if let Ok(data) = tokio::fs::read(&thumb_path).await {
-        return jpeg_response(data);
-    }
-
-    if let Err((code, msg)) = generate_thumbnail(&ts_path, &thumb_path).await {
-        return (code, msg).into_response();
-    }
-
-    match tokio::fs::read(&thumb_path).await {
+    // The backend acquires the poster frame (LocalDisk lazily renders + caches
+    // it via ffmpeg); every failure here is an internal error.
+    match backend.read_thumbnail(&id, &entry).await {
         Ok(data) => jpeg_response(data),
-        Err(_) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "failed to read thumbnail",
-        )
-            .into_response(),
+        Err(e) => thumbnail_error_response(e),
     }
+}
+
+fn thumbnail_error_response(e: ThumbnailError) -> Response {
+    (StatusCode::INTERNAL_SERVER_ERROR, e.message()).into_response()
 }
 
 // Detection debug handlers
@@ -863,8 +826,8 @@ async fn warm_filmstrip_handler(
     State(state): State<AppState>,
     Path((id, start_pts_str, index)): Path<(String, String, u8)>,
 ) -> Response {
-    let index_val = match &state.warm_index {
-        Some(idx) => idx,
+    let backend = match &state.storage {
+        Some(b) => b,
         None => return (StatusCode::NOT_FOUND, "warm storage not enabled").into_response(),
     };
 
@@ -881,19 +844,12 @@ async fn warm_filmstrip_handler(
         Err(_) => return (StatusCode::BAD_REQUEST, "invalid start_pts").into_response(),
     };
 
-    let entry = match index_val.find_event(&id, start_pts_ns) {
+    let entry = match backend.find_event(&id, start_pts_ns) {
         Some(e) => e,
         None => return (StatusCode::NOT_FOUND, "event not found").into_response(),
     };
 
-    let ts_path = index_val.resolve_file_path(&id, &entry);
-    let stem = format!("{}_{}", entry.start_pts_ns, entry.duration_ms);
-    let thumb_path = ts_path
-        .parent()
-        .unwrap()
-        .join(format!("{}_thumb_{}.jpg", stem, index));
-
-    match tokio::fs::read(&thumb_path).await {
+    match backend.read_filmstrip(&id, &entry, index).await {
         Ok(data) => (
             [
                 (header::CONTENT_TYPE, "image/jpeg"),

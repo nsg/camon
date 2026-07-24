@@ -26,6 +26,8 @@ serde_json = "1"
 # JPEG encode/decode only (RustSec-audited 2026-07-23: no open advisories).
 image = { version = "0.25", default-features = false, features = ["jpeg"] }
 reqwest = { version = "0.13.1", features = ["rustls-native-certs", "json"] }
+# Object-safe async storage-backend trait (LocalDisk now, remote in phase 2).
+async-trait = "0.1"
 libc = "0.2"
 base64 = "0.22.1"
 sha2 = "0.10"

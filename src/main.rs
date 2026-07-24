@@ -24,7 +24,10 @@ use buffer::HotBuffer;
 use camera::FfmpegPipeline;
 use config::Config;
 use locks::LockExt;
-use storage::{DetectionDebugStore, DetectionStore, EventRegistry, MotionStore, WarmEventIndex};
+use storage::{
+    DetectionDebugStore, DetectionStore, EventRegistry, LocalDiskBackend, MotionStore,
+    WarmStorageBackend,
+};
 
 fn dispatch_subcommand() -> bool {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -107,17 +110,17 @@ fn log_object_detection_config(config: &Config) -> bool {
     true
 }
 
-fn init_warm_index(config: &Config, camera_ids: &[String]) -> Option<WarmEventIndex> {
+fn init_storage(config: &Config, camera_ids: &[String]) -> Option<Arc<dyn WarmStorageBackend>> {
     if !config.storage.enabled {
         return None;
     }
     let data_dir = std::path::PathBuf::from(&config.storage.data_dir);
+    let backend = LocalDiskBackend::new(data_dir, camera_ids);
     // Salvage any event files orphaned mid-write by a crash or power cut
     // BEFORE the scan, so recovered events are indexed like any other.
-    storage::recover_orphans(&data_dir, camera_ids);
-    let index = WarmEventIndex::new(camera_ids, data_dir);
-    index.scan();
-    Some(index)
+    backend.recover_orphans();
+    backend.scan();
+    Some(Arc::new(backend))
 }
 
 fn init_motion_settings(
@@ -184,7 +187,7 @@ struct SpawnContext<'a> {
     config: &'a Config,
     motion_store: &'a MotionStore,
     detection_store: &'a DetectionStore,
-    warm_index: &'a Option<WarmEventIndex>,
+    storage: &'a Option<Arc<dyn WarmStorageBackend>>,
     motion_settings: &'a Option<analytics::MotionSettingsStore>,
     /// Crop-job queue into the global detection worker; `None` when object
     /// detection is off.
@@ -210,12 +213,11 @@ fn spawn_cameras(ctx: &SpawnContext, cameras: Vec<config::CameraConfig>) -> Came
 
         let event_tx = if ctx.config.storage.enabled {
             let (tx, rx) = tokio::sync::mpsc::channel(EVENT_CHANNEL_CAPACITY);
-            let writer = WarmWriter::new(
-                rx,
-                camera_id.clone(),
-                &ctx.config.storage,
-                ctx.warm_index.clone(),
-            );
+            let backend = ctx
+                .storage
+                .clone()
+                .expect("storage backend present when storage enabled");
+            let writer = WarmWriter::new(rx, camera_id.clone(), &ctx.config.storage, backend);
             handles.warm_handles.push(tokio::spawn(writer.run()));
             handles.event_senders.push(tx.clone());
             handles
@@ -373,7 +375,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let detection_store = DetectionStore::new(&camera_ids);
     let debug_store = DetectionDebugStore::new(&camera_ids);
     let object_detection_ready = log_object_detection_config(&config);
-    let warm_index = init_warm_index(&config, &camera_ids);
+    let storage = init_storage(&config, &camera_ids);
     let motion_settings = init_motion_settings(&config, &camera_ids);
 
     if config.storage.enabled {
@@ -414,7 +416,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config: &config,
         motion_store: &motion_store,
         detection_store: &detection_store,
-        warm_index: &warm_index,
+        storage: &storage,
         motion_settings: &motion_settings,
         detect_tx: &detect_tx,
         event_registry: &event_registry,
@@ -444,7 +446,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         motion_store,
         detection_store,
         debug_store,
-        warm_index,
+        storage,
         motion_settings,
     );
     let http_port = config.http.port;
