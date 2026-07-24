@@ -319,6 +319,9 @@ impl MpegTsSegmenter {
             );
             self.prev_media_pts = self.current_media_pts;
             // Wrap the accumulated bytes once; readers share via Arc clone.
+            // Drop the Vec's growth slack first — the segment lives in the
+            // hot buffer for minutes, so excess capacity is held that long.
+            self.current_data.shrink_to_fit();
             segment.data = Arc::new(std::mem::take(&mut self.current_data));
             if segment.frame_count > 0 {
                 self.buffer.write_recover().push(segment);
