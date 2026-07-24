@@ -16,34 +16,24 @@ This is a personal project built for my own cameras, hardware, and use case. It 
 
 We keep a single RTSP stream per camera, remux into MPEG-TS, segment at keyframe boundaries, and hold the last 10 minutes in a RAM buffer. We do that to avoid re-encoding to keep it lightweight on CPU usage, and we save it in RAM to spare disk wear.
 
-```mermaid
-flowchart LR
-  Camera -->|RTSP| KeyframeSegmenter("Keyframe Segmenter") --> HotBuffer[("Hot Buffer (10m)")]
-```
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/diagrams/01-capture-dark.svg">
+  <img alt="Camera streams RTSP into the keyframe segmenter, which fills the 10-minute in-RAM hot buffer" src="docs/diagrams/01-capture-light.svg">
+</picture>
 
 Each camera runs its own independent pipeline with its own buffer. From the buffer we feed clients (browsers watching the live stream) and the motion analyzer. When a motion event ends, the analyzer pulls the complete event from the buffer and hands it to the warm writer, which persists it to disk right away. Segments aging out of the buffer are simply freed.
 
-```mermaid
-flowchart LR
-  HotBuffer[("Hot Buffer (10m)")] -->|HLS| Clients
-  HotBuffer -->|keyframes| MA["Motion Analyzer"] --> MS[("Motion Store")]
-  MA -->|crop jobs| OD["Detection Worker (Ollama)"] --> DS[("Detection Store")]
-  MA -->|finished events| WW[("Warm Writer (disk)")]
-  OD -.->|post-hoc upgrades| WW
-```
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/diagrams/02-fanout-dark.svg">
+  <img alt="The hot buffer serves HLS to clients and keyframes to the motion analyzer, which feeds the motion store, sends crop jobs to the detection worker (which fills the detection store and post-hoc-upgrades events), and hands finished events to the warm writer" src="docs/diagrams/02-fanout-light.svg">
+</picture>
 
 Clients can stream the raw segments from the buffer directly, the only thing we need to do is to serve a playlist.m3u8 which is a simple text file to the player. Object Detection is heavy on the CPU (or GPU) so most "detections" are filtered in the Motion Analyzer stage.
 
-```mermaid
-flowchart LR
-  HotBuffer[("Hot Buffer (10m)")] -->|keyframes| Decode["Decode 320x240 (grayscale)"] --> MA
-  MA -.-> AutomaticTuning("Automatic Tuning") -.-> MA
-  MA --> MS[("Motion Store")]
-
-subgraph MA["Motion Analyzer"]
-   MOG2["Background Subtraction"] --> Morph["Morphological Opening"] --> Components["Component Filtering"]
-end
-```
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/diagrams/03-analyzer-dark.svg">
+  <img alt="Keyframes are decoded to 320 by 240 grayscale and pass through the motion analyzer stages — MOG2 background subtraction, morphological opening, component filtering — into the motion store" src="docs/diagrams/03-analyzer-light.svg">
+</picture>
 
 To make decoding as lightweight as possible, we only extract keyframes because they are self-contained and do not depend on surrounding frames. With a 1-second GOP this means the analyzer effectively samples one frame per second.
 
@@ -59,15 +49,10 @@ There is no automatic tuning and no learned suppression: MOG2's verdict is the s
 
 A fourth per-camera control, the **detection mask**, is painted on the same 16×12 grid but works one stage later and independently of motion detection. Its cells read as "the vision model never sees these pixels": every cell painted here is blacked out of every frame handed to the Ollama vision model before JPEG encoding, in the crop's own coordinate space (the cell rectangle is intersected with each crop and translated, so masked pixels are removed no matter how the frame was cropped — including the full-frame crop a lighting change can force). Motion detection is untouched; only classification is suppressed. Use it for a stationary nuisance object — a parked car that would otherwise be reported as "car" whenever a full-frame crop briefly includes it. The web UI's mask editor paints both layers on one grid, switching between the movement mask (red) and detection mask (orange) with a layer toggle. The detection mask defaults to all-off and is persisted alongside the other settings in `motion_settings.json`.
 
-```mermaid
-flowchart LR
-  HotBuffer[("Hot Buffer (10m)")] -->|motion event| Sub["Subsample 4 Frames"]
-  MA[("Motion Store")] -->|bounding boxes| Sub
-  Sub --> Crop["Crop + JPEG"] -->|bounded queue| Worker["Detection Worker (global, serial)"]
-  Worker -->|one request at a time| Ollama["Ollama"]
-  Worker --> DS[("Detection Store")]
-  Worker -.->|upgrade event| WW["Warm Writer"]
-```
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/diagrams/04-detection-dark.svg">
+  <img alt="A motion event is subsampled to four frames, cropped using motion bounding boxes, JPEG-encoded, and queued to the single global serial detection worker, which talks to Ollama one request at a time, records verdicts in the detection store, and upgrades events via the warm writer" src="docs/diagrams/04-detection-light.svg">
+</picture>
 
 The Motion Store keeps track of motion events. If there are several segments in sequence that have movements, they are considered a single motion event. We sample four frames from each event at 0/3, 1/3, 2/3 and 3/3. Using bounding boxes from the motion event, we crop the image to "zoom in" to the action, JPEG-encode the crops, and enqueue them as a job for a single global detection worker shared by all cameras. The worker is strictly serial — at most one in-flight Ollama request at any time — so a modest GPU is never hit with parallel load, and the analyzer never waits for the model: if the small queue is full the job is simply dropped with a warning (the motion event still records; only the object classification is lost).
 
@@ -75,27 +60,10 @@ The model is asked for structured output: the request carries a JSON schema (via
 
 We are still running in RAM, our 10 minute video buffer and some metadata stored in the motion and detection stores. At this stage we should have enough information to only save events that we care about on disk!
 
-```mermaid
-flowchart LR
-  HotBuffer[("Hot Buffer (10m)")] -->|segments| MA["Motion Analyzer"]
-  MS[("Motion Store")] --> MA
-  DS[("Detection Store")] --> MA
-  MA -->|event end| WarmWriter["Warm Writer"]
-  WarmWriter --> DiskMovements
-  WarmWriter --> DiskObjects
-  WarmWriter --> Metadata
-  WarmWriter --> Thumbnails
-
-  subgraph Disc
-    DiskMovements[("Movements")]
-    DiskObjects[("Objects")]
-    Metadata[("Metadata")]
-    Thumbnails[("Thumbnails")]
-  end
-
-  Disc --> Client
-  Prune -.-> Disc
-```
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/diagrams/05-storage-dark.svg">
+  <img alt="At event end the motion analyzer assembles segments plus motion and detection metadata and hands the event to the warm writer, which persists movements, objects, metadata, and thumbnails into warm storage (local disk or stathost); clients stream from storage via HLS and pruning removes old events" src="docs/diagrams/05-storage-light.svg">
+</picture>
 
 The moment a motion run ends (post-padding elapsed), the analyzer assembles the complete event — pre-padding, motion, and post-padding pulled straight from the hot buffer, plus metadata from the motion and detection stores — and hands it to the warm writer, which persists it to disk immediately. This way an event only stays at risk in RAM for seconds after it ends, not until its segments age out of the buffer. The writer also saves metadata and thumbnails that is used by the web UI. User can stream saved video events via HLS.
 
