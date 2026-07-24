@@ -2,14 +2,20 @@ use serde::Deserialize;
 use std::path::Path;
 use thiserror::Error;
 
-const DEFAULT_CONFIG_PATH: &str = "config.toml";
+/// Config files searched, in order, when no explicit `--config` path is given.
+/// TOML stays the canonical/default format; JSON is the fallback so the Home
+/// Assistant add-on can point camon straight at a config derived from
+/// `/data/options.json` (see HOMEASSISTANT.md) without a separate flag.
+const DEFAULT_CONFIG_PATHS: [&str; 2] = ["config.toml", "config.json"];
 
 #[derive(Debug, Error)]
 pub enum ConfigError {
     #[error("failed to read config file: {0}")]
     Io(#[from] std::io::Error),
-    #[error("failed to parse config: {0}")]
+    #[error("failed to parse TOML config: {0}")]
     Parse(#[from] toml::de::Error),
+    #[error("failed to parse JSON config: {0}")]
+    Json(#[from] serde_json::Error),
     #[error("no cameras configured")]
     NoCameras,
 }
@@ -353,18 +359,162 @@ pub struct Config {
 }
 
 impl Config {
+    /// Load from the first of [`DEFAULT_CONFIG_PATHS`] that exists (TOML first,
+    /// then JSON). If none exist, the primary path is still attempted so the
+    /// caller gets a clear "file not found" error naming `config.toml`.
     pub fn load() -> Result<Self, ConfigError> {
-        Self::load_from(DEFAULT_CONFIG_PATH)
+        let path = DEFAULT_CONFIG_PATHS
+            .iter()
+            .find(|p| Path::new(p).exists())
+            .copied()
+            .unwrap_or(DEFAULT_CONFIG_PATHS[0]);
+        Self::load_from(path)
     }
 
+    /// Load from an explicit path, choosing the parser by file extension:
+    /// `.json` is parsed as JSON, everything else as TOML. Both formats share
+    /// the exact same schema — they deserialize into this one struct.
     pub fn load_from<P: AsRef<Path>>(path: P) -> Result<Self, ConfigError> {
+        let path = path.as_ref();
         let content = std::fs::read_to_string(path)?;
-        let config: Config = toml::from_str(&content)?;
+        let config = Self::parse(path, &content)?;
 
         if config.cameras.is_empty() {
             return Err(ConfigError::NoCameras);
         }
 
         Ok(config)
+    }
+
+    fn parse(path: &Path, content: &str) -> Result<Self, ConfigError> {
+        let is_json = path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("json"));
+
+        if is_json {
+            Ok(serde_json::from_str(content)?)
+        } else {
+            Ok(toml::from_str(content)?)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    const TOML_SAMPLE: &str = r#"
+[http]
+port = 9090
+
+[analytics]
+enabled = true
+
+[analytics.object_detection]
+enabled = true
+
+[analytics.object_detection.ollama]
+url = "http://ollama.local:11434"
+model = "gemma4:e4b"
+
+[storage]
+enabled = true
+data_dir = "/data/storage"
+
+[[cameras]]
+id = "front-door"
+url = "rtsp://user:pass@10.0.0.5:554/stream1"
+
+[[cameras]]
+id = "yard"
+url = "rtsp://user:pass@10.0.0.6:554/stream1"
+"#;
+
+    // Same schema, JSON encoding.
+    const JSON_SAMPLE: &str = r#"
+{
+  "http": { "port": 9090 },
+  "analytics": {
+    "enabled": true,
+    "object_detection": {
+      "enabled": true,
+      "ollama": { "url": "http://ollama.local:11434", "model": "gemma4:e4b" }
+    }
+  },
+  "storage": { "enabled": true, "data_dir": "/data/storage" },
+  "cameras": [
+    { "id": "front-door", "url": "rtsp://user:pass@10.0.0.5:554/stream1" },
+    { "id": "yard", "url": "rtsp://user:pass@10.0.0.6:554/stream1" }
+  ]
+}
+"#;
+
+    fn write_temp(name: &str, content: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let mut file = std::fs::File::create(dir.path().join(name)).unwrap();
+        file.write_all(content.as_bytes()).unwrap();
+        dir
+    }
+
+    fn assert_matches_sample(config: &Config) {
+        assert_eq!(config.http.port, 9090);
+        assert!(config.analytics.enabled);
+        assert!(config.analytics.object_detection.enabled);
+        assert_eq!(
+            config.analytics.object_detection.ollama.url,
+            "http://ollama.local:11434"
+        );
+        assert!(config.storage.enabled);
+        assert_eq!(config.storage.data_dir, "/data/storage");
+        assert_eq!(config.cameras.len(), 2);
+        assert_eq!(config.cameras[0].id, "front-door");
+        assert_eq!(
+            config.cameras[1].url,
+            "rtsp://user:pass@10.0.0.6:554/stream1"
+        );
+    }
+
+    #[test]
+    fn toml_and_json_produce_the_same_config() {
+        let toml_dir = write_temp("config.toml", TOML_SAMPLE);
+        let json_dir = write_temp("config.json", JSON_SAMPLE);
+
+        let from_toml = Config::load_from(toml_dir.path().join("config.toml")).unwrap();
+        let from_json = Config::load_from(json_dir.path().join("config.json")).unwrap();
+
+        assert_matches_sample(&from_toml);
+        assert_matches_sample(&from_json);
+    }
+
+    #[test]
+    fn extension_selects_the_parser() {
+        // JSON content in a .json file parses; the same content in a .toml file
+        // is fed to the TOML parser and fails — proving selection is by extension.
+        let ok = write_temp("config.json", JSON_SAMPLE);
+        assert!(Config::load_from(ok.path().join("config.json")).is_ok());
+
+        let wrong = write_temp("config.toml", JSON_SAMPLE);
+        let err = Config::load_from(wrong.path().join("config.toml")).unwrap_err();
+        assert!(matches!(err, ConfigError::Parse(_)), "got {err:?}");
+
+        // And TOML content behind a .json extension hits the JSON parser.
+        let wrong_json = write_temp("config.json", TOML_SAMPLE);
+        let err = Config::load_from(wrong_json.path().join("config.json")).unwrap_err();
+        assert!(matches!(err, ConfigError::Json(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn missing_file_is_an_io_error() {
+        let err = Config::load_from("/nonexistent/camon/config.toml").unwrap_err();
+        assert!(matches!(err, ConfigError::Io(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn empty_cameras_is_rejected() {
+        let dir = write_temp("config.toml", "[http]\nport = 8080\n");
+        let err = Config::load_from(dir.path().join("config.toml")).unwrap_err();
+        assert!(matches!(err, ConfigError::NoCameras), "got {err:?}");
     }
 }

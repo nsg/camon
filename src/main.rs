@@ -31,8 +31,12 @@ use storage::{
 
 fn dispatch_subcommand() -> bool {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    if args.is_empty() {
-        return false;
+    // Nothing to dispatch, or the first argument is a flag (e.g. `--config`) —
+    // leave it to normal startup / `parse_config_arg`.
+    match args.first() {
+        None => return false,
+        Some(first) if first.starts_with('-') => return false,
+        _ => {}
     }
 
     match args[0].as_str() {
@@ -49,10 +53,36 @@ fn dispatch_subcommand() -> bool {
         }
         other => {
             eprintln!("unknown command: {other}");
-            eprintln!("usage: camon [install service]");
+            eprintln!("usage: camon [--config <path>] [install service]");
             std::process::exit(1);
         }
     }
+}
+
+/// Minimal `--config <path>` / `--config=<path>` parser. Kept deliberately
+/// tiny (no clap): camon takes at most this one flag. Returns `None` when the
+/// flag is absent, letting `Config::load` fall back to ./config.toml then
+/// ./config.json.
+fn parse_config_arg() -> Option<String> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut i = 0;
+    while i < args.len() {
+        let arg = &args[i];
+        if let Some(path) = arg.strip_prefix("--config=") {
+            return Some(path.to_string());
+        }
+        if arg == "--config" {
+            match args.get(i + 1) {
+                Some(path) => return Some(path.clone()),
+                None => {
+                    eprintln!("error: --config requires a path argument");
+                    std::process::exit(1);
+                }
+            }
+        }
+        i += 1;
+    }
+    None
 }
 
 async fn run_update_check_loop() {
@@ -383,7 +413,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_env_filter(EnvFilter::from_default_env().add_directive("camon=debug".parse()?))
         .init();
 
-    let config = Config::load()?;
+    let config = match parse_config_arg() {
+        Some(path) => Config::load_from(path)?,
+        None => Config::load()?,
+    };
     check_for_updates(&config).await;
 
     tracing::info!("loaded {} camera(s)", config.cameras.len());
