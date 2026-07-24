@@ -22,7 +22,10 @@ init: false
 # path prefix, so Camon's HTTP server (which serves the UI at "/") needs no
 # awareness of the prefix — the web assets use relative URLs.
 ingress: true
-ingress_port: 8080
+# An uncommon internal port ("camon" on a phone keypad) so it can never
+# collide with anything even if the add-on later gains host networking or a
+# direct port mapping. With ingress-only access no host port is bound at all.
+ingress_port: 22666
 panel_icon: mdi:cctv
 panel_title: Camon
 panel_admin: true
@@ -35,7 +38,7 @@ panel_admin: true
 # User-facing options. The run script (run.sh) translates these into the JSON
 # config Camon reads, forcing update.enabled=false and data_dir=/data/storage.
 # Note: there is no http_port option — the add-on is reached exclusively
-# through ingress, which is pinned to internal port 8080 (ingress_port above);
+# through ingress, which is pinned to internal port 22666 (ingress_port above);
 # a configurable port would only break that wiring.
 options:
   analytics: true

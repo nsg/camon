@@ -46,7 +46,7 @@ must exist when the image is built — tag the release before installing.)
 
 ```yaml
 ingress: true
-ingress_port: 8080      # Camon's internal HTTP port
+ingress_port: 22666     # Camon's internal HTTP port ("camon" on a phone keypad)
 panel_icon: mdi:cctv
 panel_title: Camon
 panel_admin: true
@@ -93,9 +93,11 @@ Two values are **forced by `run.sh`** and cannot be overridden from options:
 - **`storage.data_dir = /data/storage`.** `/data` is the add-on's own
   persistent volume — always mounted and preserved across restarts/updates, no
   `map:` entry required — so recordings survive there automatically.
-- **`http.port = 8080`.** The add-on is reached exclusively through ingress,
-  which is wired to internal port 8080; the port is pinned so that wiring can't
-  be broken from options.
+- **`http.port = 22666`.** The add-on is reached exclusively through ingress,
+  which is wired to internal port 22666 — an uncommon port picked so it can
+  never collide with another service even if host networking is ever enabled
+  (with ingress-only access, no host port is bound at all). The port is pinned
+  so that wiring can't be broken from options.
 
 ## JSON config support (used by the add-on)
 

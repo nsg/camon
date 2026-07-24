@@ -22,7 +22,7 @@ mkdir -p /data/storage
 # only emitted when a URL was provided (empty/absent => local-disk storage).
 jq '{
   update: { enabled: false },
-  http: { port: 8080 },
+  http: { port: 22666 },
   analytics: {
     enabled: .analytics,
     object_detection: {
