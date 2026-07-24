@@ -18,7 +18,7 @@ FROM rust:1-bookworm AS builder
 # the Docker context, so the Rust source is not in the context at all. Clone
 # the repository at the version tag matching config.yaml instead — pinned, so
 # the add-on always builds the exact released source.
-ARG CAMON_VERSION=v0.3.0
+ARG CAMON_VERSION=v0.3.1
 RUN git clone --depth 1 --branch ${CAMON_VERSION} https://github.com/nsg/camon /src
 WORKDIR /src
 RUN cargo build --release --locked --bin camon
