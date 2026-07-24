@@ -28,6 +28,7 @@ THEMES = {
         "disk": "#1baf7a",
         "ext": "#eb6834",
         "tint": 0.08,
+        "halo": "#ffffff",
     },
     "dark": {
         "ink": "#e6edf3",
@@ -39,6 +40,7 @@ THEMES = {
         "disk": "#199e70",
         "ext": "#d95926",
         "tint": 0.14,
+        "halo": "#0d1117",
     },
 }
 
@@ -109,10 +111,12 @@ class D:
             ]
             if label:
                 lx, ly = _along(points, label_at)
+                # The halo (page-background stroke behind the glyphs) keeps a
+                # label readable even where a line passes behind it.
                 out.append(
                     f'<text x="{lx}" y="{ly + label_dy}" text-anchor="middle"'
                     f' font-family="{FONT}" font-size="12" fill="{t["muted"]}"'
-                    f' paint-order="stroke">{label}</text>'
+                    f' stroke="{t["halo"]}" stroke-width="4" paint-order="stroke">{label}</text>'
                 )
             return "".join(out)
 
@@ -204,7 +208,13 @@ def build():
     d.edge([(329, 202), (329, 252)], label="crop jobs", label_at=0.5, label_dy=4)
     d.edge([(450, 273), (534, 273)])
     d.edge([(250, 195), (95, 235), (95, 252)], label="finished events", label_at=0.35)
-    d.edge([(250, 283), (174, 283)], label="post-hoc upgrades", dashed=True, label_dy=16)
+    d.edge(
+        [(300, 294), (300, 326), (95, 326), (95, 312)],
+        label="post-hoc upgrades",
+        dashed=True,
+        label_at=0.5,
+        label_dy=-6,
+    )
     diagrams.append(d)
 
     # 3 — inside the motion analyzer (no auto-tuning; it was removed)
@@ -224,22 +234,22 @@ def build():
     diagrams.append(d)
 
     # 4 — object detection path
-    d = D("04-detection", 700, 330)
+    d = D("04-detection", 700, 334)
     d.node(16, 22, 122, 66, ["Hot Buffer", "(10 min, RAM)"], kind="ram")
     d.node(16, 122, 150, 60, ["Motion Store", "(RAM)"], kind="ram")
-    d.node(250, 60, 178, 44, "Subsample 4 frames")
-    d.node(510, 60, 130, 44, "Crop + JPEG")
-    d.node(250, 186, 220, 44, ["Detection Worker", "(global, serial)"])
-    d.node(560, 186, 110, 44, "Ollama", kind="ext")
+    d.node(270, 60, 178, 44, "Subsample 4 frames")
+    d.node(520, 60, 150, 44, "Crop + JPEG")
+    d.node(240, 186, 220, 44, ["Detection Worker", "(global, serial)"])
+    d.node(580, 186, 110, 44, "Ollama", kind="ext")
     d.node(16, 250, 150, 60, ["Detection Store", "(RAM)"], kind="ram")
-    d.edge([(138, 55), (194, 55), (194, 71), (250, 71)], label="motion event", label_at=0.9)
-    d.edge([(166, 152), (194, 152), (194, 93), (250, 93)], label="bounding boxes", label_at=0.12, label_dy=24)
-    d.edge([(428, 82), (510, 82)])
-    d.edge([(575, 104), (575, 145), (360, 145), (360, 186)], label="bounded queue", label_at=0.55)
-    d.edge([(470, 208), (560, 208)], label="one in flight", label_dy=-9)
-    d.edge([(250, 219), (194, 240), (166, 268)], label_at=0.5)
-    d.edge([(360, 230), (360, 264)], label="upgrade event", dashed=True, label_at=0.5, label_dy=4)
-    d.node(280, 264, 160, 50, "Warm Writer", kind="disk")
+    d.edge([(138, 55), (270, 72)], label="motion event", label_at=0.5, label_dy=-8)
+    d.edge([(166, 152), (270, 104)], label="bounding boxes", label_at=0.5, label_dy=-10)
+    d.edge([(448, 82), (520, 82)])
+    d.edge([(595, 104), (595, 145), (370, 145), (370, 186)], label="bounded queue", label_at=0.5)
+    d.edge([(460, 208), (580, 208)], label="one in flight", label_dy=-9)
+    d.edge([(240, 219), (194, 240), (166, 268)], label_at=0.5)
+    d.edge([(350, 230), (350, 268)], label="upgrade event", dashed=True, label_at=0.5, label_dy=4)
+    d.node(280, 268, 160, 50, "Warm Writer", kind="disk")
     diagrams.append(d)
 
     # 5 — event persistence and warm storage
