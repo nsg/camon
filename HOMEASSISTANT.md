@@ -37,7 +37,7 @@ camon-addon/           # one add-on == one top-level folder
 The Home Assistant supervisor builds the image with `camon-addon/` as the
 Docker context, so the Rust source is not in the context — the build stage
 instead clones this repository at the version tag matching `config.yaml`
-(`v0.2.9`), so the add-on always compiles the exact released source. (That tag
+(`v0.3.0`), so the add-on always compiles the exact released source. (That tag
 must exist when the image is built — tag the release before installing.)
 
 ## Ingress and the sidebar panel
