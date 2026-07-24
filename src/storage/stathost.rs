@@ -5,9 +5,11 @@
 //! * `PUT /{bucket}/{path}` and `DELETE /{bucket}/{path}` — authenticated with
 //!   `Authorization: Bearer <token>`;
 //! * `GET /{bucket}/{path}` — public;
-//! * `GET /{bucket}/_meta/list` — authenticated, returns a JSON array of path
-//!   strings (a detailed variant, `?detail=true`, may return
-//!   `[{"path","size","mtime"}]`).
+//! * `GET /{bucket}/_meta/list?detail=true` — authenticated, returns
+//!   `[{"path","size","mtime"}]`.
+//!
+//! Requires stathost **0.2.0 or later** (atomic uploads, detailed listing,
+//! Range requests). There is deliberately no fallback for older servers.
 //!
 //! This backend slots in behind [`WarmStorageBackend`] with no on-disk layout:
 //! every event is three sibling objects under `{camera_id}/` —
@@ -28,14 +30,13 @@
 //!   returns a clear error when the event has no frames.
 //! * **Interrupted-upload hygiene.** The `.ts` is uploaded first, sidecar and
 //!   thumbs after, so a crash mid-sequence leaves at worst a `.ts` without a
-//!   sidecar — indexed as a plain movement event on the next scan. (Until
-//!   stathost ships atomic PUT, a `.ts` can also land truncated; a zero-byte
-//!   `.ts` is warned about at scan time.)
+//!   sidecar — indexed as a plain movement event on the next scan. stathost's
+//!   uploads are atomic server-side, so a truncated object can't be served; a
+//!   zero-byte `.ts` in the listing still gets a warning at scan time.
 //! * **`read_video` streams the object with Range support.** The body is never
-//!   fully buffered; a forwarded `Range` header yields a `206` from stathost
-//!   (>=0.2.0). If an older server ignores the header and answers `200`, the
-//!   read degrades to streaming the full body (a legal response to a range
-//!   request — the client replays from the start).
+//!   fully buffered; a forwarded `Range` header yields a `206`. A `200` to a
+//!   range request is legal HTTP and degrades to streaming the full body (the
+//!   client replays from the start).
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -449,9 +450,7 @@ impl WarmStorageBackend for StathostBackend {
                 tracing::warn!(path = %item.path, "skipping stathost object with unparsable name");
                 continue;
             };
-            // Only warn on a real, known-zero size (interrupted upload); a plain
-            // list carries no sizes, so stay quiet there.
-            if item.has_size && item.size == 0 {
+            if item.size == 0 {
                 tracing::warn!(path = %item.path,
                     "zero-byte .ts on stathost (interrupted upload?)");
             }
@@ -713,67 +712,27 @@ impl Http {
         req.send().await
     }
 
-    /// List every object in the bucket, preferring the detailed variant and
-    /// falling back cleanly to the plain shape (whether the server returns
-    /// plain strings or errors on `?detail=true`).
+    /// List every object in the bucket via the detailed listing
+    /// (stathost >= 0.2.0). No fallback: an unexpected response shape is an
+    /// error, surfaced by the caller.
     async fn list(&self) -> Result<Vec<ListEntry>, reqwest::Error> {
-        match self.list_raw(true).await {
-            Ok(items) => Ok(items),
-            Err(_) => self.list_raw(false).await,
-        }
-    }
-
-    async fn list_raw(&self, detail: bool) -> Result<Vec<ListEntry>, reqwest::Error> {
-        let mut url = format!("{}/_meta/list", self.base);
-        if detail {
-            url.push_str("?detail=true");
-        }
-        let items: Vec<RawListItem> = self
-            .client
-            .get(url)
+        self.client
+            .get(format!("{}/_meta/list?detail=true", self.base))
             .bearer_auth(&self.token)
             .send()
             .await?
             .error_for_status()?
             .json()
-            .await?;
-        Ok(items.into_iter().map(ListEntry::from).collect())
+            .await
     }
 }
 
-/// A `_meta/list` entry, normalized across the plain and detailed shapes.
+/// A `_meta/list?detail=true` entry. Extra fields (e.g. `mtime`) are ignored;
+/// event time comes from the filename.
+#[derive(Deserialize)]
 struct ListEntry {
     path: String,
     size: u64,
-    /// Whether `size` came from the server (detailed shape) or is a placeholder
-    /// (plain shape). Gates the zero-byte-upload warning.
-    has_size: bool,
-}
-
-/// Tolerant of both list shapes: a bare `"path"` string, or a
-/// `{"path","size","mtime"}` object (extra fields, e.g. `mtime`, are ignored).
-#[derive(Deserialize)]
-#[serde(untagged)]
-enum RawListItem {
-    Detailed { path: String, size: Option<u64> },
-    Bare(String),
-}
-
-impl From<RawListItem> for ListEntry {
-    fn from(raw: RawListItem) -> Self {
-        match raw {
-            RawListItem::Detailed { path, size } => ListEntry {
-                path,
-                size: size.unwrap_or(0),
-                has_size: size.is_some(),
-            },
-            RawListItem::Bare(path) => ListEntry {
-                path,
-                size: 0,
-                has_size: false,
-            },
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -863,24 +822,13 @@ mod tests {
 
     // ---- in-process stathost stub -----------------------------------------
 
-    #[derive(Clone, Copy, PartialEq)]
-    enum ListMode {
-        /// `?detail=true` returns `[{"path","size"}]`.
-        Detail,
-        /// Always returns plain `["path"]`, even for `?detail=true`.
-        Plain,
-        /// `?detail=true` errors (400); the plain call returns `["path"]`.
-        DetailUnsupported,
-    }
-
     #[derive(Clone)]
     struct Stub {
         files: Arc<Mutex<HashMap<String, Vec<u8>>>>,
         token: String,
-        mode: ListMode,
         fail_writes: Arc<AtomicBool>,
-        /// When set, GET ignores an incoming `Range` and answers a full `200`,
-        /// modeling a pre-0.2.0 stathost with no Range support.
+        /// When set, GET ignores an incoming `Range` and answers a full `200` —
+        /// a legal HTTP response the client must handle by replaying in full.
         ignore_range: Arc<AtomicBool>,
     }
 
@@ -949,20 +897,20 @@ mod tests {
             if !authorized(&headers, &stub.token) {
                 return StatusCode::UNAUTHORIZED.into_response();
             }
+            // Mirrors stathost >= 0.2.0: plain array without ?detail=true,
+            // [{"path","size","mtime"}] with it.
             let detail = query.as_deref() == Some("detail=true");
             let files = stub.files.lock().unwrap();
             let mut paths: Vec<String> = files.keys().cloned().collect();
             paths.sort();
-            return match stub.mode {
-                ListMode::Detail if detail => {
-                    let arr: Vec<serde_json::Value> = paths
-                        .iter()
-                        .map(|p| serde_json::json!({"path": p, "size": files[p].len(), "mtime": 0}))
-                        .collect();
-                    Json(arr).into_response()
-                }
-                ListMode::DetailUnsupported if detail => StatusCode::BAD_REQUEST.into_response(),
-                _ => Json(paths).into_response(),
+            return if detail {
+                let arr: Vec<serde_json::Value> = paths
+                    .iter()
+                    .map(|p| serde_json::json!({"path": p, "size": files[p].len(), "mtime": 0}))
+                    .collect();
+                Json(arr).into_response()
+            } else {
+                Json(paths).into_response()
             };
         }
 
@@ -996,7 +944,7 @@ mod tests {
                 let total = bytes.len() as u64;
                 let range = headers.get("range").and_then(|v| v.to_str().ok());
                 match range {
-                    // A pre-0.2.0 server ignores the header and answers 200.
+                    // A server may legally answer a range request with a full 200.
                     Some(_) if stub.ignore_range.load(Ordering::Relaxed) => full_200(bytes),
                     Some(r) => match parse_stub_range(r, total) {
                         Some((start, end)) => {
@@ -1034,11 +982,10 @@ mod tests {
         resp
     }
 
-    async fn spawn_stub(mode: ListMode, token: &str) -> (String, Stub) {
+    async fn spawn_stub(token: &str) -> (String, Stub) {
         let stub = Stub {
             files: Arc::new(Mutex::new(HashMap::new())),
             token: token.to_string(),
-            mode,
             fail_writes: Arc::new(AtomicBool::new(false)),
             ignore_range: Arc::new(AtomicBool::new(false)),
         };
@@ -1119,7 +1066,7 @@ mod tests {
 
     #[tokio::test]
     async fn write_then_scan_round_trip_detailed_list() {
-        let (url, _stub) = spawn_stub(ListMode::Detail, "secret").await;
+        let (url, _stub) = spawn_stub("secret").await;
         let backend = backend_for(&url, "secret", 0);
 
         let event = movement_event(1_000, 40);
@@ -1160,35 +1107,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn scan_tolerates_plain_list_shape() {
-        let (url, _stub) = spawn_stub(ListMode::Plain, "secret").await;
-        let backend = backend_for(&url, "secret", 0);
-        backend.write_event("cam", &movement_event(2_000, 30)).await;
-
-        let scanned = backend_for(&url, "secret", 0);
-        scanned.scan().await;
-        let e = scanned.find_event("cam", 2_000).unwrap();
-        assert_eq!(e.event_type, EventType::Movement);
-        // Plain list carries no sizes → size unknown (0).
-        assert_eq!(e.file_size, 0);
-        assert_eq!(e.filmstrip_frames, 2);
-    }
-
-    #[tokio::test]
-    async fn scan_falls_back_when_detail_unsupported() {
-        let (url, _stub) = spawn_stub(ListMode::DetailUnsupported, "secret").await;
-        let backend = backend_for(&url, "secret", 0);
-        backend.write_event("cam", &movement_event(3_000, 30)).await;
-
-        let scanned = backend_for(&url, "secret", 0);
-        scanned.scan().await;
-        // Fallback to the plain call still recovers the event.
-        assert!(scanned.find_event("cam", 3_000).is_some());
-    }
-
-    #[tokio::test]
     async fn object_event_sidecar_carries_type_and_scans_back() {
-        let (url, _stub) = spawn_stub(ListMode::Detail, "secret").await;
+        let (url, _stub) = spawn_stub("secret").await;
         let backend = backend_for(&url, "secret", 0);
 
         let mut event = movement_event(4_000, 20);
@@ -1210,7 +1130,7 @@ mod tests {
 
     #[tokio::test]
     async fn upgrade_rewrites_sidecar_without_reuploading_video() {
-        let (url, stub) = spawn_stub(ListMode::Detail, "secret").await;
+        let (url, stub) = spawn_stub("secret").await;
         let backend = backend_for(&url, "secret", 0);
         backend.write_event("cam", &movement_event(5_000, 25)).await;
 
@@ -1244,7 +1164,7 @@ mod tests {
 
     #[tokio::test]
     async fn delete_via_prune_removes_all_objects() {
-        let (url, stub) = spawn_stub(ListMode::Detail, "secret").await;
+        let (url, stub) = spawn_stub("secret").await;
         let backend = backend_for(&url, "secret", 0);
         // A movement event far enough in the past to expire.
         let old_pts = 1_000_000_000; // 1s after epoch
@@ -1263,7 +1183,7 @@ mod tests {
 
     #[tokio::test]
     async fn budget_prune_evicts_cheapest_and_oldest_first() {
-        let (url, _stub) = spawn_stub(ListMode::Detail, "secret").await;
+        let (url, _stub) = spawn_stub("secret").await;
         // Budget of 60 bytes; three 40-byte events (120 total) overflow it.
         let backend = backend_for(&url, "secret", 60);
 
@@ -1294,7 +1214,7 @@ mod tests {
 
     #[tokio::test]
     async fn scan_tolerates_ts_without_sidecar() {
-        let (url, stub) = spawn_stub(ListMode::Detail, "secret").await;
+        let (url, stub) = spawn_stub("secret").await;
         // A lone .ts with no sidecar (as an interrupted upload would leave).
         stub.files
             .lock()
@@ -1312,7 +1232,7 @@ mod tests {
 
     #[tokio::test]
     async fn write_retries_then_drops_on_persistent_failure() {
-        let (url, stub) = spawn_stub(ListMode::Detail, "secret").await;
+        let (url, stub) = spawn_stub("secret").await;
         let backend = backend_for(&url, "secret", 0);
         stub.fail_writes.store(true, Ordering::Relaxed);
 
@@ -1325,7 +1245,7 @@ mod tests {
 
     #[tokio::test]
     async fn read_thumbnail_errors_when_no_filmstrip() {
-        let (url, _stub) = spawn_stub(ListMode::Detail, "secret").await;
+        let (url, _stub) = spawn_stub("secret").await;
         let backend = backend_for(&url, "secret", 0);
         let event = continuous_event(7_000, 30); // no filmstrip frames
         backend.write_event("cam", &event).await;
@@ -1337,7 +1257,7 @@ mod tests {
 
     #[tokio::test]
     async fn read_video_serves_partial_and_suffix_ranges() {
-        let (url, _stub) = spawn_stub(ListMode::Detail, "secret").await;
+        let (url, _stub) = spawn_stub("secret").await;
         let backend = backend_for(&url, "secret", 0);
         // A 40-byte movement event (body is 40 × 0xab).
         backend.write_event("cam", &movement_event(8_000, 40)).await;
@@ -1370,7 +1290,7 @@ mod tests {
 
     #[tokio::test]
     async fn read_video_reports_unsatisfiable_range() {
-        let (url, _stub) = spawn_stub(ListMode::Detail, "secret").await;
+        let (url, _stub) = spawn_stub("secret").await;
         let backend = backend_for(&url, "secret", 0);
         backend.write_event("cam", &movement_event(9_000, 40)).await;
         let entry = backend.find_event("cam", 9_000).unwrap();
@@ -1394,8 +1314,8 @@ mod tests {
 
     #[tokio::test]
     async fn read_video_degrades_to_full_when_server_ignores_range() {
-        let (url, stub) = spawn_stub(ListMode::Detail, "secret").await;
-        // Model a pre-0.2.0 stathost that ignores Range and answers 200.
+        let (url, stub) = spawn_stub("secret").await;
+        // A 200 with the full body is a legal answer to a range request.
         stub.ignore_range.store(true, Ordering::Relaxed);
         let backend = backend_for(&url, "secret", 0);
         backend
