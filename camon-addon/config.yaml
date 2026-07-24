@@ -10,6 +10,10 @@ description: Multi-camera NVR with real-time motion/object analytics and tiered 
 url: https://github.com/nsg/camon
 arch:
   - amd64
+# Prebuilt image on GHCR, built by .github/workflows/addon.yml. With `image`
+# set the Supervisor pulls `<image>:<version>` instead of compiling the
+# Dockerfile on the Home Assistant machine.
+image: ghcr.io/nsg/{arch}-addon-camon
 # `application` waits for Home Assistant + Supervisor to be up before start.
 startup: application
 boot: auto

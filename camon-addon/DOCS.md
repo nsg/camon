@@ -23,8 +23,8 @@ Assistant sidebar via **ingress**.
    `https://github.com/nsg/camon`, and click **Add**. (The button in the
    README does this for you.)
 3. The **Camon** add-on appears in the store. Open it and click **Install**.
-   The image is built from source on first install (Rust compile + ffmpeg), so
-   the first build takes a few minutes.
+   This pulls a prebuilt image from GHCR (`ghcr.io/nsg/amd64-addon-camon`) —
+   nothing is compiled on your machine.
 4. Create the configuration file (see [Configuration](#configuration) below),
    then **Start**. With ingress enabled, **Camon** shows up in the sidebar —
    click it to open the web UI.
@@ -36,16 +36,16 @@ Standard HA add-on repository conventions:
 ```
 repository.yaml        # repository manifest (name/url/maintainer) at repo root
 camon-addon/           # one add-on == one top-level folder
-  config.yaml          # add-on manifest (slug, arch, ingress, map)
+  config.yaml          # add-on manifest (slug, arch, image, ingress, map)
   Dockerfile           # multi-stage: build Camon from source, run on Debian+ffmpeg
   run.sh               # points Camon at /config/camon.toml (forcing 3 values), then exec camon
 ```
 
-The Home Assistant supervisor builds the image with `camon-addon/` as the
-Docker context, so the Rust source is not in the context — the build stage
-instead clones this repository at the version tag matching `config.yaml`
-(`v0.3.1`), so the add-on always compiles the exact released source. (That tag
-must exist when the image is built — tag the release before installing.)
+`config.yaml` sets `image: ghcr.io/nsg/{arch}-addon-camon`, so the Home
+Assistant supervisor **pulls** the prebuilt image at the tag matching the
+add-on version — it never builds the Dockerfile itself. The image is built and
+pushed by GitHub Actions (`.github/workflows/addon.yml`); see
+[Building the image](#building-the-image).
 
 ## Ingress and the sidebar panel
 
@@ -117,6 +117,16 @@ list — is set in `camon.toml` exactly as documented for a native install.
 
 ## Building the image
 
+The image is built by the `.github/workflows/addon.yml` workflow, which runs
+whenever `camon-addon/` changes on `master` (or manually via
+`workflow_dispatch`). It reads the version from `config.yaml`, builds the
+`Dockerfile` with `camon-addon/` as the context, and pushes
+`ghcr.io/nsg/amd64-addon-camon:<version>` (plus `:latest`) with the `io.hass.*`
+labels Home Assistant expects. Releasing an add-on update is therefore: tag the
+Camon release (`vX.Y.Z`), bump `version` in `config.yaml`, and push — the
+workflow publishes the matching image tag, and installed add-ons see the
+update.
+
 The `Dockerfile` is multi-stage:
 
 1. **Build** — `rust:1-bookworm`, `cargo build --release --locked`.
@@ -130,7 +140,6 @@ musl. Keeping both stages on Debian bookworm avoids a musl cross-compile.
 `config.yaml` sets `init: false`, so the `CMD ["/run.sh"]` runs as PID 1 and
 Camon receives `SIGTERM` directly for a graceful shutdown.
 
-> The Dockerfile and `config.yaml` here were validated by conformance to the
-> Home Assistant add-on docs; they were **not** built/run in CI in this
-> environment (no Docker available), so treat the first `ha` build as the real
-> smoke test.
+> The Dockerfile is exercised end-to-end by the GitHub Actions workflow on
+> every change to `camon-addon/`; pull requests build the image without
+> pushing, so a broken build fails CI before it can reach GHCR.

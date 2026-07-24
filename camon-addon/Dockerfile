@@ -7,17 +7,22 @@
 # We deliberately do NOT use a Home Assistant base image here. The HA base
 # images are Alpine/musl, whereas the Rust toolchain image below is glibc; a
 # glibc binary won't run on musl. Debian bookworm on both the build and run
-# stages keeps them ABI-compatible and gives us a well-supported ffmpeg. Home
-# Assistant is happy to build any Dockerfile; with `init: false` in config.yaml
-# our CMD runs as PID 1 and receives SIGTERM directly (Camon shuts down
-# gracefully on SIGTERM). amd64 only — see config.yaml `arch`.
+# stages keeps them ABI-compatible and gives us a well-supported ffmpeg. With
+# `init: false` in config.yaml our CMD runs as PID 1 and receives SIGTERM
+# directly (Camon shuts down gracefully on SIGTERM). amd64 only — see
+# config.yaml `arch`.
+#
+# This Dockerfile is built by GitHub Actions (.github/workflows/addon.yml) and
+# pushed to ghcr.io/nsg/amd64-addon-camon; the Home Assistant supervisor pulls
+# that prebuilt image (config.yaml `image`) rather than building on-device.
 
 # ---- Build stage -----------------------------------------------------------
 FROM rust:1-bookworm AS builder
-# The Home Assistant supervisor builds with THIS DIRECTORY (camon-addon/) as
-# the Docker context, so the Rust source is not in the context at all. Clone
-# the repository at the version tag matching config.yaml instead — pinned, so
-# the add-on always builds the exact released source.
+# The image is built with THIS DIRECTORY (camon-addon/) as the Docker
+# context, so the Rust source is not in the context at all. Clone the
+# repository at the version tag matching config.yaml instead (the workflow
+# passes CAMON_VERSION derived from config.yaml) — pinned, so the add-on
+# always builds the exact released source.
 ARG CAMON_VERSION=v0.3.1
 RUN git clone --depth 1 --branch ${CAMON_VERSION} https://github.com/nsg/camon /src
 WORKDIR /src
