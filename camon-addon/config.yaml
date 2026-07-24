@@ -30,37 +30,14 @@ panel_icon: mdi:cctv
 panel_title: Camon
 panel_admin: true
 
+# The add-on is configured entirely by a camon.toml file — the SAME format as a
+# native install — so there is no `options:`/`schema:` block here (both are
+# optional per the HA add-on docs, omitted when there are no UI options).
+#
 # /data is the add-on's own persistent volume (always mounted; recordings live
-# under /data/storage). addon_config additionally mounts the add-on's user
-# folder (/addon_configs/..._camon) at /config, where a full camon.json —
-# same structure as the project's config.toml — overrides the options below
-# entirely (see run.sh and HOMEASSISTANT.md).
+# under /data/storage). addon_config mounts the add-on's user folder
+# (/addon_configs/..._camon) at /config read-write, where the user creates
+# camon.toml; run.sh seeds a commented camon.toml.example there on first start
+# (see run.sh and HOMEASSISTANT.md).
 map:
-  - addon_config
-
-# User-facing options. The run script (run.sh) translates these into the JSON
-# config Camon reads, forcing update.enabled=false and data_dir=/data/storage.
-# Note: there is no http_port option — the add-on is reached exclusively
-# through ingress, which is pinned to internal port 22666 (ingress_port above);
-# a configurable port would only break that wiring.
-options:
-  analytics: true
-  object_detection: false
-  ollama_url: "http://homeassistant.local:11434"
-  ollama_model: "gemma4:e4b"
-  storage: true
-  cameras:
-    - id: front-door
-      url: "rtsp://user:pass@192.168.1.100:554/stream1"
-schema:
-  analytics: bool
-  object_detection: bool
-  ollama_url: url
-  ollama_model: str
-  storage: bool
-  stathost_url: "url?"
-  stathost_bucket: "str?"
-  stathost_token: "password?"
-  cameras:
-    - id: str
-      url: str
+  - addon_config:rw

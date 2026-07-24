@@ -27,15 +27,17 @@ RUN cargo build --release --locked --bin camon
 FROM debian:bookworm-slim
 
 # ffmpeg/ffprobe are spawned by Camon; ca-certificates for HTTPS (Ollama,
-# stathost, update checks); jq to translate /data/options.json in run.sh.
+# stathost, update checks).
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         ffmpeg \
         ca-certificates \
-        jq \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /src/target/release/camon /usr/local/bin/camon
+# The commented config template from the cloned source — run.sh seeds this into
+# the add-on's config folder (/config/camon.toml.example) on first start.
+COPY --from=builder /src/config.toml.example /usr/local/share/camon/config.toml.example
 # Context is camon-addon/, so run.sh sits at the context root.
 COPY run.sh /run.sh
 RUN chmod a+x /run.sh

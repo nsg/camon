@@ -19,8 +19,9 @@ UI embedded directly in the Home Assistant sidebar via **ingress**.
 3. The **Camon** add-on appears in the store. Open it and click **Install**.
    The image is built from source on first install (Rust compile + ffmpeg), so
    the first build takes a few minutes.
-4. Configure the options (see below), then **Start**. With ingress enabled,
-   **Camon** shows up in the sidebar — click it to open the web UI.
+4. Create the configuration file (see [Configuration](#configuration) below),
+   then **Start**. With ingress enabled, **Camon** shows up in the sidebar —
+   click it to open the web UI.
 
 ## Repository layout
 
@@ -29,9 +30,9 @@ Standard HA add-on repository conventions:
 ```
 repository.yaml        # repository manifest (name/url/maintainer) at repo root
 camon-addon/           # one add-on == one top-level folder
-  config.yaml          # add-on manifest (slug, arch, ingress, options, schema)
+  config.yaml          # add-on manifest (slug, arch, ingress, map)
   Dockerfile           # multi-stage: build Camon from source, run on Debian+ffmpeg
-  run.sh               # options.json -> Camon JSON config, then exec camon
+  run.sh               # points Camon at /config/camon.toml (forcing 3 values), then exec camon
 ```
 
 The Home Assistant supervisor builds the image with `camon-addon/` as the
@@ -61,84 +62,61 @@ which leaves the document path — and therefore the relative-URL base —
 untouched. So the UI resolves correctly whether it's served at `/` (systemd
 install) or under `…/api/hassio_ingress/<token>/` (add-on).
 
-## Options mapping
+## Configuration
 
-The add-on exposes a pragmatic subset of Camon's full config. `run.sh`
-translates `/data/options.json` into the nested JSON config Camon reads (Camon
-now loads JSON as well as TOML — see below), then runs `camon --config`.
+The add-on has **no options UI**. It is configured by a `camon.toml` file with
+the **exact same format as a native install**, so everything Camon supports is
+available — see [`config.toml.example`](config.toml.example) for the full,
+commented field reference.
 
-| Add-on option     | Type (HA schema) | Maps to Camon config field                          |
-| ----------------- | ---------------- | --------------------------------------------------- |
-| `analytics`       | `bool`           | `analytics.enabled`                                 |
-| `object_detection`| `bool`           | `analytics.object_detection.enabled`                |
-| `ollama_url`      | `url`            | `analytics.object_detection.ollama.url`             |
-| `ollama_model`    | `str`            | `analytics.object_detection.ollama.model`           |
-| `storage`         | `bool`           | `storage.enabled`                                   |
-| `stathost_url`    | `url?` (optional)| `storage.stathost.url` (section emitted only if set)|
-| `stathost_bucket` | `str?` (optional)| `storage.stathost.bucket` (defaults to `camon`)     |
-| `stathost_token`  | `password?`      | `storage.stathost.token`                            |
-| `cameras`         | list of `{id, url}` | `cameras` (passthrough)                          |
+Create the file in the add-on's config folder:
 
-Anything not exposed (retention days, padding, motion tuning, confidence
-threshold, ollama fallback/timeout, …) uses Camon's built-in defaults — or use
-the full configuration file below.
+```
+/addon_configs/<repo>_camon/camon.toml
+```
 
-## Full configuration file (optional)
+That folder is the add-on's own config directory, mounted read-write at
+`/config` inside the container via `map: addon_config:rw`. Home Assistant does
+not give you a file browser for it out of the box, so you need a file-access
+add-on to create and edit the file — any of **File editor**, **Studio Code
+Server**, **SSH**, or **Samba** works.
 
-The add-on options cover the common case; for everything else, bypass them
-entirely. Home Assistant's options schema cannot validate a freeform nested
-structure, so the full config goes in a **file** instead: place a `camon.json`
-in the add-on's config folder (`/addon_configs/<repo>_camon/` — visible via
-the Samba/File editor add-ons, mounted at `/config` inside the container).
+On first start the add-on **seeds a fully commented `camon.toml.example`** into
+that folder (copied from the project's `config.toml.example`). Copy or rename
+it to `camon.toml`, add at least one `[[cameras]]` block, and restart the
+add-on. Until `camon.toml` exists the add-on logs these instructions and exits.
 
-`camon.json` has the **exact same structure as the project's
-[`config.toml`](config.toml.example)**, just JSON-encoded — Camon reads both
-formats natively, so every key the project documents works here, including
-`[analytics.motion]` defaults, retention tuning, and the Ollama fallback
-server. When the file exists, the add-on options above are ignored and the
-file is used as-is; only the three container-forced keys (`update.enabled`,
-`http.port`, `storage.data_dir`) are still merged on top. Restart the add-on
-after editing.
+### Values forced at startup
 
-Two values are **forced by `run.sh`** and cannot be overridden from options:
+Three values are **forced by `run.sh`** via `camon --set`, overriding whatever
+`camon.toml` says — they are non-negotiable inside the container:
 
 - **`update.enabled = false`.** Camon's built-in GitHub self-updater is
   disabled inside the add-on. The container filesystem is ephemeral and updates
   must flow through the Home Assistant add-on store, so an in-container binary
   swap would be pointless (lost on rebuild) and would fight Home Assistant's
   own update mechanism.
-- **`storage.data_dir = /data/storage`.** `/data` is the add-on's own
-  persistent volume — always mounted and preserved across restarts/updates, no
-  `map:` entry required — so recordings survive there automatically.
 - **`http.port = 22666`.** The add-on is reached exclusively through ingress,
   which is wired to internal port 22666 — an uncommon port picked so it can
   never collide with another service even if host networking is ever enabled
   (with ingress-only access, no host port is bound at all). The port is pinned
-  so that wiring can't be broken from options.
+  so that wiring can't be broken from the config file.
+- **`storage.data_dir = /data/storage`.** `/data` is the add-on's own
+  persistent volume — always mounted and preserved across restarts/updates — so
+  recordings survive there automatically.
 
-## JSON config support (used by the add-on)
-
-Camon loads its config from **TOML or JSON** with the identical schema; the
-parser is chosen by file extension (`.json` → JSON, otherwise TOML). You can
-also point Camon at any path with `--config`:
-
-```
-camon --config /data/camon.json
-```
-
-With no `--config`, Camon looks for `./config.toml` first, then `./config.json`.
-The add-on relies on this: `run.sh` writes `/data/camon.json` from the add-on
-options and starts `camon --config /data/camon.json`. See
-[`config.toml.example`](config.toml.example) for the full field reference (the
-JSON form is the same structure, just JSON-encoded).
+Everything else — analytics, object detection, the Ollama server (including the
+fallback), retention, motion tuning, remote stathost storage, and the camera
+list — is set in `camon.toml` exactly as documented for a native install.
 
 ## Building the image
 
 The `Dockerfile` is multi-stage:
 
 1. **Build** — `rust:1-bookworm`, `cargo build --release --locked`.
-2. **Runtime** — `debian:bookworm-slim` with `ffmpeg`, `ca-certificates`, and
-   `jq` installed; the compiled binary and `run.sh` are copied in.
+2. **Runtime** — `debian:bookworm-slim` with `ffmpeg` and `ca-certificates`
+   installed; the compiled binary, `run.sh`, and the commented
+   `config.toml.example` (seed template) are copied in.
 
 It intentionally does **not** use a Home Assistant base image: those are
 Alpine/musl, and a glibc binary from the Rust toolchain image won't run on
