@@ -15,35 +15,52 @@ set -euo pipefail
 
 OPTIONS=/data/options.json
 CONFIG=/data/camon.json
+# Full-config override: the user may place a camon.json with the EXACT same
+# structure as the project's config.toml (JSON-encoded — Camon reads both
+# formats natively) in the add-on's config folder (/addon_configs/..._camon,
+# mounted here at /config). When present it replaces the options-derived
+# config entirely; only the container-forced keys below are merged on top.
+USER_CONFIG=/config/camon.json
 
 mkdir -p /data/storage
 
-# Build the Camon config from the add-on options. Optional stathost fields are
-# only emitted when a URL was provided (empty/absent => local-disk storage).
-jq '{
-  update: { enabled: false },
-  http: { port: 22666 },
-  analytics: {
-    enabled: .analytics,
-    object_detection: {
-      enabled: .object_detection,
-      ollama: { url: .ollama_url, model: .ollama_model }
-    }
-  },
-  storage: (
-    { enabled: .storage, data_dir: "/data/storage" }
-    + ( if ((.stathost_url // "") != "") then
-          { stathost: {
-              url: .stathost_url,
-              bucket: (.stathost_bucket // "camon"),
-              token: (.stathost_token // "")
-          } }
-        else {} end )
-  ),
-  cameras: (.cameras // [])
-}' "$OPTIONS" > "$CONFIG"
-
-echo "[camon-addon] wrote $CONFIG (update.enabled forced false, data_dir=/data/storage)"
+if [ -f "$USER_CONFIG" ]; then
+  # Deep-merge the forced keys over the user's full config.
+  jq -s '.[0] * {
+    update: { enabled: false },
+    http: { port: 22666 },
+    storage: { data_dir: "/data/storage" }
+  }' "$USER_CONFIG" > "$CONFIG"
+  echo "[camon-addon] using full config from $USER_CONFIG" \
+       "(update.enabled/http.port/storage.data_dir forced)"
+else
+  # Build the Camon config from the add-on options. Optional stathost fields
+  # are only emitted when a URL was provided (empty/absent => local disk).
+  jq '{
+    update: { enabled: false },
+    http: { port: 22666 },
+    analytics: {
+      enabled: .analytics,
+      object_detection: {
+        enabled: .object_detection,
+        ollama: { url: .ollama_url, model: .ollama_model }
+      }
+    },
+    storage: (
+      { enabled: .storage, data_dir: "/data/storage" }
+      + ( if ((.stathost_url // "") != "") then
+            { stathost: {
+                url: .stathost_url,
+                bucket: (.stathost_bucket // "camon"),
+                token: (.stathost_token // "")
+            } }
+          else {} end )
+    ),
+    cameras: (.cameras // [])
+  }' "$OPTIONS" > "$CONFIG"
+  echo "[camon-addon] wrote $CONFIG from add-on options" \
+       "(update.enabled forced false, data_dir=/data/storage)"
+fi
 
 # exec so Camon becomes PID 1 and receives SIGTERM directly for graceful stop.
 exec camon --config "$CONFIG"

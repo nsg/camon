@@ -80,8 +80,25 @@ now loads JSON as well as TOML — see below), then runs `camon --config`.
 | `cameras`         | list of `{id, url}` | `cameras` (passthrough)                          |
 
 Anything not exposed (retention days, padding, motion tuning, confidence
-threshold, ollama fallback/timeout, …) uses Camon's built-in defaults. To tune
-those, edit the generated config or run Camon outside Home Assistant.
+threshold, ollama fallback/timeout, …) uses Camon's built-in defaults — or use
+the full configuration file below.
+
+## Full configuration file (optional)
+
+The add-on options cover the common case; for everything else, bypass them
+entirely. Home Assistant's options schema cannot validate a freeform nested
+structure, so the full config goes in a **file** instead: place a `camon.json`
+in the add-on's config folder (`/addon_configs/<repo>_camon/` — visible via
+the Samba/File editor add-ons, mounted at `/config` inside the container).
+
+`camon.json` has the **exact same structure as the project's
+[`config.toml`](config.toml.example)**, just JSON-encoded — Camon reads both
+formats natively, so every key the project documents works here, including
+`[analytics.motion]` defaults, retention tuning, and the Ollama fallback
+server. When the file exists, the add-on options above are ignored and the
+file is used as-is; only the three container-forced keys (`update.enabled`,
+`http.port`, `storage.data_dir`) are still merged on top. Restart the add-on
+after editing.
 
 Two values are **forced by `run.sh`** and cannot be overridden from options:
 

@@ -30,10 +30,13 @@ panel_icon: mdi:cctv
 panel_title: Camon
 panel_admin: true
 
-# No `map:` needed: /data is the add-on's own persistent volume, always mounted
-# and preserved across restarts/updates. The run script points Camon's
-# storage.data_dir at /data/storage, so recordings persist there automatically.
-# (`map` is only for Home Assistant's shared folders — config, media, share, …)
+# /data is the add-on's own persistent volume (always mounted; recordings live
+# under /data/storage). addon_config additionally mounts the add-on's user
+# folder (/addon_configs/..._camon) at /config, where a full camon.json —
+# same structure as the project's config.toml — overrides the options below
+# entirely (see run.sh and HOMEASSISTANT.md).
+map:
+  - addon_config
 
 # User-facing options. The run script (run.sh) translates these into the JSON
 # config Camon reads, forcing update.enabled=false and data_dir=/data/storage.
