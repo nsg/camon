@@ -1333,6 +1333,12 @@ document.addEventListener('DOMContentLoaded', async () => {
                 const typeLabel = ev.event_type === 'object' ? 'Object detected' : 'Movement';
                 const typeClass = ev.event_type === 'object' ? 'object' : 'movement';
 
+                // Salvaged from an interrupted write at startup: flag it so the
+                // viewer knows the tail may be cut short.
+                const recoveredBadge = ev.recovered
+                    ? ` <span class="event-recovered-badge" title="Recovered after an interruption — footage may be truncated">⚠</span>`
+                    : '';
+
                 // A motion run is subsampled to at most 4 filmstrip thumbs, and
                 // short runs yield fewer — render exactly the frames that exist so
                 // we never request a missing index (which 404s to a broken glyph).
@@ -1353,7 +1359,7 @@ document.addEventListener('DOMContentLoaded', async () => {
                 item.innerHTML = `
                     ${thumbHtml}
                     <div class="event-list-info">
-                        <div class="event-list-type ${typeClass}">${typeLabel}</div>
+                        <div class="event-list-type ${typeClass}">${typeLabel}${recoveredBadge}</div>
                         <div class="event-list-detail">${detailText}</div>
                     </div>
                     <div class="event-list-meta">

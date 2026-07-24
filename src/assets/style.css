@@ -740,6 +740,13 @@ main {
 .event-list-type.object { color: rgba(220, 50, 50, 0.9); }
 .event-list-type.movement { color: rgba(255, 200, 50, 0.9); }
 
+.event-recovered-badge {
+    color: rgba(255, 170, 50, 0.9);
+    font-size: 0.75rem;
+    margin-left: 4px;
+    cursor: help;
+}
+
 .event-list-detail {
     font-size: 0.75rem;
     color: #999;
