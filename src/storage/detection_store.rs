@@ -4,8 +4,6 @@ use std::sync::{Arc, RwLock};
 
 use crate::locks::LockExt;
 
-type FilmstripMap = HashMap<u64, Arc<Vec<Vec<u8>>>>;
-
 pub struct DetectionEntry {
     pub id: u64,
     pub segment_sequence: u64,
@@ -32,21 +30,17 @@ pub struct DetectionInfo {
 
 pub struct DetectionStore {
     cameras: Arc<HashMap<String, RwLock<VecDeque<DetectionEntry>>>>,
-    filmstrips: Arc<HashMap<String, RwLock<FilmstripMap>>>,
     next_id: Arc<AtomicU64>,
 }
 
 impl DetectionStore {
     pub fn new(camera_ids: &[String]) -> Self {
         let mut cameras = HashMap::new();
-        let mut filmstrips = HashMap::new();
         for id in camera_ids {
             cameras.insert(id.clone(), RwLock::new(VecDeque::new()));
-            filmstrips.insert(id.clone(), RwLock::new(HashMap::new()));
         }
         Self {
             cameras: Arc::new(cameras),
-            filmstrips: Arc::new(filmstrips),
             next_id: Arc::new(AtomicU64::new(1)),
         }
     }
@@ -61,18 +55,6 @@ impl DetectionStore {
 
     pub fn next_id(&self) -> u64 {
         self.next_id.fetch_add(1, Ordering::Relaxed)
-    }
-
-    pub fn insert_filmstrip(&self, camera_id: &str, sequence: u64, frames: Arc<Vec<Vec<u8>>>) {
-        if let Some(lock) = self.filmstrips.get(camera_id) {
-            lock.write_recover().insert(sequence, frames);
-        }
-    }
-
-    pub fn get_filmstrip(&self, camera_id: &str, sequence: u64) -> Option<Arc<Vec<Vec<u8>>>> {
-        let lock = self.filmstrips.get(camera_id)?;
-        let map = lock.read_recover();
-        map.get(&sequence).cloned()
     }
 
     pub fn get_detections(&self, camera_id: &str) -> Vec<DetectionSnapshot> {
@@ -133,10 +115,6 @@ impl DetectionStore {
                 }
             }
         }
-        if let Some(lock) = self.filmstrips.get(camera_id) {
-            let mut map = lock.write_recover();
-            map.retain(|&seq, _| seq >= min_sequence);
-        }
     }
 }
 
@@ -144,7 +122,6 @@ impl Clone for DetectionStore {
     fn clone(&self) -> Self {
         Self {
             cameras: Arc::clone(&self.cameras),
-            filmstrips: Arc::clone(&self.filmstrips),
             next_id: Arc::clone(&self.next_id),
         }
     }

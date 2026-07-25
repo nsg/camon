@@ -98,6 +98,10 @@ pub struct EventUpgrade {
 /// `pre_padding_ns` and never reaching before `min_start_seq` (the end of the
 /// previous event) or the start of the buffer.
 ///
+/// `filmstrip_frames` are the thumbnails the analyzer extracted for this run;
+/// they belong to the run, not to any single sequence, so they are handed in
+/// rather than looked up.
+///
 /// Returns `None` if none of the requested segments are in the buffer any
 /// more (only possible for runs longer than the hot buffer itself).
 #[allow(clippy::too_many_arguments)]
@@ -110,6 +114,7 @@ pub fn assemble_event(
     min_start_seq: u64,
     pre_padding_ns: u64,
     continues: bool,
+    filmstrip_frames: Option<Arc<Vec<Vec<u8>>>>,
 ) -> Option<FinishedEvent> {
     // Walk backwards from the first motion segment to find the pre-padding
     // start, matching the old rolling-window semantics (total pre-padding
@@ -149,7 +154,6 @@ pub fn assemble_event(
     let mut detection_details = Vec::new();
     let mut backend = None;
     let mut model = None;
-    let mut filmstrip_frames = None;
     if let Some(store) = detection_store {
         for seq in first_motion_seq..=last_seq {
             for info in store.get_detection_info(camera_id, seq) {
@@ -164,9 +168,6 @@ pub fn assemble_event(
                     backend = Some(info.backend);
                     model = Some(info.model);
                 }
-            }
-            if filmstrip_frames.is_none() {
-                filmstrip_frames = store.get_filmstrip(camera_id, seq);
             }
         }
     }
@@ -201,7 +202,7 @@ pub fn assemble_continuous_chunk(
 ) -> Option<FinishedEvent> {
     // min_start_seq == start_seq and pre_padding_ns == 0 suppress any reach-back.
     let mut event = assemble_event(
-        buffer, None, camera_id, start_seq, last_seq, start_seq, 0, continues,
+        buffer, None, camera_id, start_seq, last_seq, start_seq, 0, continues, None,
     )?;
     event.is_continuous = true;
     Some(event)
@@ -456,7 +457,7 @@ mod tests {
         let buffer = populated_buffer(10);
         let buf = buffer.read_recover();
         // Motion at seq 5, padding through seq 7, 2s of pre-padding.
-        let event = assemble_event(&buf, None, "cam", 5, 7, 0, 2 * SEC, false).unwrap();
+        let event = assemble_event(&buf, None, "cam", 5, 7, 0, 2 * SEC, false, None).unwrap();
         // Pre-padding reaches back to seq 3 (segments 3 and 4 fill 2s).
         assert_eq!(event.segments.len(), 5);
         assert_eq!(event.first_pts, 3 * SEC);
@@ -472,7 +473,7 @@ mod tests {
         let buffer = populated_buffer(10);
         let buf = buffer.read_recover();
         // Previous event ended at seq 4 — pre-padding must not reach past 5.
-        let event = assemble_event(&buf, None, "cam", 6, 8, 5, 30 * SEC, false).unwrap();
+        let event = assemble_event(&buf, None, "cam", 6, 8, 5, 30 * SEC, false, None).unwrap();
         assert_eq!(event.first_pts, 5 * SEC);
         assert_eq!(event.segments.len(), 4);
     }
@@ -490,7 +491,7 @@ mod tests {
         }
         let buf = buffer.read_recover();
         assert_eq!(buf.first_sequence(), 5);
-        let event = assemble_event(&buf, None, "cam", 7, 9, 0, 30 * SEC, false).unwrap();
+        let event = assemble_event(&buf, None, "cam", 7, 9, 0, 30 * SEC, false, None).unwrap();
         assert_eq!(event.first_pts, 5 * SEC);
         assert_eq!(event.segments.len(), 5);
     }
@@ -506,7 +507,7 @@ mod tests {
             }
         }
         let buf = buffer.read_recover();
-        assert!(assemble_event(&buf, None, "cam", 1, 3, 0, 0, false).is_none());
+        assert!(assemble_event(&buf, None, "cam", 1, 3, 0, 0, false, None).is_none());
     }
 
     #[test]
@@ -538,10 +539,20 @@ mod tests {
                 model: "test-model".to_string(),
             },
         );
-        store.insert_filmstrip("cam", 5, Arc::new(vec![vec![0xff]]));
-
         let buf = buffer.read_recover();
-        let event = assemble_event(&buf, Some(&store), "cam", 5, 7, 0, 0, false).unwrap();
+        let filmstrip = Arc::new(vec![vec![0xff]]);
+        let event = assemble_event(
+            &buf,
+            Some(&store),
+            "cam",
+            5,
+            7,
+            0,
+            0,
+            false,
+            Some(filmstrip),
+        )
+        .unwrap();
         assert!(event.has_objects);
         assert_eq!(event.object_classes, vec!["person".to_string()]);
         assert_eq!(event.backend.as_deref(), Some("ollama"));

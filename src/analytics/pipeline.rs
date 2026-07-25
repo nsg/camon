@@ -198,6 +198,64 @@ struct MotionSegment {
     duration_ns: u64,
 }
 
+/// The JPEG thumbnails of one closed motion run, shared with the event that
+/// carries them to warm storage.
+type Filmstrip = Arc<Vec<Vec<u8>>>;
+
+/// Frames kept per event once the run closes.
+const FILMSTRIP_FRAMES: usize = 4;
+/// Working size of an open run's accumulator. A run can last for hours, so
+/// past this the strip is halved rather than grown.
+const FILMSTRIP_ACCUMULATOR_CAP: usize = 8;
+
+/// Thumbnails extracted so far for the motion run that is currently open.
+/// Frames arrive batch by batch and belong to the run as a whole, not to any
+/// single segment, so they live here until the run closes.
+#[derive(Default)]
+struct RunFilmstrip {
+    frames: Vec<Vec<u8>>,
+}
+
+impl RunFilmstrip {
+    /// Add a batch's frames, dropping every second frame whenever the
+    /// accumulator outgrows its cap. Halving keeps the whole run covered at
+    /// coarser spacing instead of truncating it to its beginning or end.
+    fn push(&mut self, frames: Vec<Vec<u8>>) {
+        self.frames.extend(frames);
+        if self.frames.len() > FILMSTRIP_ACCUMULATOR_CAP {
+            let mut keep = 0;
+            self.frames.retain(|_| {
+                keep += 1;
+                keep % 2 == 1
+            });
+        }
+    }
+
+    /// Snapshot and reset, subsampled to at most [`FILMSTRIP_FRAMES`] frames
+    /// spread from the first to the last. `None` when nothing was extracted.
+    fn take(&mut self) -> Option<Filmstrip> {
+        let frames = std::mem::take(&mut self.frames);
+        if frames.is_empty() {
+            return None;
+        }
+        Some(Arc::new(subsample_filmstrip(frames)))
+    }
+}
+
+fn subsample_filmstrip(frames: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
+    let n = frames.len();
+    if n <= FILMSTRIP_FRAMES {
+        return frames;
+    }
+    let picks = [0, n / 3, 2 * n / 3, n - 1];
+    frames
+        .into_iter()
+        .enumerate()
+        .filter(|(i, _)| picks.contains(i))
+        .map(|(_, frame)| frame)
+        .collect()
+}
+
 struct PendingSegment {
     seq: u64,
     data: Arc<Vec<u8>>,
@@ -253,6 +311,7 @@ pub struct MotionAnalyzer {
     segment_crops: HashMap<u64, NormalizedRect>,
     segment_motion_rects: HashMap<u64, Vec<NormalizedRect>>,
     run_tracker: RunTracker,
+    run_filmstrip: RunFilmstrip,
     event_tx: Option<tokio::sync::mpsc::Sender<WriterMessage>>,
     pre_padding_ns: u64,
 }
@@ -298,6 +357,7 @@ impl MotionAnalyzer {
             segment_crops: HashMap::new(),
             segment_motion_rects: HashMap::new(),
             run_tracker: RunTracker::new(ctx.post_padding, ctx.max_event_duration),
+            run_filmstrip: RunFilmstrip::default(),
             event_tx: ctx.event_tx,
             pre_padding_ns: ctx.pre_padding_ns,
         })
@@ -374,8 +434,8 @@ impl MotionAnalyzer {
 
         // Emit after detection so runs that close in the same batch as their
         // motion segments still get object metadata.
-        for run in closed_runs {
-            self.emit_event(run);
+        for (run, filmstrip) in closed_runs {
+            self.emit_event(run, filmstrip);
         }
 
         Ok(())
@@ -417,15 +477,16 @@ impl MotionAnalyzer {
         Ok(segments)
     }
 
+    #[allow(clippy::type_complexity)]
     fn run_motion_analysis(
         &mut self,
         segments: Vec<PendingSegment>,
-    ) -> Result<(Vec<MotionSegment>, Vec<ClosedRun>), Box<dyn std::error::Error + Send + Sync>>
-    {
+    ) -> Result<
+        (Vec<MotionSegment>, Vec<(ClosedRun, Option<Filmstrip>)>),
+        Box<dyn std::error::Error + Send + Sync>,
+    > {
         let has_detection = self.detect_tx.is_some() && self.detection_store.is_some();
-        let capture_frames = self.detection_store.is_some();
         let mut motion_segments = Vec::new();
-        let mut motion_frames: Vec<(u64, Vec<u8>)> = Vec::new();
         let mut closed_runs = Vec::new();
 
         // Lifecycle timing is monotonic: the analyzer runs near real time, so
@@ -434,20 +495,20 @@ impl MotionAnalyzer {
         let now = Instant::now();
 
         for seg in segments {
-            let (score, crop, motion_rects, frame_jpeg) =
-                self.analyze_segment(&seg.data, capture_frames)?;
+            let (score, crop, motion_rects) = self.analyze_segment(&seg.data)?;
             self.publish_debug_maps();
 
             let has_motion = score >= MOTION_THRESHOLD;
+            // Whatever has accumulated belongs to the run that just closed:
+            // this batch's own frames are extracted later, in
+            // `run_sampled_detections`.
             if let Some(run) = self.run_tracker.observe(seg.seq, has_motion, now) {
-                closed_runs.push(run);
+                let filmstrip = self.run_filmstrip.take();
+                closed_runs.push((run, filmstrip));
             }
 
             if has_motion {
                 self.record_motion(seg.seq, seg.start_pts, seg.duration_ns, score);
-                if let Some(jpeg) = frame_jpeg {
-                    motion_frames.push((seg.seq, jpeg));
-                }
                 if has_detection {
                     if let Some(crop) = crop {
                         self.segment_crops.insert(seg.seq, crop);
@@ -466,17 +527,13 @@ impl MotionAnalyzer {
             self.last_processed = seg.seq + 1;
         }
 
-        if !motion_frames.is_empty() {
-            self.store_movement_filmstrips(motion_frames);
-        }
-
         Ok((motion_segments, closed_runs))
     }
 
     /// Assemble and hand off a finished event the moment its run closes.
     /// All segments in range are still hot and the metadata stores have not
     /// been cleaned up for them yet, so everything is read fresh here.
-    fn emit_event(&self, run: ClosedRun) {
+    fn emit_event(&self, run: ClosedRun, filmstrip: Option<Filmstrip>) {
         let tx = match self.event_tx {
             Some(ref tx) => tx,
             None => return,
@@ -493,6 +550,7 @@ impl MotionAnalyzer {
                 run.min_start_seq,
                 self.pre_padding_ns,
                 run.continues,
+                filmstrip,
             )
         };
         let event = match event {
@@ -544,49 +602,8 @@ impl MotionAnalyzer {
                 first_motion_seq = run.first_motion_seq,
                 "flushing open motion event at shutdown"
             );
-            self.emit_event(run);
-        }
-    }
-
-    fn store_movement_filmstrips(&self, frames: Vec<(u64, Vec<u8>)>) {
-        let ds = match self.detection_store {
-            Some(ref ds) => ds,
-            None => return,
-        };
-
-        // Group contiguous sequences into runs
-        let mut runs: Vec<Vec<(u64, Vec<u8>)>> = Vec::new();
-        for item in frames {
-            let start_new = match runs.last() {
-                Some(run) => item.0 != run.last().unwrap().0 + 1,
-                None => true,
-            };
-            if start_new {
-                runs.push(vec![item]);
-            } else {
-                runs.last_mut().unwrap().push(item);
-            }
-        }
-
-        for run in runs {
-            let seqs: Vec<u64> = run.iter().map(|(seq, _)| *seq).collect();
-            let all_jpegs: Vec<Vec<u8>> = run.into_iter().map(|(_, jpeg)| jpeg).collect();
-
-            // Subsample to at most 4 representative frames
-            let filmstrip_jpegs: Vec<Vec<u8>> = if all_jpegs.len() <= 4 {
-                all_jpegs
-            } else {
-                let n = all_jpegs.len();
-                [0, n / 3, 2 * n / 3, n - 1]
-                    .iter()
-                    .map(|&i| all_jpegs[i].clone())
-                    .collect()
-            };
-
-            let filmstrip = Arc::new(filmstrip_jpegs);
-            for seq in &seqs {
-                ds.insert_filmstrip(&self.camera_id, *seq, Arc::clone(&filmstrip));
-            }
+            let filmstrip = self.run_filmstrip.take();
+            self.emit_event(run, filmstrip);
         }
     }
 
@@ -642,27 +659,20 @@ impl MotionAnalyzer {
     fn analyze_segment(
         &mut self,
         data: &[u8],
-        capture_frame: bool,
     ) -> Result<
-        (
-            f32,
-            Option<NormalizedRect>,
-            Vec<NormalizedRect>,
-            Option<Vec<u8>>,
-        ),
+        (f32, Option<NormalizedRect>, Vec<NormalizedRect>),
         Box<dyn std::error::Error + Send + Sync>,
     > {
         let raw_frames = self.decoder.decode_segment(data);
 
         if raw_frames.is_empty() {
-            return Ok((0.0, None, Vec::new(), None));
+            return Ok((0.0, None, Vec::new()));
         }
 
         let (w, h) = (ANALYSIS_WIDTH as usize, ANALYSIS_HEIGHT as usize);
         let mut total_score = 0.0f32;
         let mut frame_count = 0u32;
         let mut all_rects = Vec::new();
-        let mut last_frame: Option<&Vec<u8>> = None;
 
         for frame_data in &raw_frames {
             let score = self.detector.process_frame(frame_data, w, h);
@@ -671,21 +681,11 @@ impl MotionAnalyzer {
             for &r in self.detector.motion_bboxes() {
                 all_rects.push(normalize_rect(r, ANALYSIS_WIDTH, ANALYSIS_HEIGHT));
             }
-            if capture_frame {
-                last_frame = Some(frame_data);
-            }
         }
 
         let crop = union_rects_padded(&all_rects, CROP_PADDING);
 
-        let frame_jpeg = last_frame.and_then(|f| gray_jpeg((f.as_slice(), w, h)));
-
-        Ok((
-            total_score / frame_count as f32,
-            crop,
-            all_rects,
-            frame_jpeg,
-        ))
+        Ok((total_score / frame_count as f32, crop, all_rects))
     }
 
     // --- Phase 2: Generic frame extraction + detection ---
@@ -812,7 +812,6 @@ impl MotionAnalyzer {
             .collect();
 
         let filmstrip_jpegs: Vec<Vec<u8>> = cropped.iter().filter_map(rgb_jpeg).collect();
-        self.store_filmstrip_for_run(&run, &filmstrip_jpegs);
 
         // Remove consumed segment data
         for seg in &run {
@@ -826,22 +825,15 @@ impl MotionAnalyzer {
                 DetectionJob {
                     camera_id: self.camera_id.clone(),
                     seqs: run.iter().map(|seg| seg.seq).collect(),
-                    crop_jpegs: filmstrip_jpegs,
+                    crop_jpegs: filmstrip_jpegs.clone(),
                     full_frame_jpeg,
                     motion_rects: all_motion_rects,
                     run_crop: run_crop.map(|c| (c.x, c.y, c.w, c.h)),
                 },
             );
         }
-    }
 
-    fn store_filmstrip_for_run(&self, run: &[MotionSegment], jpegs: &[Vec<u8>]) {
-        if let Some(ref ds) = self.detection_store {
-            let filmstrip = Arc::new(jpegs.to_vec());
-            for seg in run {
-                ds.insert_filmstrip(&self.camera_id, seg.seq, Arc::clone(&filmstrip));
-            }
-        }
+        self.run_filmstrip.push(filmstrip_jpegs);
     }
 }
 
@@ -1273,6 +1265,67 @@ mod tests {
         assert!(is_black(&frame, 19, 19));
         assert!(!is_black(&frame, 9, 10));
         assert!(!is_black(&frame, 20, 20));
+    }
+
+    /// One-byte stand-ins for JPEGs, tagged so subsampling order is visible.
+    fn frames(tags: &[u8]) -> Vec<Vec<u8>> {
+        tags.iter().map(|&t| vec![t]).collect()
+    }
+
+    fn tags(frames: &[Vec<u8>]) -> Vec<u8> {
+        frames.iter().map(|f| f[0]).collect()
+    }
+
+    #[test]
+    fn run_filmstrip_accumulates_across_batches() {
+        let mut strip = RunFilmstrip::default();
+        strip.push(frames(&[1, 2]));
+        strip.push(frames(&[3]));
+        let taken = strip.take().unwrap();
+        assert_eq!(tags(&taken), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn run_filmstrip_take_resets_and_is_none_when_empty() {
+        let mut strip = RunFilmstrip::default();
+        assert!(strip.take().is_none());
+        strip.push(frames(&[1]));
+        assert!(strip.take().is_some());
+        assert!(strip.take().is_none());
+    }
+
+    #[test]
+    fn run_filmstrip_halves_past_the_cap() {
+        let mut strip = RunFilmstrip::default();
+        for batch in 0..6u8 {
+            strip.push(frames(&[batch * 2, batch * 2 + 1]));
+        }
+        assert!(strip.frames.len() <= FILMSTRIP_ACCUMULATOR_CAP);
+        let taken = strip.take().unwrap();
+        assert_eq!(taken.len(), FILMSTRIP_FRAMES);
+        // Coverage still spans the run: first frame kept, last batch present.
+        assert_eq!(taken[0], vec![0]);
+        assert!(taken[FILMSTRIP_FRAMES - 1][0] >= 8);
+    }
+
+    #[test]
+    fn run_filmstrip_subsamples_spread_over_the_run() {
+        let mut strip = RunFilmstrip::default();
+        strip.push(frames(&[0, 1, 2, 3, 4, 5]));
+        let taken = strip.take().unwrap();
+        assert_eq!(tags(&taken), vec![0, 2, 4, 5]);
+    }
+
+    #[test]
+    fn run_filmstrip_close_does_not_steal_the_next_runs_frames() {
+        // Batch order in the analyzer: a run closes (take) before this batch's
+        // own frames are extracted (push).
+        let mut strip = RunFilmstrip::default();
+        strip.push(frames(&[1, 2]));
+        let closed = strip.take().unwrap();
+        strip.push(frames(&[3]));
+        assert_eq!(tags(&closed), vec![1, 2]);
+        assert_eq!(tags(&strip.take().unwrap()), vec![3]);
     }
 
     #[test]

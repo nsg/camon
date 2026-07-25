@@ -853,7 +853,7 @@ mod tests {
         let buffer = populated_buffer(10);
         let mut event = {
             let buf = buffer.read_recover();
-            assemble_event(&buf, None, "cam", 5, 7, 0, SEC, false).unwrap()
+            assemble_event(&buf, None, "cam", 5, 7, 0, SEC, false, None).unwrap()
         };
         event.filmstrip_frames = Some(std::sync::Arc::new(vec![vec![0xff], vec![0xfe]]));
 
@@ -897,7 +897,7 @@ mod tests {
         // movement-only, continues == true.
         let event = {
             let buf = buffer.read_recover();
-            assemble_event(&buf, None, "cam", 5, 7, 5, 0, true).unwrap()
+            assemble_event(&buf, None, "cam", 5, 7, 5, 0, true, None).unwrap()
         };
         assert!(!event.has_objects);
         assert!(event.continues);
@@ -927,7 +927,7 @@ mod tests {
         let buffer = populated_buffer(10);
         let mut event = {
             let buf = buffer.read_recover();
-            assemble_event(&buf, None, "cam", 5, 7, 0, SEC, false).unwrap()
+            assemble_event(&buf, None, "cam", 5, 7, 0, SEC, false, None).unwrap()
         };
         event.filmstrip_frames = Some(std::sync::Arc::new(vec![vec![0xff], vec![0xfe]]));
         let first_pts = event.first_pts;
@@ -983,7 +983,7 @@ mod tests {
         let buffer = populated_buffer(10);
         let event = {
             let buf = buffer.read_recover();
-            assemble_event(&buf, None, "cam", 5, 7, 5, 0, true).unwrap()
+            assemble_event(&buf, None, "cam", 5, 7, 5, 0, true, None).unwrap()
         };
         let first_pts = event.first_pts;
         let index = WarmEventIndex::new(&["cam".to_string()], dir.path().to_path_buf());
@@ -1103,7 +1103,7 @@ mod tests {
         let buffer = populated_buffer(10);
         let mut event = {
             let buf = buffer.read_recover();
-            assemble_event(&buf, None, "cam", 5, 7, 0, SEC, false).unwrap()
+            assemble_event(&buf, None, "cam", 5, 7, 0, SEC, false, None).unwrap()
         };
         event.filmstrip_frames = Some(std::sync::Arc::new(vec![vec![0xff], vec![0xfe]]));
         let first_pts = event.first_pts;
@@ -1266,7 +1266,7 @@ mod tests {
         let buffer = populated_buffer(10);
         let event = {
             let buf = buffer.read_recover();
-            assemble_event(&buf, None, "cam", 5, 7, 0, SEC, false).unwrap()
+            assemble_event(&buf, None, "cam", 5, 7, 0, SEC, false, None).unwrap()
         };
         let first_pts = event.first_pts;
         let backend = LocalDiskBackend::new(dir.path().to_path_buf(), &["cam".to_string()]);
