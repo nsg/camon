@@ -159,6 +159,15 @@ impl CropDecoder {
                 "-hide_banner",
                 "-loglevel",
                 "quiet",
+                // A crop decoder is spawned per batch and fed ~4s of segments,
+                // less than ffmpeg's default stream-analysis window — without
+                // these it emits nothing before the pipe goes idle.
+                "-probesize",
+                "262144",
+                "-analyzeduration",
+                "0",
+                "-fflags",
+                "nobuffer",
                 "-f",
                 "mpegts",
                 "-i",
