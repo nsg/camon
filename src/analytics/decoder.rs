@@ -9,9 +9,11 @@ const ANALYSIS_HEIGHT: u32 = 240;
 const FRAME_SIZE: usize = (ANALYSIS_WIDTH * ANALYSIS_HEIGHT) as usize;
 const FRAME_READ_TIMEOUT: Duration = Duration::from_millis(500);
 
-const CROP_WIDTH: u32 = 1920;
-const CROP_HEIGHT: u32 = 1080;
-const CROP_FRAME_SIZE: usize = (CROP_WIDTH * CROP_HEIGHT * 3) as usize;
+/// Crop decoder output size when the frames feed the vision model: its native
+/// input resolution, so a small object survives the crop.
+pub const DETECTION_CROP_SIZE: (u32, u32) = (1920, 1080);
+/// Crop decoder output size when the frames only become event thumbnails.
+pub const THUMBNAIL_CROP_SIZE: (u32, u32) = (640, 360);
 
 struct FfmpegPipe {
     segment_tx: Option<SyncSender<Vec<u8>>>,
@@ -149,11 +151,13 @@ impl FrameDecoder {
 pub struct CropDecoder {
     pipe: FfmpegPipe,
     sample_fps: u32,
+    width: u32,
+    height: u32,
 }
 
 impl CropDecoder {
-    pub fn new(sample_fps: u32) -> Result<Self, std::io::Error> {
-        let scale_filter = format!("fps={sample_fps},scale={CROP_WIDTH}:{CROP_HEIGHT}");
+    pub fn new(sample_fps: u32, (width, height): (u32, u32)) -> Result<Self, std::io::Error> {
+        let scale_filter = format!("fps={sample_fps},scale={width}:{height}");
         let pipe = spawn_ffmpeg_pipe(
             &[
                 "-hide_banner",
@@ -180,12 +184,17 @@ impl CropDecoder {
                 "rgb24",
                 "pipe:1",
             ],
-            CROP_FRAME_SIZE,
+            (width * height * 3) as usize,
             16,
             16,
         )?;
 
-        Ok(Self { pipe, sample_fps })
+        Ok(Self {
+            pipe,
+            sample_fps,
+            width,
+            height,
+        })
     }
 
     pub fn decode_segment(&self, data: &[u8], duration_ns: u64) -> Vec<Vec<u8>> {
@@ -205,11 +214,11 @@ impl CropDecoder {
     }
 
     pub fn width(&self) -> u32 {
-        CROP_WIDTH
+        self.width
     }
 
     pub fn height(&self) -> u32 {
-        CROP_HEIGHT
+        self.height
     }
 }
 

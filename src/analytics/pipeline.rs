@@ -14,7 +14,7 @@ use crate::config::AnalyticsConfig;
 use crate::locks::LockExt;
 use crate::storage::{DetectionStore, EventRecord, EventRegistry, MotionEntry, MotionStore};
 
-use super::decoder::{CropDecoder, FrameDecoder};
+use super::decoder::{CropDecoder, FrameDecoder, DETECTION_CROP_SIZE, THUMBNAIL_CROP_SIZE};
 use super::detect_worker::{enqueue_job, DetectionJob};
 use super::motion::{MotionBox, MotionDetector};
 use super::run_tracker::{ClosedRun, RunTracker};
@@ -242,6 +242,33 @@ impl RunFilmstrip {
     }
 }
 
+/// What this camera's color frames are extracted for. Detection needs the
+/// vision model's input resolution; thumbnails alone are far cheaper to decode,
+/// and with no consumer at all the crop decoder never runs.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum FrameUse {
+    None,
+    Thumbnails,
+    Detection,
+}
+
+impl FrameUse {
+    fn of(records_events: bool, detects_objects: bool) -> Self {
+        match (records_events, detects_objects) {
+            (_, true) => Self::Detection,
+            (true, false) => Self::Thumbnails,
+            (false, false) => Self::None,
+        }
+    }
+
+    fn crop_size(self) -> (u32, u32) {
+        match self {
+            Self::Detection => DETECTION_CROP_SIZE,
+            _ => THUMBNAIL_CROP_SIZE,
+        }
+    }
+}
+
 fn subsample_filmstrip(frames: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
     let n = frames.len();
     if n <= FILMSTRIP_FRAMES {
@@ -311,6 +338,7 @@ pub struct MotionAnalyzer {
     segment_crops: HashMap<u64, NormalizedRect>,
     segment_motion_rects: HashMap<u64, Vec<NormalizedRect>>,
     run_tracker: RunTracker,
+    frame_use: FrameUse,
     run_filmstrip: RunFilmstrip,
     event_tx: Option<tokio::sync::mpsc::Sender<WriterMessage>>,
     pre_padding_ns: u64,
@@ -334,6 +362,7 @@ impl MotionAnalyzer {
             .map(|s| s.detection_mask.clone())
             .unwrap_or_else(|| vec![false; MASK_CELLS]);
         let decoder = FrameDecoder::new()?;
+        let frame_use = FrameUse::of(ctx.event_tx.is_some(), ctx.detect_tx.is_some());
 
         let last_processed = ctx
             .motion_store
@@ -357,6 +386,7 @@ impl MotionAnalyzer {
             segment_crops: HashMap::new(),
             segment_motion_rects: HashMap::new(),
             run_tracker: RunTracker::new(ctx.post_padding, ctx.max_event_duration),
+            frame_use,
             run_filmstrip: RunFilmstrip::default(),
             event_tx: ctx.event_tx,
             pre_padding_ns: ctx.pre_padding_ns,
@@ -429,7 +459,7 @@ impl MotionAnalyzer {
         let (motion_segments, closed_runs) = self.run_motion_analysis(segments)?;
 
         if !motion_segments.is_empty() {
-            self.run_sampled_detections(motion_segments);
+            self.process_motion_runs(motion_segments);
         }
 
         // Emit after detection so runs that close in the same batch as their
@@ -485,7 +515,7 @@ impl MotionAnalyzer {
         (Vec<MotionSegment>, Vec<(ClosedRun, Option<Filmstrip>)>),
         Box<dyn std::error::Error + Send + Sync>,
     > {
-        let has_detection = self.detect_tx.is_some() && self.detection_store.is_some();
+        let extract_frames = self.frame_use != FrameUse::None;
         let mut motion_segments = Vec::new();
         let mut closed_runs = Vec::new();
 
@@ -501,7 +531,7 @@ impl MotionAnalyzer {
             let has_motion = score >= MOTION_THRESHOLD;
             // Whatever has accumulated belongs to the run that just closed:
             // this batch's own frames are extracted later, in
-            // `run_sampled_detections`.
+            // `process_motion_runs`.
             if let Some(run) = self.run_tracker.observe(seg.seq, has_motion, now) {
                 let filmstrip = self.run_filmstrip.take();
                 closed_runs.push((run, filmstrip));
@@ -509,7 +539,7 @@ impl MotionAnalyzer {
 
             if has_motion {
                 self.record_motion(seg.seq, seg.start_pts, seg.duration_ns, score);
-                if has_detection {
+                if extract_frames {
                     if let Some(crop) = crop {
                         self.segment_crops.insert(seg.seq, crop);
                     }
@@ -690,8 +720,11 @@ impl MotionAnalyzer {
 
     // --- Phase 2: Generic frame extraction + detection ---
 
-    fn run_sampled_detections(&mut self, segments: Vec<MotionSegment>) {
-        let crop_decoder = match CropDecoder::new(self.config.sample_fps) {
+    fn process_motion_runs(&mut self, segments: Vec<MotionSegment>) {
+        let crop_decoder = match CropDecoder::new(
+            self.config.sample_fps,
+            self.frame_use.crop_size(),
+        ) {
             Ok(d) => d,
             Err(e) => {
                 tracing::error!(camera = %self.camera_id, error = %e, "failed to create crop decoder");
@@ -701,7 +734,7 @@ impl MotionAnalyzer {
 
         let runs = group_contiguous_runs(segments);
         for run in runs {
-            self.detect_run(run, &crop_decoder);
+            self.process_run(run, &crop_decoder);
         }
     }
 
@@ -745,12 +778,13 @@ impl MotionAnalyzer {
         subsample_tagged(all_frames)
     }
 
-    /// Prepare a crop job for one contiguous motion run and hand it to the
-    /// global detection worker. This never blocks: the frames are extracted,
-    /// cropped, and JPEG-encoded here, then `try_send`-queued. If the queue
-    /// is full the job is dropped with a warning — the motion event still
-    /// persists; only the object upgrade is lost.
-    fn detect_run(&mut self, run: Vec<MotionSegment>, crop_decoder: &CropDecoder) {
+    /// Extract, crop and JPEG-encode the color frames of one contiguous motion
+    /// run. They become the filmstrip of the event the run belongs to, and —
+    /// when object detection is on — a crop job for the global detection
+    /// worker. Handing that job off never blocks: it is `try_send`-queued, and
+    /// a full queue drops it with a warning, costing the object upgrade but
+    /// never the event.
+    fn process_run(&mut self, run: Vec<MotionSegment>, crop_decoder: &CropDecoder) {
         if run.is_empty() {
             return;
         }
@@ -780,18 +814,22 @@ impl MotionAnalyzer {
         // Encode a full (uncropped) frame for debug overlay. Pick the first
         // tagged frame that has a crop (i.e. had motion). The detection mask
         // is blacked out here too so the debug UI shows exactly what the model
-        // could not see.
-        let full_frame_jpeg = tagged_frames
-            .iter()
-            .find(|(_, crop)| crop.is_some())
-            .and_then(|(frame, _)| {
-                let mut f = frame.clone();
-                apply_detection_mask(&mut f, FULL_FRAME, &self.detection_mask);
-                rgb_jpeg(&f)
-            });
+        // could not see. Only the detection debug UI reads it, so it is not
+        // encoded at all without object detection.
+        let full_frame_jpeg = self.detect_tx.as_ref().and_then(|_| {
+            tagged_frames
+                .iter()
+                .find(|(_, crop)| crop.is_some())
+                .and_then(|(frame, _)| {
+                    let mut f = frame.clone();
+                    apply_detection_mask(&mut f, FULL_FRAME, &self.detection_mask);
+                    rgb_jpeg(&f)
+                })
+        });
 
         // Apply per-frame crops, then black out any painted detection-mask
-        // cells so the model never sees masked pixels. A frame with no crop
+        // cells so masked pixels reach neither the model nor a stored
+        // thumbnail. A frame with no crop
         // falls back to the whole frame (region [0,0,1,1]); the mask is
         // applied in that region's coordinate space either way.
         let cropped: Vec<RgbFrame> = tagged_frames
@@ -1274,6 +1312,23 @@ mod tests {
 
     fn tags(frames: &[Vec<u8>]) -> Vec<u8> {
         frames.iter().map(|f| f[0]).collect()
+    }
+
+    #[test]
+    fn frames_are_extracted_for_events_without_object_detection() {
+        assert_eq!(FrameUse::of(true, false), FrameUse::Thumbnails);
+        assert_eq!(FrameUse::of(true, true), FrameUse::Detection);
+        // Detection without warm storage still needs its input frames.
+        assert_eq!(FrameUse::of(false, true), FrameUse::Detection);
+        // Nothing consumes them: no crop decoding at all.
+        assert_eq!(FrameUse::of(false, false), FrameUse::None);
+    }
+
+    #[test]
+    fn thumbnails_only_decode_smaller_frames() {
+        assert_eq!(FrameUse::Detection.crop_size(), DETECTION_CROP_SIZE);
+        assert_eq!(FrameUse::Thumbnails.crop_size(), THUMBNAIL_CROP_SIZE);
+        assert!(THUMBNAIL_CROP_SIZE.0 < DETECTION_CROP_SIZE.0);
     }
 
     #[test]
