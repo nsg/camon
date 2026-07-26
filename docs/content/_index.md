@@ -48,7 +48,7 @@ Beyond running as an ingress add-on, camon can bridge to Home Assistant over MQT
 
 ## Error Handling
 
-Camera disconnections are handled with automatic reconnection using exponential backoff (5s, doubling up to a 60s cap, with jitter); the delay resets after a stream stays healthy. A data watchdog reconnects a stream that stops delivering bytes, and a tripwire reconnects one that delivers data but produces no keyframes. Cameras operate independently — one disconnecting doesn't affect others.
+Camera disconnections are handled with automatic reconnection using exponential backoff (5s, doubling up to a 60s cap, with jitter); the delay resets after a stream stays healthy. A data watchdog reconnects a stream that stops delivering bytes, and a tripwire reconnects one that delivers data but produces no keyframes. The analysis decoders get the same treatment: handing a segment to a decoder is bounded rather than blocking, so an FFmpeg process that stops reading its input is killed and respawned instead of freezing motion analysis, and a decoder that consumes segments without emitting frames is caught by a zero-frame tripwire and respawned too. Cameras operate independently — one disconnecting doesn't affect others.
 
 ## System Dependencies
 

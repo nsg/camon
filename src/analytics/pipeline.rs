@@ -15,7 +15,9 @@ use crate::locks::LockExt;
 use crate::mqtt::{send_event, MqttEvent};
 use crate::storage::{DetectionStore, EventRecord, EventRegistry, MotionEntry, MotionStore};
 
-use super::decoder::{CropDecoder, FrameDecoder, DETECTION_CROP_SIZE, THUMBNAIL_CROP_SIZE};
+use super::decoder::{
+    CropDecoder, DecodeOutcome, FrameDecoder, DETECTION_CROP_SIZE, THUMBNAIL_CROP_SIZE,
+};
 use super::detect_worker::{enqueue_job, DetectionJob};
 use super::motion::{MotionBox, MotionDetector};
 use super::run_tracker::{ClosedRun, RunTracker};
@@ -28,6 +30,46 @@ const MOTION_THRESHOLD: f32 = 0.05;
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
 const CROP_PADDING: f32 = 0.2;
 const MIN_CROP_FRACTION: f32 = 0.15;
+
+/// Consecutive zero-frame decodes tolerated before the decoder is declared
+/// blind. A segment is one GOP and always opens on a keyframe, so a healthy
+/// decode yields at least one I-frame — but pipe buffering can push a frame
+/// past the read timeout into the next segment's read window, so a single
+/// empty decode proves nothing. Only an unbroken streak does, and at roughly
+/// one segment per second thirty of them is about half a minute of blindness:
+/// long enough that no buffering hiccup explains it, short enough that little
+/// motion is missed before the respawn.
+const BLIND_DECODER_STREAK: u32 = 30;
+
+/// Counts consecutive zero-frame decodes so an ffmpeg that consumes input but
+/// emits nothing is caught. Without it the analyzer scores empty frame lists
+/// forever, silently: the child is alive, so the liveness check never fires.
+#[derive(Default)]
+struct ZeroFrameTripwire {
+    streak: u32,
+}
+
+impl ZeroFrameTripwire {
+    /// Record one decode's frame count. Returns `true` when the streak reaches
+    /// [`BLIND_DECODER_STREAK`], which also resets it — a decoder still blind
+    /// after its respawn trips again rather than going quiet.
+    fn observe(&mut self, frames: usize) -> bool {
+        if frames > 0 {
+            self.streak = 0;
+            return false;
+        }
+        self.streak += 1;
+        if self.streak >= BLIND_DECODER_STREAK {
+            self.streak = 0;
+            return true;
+        }
+        false
+    }
+
+    fn reset(&mut self) {
+        self.streak = 0;
+    }
+}
 
 #[derive(Clone, Copy)]
 struct NormalizedRect {
@@ -331,6 +373,10 @@ pub struct MotionAnalyzer {
     config: AnalyticsConfig,
     detector: MotionDetector,
     decoder: FrameDecoder,
+    /// Watches for a decoder that consumes segments but returns no frames. The
+    /// detector above is deliberately not part of the decoder, so a respawn
+    /// leaves the learned MOG2 background model intact.
+    zero_frames: ZeroFrameTripwire,
     detect_tx: Option<tokio::sync::mpsc::Sender<DetectionJob>>,
     event_registry: Option<EventRegistry>,
     last_processed: u64,
@@ -384,6 +430,7 @@ impl MotionAnalyzer {
             config: ctx.config,
             detector,
             decoder,
+            zero_frames: ZeroFrameTripwire::default(),
             detect_tx: ctx.detect_tx,
             event_registry: ctx.event_registry,
             last_processed,
@@ -728,7 +775,29 @@ impl MotionAnalyzer {
         (f32, Option<NormalizedRect>, Vec<NormalizedRect>),
         Box<dyn std::error::Error + Send + Sync>,
     > {
-        let raw_frames = self.decoder.decode_segment(data);
+        let raw_frames = match self.decoder.decode_segment(data) {
+            DecodeOutcome::Frames(frames) => frames,
+            DecodeOutcome::Wedged => {
+                tracing::warn!(
+                    camera = %self.camera_id,
+                    "decoder stopped consuming input, restarting"
+                );
+                // The respawned decoder starts from a clean slate, so the
+                // streak the wedge interrupted says nothing about it.
+                self.zero_frames.reset();
+                self.decoder.kill();
+                return Ok((0.0, None, Vec::new()));
+            }
+        };
+
+        if self.zero_frames.observe(raw_frames.len()) {
+            tracing::error!(
+                camera = %self.camera_id,
+                segments = BLIND_DECODER_STREAK,
+                "decoder produced no frames for consecutive segments, restarting"
+            );
+            self.decoder.kill();
+        }
 
         if raw_frames.is_empty() {
             return Ok((0.0, None, Vec::new()));
@@ -1416,6 +1485,48 @@ mod tests {
         strip.push(frames(&[3]));
         assert_eq!(tags(&closed), vec![1, 2]);
         assert_eq!(tags(&strip.take().unwrap()), vec![3]);
+    }
+
+    #[test]
+    fn zero_frame_tripwire_resets_on_any_decoded_frame() {
+        let mut tripwire = ZeroFrameTripwire::default();
+        for _ in 0..BLIND_DECODER_STREAK - 1 {
+            assert!(!tripwire.observe(0));
+        }
+        assert!(!tripwire.observe(1), "a decoded frame clears the streak");
+        for _ in 0..BLIND_DECODER_STREAK - 1 {
+            assert!(!tripwire.observe(0), "streak restarts from zero");
+        }
+    }
+
+    #[test]
+    fn zero_frame_tripwire_trips_at_the_threshold_and_rearms() {
+        let mut tripwire = ZeroFrameTripwire::default();
+        for _ in 0..BLIND_DECODER_STREAK - 1 {
+            assert!(!tripwire.observe(0));
+        }
+        assert!(
+            tripwire.observe(0),
+            "trips on the threshold-th empty decode"
+        );
+        // A decoder that stays blind after its respawn must trip again.
+        for _ in 0..BLIND_DECODER_STREAK - 1 {
+            assert!(!tripwire.observe(0));
+        }
+        assert!(tripwire.observe(0));
+    }
+
+    #[test]
+    fn zero_frame_tripwire_reset_clears_a_partial_streak() {
+        let mut tripwire = ZeroFrameTripwire::default();
+        for _ in 0..BLIND_DECODER_STREAK - 1 {
+            assert!(!tripwire.observe(0));
+        }
+        tripwire.reset();
+        assert!(
+            !tripwire.observe(0),
+            "reset streak needs the full run again"
+        );
     }
 
     #[test]
