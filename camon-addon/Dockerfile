@@ -23,7 +23,7 @@ FROM rust:1-bookworm AS builder
 # repository at the version tag matching config.yaml instead (the workflow
 # passes CAMON_VERSION derived from config.yaml) — pinned, so the add-on
 # always builds the exact released source.
-ARG CAMON_VERSION=v0.3.3
+ARG CAMON_VERSION=v0.4.0
 RUN git clone --depth 1 --branch ${CAMON_VERSION} https://github.com/nsg/camon /src
 WORKDIR /src
 RUN cargo build --release --locked --bin camon

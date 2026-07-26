@@ -5,7 +5,7 @@
 # x86_64 here. ARM is deliberately deferred (see DOCS.md).
 name: Camon
 slug: camon
-version: "0.3.3"
+version: "0.4.0"
 description: Multi-camera NVR with real-time motion/object analytics and tiered storage
 url: https://github.com/nsg/camon
 arch:

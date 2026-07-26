@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.4.0
+
+- **Native Home Assistant entities via MQTT discovery.** Install the
+  Mosquitto broker add-on (plus the MQTT integration) and camon configures
+  itself from the Supervisor — no settings needed. Each camera appears as
+  its own Home Assistant device with:
+  - a **snapshot camera** entity, updated only while motion is being
+    detected (by design: idle cameras publish nothing),
+  - a **motion** binary sensor, on for the duration of a motion event,
+  - one **occupancy** binary sensor per object-detection class (e.g.
+    `person`, `car`) that clears a configurable hold time after the last
+    sighting — handy for showing a camera card only when a person is
+    around, but not for every passing car.
+  Without a broker the add-on runs exactly as before; an external broker
+  can be configured under `[mqtt]` in `camon.toml`. See DOCS for details.
+- **Camera ids are validated at startup when MQTT is enabled.** Ids
+  containing the MQTT wildcards `+` or `#`, or two ids that normalize to
+  the same slug (`Front Door` vs `front-door`), would silently break or
+  collide in Home Assistant — camon now refuses to start with an error
+  naming the camera to rename instead.
+- **Motion analysis survives a frozen ffmpeg.** A decoder process that
+  stalls (for example under severe host memory pressure) used to freeze
+  motion detection silently while recording continued. Handing frames to
+  the decoder is now bounded, and a decoder that consumes video without
+  producing frames is caught by a tripwire — both cases kill and respawn
+  the decoder automatically.
+- Dependency refresh clearing all outstanding `cargo audit` advisories.
+
 ## 0.3.3
 
 - **Event thumbnails are now color filmstrips for every event.** The crop
