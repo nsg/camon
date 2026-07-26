@@ -44,7 +44,7 @@ Vanilla HTML/CSS/JS served from the Rust binary with video playback via Vidstack
 
 ## Home Assistant
 
-Beyond running as an ingress add-on, camon can bridge to Home Assistant over MQTT (`[mqtt]` in the config; auto-configured from the Supervisor in the add-on). It publishes retained MQTT discovery messages so each camera materializes as a native HA device with three entity kinds: a snapshot camera fed with JPEG frames only while motion is active (decoded on demand from the newest hot-buffer segment — idle cameras cost nothing), a motion binary sensor tracking the physical motion run, and one occupancy binary sensor per object-detection class that holds for a configurable time after the last sighting. The bridge is strictly outbound — it subscribes to nothing — and marks all entities unavailable via a broker last-will if camon dies.
+Beyond running as an ingress add-on, camon can bridge to Home Assistant over MQTT (`[mqtt]` in the config; auto-configured from the Supervisor in the add-on). It publishes retained MQTT discovery messages so each camera materializes as a native HA device with four entity kinds: a snapshot camera fed with JPEG frames only while motion is active (decoded on demand from the newest hot-buffer segment — idle cameras cost nothing), a motion binary sensor tracking the physical motion run, one occupancy binary sensor per object-detection class that holds for a configurable time after the last sighting, and one snapshot camera per such class showing the cropped frame from the last sighting of that class (retained, so it persists across restarts). The bridge is strictly outbound — it subscribes to nothing — and marks all entities unavailable via a broker last-will if camon dies.
 
 ## Error Handling
 

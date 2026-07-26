@@ -9,13 +9,28 @@
 //!
 //! # Entities
 //!
-//! Per camera, three kinds of entity:
+//! Per camera, four kinds of entity:
 //!
 //! - a **camera** fed by JPEG snapshots;
 //! - a **motion** binary sensor, ON for the lifetime of a motion run;
 //! - one **occupancy** binary sensor per configured object-detection class, ON
 //!   from the moment a verdict names that class until `occupancy_hold_secs`
-//!   pass with no new sighting.
+//!   pass with no new sighting;
+//! - one **occupancy snapshot** camera per configured class, holding the crop
+//!   the vision model classified — see below.
+//!
+//! # Per-class sighting snapshots
+//!
+//! A verdict carries, per named class, the JPEG the model actually looked at:
+//! the motion crop of the frame with that class's strongest detection. It is
+//! published retained, so the entity is not tied to the occupancy sensor's
+//! hold-off — it keeps showing the last sighting of that class indefinitely,
+//! long after the sensor went OFF, and is there the moment Home Assistant
+//! subscribes. "When did a cat last walk past, and what did it look like" is
+//! then one dashboard tile rather than an event search. The bytes are not held
+//! in memory, so unlike the sensor states these are not re-asserted on
+//! reconnect; a broker that loses its retained set fills the tile in again on
+//! the next sighting.
 //!
 //! # Motion-gated snapshots
 //!
@@ -105,11 +120,25 @@ pub enum MqttEvent {
     MotionStart { camera_id: String },
     /// The motion run closed (post-padding elapsed, or a shutdown flush).
     MotionEnd { camera_id: String },
-    /// A detection verdict, already deduplicated and confidence-filtered.
+    /// A detection verdict, already deduplicated and confidence-filtered: one
+    /// entry per named class, each with the frame that evidences it.
     Detections {
         camera_id: String,
-        classes: Vec<String>,
+        sightings: Vec<Sighting>,
     },
+}
+
+/// One class a verdict named, together with the picture behind it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Sighting {
+    /// The object class, as configured in `analytics.object_detection.classes`.
+    pub class: String,
+    /// The JPEG the vision model classified — the motion crop of the frame
+    /// holding this class's highest-confidence detection, falling back to the
+    /// run's full frame. `None` when the job carried no frame at all, in which
+    /// case nothing is published to the snapshot topic and the entity keeps
+    /// showing the previous sighting.
+    pub frame_jpeg: Option<Vec<u8>>,
 }
 
 /// Hand an event to the bridge without ever blocking the producer. Both
@@ -182,6 +211,12 @@ impl Topics {
         format!("{}/{}/occupancy/{}", self.prefix, camera_id, class)
     }
 
+    /// The retained crop behind the last sighting of `class`. A subtopic of the
+    /// occupancy state topic so the two read as one pair in an MQTT explorer.
+    fn occupancy_snapshot(&self, camera_id: &str, class: &str) -> String {
+        format!("{}/snapshot", self.occupancy(camera_id, class))
+    }
+
     fn snapshot(&self, camera_id: &str) -> String {
         format!("{}/{}/snapshot", self.prefix, camera_id)
     }
@@ -206,7 +241,8 @@ fn device_block(camera_id: &str) -> serde_json::Value {
 }
 
 /// The retained discovery payloads for one camera: the snapshot camera, the
-/// motion sensor, and one occupancy sensor per configured class.
+/// motion sensor, and per configured class an occupancy sensor plus the camera
+/// showing that class's last sighting.
 fn discovery_payloads(
     topics: &Topics,
     camera_id: &str,
@@ -252,6 +288,19 @@ fn discovery_payloads(
                 "unique_id": format!("camon_{slug}_occupancy_{class_slug}"),
                 "state_topic": topics.occupancy(camera_id, class),
                 "device_class": "occupancy",
+                "availability_topic": availability,
+                "device": device,
+            }),
+        ));
+        // The evidence tile for that sensor. Its topic is retained, so this
+        // entity survives the occupancy hold-off expiring and keeps showing the
+        // last sighting of the class until the next one replaces it.
+        out.push((
+            topics.discovery("camera", &format!("camon_{slug}_occupancy_{class_slug}")),
+            serde_json::json!({
+                "name": format!("{} snapshot", capitalize(class)),
+                "unique_id": format!("camon_{slug}_occupancy_{class_slug}_snapshot"),
+                "topic": topics.occupancy_snapshot(camera_id, class),
                 "availability_topic": availability,
                 "device": device,
             }),
@@ -499,9 +548,13 @@ fn handle_event(
             // instead of freezing wherever the cadence happened to land.
             spawn_snapshot(client, topics, ctx, &camera_id, snapshot_tasks);
         }
-        MqttEvent::Detections { camera_id, classes } => {
+        MqttEvent::Detections {
+            camera_id,
+            sightings,
+        } => {
             let now = Instant::now();
-            for class in classes {
+            for sighting in sightings {
+                let class = sighting.class;
                 // A verdict can only name a configured class, but the sensor
                 // set is built from the config, so anything else has no entity
                 // to publish to.
@@ -512,6 +565,16 @@ fn handle_event(
                     tracing::debug!(camera = %camera_id, class = %class, "mqtt occupancy ON");
                 }
                 publish_state(client, &topics.occupancy(&camera_id, &class), "ON");
+                // No in-flight guard like `spawn_snapshot`'s: the bytes came
+                // with the event, so this is a queue push and nothing else.
+                // QoS 0 because the next verdict supersedes this one anyway;
+                // retained so the tile keeps the sighting for good.
+                if let Some(jpeg) = sighting.frame_jpeg {
+                    let topic = topics.occupancy_snapshot(&camera_id, &class);
+                    if let Err(e) = client.try_publish(&topic, QoS::AtMostOnce, true, jpeg) {
+                        tracing::warn!(topic = %topic, error = %e, "occupancy snapshot publish failed");
+                    }
+                }
             }
         }
     }
@@ -888,7 +951,7 @@ mod tests {
             "sw_version": env!("CAMON_VERSION"),
         });
 
-        assert_eq!(payloads.len(), 3);
+        assert_eq!(payloads.len(), 4);
 
         assert_eq!(
             payloads[0].0,
@@ -936,6 +999,21 @@ mod tests {
                 "device": device,
             })
         );
+
+        assert_eq!(
+            payloads[3].0,
+            "homeassistant/camera/camon_front_door_occupancy_person/config"
+        );
+        assert_eq!(
+            payloads[3].1,
+            serde_json::json!({
+                "name": "Person snapshot",
+                "unique_id": "camon_front_door_occupancy_person_snapshot",
+                "topic": "camon/Front Door/occupancy/person/snapshot",
+                "availability_topic": "camon/availability",
+                "device": device,
+            })
+        );
     }
 
     #[test]
@@ -943,6 +1021,20 @@ mod tests {
         let topics = Topics::new(&MqttConfig::default());
         let payloads = discovery_payloads(&topics, "yard", &[]);
         assert_eq!(payloads.len(), 2);
+    }
+
+    #[test]
+    fn every_class_adds_a_sensor_and_a_snapshot_camera() {
+        let topics = Topics::new(&MqttConfig::default());
+        let classes = ["person".to_string(), "cat".to_string()];
+        let payloads = discovery_payloads(&topics, "yard", &classes);
+        assert_eq!(payloads.len(), 2 + 2 * classes.len());
+        // Unique ids must stay distinct across components.
+        let ids: HashSet<&str> = payloads
+            .iter()
+            .map(|(_, payload)| payload["unique_id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids.len(), payloads.len());
     }
 
     #[test]
@@ -956,6 +1048,10 @@ mod tests {
         assert_eq!(topics.availability(), "camon/availability");
         assert_eq!(topics.motion("yard"), "camon/yard/motion");
         assert_eq!(topics.occupancy("yard", "car"), "camon/yard/occupancy/car");
+        assert_eq!(
+            topics.occupancy_snapshot("yard", "car"),
+            "camon/yard/occupancy/car/snapshot"
+        );
         assert_eq!(topics.snapshot("yard"), "camon/yard/snapshot");
         assert_eq!(
             topics.discovery("camera", "camon_yard"),

@@ -25,7 +25,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 
 use crate::buffer::warm::{EventUpgrade, WriterMessage};
-use crate::mqtt::{send_event, MqttEvent};
+use crate::mqtt::{send_event, MqttEvent, Sighting};
 use crate::storage::warm_index::DetectionDetail;
 use crate::storage::{DetectionDebugStore, DetectionEntry, DetectionStore, EventRegistry};
 
@@ -102,7 +102,10 @@ impl DetectionWorker {
     }
 
     async fn process_job(&self, job: DetectionJob) {
-        let mut detections: Vec<Detection> = Vec::new();
+        // Kept per frame rather than flattened so each detection stays
+        // attributable to the crop it came from: entry `i` holds the verdict
+        // for `job.crop_jpegs[i]`, including for frames the model failed on.
+        let mut per_frame: Vec<Vec<Detection>> = Vec::new();
         let mut raw_responses = Vec::new();
         let mut model = self.client.model().to_string();
 
@@ -110,17 +113,19 @@ impl DetectionWorker {
         for jpeg in job.crop_jpegs.iter().take(MAX_FRAMES_PER_RUN) {
             match self.client.detect_jpeg(jpeg).await {
                 Ok(result) => {
-                    detections.extend(result.detections);
+                    per_frame.push(result.detections);
                     raw_responses.push(result.raw_response);
                     model = result.model;
                 }
                 Err(e) => {
                     // A timeout or server error costs only the upgrade.
                     tracing::warn!(camera = %job.camera_id, error = %e, "frame detection failed");
+                    per_frame.push(Vec::new());
                     raw_responses.push(format!("ERROR: {e}"));
                 }
             }
         }
+        let detections: Vec<Detection> = per_frame.concat();
 
         self.store_debug_entry(&job, &detections, raw_responses, &model);
 
@@ -144,7 +149,12 @@ impl DetectionWorker {
                 tx,
                 MqttEvent::Detections {
                     camera_id: job.camera_id.clone(),
-                    classes: classes.clone(),
+                    sightings: build_sightings(
+                        &classes,
+                        &per_frame,
+                        &job.crop_jpegs,
+                        job.full_frame_jpeg.as_deref(),
+                    ),
                 },
             );
         }
@@ -294,6 +304,51 @@ fn deduplicate_by_class(detections: &[Detection]) -> (Vec<String>, Vec<f32>) {
     (classes, confidences)
 }
 
+/// The frame that best evidences each class: the index of the frame holding
+/// that class's highest-confidence detection. `per_frame[i]` is the verdict for
+/// crop `i`, so the returned index addresses `crop_jpegs` directly.
+fn best_frame_per_class(per_frame: &[Vec<Detection>]) -> HashMap<&str, usize> {
+    let mut best: HashMap<&str, (usize, f32)> = HashMap::new();
+    for (idx, frame) in per_frame.iter().enumerate() {
+        for d in frame {
+            let entry = best
+                .entry(d.class_name.as_str())
+                .or_insert((idx, d.confidence));
+            if d.confidence > entry.1 {
+                *entry = (idx, d.confidence);
+            }
+        }
+    }
+    best.into_iter()
+        .map(|(class, (idx, _))| (class, idx))
+        .collect()
+}
+
+/// Pair every class of the verdict with the picture behind it, for the Home
+/// Assistant bridge to publish retained: the crop the model classified when
+/// picking that class, the run's full frame when the crops are gone, and
+/// nothing at all when the job carried no frame.
+fn build_sightings(
+    classes: &[String],
+    per_frame: &[Vec<Detection>],
+    crop_jpegs: &[Vec<u8>],
+    full_frame_jpeg: Option<&[u8]>,
+) -> Vec<Sighting> {
+    let best = best_frame_per_class(per_frame);
+    classes
+        .iter()
+        .map(|class| Sighting {
+            class: class.clone(),
+            frame_jpeg: best
+                .get(class.as_str())
+                .and_then(|&idx| crop_jpegs.get(idx))
+                .map(Vec::as_slice)
+                .or(full_frame_jpeg)
+                .map(<[u8]>::to_vec),
+        })
+        .collect()
+}
+
 /// Enqueue a job without ever blocking the analyzer. A full queue drops the
 /// job with a warning — the motion event still persists, only the object
 /// upgrade is lost.
@@ -371,5 +426,68 @@ mod tests {
         assert_eq!(classes.len(), 2);
         let person_idx = classes.iter().position(|c| c == "person").unwrap();
         assert!((confidences[person_idx] - 0.9).abs() < 0.001);
+    }
+
+    fn detection(class: &str, confidence: f32) -> Detection {
+        Detection {
+            class_name: class.to_string(),
+            confidence,
+            bbox: None,
+        }
+    }
+
+    #[test]
+    fn best_frame_is_the_argmax_of_confidence_per_class() {
+        let per_frame = vec![
+            vec![detection("person", 0.6), detection("cat", 0.9)],
+            vec![],
+            vec![detection("person", 0.8), detection("cat", 0.7)],
+        ];
+        let best = best_frame_per_class(&per_frame);
+        assert_eq!(best["person"], 2);
+        assert_eq!(best["cat"], 0);
+        // A class nobody saw has no frame.
+        assert!(!best.contains_key("car"));
+    }
+
+    #[test]
+    fn sighting_carries_the_crop_the_class_was_seen_in() {
+        let per_frame = vec![
+            vec![detection("person", 0.6), detection("cat", 0.9)],
+            vec![detection("person", 0.8)],
+        ];
+        let crops = vec![vec![0xaa], vec![0xbb]];
+        let sightings = build_sightings(
+            &["person".to_string(), "cat".to_string()],
+            &per_frame,
+            &crops,
+            Some(&[0xcc]),
+        );
+        assert_eq!(
+            sightings,
+            vec![
+                Sighting {
+                    class: "person".to_string(),
+                    frame_jpeg: Some(vec![0xbb]),
+                },
+                Sighting {
+                    class: "cat".to_string(),
+                    frame_jpeg: Some(vec![0xaa]),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn sighting_falls_back_to_the_full_frame_then_to_nothing() {
+        let classes = ["person".to_string()];
+        // No crops to point at: the full frame stands in.
+        let sightings = build_sightings(&classes, &[], &[], Some(&[0xcc]));
+        assert_eq!(sightings[0].frame_jpeg, Some(vec![0xcc]));
+
+        // Neither: nothing is published for this sighting.
+        let sightings = build_sightings(&classes, &[], &[], None);
+        assert_eq!(sightings[0].class, "person");
+        assert_eq!(sightings[0].frame_jpeg, None);
     }
 }

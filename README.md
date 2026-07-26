@@ -228,9 +228,11 @@ min_free_bytes = 2147483648
 # MQTT bridge to Home Assistant (default: false). When enabled, camon
 # publishes MQTT discovery messages creating one HA device per camera: a
 # snapshot camera entity (updated only while motion is detected — idle
-# cameras stay quiet), a motion binary_sensor, and one occupancy
-# binary_sensor per analytics.object_detection.classes entry that clears
-# occupancy_hold_secs after the last sighting. In the Home Assistant add-on
+# cameras stay quiet), a motion binary_sensor, and per
+# analytics.object_detection.classes entry both an occupancy binary_sensor
+# that clears occupancy_hold_secs after the last sighting and a snapshot
+# camera showing the cropped frame from the last sighting of that class
+# (retained, so it persists across restarts). In the Home Assistant add-on
 # this section is auto-configured from the Mosquitto add-on via the
 # Supervisor and normally needs no manual settings. While enabled, camera ids
 # must not contain "+" or "#" (MQTT wildcards) and must stay unique once
@@ -307,7 +309,7 @@ This repository is also a valid [Home Assistant add-on repository](https://devel
 
 See the [add-on documentation](camon-addon/DOCS.md) for install steps, ingress notes, the `camon.toml` configuration, and the amd64-only caveat.
 
-With the `[mqtt]` section enabled (automatic in the add-on when the Mosquitto broker add-on is installed), each camera also appears as native Home Assistant entities via MQTT discovery: a motion-gated snapshot camera, a motion sensor, and per-class occupancy sensors — no custom integration required.
+With the `[mqtt]` section enabled (automatic in the add-on when the Mosquitto broker add-on is installed), each camera also appears as native Home Assistant entities via MQTT discovery: a motion-gated snapshot camera, a motion sensor, per-class occupancy sensors, and a per-class snapshot camera showing the cropped frame from the last sighting of that class (retained, so it persists across restarts) — no custom integration required.
 
 ## License
 

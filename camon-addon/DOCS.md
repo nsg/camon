@@ -144,6 +144,10 @@ id>`"**, containing:
   `cat`) — turns on when that class is seen and clears
   `occupancy_hold_secs` after the last sighting. Useful for automations like
   "only show the front-door camera card while a person is present."
+- **One snapshot camera entity per detected object class** — shows the
+  cropped frame from the last sighting of that class; retained, so it
+  persists across restarts and keeps the picture long after the occupancy
+  sensor has cleared.
 
 See `config.toml.example`'s `[mqtt]` section for the full set of keys (broker
 host/port/credentials, topic prefixes, timing) if you need to override the
