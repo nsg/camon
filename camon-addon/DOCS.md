@@ -115,6 +115,40 @@ Everything else — analytics, object detection, the Ollama server (including th
 fallback), retention, motion tuning, remote stathost storage, and the camera
 list — is set in `camon.toml` exactly as documented for a native install.
 
+## MQTT / Home Assistant entities
+
+Camon can publish [MQTT discovery](https://www.home-assistant.io/integrations/mqtt/#mqtt-discovery)
+messages so each camera shows up as native Home Assistant entities, with no
+manual YAML required:
+
+1. Install the **Mosquitto broker** add-on (Settings → Add-ons → Add-on
+   store) and set up the **MQTT** integration (discovery is enabled by
+   default).
+2. Restart Camon. `config.yaml` requests `mqtt:want` access to the
+   Supervisor's broker service, so `run.sh` detects the Mosquitto add-on and
+   configures `[mqtt]` for you automatically — you normally don't need to set
+   anything under `[mqtt]` in `camon.toml` at all. (If you'd rather point at
+   an external broker instead, set `[mqtt]` in `camon.toml` yourself; it's
+   only overridden when a Supervisor-managed broker is actually installed.)
+
+Each camera gets its own Home Assistant device, named **"Camon `<camera
+id>`"**, containing:
+
+- **A snapshot camera entity** — updated only while motion is being detected
+  on that camera. This is by design: it keeps HA/the broker quiet for idle
+  cameras instead of pushing an image on a fixed timer regardless of
+  activity.
+- **A motion `binary_sensor`** — on for the duration of a motion event.
+- **One occupancy `binary_sensor` per detected object class** (from
+  `analytics.object_detection.classes`, e.g. `person`, `car`, `truck`, `dog`,
+  `cat`) — turns on when that class is seen and clears
+  `occupancy_hold_secs` after the last sighting. Useful for automations like
+  "only show the front-door camera card while a person is present."
+
+See `config.toml.example`'s `[mqtt]` section for the full set of keys (broker
+host/port/credentials, topic prefixes, timing) if you need to override the
+auto-configuration or point at an external broker.
+
 ## Building the image
 
 The image is built by the `.github/workflows/addon.yml` workflow, which runs

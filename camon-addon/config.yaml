@@ -34,6 +34,17 @@ panel_icon: mdi:cctv
 panel_title: Camon
 panel_admin: true
 
+# --- MQTT: optional access to the Supervisor's broker service --------------
+# `mqtt:want` grants this add-on access to the Supervisor's /services/mqtt
+# endpoint, which exposes the connection details (host/port/credentials) of
+# whatever MQTT broker is installed (typically the official Mosquitto
+# add-on). "want", not "need": camon must still start fine with MQTT
+# disabled if no broker is installed — run.sh checks the endpoint and falls
+# back gracefully when it's unavailable. Same pattern as the nsg/tellstick
+# add-on.
+services:
+  - mqtt:want
+
 # The add-on is configured entirely by a camon.toml file — the SAME format as a
 # native install — so there is no `options:`/`schema:` block here (both are
 # optional per the HA add-on docs, omitted when there are no UI options).

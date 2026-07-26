@@ -32,11 +32,13 @@ RUN cargo build --release --locked --bin camon
 FROM debian:bookworm-slim
 
 # ffmpeg/ffprobe are spawned by Camon; ca-certificates for HTTPS (Ollama,
-# stathost, update checks).
+# stathost, update checks); jq for run.sh to parse the Supervisor's
+# /services/mqtt JSON response (MQTT auto-configuration).
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         ffmpeg \
         ca-certificates \
+        jq \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /src/target/release/camon /usr/local/bin/camon
