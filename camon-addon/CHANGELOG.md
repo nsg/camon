@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.4.2
+
+- **Every occupancy sensor now has a matching snapshot camera** (e.g. "Cat
+  snapshot" next to "Cat occupancy"): the cropped frame the vision model
+  actually classified when it last saw that class. Retained on the broker,
+  so the tile keeps showing the last sighting — long after the occupancy
+  sensor has cleared, and across Home Assistant restarts. Handy for
+  notifications that show *the cat*, not just the camera.
+
 ## 0.4.1
 
 - **Fix MQTT auto-configuration: `curl` was missing from the 0.4.0
