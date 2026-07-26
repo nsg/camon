@@ -12,6 +12,7 @@ use crate::buffer::warm::{assemble_event, WriterMessage};
 use crate::buffer::HotBuffer;
 use crate::config::AnalyticsConfig;
 use crate::locks::LockExt;
+use crate::mqtt::{send_event, MqttEvent};
 use crate::storage::{DetectionStore, EventRecord, EventRegistry, MotionEntry, MotionStore};
 
 use super::decoder::{CropDecoder, FrameDecoder, DETECTION_CROP_SIZE, THUMBNAIL_CROP_SIZE};
@@ -316,6 +317,10 @@ pub struct AnalyzerContext {
     /// Duration cap per event chunk, as monotonic wall time. `Duration::ZERO`
     /// disables chunking. Lifecycle timing — Instant.
     pub max_event_duration: Duration,
+    /// Motion lifecycle events for the Home Assistant MQTT bridge. `None` when
+    /// MQTT is disabled. Only ever `try_send`, never awaited: the analyzer is a
+    /// blocking loop and must not stall on the bridge.
+    pub mqtt_tx: Option<tokio::sync::mpsc::Sender<MqttEvent>>,
 }
 
 pub struct MotionAnalyzer {
@@ -341,6 +346,7 @@ pub struct MotionAnalyzer {
     frame_use: FrameUse,
     run_filmstrip: RunFilmstrip,
     event_tx: Option<tokio::sync::mpsc::Sender<WriterMessage>>,
+    mqtt_tx: Option<tokio::sync::mpsc::Sender<MqttEvent>>,
     pre_padding_ns: u64,
 }
 
@@ -389,6 +395,7 @@ impl MotionAnalyzer {
             frame_use,
             run_filmstrip: RunFilmstrip::default(),
             event_tx: ctx.event_tx,
+            mqtt_tx: ctx.mqtt_tx,
             pre_padding_ns: ctx.pre_padding_ns,
         })
     }
@@ -529,12 +536,26 @@ impl MotionAnalyzer {
             self.publish_debug_maps();
 
             let has_motion = score >= MOTION_THRESHOLD;
+            // The physical motion period, as opposed to the event chunking:
+            // the duration cap closes one chunk and opens the next inside a
+            // single `observe`, so a chunk boundary leaves the tracker open
+            // and produces no MQTT transition.
+            let was_open = self.run_tracker.is_open();
             // Whatever has accumulated belongs to the run that just closed:
             // this batch's own frames are extracted later, in
             // `process_motion_runs`.
             if let Some(run) = self.run_tracker.observe(seg.seq, has_motion, now) {
                 let filmstrip = self.run_filmstrip.take();
                 closed_runs.push((run, filmstrip));
+            }
+            match (was_open, self.run_tracker.is_open()) {
+                (false, true) => self.send_motion_event(MqttEvent::MotionStart {
+                    camera_id: self.camera_id.clone(),
+                }),
+                (true, false) => self.send_motion_event(MqttEvent::MotionEnd {
+                    camera_id: self.camera_id.clone(),
+                }),
+                _ => {}
             }
 
             if has_motion {
@@ -625,6 +646,15 @@ impl MotionAnalyzer {
         }
     }
 
+    /// Hand a motion transition to the MQTT bridge. This runs on the blocking
+    /// analyzer thread, so it must never await: a full or closed queue drops
+    /// the event rather than stalling motion detection.
+    fn send_motion_event(&self, event: MqttEvent) {
+        if let Some(ref tx) = self.mqtt_tx {
+            send_event(tx, event);
+        }
+    }
+
     fn flush_open_run(&mut self) {
         if let Some(run) = self.run_tracker.flush() {
             tracing::info!(
@@ -634,6 +664,11 @@ impl MotionAnalyzer {
             );
             let filmstrip = self.run_filmstrip.take();
             self.emit_event(run, filmstrip);
+            // The run never saw its post-padding close, so HA would otherwise
+            // be left with a motion sensor stuck ON across the restart.
+            self.send_motion_event(MqttEvent::MotionEnd {
+                camera_id: self.camera_id.clone(),
+            });
         }
     }
 

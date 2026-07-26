@@ -130,6 +130,48 @@ min_free_bytes = 2147483648
 # # Set false to keep this section but fall back to local-disk storage.
 # enabled = true
 
+# --- MQTT / Home Assistant integration (optional) --------------------------
+# When enabled, camon connects to a broker and publishes Home Assistant MQTT
+# discovery messages, creating one HA device per camera containing:
+#   - a snapshot camera entity that updates only while motion is detected on
+#     that camera (idle cameras stay quiet instead of republishing an image
+#     every snapshot_interval_secs regardless of activity)
+#   - a motion binary_sensor, on for the duration of a motion event
+#   - one occupancy binary_sensor per class in
+#     analytics.object_detection.classes above (e.g. "person", "car") — turns
+#     on when that class is seen and clears occupancy_hold_secs after the
+#     last sighting
+#
+# Discovery requires the Home Assistant MQTT integration to be configured
+# with discovery enabled (the default).
+#
+# In the Home Assistant add-on this section normally does not need to be set
+# at all: installing the Mosquitto broker add-on lets run.sh auto-configure
+# host/port/username/password from the Supervisor, overriding whatever is
+# set here.
+[mqtt]
+# Enable MQTT / Home Assistant discovery (default: false)
+enabled = false
+# Broker hostname (default: "localhost")
+host = "localhost"
+# Broker port (default: 1883)
+port = 1883
+# Broker username (optional, default: none)
+# username = "camon"
+# Broker password (optional, default: none)
+# password = "s3cr3t"
+# Prefix for camon's own state topics (default: "camon")
+topic_prefix = "camon"
+# Prefix the Home Assistant MQTT integration watches for discovery messages
+# (default: "homeassistant")
+discovery_prefix = "homeassistant"
+# How often the snapshot camera image is republished while motion is active,
+# in seconds (default: 5)
+snapshot_interval_secs = 5
+# Seconds an occupancy sensor stays "on" after the last sighting of that
+# class before it clears (default: 60)
+occupancy_hold_secs = 60
+
 # Camera definitions — add one [[cameras]] block per camera
 
 [[cameras]]

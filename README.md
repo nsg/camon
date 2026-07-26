@@ -224,6 +224,31 @@ min_free_bytes = 2147483648
 # token = "s3cr3t-token"
 # max_stored_bytes = 0
 
+[mqtt]
+# MQTT bridge to Home Assistant (default: false). When enabled, camon
+# publishes MQTT discovery messages creating one HA device per camera: a
+# snapshot camera entity (updated only while motion is detected — idle
+# cameras stay quiet), a motion binary_sensor, and one occupancy
+# binary_sensor per analytics.object_detection.classes entry that clears
+# occupancy_hold_secs after the last sighting. In the Home Assistant add-on
+# this section is auto-configured from the Mosquitto add-on via the
+# Supervisor and normally needs no manual settings.
+enabled = false
+# Broker hostname and port (defaults: "localhost", 1883)
+host = "localhost"
+port = 1883
+# Broker credentials (optional, default: none)
+# username = "camon"
+# password = "s3cr3t"
+# Prefix for camon's own state topics (default: "camon")
+topic_prefix = "camon"
+# Prefix the HA MQTT integration watches for discovery (default: "homeassistant")
+discovery_prefix = "homeassistant"
+# Snapshot cadence while motion is active, in seconds (default: 5)
+snapshot_interval_secs = 5
+# Seconds an occupancy sensor stays "on" after the last sighting (default: 60)
+occupancy_hold_secs = 60
+
 # Add one [[cameras]] block per camera
 [[cameras]]
 id = "front-door"
@@ -278,6 +303,8 @@ This repository is also a valid [Home Assistant add-on repository](https://devel
 [![Add repository to my Home Assistant](https://my.home-assistant.io/badges/supervisor_add_addon_repository.svg)](https://my.home-assistant.io/redirect/supervisor_add_addon_repository/?repository_url=https%3A%2F%2Fgithub.com%2Fnsg%2Fcamon)
 
 See the [add-on documentation](camon-addon/DOCS.md) for install steps, ingress notes, the `camon.toml` configuration, and the amd64-only caveat.
+
+With the `[mqtt]` section enabled (automatic in the add-on when the Mosquitto broker add-on is installed), each camera also appears as native Home Assistant entities via MQTT discovery: a motion-gated snapshot camera, a motion sensor, and per-class occupancy sensors — no custom integration required.
 
 ## License
 

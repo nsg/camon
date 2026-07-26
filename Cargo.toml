@@ -42,6 +42,10 @@ futures-core = "0.3"
 # macro machinery (keeps futures-macro out of the graph).
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 tokio-util = { version = "0.7", features = ["io"] }
+# MQTT 3.1.1 client for the Home Assistant bridge. Default features off: the
+# broker is a LAN service reached over plain TCP, so the rustls stack the
+# default `use-rustls` feature pulls in would be dead weight.
+rumqttc = { version = "0.25.1", default-features = false }
 
 [dev-dependencies]
 tempfile = "3.27.0"

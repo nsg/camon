@@ -409,6 +409,84 @@ impl Default for UpdateConfig {
     }
 }
 
+fn default_mqtt_host() -> String {
+    "localhost".to_string()
+}
+
+fn default_mqtt_port() -> u16 {
+    1883
+}
+
+fn default_mqtt_topic_prefix() -> String {
+    "camon".to_string()
+}
+
+/// Home Assistant's own default discovery prefix. Changing it here must match
+/// the `discovery_prefix` of HA's MQTT integration or nothing is discovered.
+fn default_mqtt_discovery_prefix() -> String {
+    "homeassistant".to_string()
+}
+
+/// Snapshot cadence while motion is active. Snapshots are motion-gated by
+/// design (see `crate::mqtt`), so this only ever costs decode work during a
+/// run — 5s is a compromise between a responsive HA camera tile and the
+/// per-frame ffmpeg decode.
+fn default_mqtt_snapshot_interval_secs() -> u64 {
+    5
+}
+
+/// How long an occupancy sensor stays ON after the last sighting of its class.
+/// The vision model only sees frames during motion runs, so without a hold-off
+/// a parked person would flap OFF between runs; a minute reads as "still here"
+/// for automations without pinning the sensor ON indefinitely.
+fn default_mqtt_occupancy_hold_secs() -> u64 {
+    60
+}
+
+/// MQTT bridge to Home Assistant. Off by default: camon is fully usable
+/// standalone, and an unreachable broker should never be a startup concern for
+/// users who don't run HA.
+#[derive(Debug, Clone, Deserialize)]
+pub struct MqttConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_mqtt_host")]
+    pub host: String,
+    #[serde(default = "default_mqtt_port")]
+    pub port: u16,
+    /// Broker credentials. Both must be set for authentication to be attempted.
+    #[serde(default)]
+    pub username: Option<String>,
+    #[serde(default)]
+    pub password: Option<String>,
+    /// Root of camon's own state topics (`<prefix>/<camera>/motion`, ...).
+    #[serde(default = "default_mqtt_topic_prefix")]
+    pub topic_prefix: String,
+    /// Root of the Home Assistant discovery topics.
+    #[serde(default = "default_mqtt_discovery_prefix")]
+    pub discovery_prefix: String,
+    #[serde(default = "default_mqtt_snapshot_interval_secs")]
+    pub snapshot_interval_secs: u64,
+    #[serde(default = "default_mqtt_occupancy_hold_secs")]
+    pub occupancy_hold_secs: u64,
+}
+
+impl Default for MqttConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            host: default_mqtt_host(),
+            port: default_mqtt_port(),
+            username: None,
+            password: None,
+            topic_prefix: default_mqtt_topic_prefix(),
+            discovery_prefix: default_mqtt_discovery_prefix(),
+            snapshot_interval_secs: default_mqtt_snapshot_interval_secs(),
+            occupancy_hold_secs: default_mqtt_occupancy_hold_secs(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
     #[serde(default)]
@@ -421,6 +499,8 @@ pub struct Config {
     pub analytics: AnalyticsConfig,
     #[serde(default)]
     pub storage: WarmConfig,
+    #[serde(default)]
+    pub mqtt: MqttConfig,
     #[serde(default)]
     pub cameras: Vec<CameraConfig>,
 }
@@ -587,5 +667,39 @@ url = "rtsp://user:pass@10.0.0.6:554/stream1"
         // File said 9090 / default-true; the overrides win.
         assert_eq!(config.http.port, 22666);
         assert!(!config.update.enabled);
+    }
+
+    #[test]
+    fn mqtt_defaults_to_disabled() {
+        let dir = write_temp("config.toml", TOML_SAMPLE);
+        let config = Config::load_from_with_overrides(dir.path().join("config.toml"), &[]).unwrap();
+        assert!(!config.mqtt.enabled);
+        assert_eq!(config.mqtt.host, "localhost");
+        assert_eq!(config.mqtt.port, 1883);
+        assert_eq!(config.mqtt.topic_prefix, "camon");
+        assert_eq!(config.mqtt.discovery_prefix, "homeassistant");
+        assert_eq!(config.mqtt.snapshot_interval_secs, 5);
+        assert_eq!(config.mqtt.occupancy_hold_secs, 60);
+        assert!(config.mqtt.username.is_none());
+    }
+
+    #[test]
+    fn mqtt_section_is_parsed_and_overridable() {
+        let toml = format!(
+            "{TOML_SAMPLE}\n[mqtt]\nenabled = true\nhost = \"10.0.0.2\"\nusername = \"ha\"\n\
+             password = \"secret\"\n"
+        );
+        let dir = write_temp("config.toml", &toml);
+        let overrides = [Override::parse("mqtt.occupancy_hold_secs=120").unwrap()];
+        let config =
+            Config::load_from_with_overrides(dir.path().join("config.toml"), &overrides).unwrap();
+        assert!(config.mqtt.enabled);
+        assert_eq!(config.mqtt.host, "10.0.0.2");
+        assert_eq!(config.mqtt.username.as_deref(), Some("ha"));
+        assert_eq!(config.mqtt.password.as_deref(), Some("secret"));
+        // Unset keys keep their defaults; `--set` reaches the new section
+        // through the generic override path.
+        assert_eq!(config.mqtt.port, 1883);
+        assert_eq!(config.mqtt.occupancy_hold_secs, 120);
     }
 }

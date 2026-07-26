@@ -42,6 +42,10 @@ HTTP REST API for playback and search. Supports live and historical video playba
 
 Vanilla HTML/CSS/JS served from the Rust binary with video playback via Vidstack (CDN). No build tools required — cargo builds everything. Provides live view with scrollback, timeline scrubbing across tiers (transparent to user), event search, and clip export.
 
+## Home Assistant
+
+Beyond running as an ingress add-on, camon can bridge to Home Assistant over MQTT (`[mqtt]` in the config; auto-configured from the Supervisor in the add-on). It publishes retained MQTT discovery messages so each camera materializes as a native HA device with three entity kinds: a snapshot camera fed with JPEG frames only while motion is active (decoded on demand from the newest hot-buffer segment — idle cameras cost nothing), a motion binary sensor tracking the physical motion run, and one occupancy binary sensor per object-detection class that holds for a configurable time after the last sighting. The bridge is strictly outbound — it subscribes to nothing — and marks all entities unavailable via a broker last-will if camon dies.
+
 ## Error Handling
 
 Camera disconnections are handled with automatic reconnection using exponential backoff (5s, doubling up to a 60s cap, with jitter); the delay resets after a stream stays healthy. A data watchdog reconnects a stream that stops delivering bytes, and a tripwire reconnects one that delivers data but produces no keyframes. Cameras operate independently — one disconnecting doesn't affect others.

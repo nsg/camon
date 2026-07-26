@@ -25,6 +25,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 
 use crate::buffer::warm::{EventUpgrade, WriterMessage};
+use crate::mqtt::{send_event, MqttEvent};
 use crate::storage::warm_index::DetectionDetail;
 use crate::storage::{DetectionDebugStore, DetectionEntry, DetectionStore, EventRegistry};
 
@@ -63,6 +64,8 @@ pub struct DetectionWorker {
     /// enabled; without them verdicts still land in the detection store.
     event_registry: Option<EventRegistry>,
     event_senders: HashMap<String, mpsc::Sender<WriterMessage>>,
+    /// Verdicts for the Home Assistant MQTT bridge. `None` when MQTT is off.
+    mqtt_tx: Option<mpsc::Sender<MqttEvent>>,
 }
 
 impl DetectionWorker {
@@ -72,6 +75,7 @@ impl DetectionWorker {
         debug_store: Option<DetectionDebugStore>,
         event_registry: Option<EventRegistry>,
         event_senders: HashMap<String, mpsc::Sender<WriterMessage>>,
+        mqtt_tx: Option<mpsc::Sender<MqttEvent>>,
     ) -> Self {
         Self {
             client,
@@ -79,6 +83,7 @@ impl DetectionWorker {
             debug_store,
             event_registry,
             event_senders,
+            mqtt_tx,
         }
     }
 
@@ -130,6 +135,19 @@ impl DetectionWorker {
         );
 
         let (classes, confidences) = deduplicate_by_class(&detections);
+        // Everything reaching here already passed the client's allowed-class
+        // and confidence-threshold filtering (`ollama::parse_detections`), so
+        // the deduped classes are exactly the verdict — the same set that goes
+        // into the detection store and the event upgrade.
+        if let Some(ref tx) = self.mqtt_tx {
+            send_event(
+                tx,
+                MqttEvent::Detections {
+                    camera_id: job.camera_id.clone(),
+                    classes: classes.clone(),
+                },
+            );
+        }
         self.store_detections(&job, &classes, &confidences, &model);
         self.upgrade_covering_events(&job, &detections, &classes, &model)
             .await;

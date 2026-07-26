@@ -138,6 +138,15 @@ impl RunTracker {
         None
     }
 
+    /// Whether a run (or a chunk of one) is currently open. Compared before and
+    /// after [`observe`](Self::observe) to spot the physical start and end of
+    /// motion: the duration cap closes and reopens within a single call, so a
+    /// chunk boundary leaves this `true` throughout and is invisible to
+    /// consumers that only care about "is something moving".
+    pub fn is_open(&self) -> bool {
+        self.open.is_some()
+    }
+
     /// Close an open run immediately (shutdown flush — no post-padding wait).
     pub fn flush(&mut self) -> Option<ClosedRun> {
         self.close()
@@ -352,6 +361,22 @@ mod tests {
         assert_eq!(c.min_start_seq, 2);
         // Final chunk of a chain still carries continues (it continues B).
         assert!(c.continues);
+    }
+
+    #[test]
+    fn is_open_tracks_the_physical_motion_period() {
+        let mut t = RunTracker::new(POST, CAP);
+        let t0 = base();
+        assert!(!t.is_open());
+        t.observe(0, true, t0);
+        assert!(t.is_open());
+        // The duration cap closes a chunk and opens its follow-on inside one
+        // observe: the physical motion period never appears to end.
+        assert!(t.observe(1, true, t0 + CAP).is_some());
+        assert!(t.is_open());
+        // Post-padding elapsing is the real end.
+        t.observe(2, false, t0 + CAP + POST + Duration::from_nanos(1));
+        assert!(!t.is_open());
     }
 
     #[test]

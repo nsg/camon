@@ -12,6 +12,7 @@ mod config;
 mod install;
 mod locks;
 mod mpegts;
+mod mqtt;
 mod storage;
 mod update;
 
@@ -24,6 +25,7 @@ use buffer::HotBuffer;
 use camera::FfmpegPipeline;
 use config::Config;
 use locks::LockExt;
+use mqtt::{BridgeContext, MqttEvent, MQTT_EVENT_CAPACITY};
 use storage::{
     DetectionDebugStore, DetectionStore, EventRegistry, LocalDiskBackend, MotionStore,
     StathostBackend, WarmStorageBackend,
@@ -279,6 +281,9 @@ struct SpawnContext<'a> {
     /// detection is off.
     detect_tx: &'a Option<tokio::sync::mpsc::Sender<DetectionJob>>,
     event_registry: &'a Option<EventRegistry>,
+    /// Motion lifecycle events for the Home Assistant bridge; `None` when
+    /// `[mqtt].enabled` is false.
+    mqtt_tx: &'a Option<tokio::sync::mpsc::Sender<MqttEvent>>,
     shutdown: &'a Arc<AtomicBool>,
 }
 
@@ -358,6 +363,7 @@ fn spawn_cameras(ctx: &SpawnContext, cameras: Vec<config::CameraConfig>) -> Came
                         .clone()
                         .expect("motion settings initialized when analytics enabled"),
                     event_tx,
+                    mqtt_tx: ctx.mqtt_tx.clone(),
                     pre_padding_ns: ctx.config.storage.pre_padding_secs * 1_000_000_000,
                     post_padding: std::time::Duration::from_secs(
                         ctx.config.storage.post_padding_secs,
@@ -389,9 +395,14 @@ async fn wait_for_signal(shutdown: &AtomicBool) {
     shutdown.store(true, Ordering::Relaxed);
 }
 
+/// How long shutdown waits for the MQTT bridge to publish its retained
+/// `offline` marker and disconnect before giving up on it.
+const MQTT_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 async fn graceful_shutdown(
     handles: CameraHandles,
     detect_worker_handle: Option<tokio::task::JoinHandle<()>>,
+    mqtt_handle: Option<tokio::task::JoinHandle<()>>,
 ) {
     // Analyzers poll the shutdown flag every ~200ms and flush any open motion
     // run as a complete event before exiting — join them, never abort.
@@ -413,6 +424,21 @@ async fn graceful_shutdown(
     if let Some(handle) = detect_worker_handle {
         handle.abort();
         let _ = handle.await;
+    }
+
+    // Joined here — after the analyzers flushed their final MotionEnd, before
+    // the buffers and writers go away — so the bridge can still reflect that
+    // last transition and publish the retained `offline` marker. A broker that
+    // has become unreachable must not hold shutdown up, hence the timeout.
+    if let Some(handle) = mqtt_handle {
+        let abort = handle.abort_handle();
+        if tokio::time::timeout(MQTT_SHUTDOWN_TIMEOUT, handle)
+            .await
+            .is_err()
+        {
+            tracing::warn!("mqtt bridge did not stop in time, aborting it");
+            abort.abort();
+        }
     }
 
     let mut buffers_with_ids = Vec::new();
@@ -502,6 +528,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let shutdown = Arc::new(AtomicBool::new(false));
+
+    // The MQTT bridge is fed by the analyzers (motion) and the detection worker
+    // (verdicts), so its channel must exist before either is spawned.
+    let (mqtt_tx, mqtt_rx) = if config.mqtt.enabled {
+        if !config.analytics.enabled {
+            tracing::warn!(
+                "mqtt enabled without analytics: snapshots and sensors are motion-gated, so \
+                 the entities will stay idle (availability and discovery still published)"
+            );
+        }
+        let (tx, rx) = tokio::sync::mpsc::channel(MQTT_EVENT_CAPACITY);
+        (Some(tx), Some(rx))
+    } else {
+        (None, None)
+    };
+
     let spawn_ctx = SpawnContext {
         config: &config,
         motion_store: &motion_store,
@@ -510,6 +552,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         motion_settings: &motion_settings,
         detect_tx: &detect_tx,
         event_registry: &event_registry,
+        mqtt_tx: &mqtt_tx,
         shutdown: &shutdown,
     };
     let camera_handles = spawn_cameras(&spawn_ctx, config.cameras.clone());
@@ -522,11 +565,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Some(debug_store.clone()),
                 event_registry.clone(),
                 camera_handles.event_sender_map.clone(),
+                mqtt_tx.clone(),
             );
             Some(tokio::spawn(worker.run(rx)))
         }
         _ => None,
     };
+
+    let mqtt_handle = mqtt_rx.map(|rx| {
+        // Occupancy sensors only exist for classes the model is actually asked
+        // about; with object detection off there are none.
+        let classes = if config.analytics.enabled && config.analytics.object_detection.enabled {
+            config.analytics.object_detection.classes.clone()
+        } else {
+            Vec::new()
+        };
+        mqtt::spawn_bridge(
+            BridgeContext {
+                config: config.mqtt.clone(),
+                buffers: Arc::new(camera_handles.buffers_map.clone()),
+                camera_ids: camera_ids.clone(),
+                classes,
+                shutdown: Arc::clone(&shutdown),
+            },
+            rx,
+        )
+    });
+    // The analyzers and detection worker hold their own clones; dropping this
+    // one lets the bridge see the channel close once they are gone.
+    drop(mqtt_tx);
     // Analyzers hold their own clones; dropping the original closes the job
     // channel once they exit, letting the worker finish in normal operation.
     drop(detect_tx);
@@ -549,7 +616,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     wait_for_signal(&shutdown).await;
     server_handle.abort();
 
-    graceful_shutdown(camera_handles, detect_worker_handle).await;
+    graceful_shutdown(camera_handles, detect_worker_handle, mqtt_handle).await;
 
     tracing::info!("shutdown complete");
     Ok(())
