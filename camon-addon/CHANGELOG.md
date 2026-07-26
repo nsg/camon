@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.4.1
+
+- **Fix MQTT auto-configuration: `curl` was missing from the 0.4.0
+  image.** The Supervisor broker lookup failed with `curl: command not
+  found` and fell back to "no Supervisor MQTT service found", so the Home
+  Assistant entities never appeared unless `[mqtt]` was configured by hand
+  in `camon.toml`. With this update the Mosquitto add-on is detected
+  automatically as intended.
+
 ## 0.4.0
 
 - **Native Home Assistant entities via MQTT discovery.** Install the
