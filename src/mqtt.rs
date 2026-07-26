@@ -133,8 +133,9 @@ pub fn send_event(tx: &tokio::sync::mpsc::Sender<MqttEvent>, event: MqttEvent) -
 
 /// Lowercase slug with every non-alphanumeric character folded to `_`. Camera
 /// ids are free-form, but they end up inside MQTT topics and Home Assistant
-/// unique ids, so they are normalized once here.
-fn slugify(id: &str) -> String {
+/// unique ids, so they are normalized once here. `Config::validate` uses the
+/// same function to reject ids that would collide once normalized.
+pub(crate) fn slugify(id: &str) -> String {
     id.chars()
         .map(|c| {
             if c.is_ascii_alphanumeric() {

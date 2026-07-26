@@ -1,4 +1,5 @@
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::path::Path;
 use thiserror::Error;
 
@@ -12,6 +13,20 @@ pub enum ConfigError {
     Parse(#[from] toml::de::Error),
     #[error("no cameras configured")]
     NoCameras,
+    #[error(
+        "camera id {id:?} contains {character:?}, which is an MQTT topic wildcard; \
+         rename the camera or disable [mqtt]"
+    )]
+    MqttWildcardCameraId { id: String, character: char },
+    #[error(
+        "camera ids {first:?} and {second:?} both normalize to MQTT slug {slug:?}; \
+         rename one so Home Assistant entities don't collide"
+    )]
+    MqttSlugCollision {
+        first: String,
+        second: String,
+        slug: String,
+    },
 }
 
 /// A single `--set <dotted.path>=<value>` startup override, applied to the
@@ -523,12 +538,43 @@ impl Config {
             ov.apply(&mut value);
         }
         let config: Config = value.try_into()?;
+        config.validate()?;
+        Ok(config)
+    }
 
-        if config.cameras.is_empty() {
+    /// Post-parse checks that TOML deserialization can't express. Failing here
+    /// is deliberate: with the MQTT bridge on, a bad camera id costs entities
+    /// that silently never update, which is worse than refusing to start.
+    fn validate(&self) -> Result<(), ConfigError> {
+        if self.cameras.is_empty() {
             return Err(ConfigError::NoCameras);
         }
 
-        Ok(config)
+        // Camera ids only reach MQTT topics and Home Assistant unique ids when
+        // the bridge is enabled; otherwise they stay free-form.
+        if !self.mqtt.enabled {
+            return Ok(());
+        }
+
+        let mut slugs: HashMap<String, &str> = HashMap::new();
+        for camera in &self.cameras {
+            if let Some(character) = camera.id.chars().find(|c| matches!(c, '+' | '#')) {
+                return Err(ConfigError::MqttWildcardCameraId {
+                    id: camera.id.clone(),
+                    character,
+                });
+            }
+            let slug = crate::mqtt::slugify(&camera.id);
+            if let Some(first) = slugs.insert(slug.clone(), &camera.id) {
+                return Err(ConfigError::MqttSlugCollision {
+                    first: first.to_string(),
+                    second: camera.id.clone(),
+                    slug,
+                });
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -701,5 +747,69 @@ url = "rtsp://user:pass@10.0.0.6:554/stream1"
         // through the generic override path.
         assert_eq!(config.mqtt.port, 1883);
         assert_eq!(config.mqtt.occupancy_hold_secs, 120);
+    }
+
+    const WILDCARD_CAMERAS: &str = r#"
+[[cameras]]
+id = "cam+1"
+url = "rtsp://10.0.0.5:554/stream1"
+"#;
+
+    const COLLIDING_CAMERAS: &str = r#"
+[[cameras]]
+id = "Front Door"
+url = "rtsp://10.0.0.5:554/stream1"
+
+[[cameras]]
+id = "front-door"
+url = "rtsp://10.0.0.6:554/stream1"
+"#;
+
+    fn load_with_mqtt(cameras: &str, enabled: bool) -> Result<Config, ConfigError> {
+        let toml = format!("[mqtt]\nenabled = {enabled}\n{cameras}");
+        let dir = write_temp("config.toml", &toml);
+        Config::load_from_with_overrides(dir.path().join("config.toml"), &[])
+    }
+
+    #[test]
+    fn mqtt_rejects_wildcard_camera_id() {
+        let err = load_with_mqtt(WILDCARD_CAMERAS, true).unwrap_err();
+        assert!(
+            matches!(err, ConfigError::MqttWildcardCameraId { .. }),
+            "got {err:?}"
+        );
+        let message = err.to_string();
+        assert!(message.contains("cam+1"), "got {message}");
+        assert!(message.contains('+'), "got {message}");
+    }
+
+    #[test]
+    fn mqtt_rejects_colliding_camera_slugs() {
+        let err = load_with_mqtt(COLLIDING_CAMERAS, true).unwrap_err();
+        assert!(
+            matches!(err, ConfigError::MqttSlugCollision { .. }),
+            "got {err:?}"
+        );
+        let message = err.to_string();
+        assert!(message.contains("Front Door"), "got {message}");
+        assert!(message.contains("front-door"), "got {message}");
+        assert!(message.contains("front_door"), "got {message}");
+    }
+
+    #[test]
+    fn disabled_mqtt_leaves_camera_ids_unconstrained() {
+        load_with_mqtt(WILDCARD_CAMERAS, false).unwrap();
+        load_with_mqtt(COLLIDING_CAMERAS, false).unwrap();
+    }
+
+    #[test]
+    fn mqtt_accepts_distinct_camera_ids() {
+        let config = load_with_mqtt(
+            "\n[[cameras]]\nid = \"front-door\"\nurl = \"rtsp://10.0.0.5:554/stream1\"\n\n\
+             [[cameras]]\nid = \"yard\"\nurl = \"rtsp://10.0.0.6:554/stream1\"\n",
+            true,
+        )
+        .unwrap();
+        assert_eq!(config.cameras.len(), 2);
     }
 }

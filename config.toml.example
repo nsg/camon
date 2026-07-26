@@ -149,6 +149,11 @@ min_free_bytes = 2147483648
 # at all: installing the Mosquitto broker add-on lets run.sh auto-configure
 # host/port/username/password from the Supervisor, overriding whatever is
 # set here.
+#
+# While MQTT is enabled, camera ids must not contain "+" or "#" (MQTT topic
+# wildcards) and must stay unique once lowercased with non-alphanumerics
+# folded to "_" ("Front Door" and "front-door" both become "front_door");
+# camon refuses to start otherwise.
 [mqtt]
 # Enable MQTT / Home Assistant discovery (default: false)
 enabled = false

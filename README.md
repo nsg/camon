@@ -232,7 +232,10 @@ min_free_bytes = 2147483648
 # binary_sensor per analytics.object_detection.classes entry that clears
 # occupancy_hold_secs after the last sighting. In the Home Assistant add-on
 # this section is auto-configured from the Mosquitto add-on via the
-# Supervisor and normally needs no manual settings.
+# Supervisor and normally needs no manual settings. While enabled, camera ids
+# must not contain "+" or "#" (MQTT wildcards) and must stay unique once
+# lowercased with non-alphanumerics folded to "_" — camon refuses to start
+# otherwise.
 enabled = false
 # Broker hostname and port (defaults: "localhost", 1883)
 host = "localhost"
