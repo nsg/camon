@@ -409,8 +409,11 @@ impl WarmEventIndex {
         dir.join(format!("{}_{}.ts", entry.start_pts_ns, entry.duration_ms))
     }
 
-    /// Delete every event past its per-class retention and drop it from the
-    /// index. Returns the number of events actually deleted.
+    /// Delete events past their per-class retention, up to this sweep's share
+    /// of the camera (see [`cap_sweep_deletions`]), and drop each one from the
+    /// index once its video is gone — an event whose files could not be deleted
+    /// stays listed for the next sweep to retry. Returns the number of events
+    /// actually deleted.
     ///
     /// `cancel` is polled between events and between cameras so a shutdown
     /// does not wait out a whole sweep. Never mid-event: an event that lost

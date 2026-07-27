@@ -35,7 +35,7 @@ Clients can stream the raw segments from the buffer directly, the only thing we 
   <img alt="Keyframes are decoded to 320 by 240 grayscale and pass through the motion analyzer stages — MOG2 background subtraction, morphological opening, component filtering — into the motion store" src="docs/diagrams/03-analyzer-light.svg">
 </picture>
 
-To make decoding as lightweight as possible, we only extract keyframes because they are self-contained and do not depend on surrounding frames. With a 1-second GOP this means the analyzer effectively samples one frame per second.
+To make decoding as lightweight as possible, we only extract keyframes because they are self-contained and do not depend on surrounding frames. With a 1-second GOP this means the analyzer effectively samples one frame per second. A segment carries its own answer for how many frames it owes — one per keyframe it holds — so a decode ends as soon as they arrive rather than when a timer runs out, and the timeout is left as the safety net it was meant to be. A segment whose frames never came produces no verdict at all rather than a quiet one: scoring unseen footage as motionless would both discard it and split a motion event across it. If the analyzer falls behind and segments age out of the hot buffer before it reaches them, the footage that went unanalyzed is reported rather than disappearing quietly.
 
 The Motion Analyzer uses a built-in pure-Rust implementation of the Zivkovic MOG2 (Mixture of Gaussians) background subtractor — validated bit-exact against OpenCV's — to detect foreground motion, followed by morphological opening to eliminate noise and connected-component filtering to discard small blobs. The background model spans about 5 minutes at the 1 fps analysis rate, so persistent motion like tree sway gets absorbed into the background.
 
@@ -46,6 +46,8 @@ Motion detection is governed by three deterministic, per-camera controls, editab
 - **Movement mask** — a 16×12 grid of cells painted over the camera view; masked cells are zeroed in the MOG2 foreground mask before morphology and connected-component labeling, so they are excluded from detection deterministically. Read it as "nothing ever moves here": paint a busy road or a swaying tree to keep it from producing motion events.
 
 There is no automatic tuning and no learned suppression: MOG2's verdict is the sole gate on what footage persists, so the settings only ever change when a human moves them. Config defaults for the two sliders can be set under `[analytics.motion]`; the per-camera file wins once a camera has been adjusted.
+
+That file is written like an event: staged, fsynced, renamed into place, and the directory fsynced after — a truncated one loads as defaults, which would quietly un-paint a privacy mask — and saves are serialised per camera so two edits at once cannot share a staging file. A save that fails is reported rather than acknowledged: the API answers with the error and the web UI shows it above the settings panel. The change stays applied to the running detector either way, because a mask exists to stop something being seen and has to take effect even when the disk will not take it; what is lost is only that it survives a restart.
 
 A fourth per-camera control, the **detection mask**, is painted on the same 16×12 grid but works one stage later and independently of motion detection. Its cells read as "the vision model never sees these pixels": every cell painted here is blacked out of every frame handed to the Ollama vision model before JPEG encoding, in the crop's own coordinate space (the cell rectangle is intersected with each crop and translated, so masked pixels are removed no matter how the frame was cropped — including the full-frame crop a lighting change can force). Motion detection is untouched; only classification is suppressed. Use it for a stationary nuisance object — a parked car that would otherwise be reported as "car" whenever a full-frame crop briefly includes it. The web UI's mask editor paints both layers on one grid, switching between the movement mask (red) and detection mask (orange) with a layer toggle. The detection mask defaults to all-off and is persisted alongside the other settings in `motion_settings.json`.
 
@@ -83,7 +85,15 @@ Both modes share the same warm writer, retention pruning, and HLS playback path;
 
 Event files are written atomically — staged as `.tmp`, fsynced, then renamed into place — so a crash or power cut never leaves a half-indexed event. On the next startup camon **recovers** interrupted writes instead of discarding them: an orphaned `.ts.tmp` (which may hold the footage of exactly the incident that cut the power) is trimmed to its last intact packet, its real duration recomputed from the stream timestamps, and indexed like any other event with a `"recovered": true` flag. If the disk runs low, a `min_free_bytes` guard emergency-prunes the oldest recordings (continuous first, then movements, then objects) so the writer keeps recording instead of failing.
 
+Retention belongs to one task for the whole store rather than to each camera's writer — a sweep covers every camera, so one task does it however many cameras are configured, instead of a sweep per camera racing all the others — and it runs hourly; on shutdown it stops between events, never part-way through deleting one. An event leaves the index only once its video is actually gone — a delete that fails leaves the event listed and playable and the next sweep retries it, instead of unindexing a recording that is still occupying disk with nothing left to describe it. The emergency low-space pass skips events it has already failed to delete, so they cannot stand in front of events that would free space, and space it failed to reclaim is never counted as reclaimed.
+
+A scheduled sweep also deletes at most a quarter of a camera's events (at least four, so a small archive still drains). An event's age is measured against the wall clock, and a box without a battery-backed clock resumes at its last shutdown time and is then corrected forward by however long it was switched off — which makes the whole archive look expired at once. The cap turns that into a loud warning and a trickle rather than an empty archive; the held-back events follow on later sweeps, and ordinary expiry is a few percent of an archive per sweep and never reaches the limit. It bounds the scheduled sweep only: a disk genuinely running out still prunes as much as it needs, as does the stathost `max_stored_bytes` budget.
+
+A shutdown — from SIGTERM or from an installed update — flushes what is in flight, and nothing in it waits out a retry: a camera parked in its reconnect backoff and an analyzer waiting to respawn its decoder both wake the moment the shutdown is requested, so stopping camon never costs a minute of waiting for work that has already been abandoned.
+
 A camera can also end up recording nothing without anything crashing — an ignore mask painted over the whole frame, a sensitivity slider at its least sensitive, a stream that never reaches camon, or writes that keep failing. Each of those looks identical from the outside: an empty event list. camon therefore **watches each camera for silence** and warns when one has written no event for too long. The limit depends on what the camera is supposed to produce: a continuous recorder rolls a chunk every `max_event_duration_secs` whatever the scene does, so ten missed chunks in a row (20 minutes at the default) is already a fault, while in event mode an empty garden legitimately scores no motion all night and the limit is 24 hours — half the default `movement_retention_days`, so the warning arrives while there is still footage to save. The silence is measured from the newest event **on disk**, not from process start, so it survives restarts, and each warning states the whole silence rather than the time since the last one. Cameras that are not expected to record (storage disabled) are not watched at all.
+
+Knowing a camera is silent is not the same as knowing why, so each connection also reports what camon actually saw on it: whether bytes arrived at all, whether they were a transport stream, whether a program map named an H.264 stream, whether packets reached that stream, and whether any of them flagged a random access point. That last one is the quiet killer — camon cuts a segment only on that flag, and a camera that never sets it produces a stream that looks perfectly alive and yields no footage, which without the report would show up as nothing but an endless reconnect loop. Each report says what was observed and over how long and offers the causes that fit rather than naming one, a connection too short to judge says so instead of blaming the camera, and repeated failures escalate on a widening schedule instead of repeating every minute. The count clears only when a connection actually records something.
 
 ### Storage backends
 
@@ -91,6 +101,8 @@ The warm event store sits behind a backend seam, so *where* events live is a con
 
 - **Local disk** (default) — the `data_dir` on the machine running camon, with the atomic write ladder, crash recovery, and `min_free_bytes` free-space guard described above.
 - **Remote stathost** — a [stathost](https://github.com/nsg/stathost) static file host, selected by adding a `[storage.stathost]` section. Each event becomes three sibling objects under `{camera}/` on the host — the `.ts` video, a `.json` sidecar (which here also carries the event **type**, since there are no `movements/`/`objects/`/`continuous/` directories), and eager `{stem}_thumb_{i}.jpg` filmstrip frames. Time-based retention still applies via `DELETE`; because the client can't see the server's disk, retention-by-space becomes a client-side **budget** (`max_stored_bytes`) that prunes the oldest events (continuous → movements → objects) when tracked usage exceeds it. Post-hoc movement→object upgrades just rewrite the sidecar in place — no object is ever renamed or moved.
+
+  Every request to the host is bounded, because the warm writer awaits them inline and an unbounded one would wedge that camera's recording and its shutdown: 10s to connect, 60s in total for a delete, a sidecar or thumbnail read, or the startup listing, and 300s for an upload, which has to allow tens of megabytes on a slow uplink. Ranged playback is the deliberate exception — a total ceiling would cut off a player that drains the body at its own pace, so it is bounded by a 30s idle budget instead.
 
   Requires stathost **0.2.0 or later** — camon relies on its atomic uploads (readers never see a partially uploaded object), its detailed listing (`?detail=true`) for accurate storage accounting, and its HTTP Range support; there is no fallback for older servers. Because the sidecar is the only record of an event's **type**, it is uploaded *before* the video, which commits the event — an event whose sidecar cannot be stored is failed rather than written as a video that would scan back as a plain movement and expire on the wrong retention. The one exception is a plain movement event, which is exactly what a sidecar-less `.ts` scans back as anyway. Nothing is rolled back on a failed upload (a failure can still have committed server-side): the leftovers are an orphan sidecar, which the scan ignores, or a video that its sidecar still types correctly. Warm-event playback **streams** rather than buffering the whole event in RAM: the playback handler forwards a single `Range` header to stathost and relays the `206`/`Content-Range` response, so seeking fetches only the requested bytes.
 
@@ -136,6 +148,8 @@ Create a `config.toml` in the working directory. Point Camon at a config anywher
 ```bash
 camon --config /etc/camon/config.toml --set http.port=9090 --set update.enabled=true
 ```
+
+The whole configuration is validated before anything starts, and camon exits with the problem rather than running on defaults it silently fell back to — an unknown key included, since a typo is otherwise indistinguishable from an omission (keys camon itself shipped and later removed are dropped with advice instead, so a config that booted before keeps booting).
 
 All sections are optional — defaults are shown below:
 
@@ -186,7 +200,9 @@ allow_open = false
 [analytics]
 # Enable MOG2 motion detection (default: false)
 enabled = true
-# Frame sample rate for analysis (default: 5)
+# Frame rate ffmpeg decodes at when extracting frames from a motion run for
+# object detection (default: 5). Motion analysis itself is keyframe-driven —
+# roughly one frame per second at a 1-second GOP — and ignores this.
 sample_fps = 5
 
 # Object detection via Ollama (requires analytics enabled).
@@ -198,7 +214,9 @@ enabled = true
 # Minimum confidence threshold (default: 0.5)
 confidence_threshold = 0.5
 # Object classes to detect (default: person, car, truck, dog, cat).
-# Also constrains the model's structured JSON output.
+# Also constrains the model's structured JSON output. Lower-cased and
+# deduplicated at load, and while [mqtt] is enabled a class may not contain
+# "+" or "#" — it reaches the occupancy topic verbatim.
 classes = ["person", "car", "truck", "dog", "cat"]
 
 [analytics.object_detection.ollama]
@@ -237,7 +255,9 @@ post_padding_secs = 10
 max_event_duration_secs = 120
 # Retention for movement-only events in days (default: 2). All three retentions
 # are whole days from 1 to 3650; 0 is rejected, as it would expire every event
-# the moment it is written.
+# the moment it is written. One task sweeps every camera hourly, and a sweep
+# deletes at most a quarter of a camera's events, so a clock corrected forward
+# cannot empty the archive in one pass — see "Durability" above.
 movement_retention_days = 2
 # Retention for object detection events in days (default: 14)
 object_retention_days = 14
@@ -246,7 +266,8 @@ object_retention_days = 14
 continuous_retention_days = 1
 # Minimum free space (bytes) on the storage filesystem (default: 2 GiB).
 # Below this, the oldest recordings are emergency-pruned (continuous →
-# movements → objects) before each write. 0 disables the guard.
+# movements → objects) before each write. 0 disables the guard. This pass skips
+# events it has already failed to delete and is not bound by the sweep's cap.
 min_free_bytes = 2147483648
 
 # Optional: send warm events to a remote stathost host instead of data_dir.
@@ -268,10 +289,16 @@ min_free_bytes = 2147483648
 # camera showing the cropped frame from the last sighting of that class
 # (retained, so it persists across restarts). In the Home Assistant add-on
 # this section is auto-configured from the Mosquitto add-on via the
-# Supervisor and normally needs no manual settings. While enabled, camera ids
-# must not contain "+" or "#" (MQTT wildcards) and must stay unique once
-# lowercased with non-alphanumerics folded to "_" — camon refuses to start
-# otherwise.
+# Supervisor and normally needs no manual settings. On every (re)connect camon
+# restates every configured entity explicitly, on or off, and flips
+# availability to "online" last, so a retained ON left behind by a camon that
+# died mid-motion is always contradicted. Snapshots are not queued while the
+# broker is unreachable — an image would be long superseded by the time it
+# could be delivered — and each snapshot decode gives up after 15 seconds.
+# While enabled, camera ids must not contain "+" or "#" (MQTT wildcards) and
+# must stay unique once lowercased with non-alphanumerics folded to "_"; the
+# same wildcard rule applies to the object detection class names, since they
+# reach the topic verbatim. camon refuses to start otherwise.
 enabled = false
 # Broker hostname and port (defaults: "localhost", 1883)
 host = "localhost"
@@ -322,7 +349,7 @@ url = "rtsp://admin:password@192.168.1.100:554/stream1"
 | `GET` | `/api/cameras/{id}/detections` | Detected objects with confidence |
 | `GET` | `/api/cameras/{id}/detections/{id}/frame` | JPEG frame of detection |
 | `GET` | `/api/cameras/{id}/hot-events` | Hot buffer motion events |
-| `GET` | `/api/cameras/{id}/events?from=&to=` | Query warm events by time range |
+| `GET` | `/api/cameras/{id}/events` | Warm events overlapping a time range (`from`, `to`) |
 | `GET` | `/api/cameras/{id}/events/{pts}/playlist.m3u8` | Warm event HLS playlist |
 | `GET` | `/api/cameras/{id}/events/{pts}/segment` | Warm event HLS segment |
 | `GET` | `/api/cameras/{id}/events/{pts}/thumbnail` | Warm event thumbnail JPEG |
@@ -330,6 +357,12 @@ url = "rtsp://admin:password@192.168.1.100:554/stream1"
 | `GET` | `/api/cameras/{id}/detection-debug` | Detection debug entries |
 | `GET` | `/api/cameras/{id}/detection-debug/{id}/frame/{index}` | Detection debug frame JPEG |
 | `GET` | `/api/cameras/{id}/detection-debug/{id}/full-frame` | Detection debug full frame JPEG |
+
+Every route above sits behind `[http] token` when one is set: a request without it answers `401` with `WWW-Authenticate: Bearer`. Only `/api` is covered — the UI shell (`/`) and its assets stay open so the token prompt can load. A GET may carry the token as `?token=` instead of the header; a `PUT` may not.
+
+`from` and `to` on the event query are wall-clock nanoseconds, and either may be left out (an omitted `from` reaches back to the start of the archive, an omitted `to` runs to the end). The range is matched by **overlap**, so an event that started before `from` and is still running inside it is returned; that is how a long continuous chunk shows up in a window it merely spans. A range with `from` greater than `to` answers `400` rather than guessing at what was meant.
+
+`PUT /api/cameras/{id}/motion/settings` answers `500` when the new settings could not be written to disk. The change is still applied to the running detector — a mask exists to stop something being seen, so it has to take effect even when the disk will not take it — and the body says so; what is lost is only that it survives a restart.
 
 ## Storage Tiers
 
@@ -347,6 +380,8 @@ This repository is also a valid [Home Assistant add-on repository](https://devel
 See the [add-on documentation](camon-addon/DOCS.md) for install steps, ingress notes, the `camon.toml` configuration, and the amd64-only caveat.
 
 With the `[mqtt]` section enabled (automatic in the add-on when the Mosquitto broker add-on is installed), each camera also appears as native Home Assistant entities via MQTT discovery: a motion-gated snapshot camera, a motion sensor, per-class occupancy sensors, and a per-class snapshot camera showing the cropped frame from the last sighting of that class (retained, so it persists across restarts) — no custom integration required.
+
+Because every state is published retained, a connection that drops mid-motion would otherwise leave Home Assistant showing movement that never ends. Every reconnect therefore restates *every* configured entity — the ones that are off just as loudly as the ones that are on — and only then marks the device available again, so nothing is trusted while the broker still holds a stale value.
 
 ## License
 

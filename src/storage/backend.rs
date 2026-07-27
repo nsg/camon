@@ -172,7 +172,9 @@ pub trait WarmStorageBackend: Send + Sync {
     /// and rewrites the sidecar; a remote backend rewrites a sidecar in place.
     async fn upgrade_event(&self, camera_id: &str, upgrade: &EventUpgrade);
 
-    /// Delete every event older than its per-class retention.
+    /// Delete events older than their per-class retention, bounded by the
+    /// per-camera share one sweep may take (`cap_sweep_deletions`), so a
+    /// forward clock jump cannot empty an archive in a single pass.
     ///
     /// `cancel` is the shutdown flag. A sweep is long (a remote backend deletes
     /// one event at a time, each able to sit on a request timeout) and the

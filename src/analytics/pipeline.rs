@@ -112,8 +112,10 @@ fn sleep_unless_shutdown(total: Duration, shutdown: &AtomicBool) {
 }
 
 /// Counts consecutive zero-frame decodes so an ffmpeg that consumes input but
-/// emits nothing is caught. Without it the analyzer scores empty frame lists
-/// forever, silently: the child is alive, so the liveness check never fires.
+/// emits nothing is caught. A single empty decode is normal and simply leaves
+/// that segment unanalyzed, so nothing else notices a decoder that never
+/// recovers: it analyzes nothing for ever while the child stays alive, past
+/// every liveness check there is.
 #[derive(Default)]
 struct ZeroFrameTripwire {
     streak: u32,
@@ -975,8 +977,10 @@ impl MotionAnalyzer {
             );
             let filmstrip = self.run_filmstrip.take();
             self.emit_event(run, filmstrip);
-            // The run never saw its post-padding close, so HA would otherwise
-            // be left with a motion sensor stuck ON across the restart.
+            // The run never saw its post-padding close, so nothing else would
+            // clear the motion sensor. The bridge restates every entity on its
+            // next connect, but that only helps if camon comes back — and it
+            // leaves HA holding movement until it does.
             self.send_motion_event(MqttEvent::MotionEnd {
                 camera_id: self.camera_id.clone(),
             });

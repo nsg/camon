@@ -4,6 +4,12 @@
 # --config, and override individual values at startup with --set:
 #   camon --config /path/to/config.toml --set http.port=9090
 # (The Home Assistant add-on uses both; see HOMEASSISTANT.md.)
+#
+# The whole file is validated before anything starts, and camon exits with the
+# problem rather than running on defaults: a key it does not know is an error
+# (a typo would otherwise silently leave the default in force), while keys camon
+# itself shipped and later removed are dropped with advice, so a config that
+# booted before keeps booting.
 
 [update]
 # Auto-update from GitHub Releases on startup and every 12 hours (default:
@@ -40,7 +46,10 @@ allow_open = false
 [analytics]
 # Enable MOG2 motion detection (default: false)
 enabled = true
-# Frame sample rate for analysis (default: 5)
+# Frame rate ffmpeg decodes at when pulling frames out of a motion run for
+# object detection (default: 5). Motion analysis itself is keyframe-driven —
+# one frame per keyframe, so about one per second at a 1-second GOP — and is
+# not affected by this.
 sample_fps = 5
 
 # Default motion-detection settings. These seed each camera's
@@ -69,7 +78,8 @@ enabled = true
 confidence_threshold = 0.5
 # Object classes to detect (default: person, car, truck, dog, cat).
 # Also constrains the model's structured JSON output — only these classes can
-# be returned.
+# be returned. Folded to lower case and deduplicated at load, so the Home
+# Assistant entities and the model prompt always agree on the spelling.
 classes = ["person", "car", "truck", "dog", "cat"]
 
 [analytics.object_detection.ollama]
@@ -114,13 +124,23 @@ post_padding_secs = 10
 # cannot push a chunk past the cap. 0 disables chunking:
 # allowed with analytics enabled (motion end still closes each event), rejected
 # in continuous mode, where the cap is the only thing that rolls a chunk and
-# nothing would be written until shutdown. Timing is monotonic (wall clock), so
-# a camera PTS jump can't stall it.
+# nothing would be written until shutdown. Timing runs on a monotonic clock
+# rather than the camera's PTS, so a camera timestamp jump can't stall it.
 max_event_duration_secs = 120
 # Retention for movement-only events in days (default: 2). All three retentions
-# below are whole days from 1 to 3650. 0 is rejected: it does not mean "keep
-# forever" but "expired the moment it was written", so the next hourly sweep
-# would delete the whole archive.
+# below are whole days from 1 to 3650, checked at startup while storage is
+# enabled. 0 is rejected: it does not mean "keep forever" but "expired the
+# moment it was written", so every sweep would be deleting footage that was
+# just recorded. The upper bound keeps the retention from overflowing into a very
+# short one; a retention that long is really a disk-space limit, which is what
+# min_free_bytes below is for.
+#
+# One task owns retention for the whole store and sweeps every camera hourly.
+# A sweep deletes at most a quarter of a camera's events (at least four), so a
+# clock corrected forward — routine on a box without a battery-backed clock,
+# which resumes at its last shutdown time — cannot empty the archive in one
+# pass: it warns and the rest survives for later sweeps. An event stays indexed
+# and playable if its files could not be deleted, and the next sweep retries.
 movement_retention_days = 2
 # Retention for object detection events in days (default: 14)
 object_retention_days = 14
@@ -135,6 +155,9 @@ continuous_retention_days = 1
 # retention prune to catch up, and keeps the filesystem out of the near-full
 # regime where allocation degrades. 0 disables the guard. (Ignored by the
 # remote stathost backend below, which measures against max_stored_bytes.)
+# This pass skips events it has already failed to delete — the hourly sweep
+# retries those — and is not bounded by that sweep's per-camera cap, since a
+# disk that is actually full has to be freed.
 min_free_bytes = 2147483648
 
 # --- Remote warm-storage backend (optional) --------------------------------
@@ -143,6 +166,12 @@ min_free_bytes = 2147483648
 # (github.com/nsg/stathost) instead. Analytics, motion settings, and the hot
 # buffer always stay local; only the warm event store moves. Time-based
 # retention (the *_retention_days above) still applies, via DELETE.
+#
+# Every request is bounded, because a warm writer awaits them inline: 10s to
+# connect, 60s in total per delete, sidecar/thumbnail read or startup listing,
+# and 300s per upload (an event video can be tens of megabytes on a slow
+# uplink). Ranged playback has an idle budget of 30s instead of a total, so a
+# player draining the body slowly is not cut off.
 #
 # Requires stathost 0.2.0 or later (atomic uploads, detailed listing, Range
 # requests); there is no fallback for older servers. There are no directories
@@ -182,6 +211,14 @@ min_free_bytes = 2147483648
 #     from the last sighting of that class (retained, so it persists across
 #     restarts)
 #
+# Every state is published retained, so a bridge that dropped mid-motion would
+# leave a stale ON standing in Home Assistant. On every connect camon therefore
+# restates every configured entity explicitly — off as loudly as on — and
+# publishes availability last, so nothing is marked available while the broker
+# still holds an old value. Snapshots are dropped rather than queued while the
+# broker is unreachable (an image would be long superseded by the time it could
+# be delivered), and a snapshot decode gives up after 15 seconds.
+#
 # Discovery requires the Home Assistant MQTT integration to be configured
 # with discovery enabled (the default).
 #
@@ -192,8 +229,10 @@ min_free_bytes = 2147483648
 #
 # While MQTT is enabled, camera ids must not contain "+" or "#" (MQTT topic
 # wildcards) and must stay unique once lowercased with non-alphanumerics
-# folded to "_" ("Front Door" and "front-door" both become "front_door");
-# camon refuses to start otherwise.
+# folded to "_" ("Front Door" and "front-door" both become "front_door").
+# The class names in analytics.object_detection.classes above reach the
+# occupancy topics verbatim, so they must not hold a wildcard either. camon
+# refuses to start otherwise.
 [mqtt]
 # Enable MQTT / Home Assistant discovery (default: false)
 enabled = false
