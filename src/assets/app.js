@@ -48,6 +48,9 @@ document.addEventListener('DOMContentLoaded', async () => {
     const maskLayerHint = document.getElementById('mask-layer-hint');
     const layerMovementBtn = document.getElementById('layer-movement-btn');
     const layerDetectionBtn = document.getElementById('layer-detection-btn');
+    const settingsError = document.getElementById('settings-error');
+    const settingsErrorText = document.getElementById('settings-error-text');
+    const settingsErrorDismiss = document.getElementById('settings-error-dismiss');
     const liveBtn = document.getElementById('live-btn');
 
     // View 2: Event Browser
@@ -363,11 +366,17 @@ document.addEventListener('DOMContentLoaded', async () => {
         const show = settingsPanel.hidden;
         settingsPanel.hidden = !show;
         settingsBtn.classList.toggle('active', show);
-        if (!show && maskEditEnabled) {
+        if (show) {
+            // Whatever failed last time the panel was open has been read or
+            // ignored by now; reopening should not replay it.
+            clearSettingsError();
+        } else if (maskEditEnabled) {
             // Collapsing the panel exits mask-edit mode.
             setMaskEditEnabled(false);
         }
     });
+
+    settingsErrorDismiss.addEventListener('click', clearSettingsError);
 
     sensitivitySlider.addEventListener('input', () => {
         sensitivityValue.textContent = sensitivitySlider.value;
@@ -719,6 +728,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         detectionCells = [];
         settingsPanel.hidden = true;
         settingsBtn.classList.remove('active');
+        clearSettingsError();
 
         isLiveScrubbing = false;
         tlPointerId = null;
@@ -1149,16 +1159,40 @@ document.addEventListener('DOMContentLoaded', async () => {
         if (maskEditEnabled) drawMask();
     }
 
+    function showSettingsError(message) {
+        settingsErrorText.textContent = message;
+        settingsError.hidden = false;
+    }
+
+    function clearSettingsError() {
+        settingsError.hidden = true;
+        settingsErrorText.textContent = '';
+    }
+
+    // The server keeps a change it could not persist applied to the running
+    // detector, so a failure here deliberately leaves the sliders and the
+    // painted mask showing the new value — only the message says it will not
+    // survive a restart. A network failure is a different answer and says so:
+    // the change may or may not have reached the server at all.
     function putMotionSettings(partial) {
         if (!currentDetailCameraId) return;
+        clearSettingsError();
         apiFetch(`api/cameras/${encodeURIComponent(currentDetailCameraId)}/motion/settings`, {
             method: 'PUT',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(partial),
         })
-            .then(r => r.ok ? r.json() : null)
-            .then(data => { if (data) applyMotionSettings(data); })
-            .catch(err => console.error('Failed to update motion settings:', err));
+            .then(r => {
+                if (r.ok) return r.json().then(applyMotionSettings);
+                // A 401 raises the token prompt, which is the whole message.
+                if (r.status === 401) return;
+                return r.text().then(body => showSettingsError(
+                    body.trim() || `the server refused the change (HTTP ${r.status})`));
+            })
+            .catch(err => {
+                console.error('Failed to update motion settings:', err);
+                showSettingsError('could not reach camon — the change may or may not have been saved, reload to see what stuck');
+            });
     }
 
     function setMaskEditEnabled(enabled) {

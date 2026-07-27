@@ -32,6 +32,19 @@ const POLL_INTERVAL: Duration = Duration::from_millis(200);
 /// How long to wait before trying a dead decoder again.
 const DECODER_RESTART_BACKOFF: Duration = Duration::from_secs(5);
 
+const CROP_PADDING: f32 = 0.2;
+const MIN_CROP_FRACTION: f32 = 0.15;
+
+/// Consecutive zero-frame decodes tolerated before the decoder is declared
+/// blind. A segment is one GOP and always opens on a keyframe, so a healthy
+/// decode yields at least one I-frame — but a freshly spawned ffmpeg swallows
+/// several seconds of input while it probes the stream, so a single empty
+/// decode proves nothing. Only an unbroken streak does, and at roughly
+/// one segment per second thirty of them is about half a minute of blindness:
+/// long enough that no buffering hiccup explains it, short enough that little
+/// motion is missed before the respawn.
+const BLIND_DECODER_STREAK: u32 = 30;
+
 /// Sleep up to `total`, returning early once shutdown is requested, so a backoff
 /// never holds the drain up. The analyzer body runs on a blocking thread and so
 /// cannot select against the shutdown notify the async tasks use; polling the
@@ -46,18 +59,6 @@ fn sleep_unless_shutdown(total: Duration, shutdown: &AtomicBool) {
         thread::sleep(remaining.min(POLL_INTERVAL));
     }
 }
-const CROP_PADDING: f32 = 0.2;
-const MIN_CROP_FRACTION: f32 = 0.15;
-
-/// Consecutive zero-frame decodes tolerated before the decoder is declared
-/// blind. A segment is one GOP and always opens on a keyframe, so a healthy
-/// decode yields at least one I-frame — but a freshly spawned ffmpeg swallows
-/// several seconds of input while it probes the stream, so a single empty
-/// decode proves nothing. Only an unbroken streak does, and at roughly
-/// one segment per second thirty of them is about half a minute of blindness:
-/// long enough that no buffering hiccup explains it, short enough that little
-/// motion is missed before the respawn.
-const BLIND_DECODER_STREAK: u32 = 30;
 
 /// Counts consecutive zero-frame decodes so an ffmpeg that consumes input but
 /// emits nothing is caught. Without it the analyzer scores empty frame lists

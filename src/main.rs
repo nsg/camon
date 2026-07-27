@@ -159,6 +159,10 @@ impl ShutdownSignal {
     /// Raise the flag and wake every worker waiting on it. `notify_waiters`
     /// reaches all of them at once but leaves no permit behind for one that
     /// arrives afterwards, hence the flag re-check in `sleep_or_shutdown`.
+    ///
+    /// It does not wake the main task parked in `wait_for_shutdown`, so it is
+    /// only for callers that reach that themselves — anyone else has to notify
+    /// `wake` too, as `request_restart` does, or the drain never starts.
     fn request(&self) {
         self.flag.store(true, Ordering::Relaxed);
         self.drain.notify_waiters();

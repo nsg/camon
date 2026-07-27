@@ -268,15 +268,7 @@ fn load(path: &Path) -> Option<MotionSettings> {
 /// there is no second chance here of the kind the event path has.
 fn save(path: &Path, settings: &MotionSettings) -> std::io::Result<()> {
     let dir = path.parent().unwrap_or(Path::new("."));
-    // A directory that has just come into existence is itself only durable once
-    // its own parent is synced; the settings file inside it would go with it.
-    let dir_is_new = !dir.exists();
-    std::fs::create_dir_all(dir)?;
-    if dir_is_new {
-        if let Some(grandparent) = dir.parent() {
-            sync_dir(grandparent)?;
-        }
-    }
+    create_dir_all_synced(dir)?;
 
     let json = serde_json::to_string_pretty(settings).map_err(std::io::Error::other)?;
     let tmp = tmp_path(path);
@@ -285,6 +277,29 @@ fn save(path: &Path, settings: &MotionSettings) -> std::io::Result<()> {
         return Err(e);
     }
     sync_dir(dir)
+}
+
+/// `create_dir_all`, then make every directory it had to create durable. A
+/// directory only exists for certain once the parent holding its entry is
+/// synced, and that runs the whole way up: on a first ever start `{data_dir}`
+/// itself can be new, and syncing only the camera directory's parent would
+/// leave the tree able to vanish from above with the settings file inside it.
+fn create_dir_all_synced(dir: &Path) -> std::io::Result<()> {
+    let mut created = Vec::new();
+    let mut missing = Some(dir);
+    while let Some(d) = missing.filter(|d| !d.exists()) {
+        created.push(d);
+        missing = d.parent();
+    }
+    std::fs::create_dir_all(dir)?;
+    // Top down, so an entry is only made durable once the directory holding it
+    // is: `created` runs deepest first.
+    for d in created.iter().rev() {
+        if let Some(parent) = d.parent() {
+            sync_dir(parent)?;
+        }
+    }
+    Ok(())
 }
 
 fn tmp_path(path: &Path) -> PathBuf {
@@ -564,16 +579,22 @@ mod tests {
                     // A whole-mask pattern keyed to the writer, so a file mixing
                     // two of them cannot match any single writer's update.
                     let mask: Vec<bool> = (0..MASK_CELLS).map(|c| c % 8 == i).collect();
-                    store
-                        .update(
-                            "cam1",
-                            SettingsUpdate {
-                                var_threshold: Some(20.0 + i as f64),
-                                detection_mask: Some(mask),
-                                ..Default::default()
-                            },
-                        )
-                        .unwrap();
+                    // Repeated, because a single update per thread is often
+                    // over before the next thread has even spawned — the
+                    // writers have to genuinely overlap for the collision to
+                    // be certain rather than a coin flip.
+                    for _ in 0..50 {
+                        store
+                            .update(
+                                "cam1",
+                                SettingsUpdate {
+                                    var_threshold: Some(20.0 + i as f64),
+                                    detection_mask: Some(mask.clone()),
+                                    ..Default::default()
+                                },
+                            )
+                            .expect("a save collided with a concurrent one");
+                    }
                 })
             })
             .collect();
