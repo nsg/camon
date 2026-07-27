@@ -471,8 +471,19 @@ async fn graceful_shutdown(
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     dispatch_subcommand();
 
+    // A healthy production log is empty: only things that need attention
+    // (warn and up) are logged by default. Dev builds keep the full debug
+    // stream, and RUST_LOG (e.g. `RUST_LOG=camon=debug`) overrides both when
+    // an incident needs more detail.
+    let default_filter = if cfg!(debug_assertions) {
+        "camon=debug"
+    } else {
+        "camon=warn"
+    };
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env().add_directive("camon=debug".parse()?))
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_filter)),
+        )
         .init();
 
     let args = parse_cli_args();
