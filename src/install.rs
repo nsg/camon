@@ -40,10 +40,10 @@ fn resolve_working_dir() -> PathBuf {
 /// 90s, while shutdown flushes recordings that a remote warm-storage backend
 /// uploads with a 300s per-request timeout. A SIGKILL here truncates exactly
 /// the footage the graceful shutdown exists to save, and unlike the
-/// update-initiated drain — which has [`crate::RESTART_DRAIN_DEADLINE`] as its
+/// update-initiated drain — which has [`camon::app::RESTART_DRAIN_DEADLINE`] as its
 /// own backstop — nothing else bounds this one. Same budget as that deadline,
 /// deliberately.
-const STOP_TIMEOUT_SECS: u64 = crate::RESTART_DRAIN_DEADLINE.as_secs();
+const STOP_TIMEOUT_SECS: u64 = camon::app::RESTART_DRAIN_DEADLINE.as_secs();
 
 /// Camon exits cleanly of its own accord after installing an update, so the
 /// service must be restarted on a *successful* exit, not only after a crash.

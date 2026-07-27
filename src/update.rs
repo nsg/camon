@@ -282,7 +282,7 @@ pub async fn check_and_update() -> Result<bool, Box<dyn std::error::Error>> {
 /// named after this process's pid, so nothing — not even the next update from
 /// this same installation — would ever clean it up.
 fn stage_binary(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    let staged = crate::durable::write_synced(path, bytes).and_then(|()| {
+    let staged = camon::durable::write_synced(path, bytes).and_then(|()| {
         let file = std::fs::File::open(path)?;
         file.set_permissions(std::fs::Permissions::from_mode(0o755))?;
         file.sync_all()
@@ -795,16 +795,16 @@ fn write_guard(path: &Path, guard: &InstallGuard) -> std::io::Result<()> {
     // Not the shared `{name}.tmp` staging name: two camon processes can race
     // for the same guard, and each needs its own staging file.
     let temp = sibling(path, &format!(".{}.tmp", std::process::id()));
-    crate::durable::write_synced(&temp, text.as_bytes())?;
+    camon::durable::write_synced(&temp, text.as_bytes())?;
     std::fs::rename(&temp, path)?;
     sync_parent(path)
 }
 
 fn sync_parent(path: &Path) -> std::io::Result<()> {
-    match crate::durable::parent_dir(path) {
+    match camon::durable::parent_dir(path) {
         // A bare relative name resolves to `.`, which is a real directory to
         // sync rather than a reason to skip the sync.
-        Some(dir) => crate::durable::sync_dir(dir),
+        Some(dir) => camon::durable::sync_dir(dir),
         None => Ok(()),
     }
 }
