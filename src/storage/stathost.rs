@@ -41,6 +41,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use futures_util::TryStreamExt;
@@ -58,6 +59,27 @@ use crate::storage::warm_index::{parse_event_filename, parse_sidecar_json, Detec
 use crate::storage::{EventType, WarmEventEntry};
 
 const NANOS_PER_MS: u64 = 1_000_000;
+
+/// Writes, deletes and the scan are awaited inline by the serial per-camera
+/// warm writer, so an unbounded request stalls that camera's recording and its
+/// shutdown. Both clients bound the connect phase; the rest differs by call
+/// shape.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Total per-request ceiling for the non-streaming calls: delete, sidecar and
+/// thumbnail GETs, and the whole-bucket listing — which is not small, a busy
+/// bucket lists thousands of entries at startup.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+/// Total per-request ceiling for uploads: event videos reach tens of MB, which
+/// [`REQUEST_TIMEOUT`] would drop on a slow uplink. This bounds one request,
+/// not one event — `write_event` retries the video once, then uploads a sidecar
+/// and each thumbnail, so a half-broken link can hold the warm writer for a
+/// multiple of this.
+const UPLOAD_TIMEOUT: Duration = Duration::from_secs(300);
+/// Idle budget for the streaming client only. reqwest arms it flat until the
+/// response headers arrive, then per response frame with a reset on each — the
+/// right shape for a body a player drains at its own pace. The flat phase is
+/// harmless here because a ranged GET carries no request body.
+const STREAM_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The remote warm store: an HTTP client plus a self-maintained in-RAM index.
 pub struct StathostBackend {
@@ -84,7 +106,15 @@ impl StathostBackend {
         }
         Self {
             http: Http {
-                client: reqwest::Client::new(),
+                client: reqwest::Client::builder()
+                    .connect_timeout(CONNECT_TIMEOUT)
+                    .build()
+                    .expect("stathost http client"),
+                stream_client: reqwest::Client::builder()
+                    .connect_timeout(CONNECT_TIMEOUT)
+                    .read_timeout(STREAM_READ_TIMEOUT)
+                    .build()
+                    .expect("stathost streaming http client"),
                 base,
                 token: config.token.clone(),
             },
@@ -635,7 +665,14 @@ impl WarmStorageBackend for StathostBackend {
 /// Thin reqwest wrapper over the stathost object API. `base` is
 /// `{url}/{bucket}` with no trailing slash.
 struct Http {
+    /// Every call that completes within one request/response, bounded by a
+    /// per-request total timeout.
     client: reqwest::Client,
+    /// Playback only. A total timeout would cut long streams short, so this one
+    /// carries [`STREAM_READ_TIMEOUT`] instead — which in turn would be wrong
+    /// for the uploads on `client`, where reqwest counts the whole request body
+    /// write against it.
+    stream_client: reqwest::Client,
     base: String,
     token: String,
 }
@@ -657,6 +694,7 @@ impl Http {
         self.client
             .put(self.url(path))
             .bearer_auth(&self.token)
+            .timeout(UPLOAD_TIMEOUT)
             .body(body)
             .send()
             .await?
@@ -669,6 +707,7 @@ impl Http {
             .client
             .delete(self.url(path))
             .bearer_auth(&self.token)
+            .timeout(REQUEST_TIMEOUT)
             .send()
             .await
         {
@@ -691,6 +730,7 @@ impl Http {
             .client
             .get(self.url(path))
             .bearer_auth(&self.token)
+            .timeout(REQUEST_TIMEOUT)
             .send()
             .await?
             .error_for_status()?;
@@ -700,12 +740,19 @@ impl Http {
     /// Start a streamed GET, optionally forwarding a single `Range`. The raw
     /// response is returned unvalidated so the caller can distinguish `206`
     /// (partial), `200` (full / range-ignored) and `416` (unsatisfiable).
+    ///
+    /// Uses `stream_client`, deliberately without a total timeout: the body is
+    /// handed to a player that drains it at its own pace, so only the connect
+    /// and per-frame idle budgets apply.
     async fn get_ranged(
         &self,
         path: &str,
         range: Option<RangeRequest>,
     ) -> Result<reqwest::Response, reqwest::Error> {
-        let mut req = self.client.get(self.url(path)).bearer_auth(&self.token);
+        let mut req = self
+            .stream_client
+            .get(self.url(path))
+            .bearer_auth(&self.token);
         if let Some(range) = range {
             req = req.header(reqwest::header::RANGE, range.header_value());
         }
@@ -719,6 +766,7 @@ impl Http {
         self.client
             .get(format!("{}/_meta/list?detail=true", self.base))
             .bearer_auth(&self.token)
+            .timeout(REQUEST_TIMEOUT)
             .send()
             .await?
             .error_for_status()?

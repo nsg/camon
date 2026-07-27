@@ -1,10 +1,23 @@
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use sha2::{Digest, Sha256};
 
 const GITHUB_API_URL: &str = "https://api.github.com/repos/nsg/camon/releases/latest";
 const CHECKSUMS_ASSET: &str = "sha256sums.txt";
+
+/// This runs before the cameras start, so a stalled request keeps the whole NVR
+/// offline until it gives up.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Idle budget: reqwest arms it flat until the response headers arrive, then
+/// per response frame with a reset on each. These requests carry no body, so
+/// the flat phase is only connect-and-wait, and the multi-MB binary download is
+/// bounded by stalling rather than by how long it legitimately takes.
+const READ_TIMEOUT: Duration = Duration::from_secs(30);
+/// Total ceiling for the two small JSON/text requests. The binary download
+/// deliberately has none: a slow link may need minutes for it.
+const METADATA_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(serde::Deserialize)]
 struct Release {
@@ -22,11 +35,15 @@ pub async fn check_and_update() -> Result<bool, Box<dyn std::error::Error>> {
     let current_version = env!("CARGO_PKG_VERSION");
     tracing::info!(version = %current_version, "checking for updates");
 
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .connect_timeout(CONNECT_TIMEOUT)
+        .read_timeout(READ_TIMEOUT)
+        .build()?;
     let release: Release = client
         .get(GITHUB_API_URL)
         .header("User-Agent", format!("camon/{current_version}"))
         .header("Accept", "application/vnd.github.v3+json")
+        .timeout(METADATA_TIMEOUT)
         .send()
         .await?
         .error_for_status()?
@@ -84,6 +101,7 @@ pub async fn check_and_update() -> Result<bool, Box<dyn std::error::Error>> {
             let text = client
                 .get(&sums_asset.browser_download_url)
                 .header("User-Agent", format!("camon/{current_version}"))
+                .timeout(METADATA_TIMEOUT)
                 .send()
                 .await?
                 .error_for_status()?
