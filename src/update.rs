@@ -186,15 +186,10 @@ pub async fn check_and_update() -> Result<bool, Box<dyn std::error::Error>> {
 
     verify_download(&bytes, &asset.name, checksums.as_deref())?;
 
-    std::fs::write(&paths.staging, &bytes)?;
-    if let Err(e) = std::fs::set_permissions(&paths.staging, std::fs::Permissions::from_mode(0o755))
-    {
-        // Every path out of here from now on takes the staging file with it —
-        // it is a complete, executable copy of a release binary sitting next to
-        // the real one, and nothing else ever cleans it up.
-        let _ = std::fs::remove_file(&paths.staging);
-        return Err(e.into());
-    }
+    // Every path out of here takes the staging file with it — it is a complete,
+    // executable copy of a release binary sitting next to the real one, and
+    // nothing else ever cleans it up.
+    stage_binary(&paths.staging, &bytes)?;
 
     // The tag is a label a human typed; what the binary says about itself is
     // what decides whether the process started after the restart will download
@@ -239,6 +234,10 @@ pub async fn check_and_update() -> Result<bool, Box<dyn std::error::Error>> {
         }
     };
 
+    // An ordinary inode swap, running executable or not: nothing opens the live
+    // binary for writing (which is what would earn ETXTBSY), only the directory
+    // entry changes, and this process goes on executing the inode it started
+    // from until it exits, which is when that inode is finally freed.
     if let Err(e) = std::fs::rename(&paths.staging, &paths.exe) {
         // Nothing was installed, so the attempt must not stand — three failed
         // swaps would otherwise block a version that never ran.
@@ -250,9 +249,48 @@ pub async fn check_and_update() -> Result<bool, Box<dyn std::error::Error>> {
         )
         .into());
     }
+    // The swap is what the rest of this function was protecting, and it is not
+    // durable until the directory holding the name is synced. Not an error to
+    // return: the binary *is* installed, and reporting failure here would leave
+    // the process running the old one and downloading the same release again on
+    // the next check, spending the attempts the guard exists to ration.
+    if let Err(e) = sync_parent(&paths.exe) {
+        tracing::warn!(
+            path = %paths.exe.display(),
+            error = %e,
+            "installed {latest_text} but could not fsync the directory holding it: the new binary \
+             is in place and will start on the restart, but a power cut before the entry reaches \
+             the disk could resolve the name back to the old one"
+        );
+    }
 
     tracing::info!(version = %latest_text, attempt, "update applied successfully");
     Ok(true)
+}
+
+/// Write the downloaded binary to its staging path, executable and durable.
+///
+/// The fsync is the point: the rename that publishes this file is atomic but
+/// says nothing about its contents, so without it a power cut moments after an
+/// update can leave a truncated or empty `camon` under the live name — an
+/// installation that no longer starts at all, which is a worse outcome than any
+/// the update was meant to fix. The mode belongs to the same guarantee: a binary
+/// that comes back without its `x` bit is just as unbootable, so it is set
+/// before the fsync rather than after one that could not have covered it.
+///
+/// A failed write takes the staging file with it. It is a multi-megabyte file
+/// named after this process's pid, so nothing — not even the next update from
+/// this same installation — would ever clean it up.
+fn stage_binary(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let staged = crate::durable::write_synced(path, bytes).and_then(|()| {
+        let file = std::fs::File::open(path)?;
+        file.set_permissions(std::fs::Permissions::from_mode(0o755))?;
+        file.sync_all()
+    });
+    if staged.is_err() {
+        let _ = std::fs::remove_file(path);
+    }
+    staged
 }
 
 /// Refuse this release for good: say why, and write it down so the asset is not
@@ -1129,6 +1167,37 @@ mod tests {
         let doc = format!("{}  camon-linux-glibc\n", sha256_hex(&bytes));
         let err = verify_download(&bytes, "camon-linux-glibc", Some(&doc)).unwrap_err();
         assert!(err.contains("not a valid ELF"), "got: {err}");
+    }
+
+    /// Whether the fsync reached the platter is not observable from a test; the
+    /// two properties the swap depends on are — the staged file holds the whole
+    /// download, and it is executable before anything renames it into place.
+    #[test]
+    fn a_staged_binary_is_complete_and_executable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = UpdatePaths::for_exe(&dir.path().join("camon")).staging;
+
+        stage_binary(&path, &fake_elf()).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), fake_elf());
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o755, "the staged binary is not executable");
+
+        // Truncating, so a shorter release cannot inherit the tail of a longer
+        // one left by an earlier attempt of the same process.
+        stage_binary(&path, b"short").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"short");
+    }
+
+    /// A staging file is named after this process's pid, so one left behind by a
+    /// failed write is never written over and never removed by anything else.
+    #[test]
+    fn a_staged_binary_that_cannot_be_written_leaves_nothing_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("camon.update.tmp");
+        std::fs::create_dir(&path).unwrap();
+
+        assert!(stage_binary(&path, &fake_elf()).is_err());
+        assert!(!path.is_file());
     }
 
     /// The updater and `camon version` are one contract: what main prints has

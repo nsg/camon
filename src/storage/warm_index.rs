@@ -415,11 +415,12 @@ impl WarmEventIndex {
     /// stays listed for the next sweep to retry. Returns the number of events
     /// actually deleted.
     ///
-    /// `cancel` is polled between events and between cameras so a shutdown
-    /// does not wait out a whole sweep. Never mid-event: an event that lost
-    /// its `.ts` but kept its sidecar and thumbnails is invisible to the
-    /// startup scan, which only looks at `.ts` files, so those files would
-    /// leak exactly as the ones this method refuses to unindex would.
+    /// `cancel` is polled between events and between cameras so a shutdown does
+    /// not wait out a whole sweep. Stopping part-way through one event would be
+    /// survivable too — [`remove_event_files`](Self::remove_event_files) unlinks
+    /// the `.ts` last, so what is left of an interrupted delete is an event the
+    /// next startup scan still finds and the next sweep deletes again — but
+    /// per-event granularity is already fine enough to stop promptly.
     pub async fn prune<F: FnMut() -> bool>(
         &self,
         movement_max_age_ns: u64,
@@ -521,11 +522,36 @@ impl WarmEventIndex {
         total_deleted
     }
 
-    /// Delete every file belonging to one event (.ts, sidecar, thumbnails).
+    /// Delete every file belonging to one event — sidecar and thumbnails first,
+    /// the video last.
+    ///
+    /// That order is the whole durability story of a delete. Unlinks are not
+    /// fsynced, so a power cut part-way through leaves whichever of them the
+    /// filesystem happened to have committed; the `.ts` is the one file anything
+    /// looks for afterwards, since the startup scan indexes `.ts` entries and
+    /// only sweeps `.tmp` besides. Unlinking it last means the survivor of a
+    /// partial delete is always an event retention will find and expire again,
+    /// which retries the rest — where unlinking it first could strand a sidecar
+    /// and a handful of thumbnails that nothing would ever look at, let alone
+    /// collect. It mirrors the write, where the `.ts` is renamed into place last
+    /// and is likewise what says the event exists.
     async fn remove_event_files(&self, camera_id: &str, entry: &WarmEventEntry) -> Removal {
         let path = self.resolve_file_path(camera_id, entry);
-        let thumb = path.with_extension("jpg");
-        let removed = match tokio::fs::remove_file(&path).await {
+        // Best effort, and deliberately not a reason to keep the video: camon
+        // promises to delete footage on a retention schedule, and holding an
+        // expired recording because a thumbnail resisted breaks a larger promise
+        // than the kilobytes it would save. A failure here is near-hypothetical
+        // anyway — the right to unlink comes from the directory, so whatever
+        // refuses one of these files refuses the `.ts` below it too.
+        let _ = tokio::fs::remove_file(&path.with_extension("jpg")).await;
+        let _ = tokio::fs::remove_file(&path.with_extension("json")).await;
+        let stem = format!("{}_{}", entry.start_pts_ns, entry.duration_ms);
+        let dir = path.parent().unwrap_or(&self.data_dir);
+        for i in 0..4 {
+            let _ = tokio::fs::remove_file(dir.join(format!("{}_thumb_{}.jpg", stem, i))).await;
+        }
+
+        match tokio::fs::remove_file(&path).await {
             Ok(()) => Removal::Deleted,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Removal::Missing,
             Err(e) => {
@@ -538,26 +564,15 @@ impl WarmEventIndex {
                     error = %e,
                     "failed to delete warm event file"
                 );
+                // The video is still on disk, so the entry stays indexed for the
+                // next attempt — it is now a bare `.ts` with its metadata
+                // already gone, which is what an event whose thumbnails and
+                // classes could not be kept looks like. Being indexed is not a
+                // promise that it still reads: whatever blocked the delete may
+                // well block playback too.
                 Removal::Failed
             }
-        };
-        // The video is still on disk, so the entry stays indexed for the next
-        // attempt and its metadata is left intact — stripping the sidecar and
-        // thumbnails off a file that is still there helps nobody. Being
-        // indexed is not a promise that it still reads: whatever blocked the
-        // delete may well block playback too.
-        if matches!(removed, Removal::Failed) {
-            return removed;
         }
-        let _ = tokio::fs::remove_file(&thumb).await;
-        let _ = tokio::fs::remove_file(&path.with_extension("json")).await;
-        // Clean up filmstrip thumbnails
-        let stem = format!("{}_{}", entry.start_pts_ns, entry.duration_ms);
-        let dir = path.parent().unwrap_or(&self.data_dir);
-        for i in 0..4 {
-            let _ = tokio::fs::remove_file(dir.join(format!("{}_thumb_{}.jpg", stem, i))).await;
-        }
-        removed
     }
 
     /// Remember that this event resisted deletion, so the low-space guard
@@ -1213,6 +1228,61 @@ mod tests {
         );
         assert!(entries(&index).is_empty());
         assert!(!path.exists());
+    }
+
+    /// Every file of an event goes with it. Metadata whose `.ts` is gone is
+    /// invisible to the startup scan and to retention alike, so anything left
+    /// behind here is left behind for as long as the installation lasts.
+    #[tokio::test]
+    async fn prune_deletes_the_sidecar_and_thumbnails_with_the_video() {
+        let dir = tempfile::tempdir().unwrap();
+        write_event_files(dir.path(), "continuous", "1000_1000", Some("{}"));
+        let d = dir.path().join("cam").join("continuous");
+        std::fs::write(d.join("1000_1000.jpg"), b"jpg").unwrap();
+        for i in 0..4 {
+            std::fs::write(d.join(format!("1000_1000_thumb_{i}.jpg")), b"jpg").unwrap();
+        }
+
+        let index = WarmEventIndex::new(&["cam".to_string()], dir.path().to_path_buf());
+        index.scan();
+        assert_eq!(index.prune(1, 1, 1, running()).await, 1);
+
+        let left: Vec<_> = std::fs::read_dir(&d)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert!(left.is_empty(), "orphaned by the delete: {left:?}");
+    }
+
+    /// The order a delete runs in, made visible by a `.ts` that cannot be
+    /// unlinked at all: the metadata is already gone by the time that fails. A
+    /// power cut between the unlinks leaves the same shape and cannot be tested
+    /// — what it would leave is the `.ts`, which the next scan indexes and the
+    /// next sweep deletes again, where a surviving sidecar or thumbnail would be
+    /// collected by nothing.
+    #[tokio::test]
+    async fn a_delete_that_cannot_finish_leaves_the_video_rather_than_its_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        write_undeletable_event(dir.path(), "continuous", "1000_1000");
+        let d = dir.path().join("cam").join("continuous");
+        std::fs::write(d.join("1000_1000.json"), "{}").unwrap();
+        std::fs::write(d.join("1000_1000_thumb_0.jpg"), b"jpg").unwrap();
+
+        let index = WarmEventIndex::new(&["cam".to_string()], dir.path().to_path_buf());
+        index.scan();
+        assert_eq!(index.prune(1, 1, 1, running()).await, 0);
+
+        assert!(d.join("1000_1000.ts").is_dir(), "the video was deleted");
+        assert!(
+            !d.join("1000_1000.json").exists(),
+            "the sidecar was left for the video's sake"
+        );
+        assert!(!d.join("1000_1000_thumb_0.jpg").exists());
+        assert_eq!(
+            entries(&index).len(),
+            1,
+            "an event still on disk was unindexed"
+        );
     }
 
     #[tokio::test]

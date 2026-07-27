@@ -29,6 +29,9 @@
 # comes back — a service starting a different binary than the updater replaces
 # — from restarting camon indefinitely. Camon logs which of the two it hit and
 # what to fix; deleting the guard file retries, and any newer release resets it.
+# The download is fsynced before it is renamed over the running binary and the
+# directory holding the name is fsynced after, so a power cut moments after an
+# update cannot leave a truncated `camon` that never starts again.
 enabled = false
 
 [buffer]
