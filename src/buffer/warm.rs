@@ -1,6 +1,6 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
 
@@ -10,7 +10,7 @@ use crate::config::WarmConfig;
 use crate::locks::LockExt;
 use crate::storage::backend::{WarmStorageBackend, WriteOutcome};
 use crate::storage::warm_index::DetectionDetail;
-use crate::storage::{DetectionStore, EventType};
+use crate::storage::{DetectionStore, EventType, RecordingWatchdog};
 
 const NANOS_PER_MS: u64 = 1_000_000;
 
@@ -328,6 +328,10 @@ pub struct WarmWriter {
     /// filesystem has less free space than this, the oldest events are
     /// emergency-pruned first. 0 disables the guard.
     min_free_bytes: u64,
+    /// Told about every event that reached storage. This is the last point at
+    /// which an event is known to have survived, so it is where the watchdog's
+    /// clock is reset from.
+    watchdog: Arc<RecordingWatchdog>,
 }
 
 const NANOS_PER_SEC: u64 = 1_000_000_000;
@@ -338,12 +342,14 @@ impl WarmWriter {
         camera_id: String,
         warm_config: &WarmConfig,
         backend: Arc<dyn WarmStorageBackend>,
+        watchdog: Arc<RecordingWatchdog>,
     ) -> Self {
         Self {
             receiver,
             camera_id,
             backend,
             min_free_bytes: warm_config.min_free_bytes,
+            watchdog,
         }
     }
 
@@ -368,7 +374,7 @@ impl WarmWriter {
         self.backend
             .guard_free_space(&self.camera_id, self.min_free_bytes)
             .await;
-        match self.backend.write_event(&self.camera_id, &event).await {
+        let outcome = match self.backend.write_event(&self.camera_id, &event).await {
             WriteOutcome::NoSpace => {
                 tracing::warn!(
                     camera = %self.camera_id,
@@ -386,8 +392,15 @@ impl WarmWriter {
                         "dropping event: write failed again after emergency prune"
                     );
                 }
+                retry
             }
-            WriteOutcome::Written | WriteOutcome::Failed => {}
+            // Listed rather than caught by a wildcard: a future outcome has to
+            // be a compile error here, not a silent fall-through into "not
+            // written" that skips whatever logging it deserves.
+            outcome @ (WriteOutcome::Written | WriteOutcome::Failed) => outcome,
+        };
+        if outcome == WriteOutcome::Written {
+            self.watchdog.record(&self.camera_id, Instant::now());
         }
     }
 
@@ -487,7 +500,7 @@ impl RetentionTask {
 mod tests {
     use super::*;
     use crate::storage::backend::deduplicate_detections;
-    use crate::storage::{DetectionEntry, WarmEventEntry};
+    use crate::storage::{DetectionEntry, RecordingMode, WarmEventEntry};
 
     const SEC: u64 = 1_000_000_000;
 
@@ -695,6 +708,12 @@ mod tests {
         emergency_prunes: AtomicUsize,
         /// When set, the next write reports a full disk and clears the flag.
         no_space_next_write: AtomicBool,
+        /// When set, every write fails outright — the outcome that loses an
+        /// event with no retry behind it.
+        fail_writes: AtomicBool,
+        /// When set, the emergency prune does not make room after all, so the
+        /// retry that follows a full disk fails too.
+        fail_after_prune: AtomicBool,
         /// How long a sweep takes, for cadence tests.
         prune_duration: Duration,
         /// When set, a sweep parks here until notified — a sweep that is in
@@ -707,7 +726,9 @@ mod tests {
     impl WarmStorageBackend for RecordingBackend {
         async fn write_event(&self, _camera_id: &str, _event: &FinishedEvent) -> WriteOutcome {
             self.writes.fetch_add(1, Ordering::Relaxed);
-            if self.no_space_next_write.swap(false, Ordering::Relaxed) {
+            if self.fail_writes.load(Ordering::Relaxed) {
+                WriteOutcome::Failed
+            } else if self.no_space_next_write.swap(false, Ordering::Relaxed) {
                 WriteOutcome::NoSpace
             } else {
                 WriteOutcome::Written
@@ -744,6 +765,9 @@ mod tests {
 
         async fn emergency_prune(&self, _camera_id: &str, _min_free_bytes: u64) {
             self.emergency_prunes.fetch_add(1, Ordering::Relaxed);
+            if self.fail_after_prune.load(Ordering::Relaxed) {
+                self.fail_writes.store(true, Ordering::Relaxed);
+            }
         }
 
         fn free_space(&self) -> std::io::Result<u64> {
@@ -753,6 +777,10 @@ mod tests {
         async fn scan(&self) {}
 
         fn recover_orphans(&self) {}
+
+        fn newest_event_end_ns(&self, _camera_id: &str) -> Option<u64> {
+            None
+        }
 
         fn query(&self, _camera_id: &str, _from_ns: u64, _to_ns: u64) -> Vec<WarmEventEntry> {
             unimplemented!("read path unused in writer tests")
@@ -820,6 +848,7 @@ mod tests {
             "cam".to_string(),
             &WarmConfig::default(),
             backend.clone(),
+            Arc::new(RecordingWatchdog::new()),
         );
         let handle = tokio::spawn(writer.run());
 
@@ -843,6 +872,7 @@ mod tests {
             "cam".to_string(),
             &WarmConfig::default(),
             backend.clone(),
+            Arc::new(RecordingWatchdog::new()),
         );
         let handle = tokio::spawn(writer.run());
 
@@ -853,6 +883,72 @@ mod tests {
         assert_eq!(backend.emergency_prunes.load(Ordering::Relaxed), 1);
         assert_eq!(backend.writes.load(Ordering::Relaxed), 2, "no retry");
         assert_eq!(backend.prunes.load(Ordering::Relaxed), 0);
+    }
+
+    /// Push one event through a writer and report how many recordings the
+    /// watchdog ended up crediting the camera with.
+    async fn events_credited_to_watchdog(backend: Arc<RecordingBackend>) -> u64 {
+        let watchdog = Arc::new(RecordingWatchdog::new());
+        let registered = Instant::now();
+        watchdog.register("cam", RecordingMode::Event, registered, Duration::ZERO);
+
+        let (tx, rx) = mpsc::channel(4);
+        let writer = WarmWriter::new(
+            rx,
+            "cam".to_string(),
+            &WarmConfig::default(),
+            backend,
+            Arc::clone(&watchdog),
+        );
+        let handle = tokio::spawn(writer.run());
+        tx.send(WriterMessage::Event(test_event())).await.unwrap();
+        drop(tx);
+        handle.await.unwrap();
+
+        // Far enough past the limit that the camera is reported either way; the
+        // count in the report is what says whether the write counted.
+        let reports = watchdog.check(registered + Duration::from_secs(2 * 24 * 3600));
+        assert_eq!(reports.len(), 1);
+        reports[0].events
+    }
+
+    /// What the watchdog counts has to be footage that actually landed — down
+    /// the full durability ladder, retry included. Both backends log a failed
+    /// write, but nothing retries it and nothing tallies what was lost, so a
+    /// camera whose writes fail has to reach the watchdog as one that is
+    /// recording nothing.
+    #[tokio::test]
+    async fn only_an_event_that_reached_storage_clears_the_watchdog() {
+        for (case, fail_writes, no_space, fail_after_prune, expected) in [
+            ("written", false, false, false, 1),
+            ("failed", true, false, false, 0),
+            (
+                "no space, then written after the prune",
+                false,
+                true,
+                false,
+                1,
+            ),
+            (
+                "no space, still failing after the prune",
+                false,
+                true,
+                true,
+                0,
+            ),
+        ] {
+            let backend = Arc::new(RecordingBackend::default());
+            backend.fail_writes.store(fail_writes, Ordering::Relaxed);
+            backend
+                .no_space_next_write
+                .store(no_space, Ordering::Relaxed);
+            backend
+                .fail_after_prune
+                .store(fail_after_prune, Ordering::Relaxed);
+
+            let credited = events_credited_to_watchdog(Arc::clone(&backend)).await;
+            assert_eq!(credited, expected, "{case}");
+        }
     }
 
     fn spawn_retention(

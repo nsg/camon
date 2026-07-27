@@ -9,6 +9,7 @@ use thiserror::Error;
 use crate::buffer::{GopSegment, HotBuffer};
 use crate::config::CameraConfig;
 use crate::locks::LockExt;
+use crate::retry::Streak;
 
 /// Reconnect if no bytes are read from ffmpeg for this long.
 const DATA_TIMEOUT_SECS: u64 = 30;
@@ -22,10 +23,6 @@ const ESCALATE_AFTER: u32 = 4;
 /// a window for "no keyframe" to mean more than "camon did not look for long",
 /// and no stream is accused on that.
 const MIN_KEYFRAME_WINDOW_SECS: u64 = 30;
-/// Never let more than this many failures pass between two reports. Doubling
-/// alone would leave a camera dead for twelve hours with its last error nine
-/// hours back and the next nine hours out — silent exactly when it matters.
-const MAX_REPORT_GAP: u32 = 60;
 /// A run that kept going this long was a working stream that hiccupped, not a
 /// camera that never gets going, so its next stop is worth a line again.
 const SETTLED_RUN_SECS: u64 = 600;
@@ -286,36 +283,6 @@ enum Report {
     Camera(u32),
 }
 
-/// Consecutive occurrences of one kind of outcome, and when to speak up about
-/// them. Doubling keeps a permanently broken camera visible without a line a
-/// minute forever; the cap stops the gap growing past an hour.
-struct Streak {
-    count: u32,
-    next_report: u32,
-}
-
-impl Streak {
-    fn new() -> Self {
-        Self {
-            count: 0,
-            next_report: 1,
-        }
-    }
-
-    fn reset(&mut self) {
-        *self = Self::new();
-    }
-
-    fn record(&mut self) -> Option<u32> {
-        self.count += 1;
-        if self.count < self.next_report {
-            return None;
-        }
-        self.next_report = self.count + self.count.min(MAX_REPORT_GAP);
-        Some(self.count)
-    }
-}
-
 /// Decides how loudly a finished run is reported.
 ///
 /// Each streak is cleared only by evidence that the condition it counts has
@@ -323,18 +290,10 @@ impl Streak {
 /// clears the stall streak. Outcomes that show neither — an unrelated error, a
 /// panic — never reach this type at all, so they cannot defer a diagnosis by
 /// resetting a count they say nothing about.
+#[derive(Default)]
 pub struct NoRecordingTracker {
     fault: Streak,
     stall: Streak,
-}
-
-impl Default for NoRecordingTracker {
-    fn default() -> Self {
-        Self {
-            fault: Streak::new(),
-            stall: Streak::new(),
-        }
-    }
 }
 
 impl NoRecordingTracker {
@@ -823,6 +782,7 @@ mod tests {
     use super::*;
     use crate::mpegts::testutil::{keyframe_packet, pes_packet};
     use crate::mpegts::TS_PACKET_SIZE;
+    use crate::retry::MAX_REPORT_GAP;
     use std::sync::Mutex;
     use tracing::Level;
 
@@ -1288,7 +1248,7 @@ mod tests {
         // Reporting advances the streak it reports on: a report that cleared it
         // would restart at one here and never escalate at all.
         assert_eq!(tracker.classify(&failure), Report::Quiet);
-        assert_eq!(tracker.fault.count, 13);
+        assert_eq!(tracker.fault.count(), 13);
     }
 
     #[test]

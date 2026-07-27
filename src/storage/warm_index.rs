@@ -360,6 +360,16 @@ impl WarmEventIndex {
         }
     }
 
+    /// End of the newest indexed event, in wall-clock nanoseconds. Entries are
+    /// kept sorted by start, so the last one is the newest.
+    pub fn newest_event_end_ns(&self, camera_id: &str) -> Option<u64> {
+        let entries = self.cameras.get(camera_id)?.read_recover();
+        entries.last().map(|e| {
+            e.start_pts_ns
+                .saturating_add((e.duration_ms as u64) * 1_000_000)
+        })
+    }
+
     pub fn find_event(&self, camera_id: &str, start_pts_ns: u64) -> Option<WarmEventEntry> {
         let lock = self.cameras.get(camera_id)?;
         let entries = lock.read_recover();
@@ -795,6 +805,25 @@ mod tests {
 
     fn entries(index: &WarmEventIndex) -> Vec<WarmEventEntry> {
         index.query("cam", 0, u64::MAX)
+    }
+
+    /// Seeds the recording watchdog, so it has to be the END of the newest
+    /// event: a camera mid-way through a long continuous chunk has not been
+    /// silent since that chunk started.
+    #[test]
+    fn newest_event_end_is_the_end_of_the_last_event() {
+        let index = indexed(&[(0, 1000), (10 * SEC, 5000), (5 * SEC, 1000)]);
+        assert_eq!(
+            index.newest_event_end_ns("cam"),
+            Some(10 * SEC + 5 * SEC),
+            "not the end of the latest-starting event"
+        );
+    }
+
+    #[test]
+    fn newest_event_end_is_none_without_events_or_camera() {
+        assert_eq!(indexed(&[]).newest_event_end_ns("cam"), None);
+        assert_eq!(indexed(&[(0, 1000)]).newest_event_end_ns("other"), None);
     }
 
     /// A cancel predicate that never fires, for the sweeps that are not about

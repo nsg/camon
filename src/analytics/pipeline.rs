@@ -13,6 +13,7 @@ use crate::buffer::HotBuffer;
 use crate::config::AnalyticsConfig;
 use crate::locks::LockExt;
 use crate::mqtt::{send_event, MqttEvent};
+use crate::retry::{jittered, RetrySchedule, Streak};
 use crate::storage::{DetectionStore, EventRecord, EventRegistry, MotionEntry, MotionStore};
 
 use super::decoder::{
@@ -31,6 +32,56 @@ const POLL_INTERVAL: Duration = Duration::from_millis(200);
 
 /// How long to wait before trying a dead decoder again.
 const DECODER_RESTART_BACKOFF: Duration = Duration::from_secs(5);
+
+/// Ceiling on the decoder-spawn backoff. Spawning a decoder fails for two very
+/// different reasons: a transient one (a fork that lost a race for memory, an
+/// exhausted fd table) that clears on its own, and a permanent one (no ffmpeg on
+/// PATH) that never does. Doubling from [`DECODER_RESTART_BACKOFF`] to a minute
+/// serves both — the same shape the camera pipeline's reconnect uses — so the
+/// first recovers within a minute of clearing and the second stops costing an
+/// ffmpeg fork every five seconds.
+const DECODER_SPAWN_BACKOFF_MAX: Duration = Duration::from_secs(60);
+
+const DECODER_SPAWN_SCHEDULE: RetrySchedule = RetrySchedule {
+    start: DECODER_RESTART_BACKOFF,
+    max: DECODER_SPAWN_BACKOFF_MAX,
+};
+
+/// The one policy for failing to spawn a decoder, used by both places that do
+/// it: building an analyzer and replacing one whose decoder died. They fail for
+/// identical reasons, so a missing ffmpeg must not produce a line a minute
+/// through one path and twelve through the other.
+///
+/// Reporting escalates rather than repeating: something permanently broken
+/// stays visible without burying every other line in the log.
+struct DecoderSpawnRetry {
+    schedule: RetrySchedule,
+    backoff: Duration,
+    streak: Streak,
+}
+
+impl DecoderSpawnRetry {
+    fn new(schedule: RetrySchedule) -> Self {
+        Self {
+            schedule,
+            backoff: schedule.start,
+            streak: Streak::new(),
+        }
+    }
+
+    /// Record a failed spawn. Returns how long to wait, and the streak length
+    /// when this failure is one worth a log line.
+    fn failed(&mut self) -> (Duration, Option<u32>) {
+        let delay = jittered(self.backoff);
+        self.backoff = self.schedule.next(self.backoff);
+        (delay, self.streak.record())
+    }
+
+    fn succeeded(&mut self) {
+        self.backoff = self.schedule.start;
+        self.streak.reset();
+    }
+}
 
 const CROP_PADDING: f32 = 0.2;
 const MIN_CROP_FRACTION: f32 = 0.15;
@@ -448,6 +499,10 @@ struct PendingSegment {
     duration_ns: u64,
 }
 
+/// Cloneable so a failed construction can be retried with it. Every field is
+/// either a handle (`Arc`, channel sender, store) or small config, so a clone
+/// costs nothing worth avoiding.
+#[derive(Clone)]
 pub struct AnalyzerContext {
     pub camera_id: String,
     pub buffer: Arc<RwLock<HotBuffer>>,
@@ -488,6 +543,8 @@ pub struct MotionAnalyzer {
     config: AnalyticsConfig,
     detector: MotionDetector,
     decoder: FrameDecoder,
+    /// Backoff and log escalation for a decoder that will not respawn.
+    decoder_retry: DecoderSpawnRetry,
     /// Watches for a decoder that consumes segments but returns no frames. The
     /// detector above is deliberately not part of the decoder, so a respawn
     /// leaves the learned MOG2 background model intact.
@@ -554,6 +611,7 @@ impl MotionAnalyzer {
             config: ctx.config,
             detector,
             decoder,
+            decoder_retry: DecoderSpawnRetry::new(DECODER_SPAWN_SCHEDULE),
             zero_frames: ZeroFrameTripwire::default(),
             detect_tx: ctx.detect_tx,
             event_registry: ctx.event_registry,
@@ -604,11 +662,21 @@ impl MotionAnalyzer {
         match FrameDecoder::new() {
             Ok(d) => {
                 self.decoder = d;
+                self.decoder_retry.succeeded();
                 true
             }
             Err(e) => {
-                tracing::error!(camera = %self.camera_id, error = %e, "failed to restart decoder");
-                sleep_unless_shutdown(DECODER_RESTART_BACKOFF, shutdown);
+                let (delay, report) = self.decoder_retry.failed();
+                if let Some(attempts) = report {
+                    tracing::error!(
+                        camera = %self.camera_id,
+                        error = %e,
+                        attempts,
+                        retry_in_secs = delay.as_secs(),
+                        "failed to restart decoder"
+                    );
+                }
+                sleep_unless_shutdown(delay, shutdown);
                 false
             }
         }
@@ -1307,15 +1375,64 @@ fn gray_jpeg((data, w, h): (&[u8], usize, usize)) -> Option<Vec<u8>> {
     encode_jpeg_raw(data, w, h, image::ExtendedColorType::L8)
 }
 
+/// Build until it succeeds or shutdown is requested; `None` means only the
+/// latter. The sleep between attempts is shutdown-aware, so a camera stuck in
+/// here never holds the drain up.
+fn build_with_retry<T, E: std::fmt::Display>(
+    camera_id: &str,
+    what: &str,
+    shutdown: &AtomicBool,
+    schedule: RetrySchedule,
+    mut build: impl FnMut() -> Result<T, E>,
+) -> Option<T> {
+    let mut retry = DecoderSpawnRetry::new(schedule);
+    while !shutdown.load(Ordering::Relaxed) {
+        match build() {
+            Ok(built) => return Some(built),
+            Err(e) => {
+                let (delay, report) = retry.failed();
+                if let Some(attempts) = report {
+                    tracing::error!(
+                        camera = %camera_id,
+                        error = %e,
+                        attempts,
+                        retry_in_secs = delay.as_secs(),
+                        "failed to create {what}, retrying"
+                    );
+                }
+                sleep_unless_shutdown(delay, shutdown);
+            }
+        }
+    }
+    None
+}
+
+/// Construction is retried rather than fatal because it fails for the same
+/// reasons a running decoder dies — which [`MotionAnalyzer::ensure_decoder_alive`]
+/// already respawns through. Giving up here instead left the camera with no
+/// analyzer at all, and in event mode nothing else writes events: it recorded
+/// nothing for the rest of the process after a single line at startup.
 pub fn spawn_analyzer(
     ctx: AnalyzerContext,
     shutdown: Arc<AtomicBool>,
 ) -> tokio::task::JoinHandle<()> {
     let camera_id = ctx.camera_id.clone();
-    tokio::task::spawn_blocking(move || match MotionAnalyzer::new(ctx) {
-        Ok(analyzer) => analyzer.run(shutdown),
-        Err(e) => {
-            tracing::error!(camera = %camera_id, error = %e, "failed to create motion analyzer");
+    tokio::task::spawn_blocking(move || {
+        let analyzer = build_with_retry(
+            &camera_id,
+            "motion analyzer",
+            &shutdown,
+            DECODER_SPAWN_SCHEDULE,
+            || MotionAnalyzer::new(ctx.clone()),
+        );
+        // The retry needs the context to still be here, but the analyzer now
+        // holds its own clone of every sender in it. Shutdown drains the warm
+        // writers by dropping the last sender and waiting for the channel to
+        // close, so a duplicate that outlives construction is a hang waiting
+        // for the one camera whose analyzer takes longest to stop.
+        drop(ctx);
+        if let Some(analyzer) = analyzer {
+            analyzer.run(shutdown);
         }
     })
 }
@@ -1323,6 +1440,7 @@ pub fn spawn_analyzer(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicU32;
 
     /// The decoder-restart backoff must not outlive a shutdown request: the
     /// analyzer is joined by the drain, and five seconds per camera is time the
@@ -1356,6 +1474,198 @@ mod tests {
         let started = Instant::now();
         sleep_unless_shutdown(Duration::from_millis(250), &AtomicBool::new(false));
         assert!(started.elapsed() >= Duration::from_millis(250));
+    }
+
+    /// Milliseconds, not the production seconds: the schedule is a parameter so
+    /// the retry can be exercised without the test waiting out a real backoff.
+    const TEST_RETRY: RetrySchedule = RetrySchedule {
+        start: Duration::from_millis(5),
+        max: Duration::from_millis(20),
+    };
+
+    fn failing_build(attempts: &AtomicU32) -> impl FnMut() -> Result<(), &'static str> + '_ {
+        || {
+            attempts.fetch_add(1, Ordering::Relaxed);
+            Err("no ffmpeg")
+        }
+    }
+
+    /// The failure this retries — a decoder that would not spawn — used to end
+    /// the analyzer task for good, leaving the camera recording nothing.
+    #[test]
+    fn analyzer_construction_is_retried_until_it_succeeds() {
+        let attempts = AtomicU32::new(0);
+        let built = build_with_retry(
+            "cam",
+            "motion analyzer",
+            &AtomicBool::new(false),
+            TEST_RETRY,
+            || match attempts.fetch_add(1, Ordering::Relaxed) {
+                0 | 1 => Err("no ffmpeg"),
+                _ => Ok("analyzer"),
+            },
+        );
+        assert_eq!(built, Some("analyzer"));
+        assert_eq!(attempts.load(Ordering::Relaxed), 3);
+    }
+
+    #[test]
+    fn analyzer_construction_retry_ends_when_shutdown_is_requested() {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let signaller = Arc::clone(&shutdown);
+        std::thread::spawn(move || {
+            thread::sleep(Duration::from_millis(50));
+            signaller.store(true, Ordering::Relaxed);
+        });
+
+        let attempts = AtomicU32::new(0);
+        let started = Instant::now();
+        let built = build_with_retry(
+            "cam",
+            "motion analyzer",
+            &shutdown,
+            TEST_RETRY,
+            failing_build(&attempts),
+        );
+        assert!(built.is_none());
+        assert!(
+            attempts.load(Ordering::Relaxed) > 1,
+            "gave up after a single attempt instead of retrying"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "retry loop outlived the shutdown request"
+        );
+    }
+
+    /// Delays widen towards the ceiling and reports thin out, so a decoder that
+    /// will never spawn costs a handful of lines rather than one a minute for
+    /// as long as the process lives.
+    #[test]
+    fn a_decoder_that_never_spawns_backs_off_and_stops_repeating_itself() {
+        let mut retry = DecoderSpawnRetry::new(DECODER_SPAWN_SCHEDULE);
+        let mut reported = Vec::new();
+        let mut delays = Vec::new();
+        for _ in 0..200 {
+            let (delay, report) = retry.failed();
+            delays.push(delay);
+            if let Some(attempts) = report {
+                reported.push(attempts);
+            }
+        }
+
+        assert_eq!(&reported[..5], &[1, 2, 4, 8, 16]);
+        assert!(
+            reported.len() < 15,
+            "200 failures produced {} lines",
+            reported.len()
+        );
+        // Jitter is +/-20%, so the ceiling is a band rather than a value.
+        let last = *delays.last().unwrap();
+        assert!(
+            last >= DECODER_SPAWN_BACKOFF_MAX * 4 / 5 && last <= DECODER_SPAWN_BACKOFF_MAX * 6 / 5,
+            "{last:?} is not near the ceiling"
+        );
+        assert!(delays[0] < delays[3], "backoff did not widen");
+    }
+
+    /// Both decoder-spawn sites share one policy, so a working spawn puts the
+    /// next failure back at the start of the schedule either way.
+    #[test]
+    fn a_successful_spawn_clears_the_backoff_and_the_streak() {
+        let mut retry = DecoderSpawnRetry::new(DECODER_SPAWN_SCHEDULE);
+        for _ in 0..20 {
+            retry.failed();
+        }
+        retry.succeeded();
+
+        let (delay, report) = retry.failed();
+        assert_eq!(report, Some(1), "escalation did not reset");
+        assert!(delay <= DECODER_SPAWN_SCHEDULE.start * 6 / 5, "{delay:?}");
+    }
+
+    /// Jitter exists so a failure that hits every camera at once — an fd table
+    /// that filled up — does not put every camera's retry on the same tick.
+    #[test]
+    fn two_cameras_failing_together_do_not_retry_in_lockstep() {
+        let delays: std::collections::HashSet<Duration> = (0..16)
+            .map(|_| DecoderSpawnRetry::new(DECODER_SPAWN_SCHEDULE).failed().0)
+            .collect();
+        assert!(delays.len() > 1, "every camera drew the same delay");
+    }
+
+    /// A camera must not spawn an ffmpeg during the drain.
+    #[test]
+    fn analyzer_construction_is_not_attempted_once_shutdown_is_requested() {
+        let attempts = AtomicU32::new(0);
+        let built = build_with_retry(
+            "cam",
+            "motion analyzer",
+            &AtomicBool::new(true),
+            DECODER_SPAWN_SCHEDULE,
+            failing_build(&attempts),
+        );
+        assert!(built.is_none());
+        assert_eq!(attempts.load(Ordering::Relaxed), 0);
+    }
+
+    fn test_context(camera_id: &str, data_dir: &std::path::Path) -> AnalyzerContext {
+        let ids = [camera_id.to_string()];
+        AnalyzerContext {
+            camera_id: camera_id.to_string(),
+            buffer: HotBuffer::new(camera_id.to_string(), 30),
+            motion_store: MotionStore::new(&ids),
+            detection_store: None,
+            detect_tx: None,
+            event_registry: None,
+            config: AnalyticsConfig::default(),
+            motion_settings: MotionSettingsStore::new(
+                &ids,
+                data_dir,
+                DEFAULT_VAR_THRESHOLD,
+                DEFAULT_MIN_CONTOUR_AREA,
+            ),
+            event_tx: None,
+            mqtt_tx: None,
+            pre_padding_ns: 0,
+            post_padding: Duration::from_secs(10),
+            max_event_duration: Duration::from_secs(120),
+        }
+    }
+
+    /// The real spawn path, not just the retry helper it is built from: a task
+    /// spawned into a drain must not construct anything and must not sit out a
+    /// backoff before noticing.
+    #[tokio::test]
+    async fn spawn_analyzer_stops_at_once_when_shutdown_is_already_requested() {
+        let dir = tempfile::tempdir().unwrap();
+        let started = Instant::now();
+        let handle = spawn_analyzer(
+            test_context("cam", dir.path()),
+            Arc::new(AtomicBool::new(true)),
+        );
+        handle.await.expect("analyzer task panicked");
+        assert!(started.elapsed() < DECODER_SPAWN_SCHEDULE.start);
+    }
+
+    /// The other half of the real path — construction that actually spawns
+    /// ffmpeg, then the run loop, then a clean stop. Ignored by default like
+    /// the rest of the tests that need an `ffmpeg` binary.
+    #[tokio::test]
+    #[ignore]
+    async fn spawn_analyzer_builds_a_real_analyzer_and_stops_on_shutdown() {
+        let dir = tempfile::tempdir().unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let handle = spawn_analyzer(test_context("cam", dir.path()), Arc::clone(&shutdown));
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(!handle.is_finished(), "analyzer stopped on its own");
+
+        shutdown.store(true, Ordering::Relaxed);
+        tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("analyzer did not stop")
+            .expect("analyzer task panicked");
     }
 
     #[test]

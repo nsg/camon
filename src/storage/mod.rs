@@ -6,6 +6,7 @@ mod recovery;
 pub mod stathost;
 mod store;
 pub mod warm_index;
+pub mod watchdog;
 
 pub use backend::{
     LocalDiskBackend, RangeRequest, ServedRange, ThumbnailError, VideoStream, WarmStorageBackend,
@@ -17,3 +18,4 @@ pub use recovery::recover_orphans;
 pub use stathost::StathostBackend;
 pub use store::{MotionEntry, MotionStore};
 pub use warm_index::{EventType, WarmEventEntry, WarmEventIndex};
+pub use watchdog::{RecordingMode, RecordingWatchdog};

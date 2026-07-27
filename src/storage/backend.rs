@@ -218,6 +218,12 @@ pub trait WarmStorageBackend: Send + Sync {
     /// The event with exactly this start PTS, if indexed.
     fn find_event(&self, camera_id: &str, start_pts_ns: u64) -> Option<WarmEventEntry>;
 
+    /// End of this camera's newest stored event, in wall-clock nanoseconds, or
+    /// `None` when it has nothing stored. Seeds the recording watchdog: silence
+    /// has to be measured from the last footage that exists, not from process
+    /// start, or a nightly restart resets it before it can ever be reported.
+    fn newest_event_end_ns(&self, camera_id: &str) -> Option<u64>;
+
     /// Stream a stored event's video (callers never see a path, and the body is
     /// never fully buffered). `range` carries an optional single HTTP range; the
     /// returned [`VideoStream`] reports the total size and how the range was
@@ -400,6 +406,10 @@ impl WarmStorageBackend for LocalDiskBackend {
 
     fn find_event(&self, camera_id: &str, start_pts_ns: u64) -> Option<WarmEventEntry> {
         self.index.find_event(camera_id, start_pts_ns)
+    }
+
+    fn newest_event_end_ns(&self, camera_id: &str) -> Option<u64> {
+        self.index.newest_event_end_ns(camera_id)
     }
 
     async fn read_video(

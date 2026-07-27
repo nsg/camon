@@ -6,4 +6,5 @@ pub mod config;
 pub mod locks;
 pub mod mpegts;
 pub mod mqtt;
+pub mod retry;
 pub mod storage;

@@ -75,13 +75,15 @@ The `storage` and `analytics` flags together select what gets recorded:
 
 - **Event recording** (`storage.enabled = true`, `analytics.enabled = true`) — the default. Only motion and object events are saved, into `movements/` and `objects/`. Storage is proportional to activity.
 - **Continuous recording** (`storage.enabled = true`, `analytics.enabled = false`) — "dumb NVR" mode. With no analyzer to gate on motion, a per-camera recorder rolls every segment from the hot buffer to disk in fixed-length chunks (each `max_event_duration_secs` long) under `continuous/`. Every chunk is a whole-GOP `.ts` that decodes on its own, and successive chunks carry a `"continues"` flag so the timeline stitches seamlessly. This is heavy — roughly **43 GB/day/camera at 4 Mbps** — so `continuous_retention_days` defaults to 1.
-- **No recording** (`storage.enabled = false`) — live view only; nothing hits disk.
+- **No recording** (`storage.enabled = false`) — live view only; nothing hits disk. camon says which of the two storage-off states it is in at startup: with analytics still on it **warns**, because motion is detected and published to MQTT and then thrown away, which is a deliberate setup for a motion sensor and an expensive surprise if recording was the point.
 
 Both modes share the same warm writer, retention pruning, and HLS playback path; only the trigger differs.
 
 ### Durability
 
 Event files are written atomically — staged as `.tmp`, fsynced, then renamed into place — so a crash or power cut never leaves a half-indexed event. On the next startup camon **recovers** interrupted writes instead of discarding them: an orphaned `.ts.tmp` (which may hold the footage of exactly the incident that cut the power) is trimmed to its last intact packet, its real duration recomputed from the stream timestamps, and indexed like any other event with a `"recovered": true` flag. If the disk runs low, a `min_free_bytes` guard emergency-prunes the oldest recordings (continuous first, then movements, then objects) so the writer keeps recording instead of failing.
+
+A camera can also end up recording nothing without anything crashing — an ignore mask painted over the whole frame, a sensitivity slider at its least sensitive, a stream that never reaches camon, or writes that keep failing. Each of those looks identical from the outside: an empty event list. camon therefore **watches each camera for silence** and warns when one has written no event for too long. The limit depends on what the camera is supposed to produce: a continuous recorder rolls a chunk every `max_event_duration_secs` whatever the scene does, so ten missed chunks in a row (20 minutes at the default) is already a fault, while in event mode an empty garden legitimately scores no motion all night and the limit is 24 hours — half the default `movement_retention_days`, so the warning arrives while there is still footage to save. The silence is measured from the newest event **on disk**, not from process start, so it survives restarts, and each warning states the whole silence rather than the time since the last one. Cameras that are not expected to record (storage disabled) are not watched at all.
 
 ### Storage backends
 

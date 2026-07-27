@@ -812,6 +812,14 @@ impl WarmStorageBackend for StathostBackend {
         }
     }
 
+    fn newest_event_end_ns(&self, camera_id: &str) -> Option<u64> {
+        let entries = self.cameras.get(camera_id)?.read_recover();
+        entries.last().map(|e| {
+            e.start_pts_ns
+                .saturating_add((e.duration_ms as u64) * NANOS_PER_MS)
+        })
+    }
+
     fn find_event(&self, camera_id: &str, start_pts_ns: u64) -> Option<WarmEventEntry> {
         let lock = self.cameras.get(camera_id)?;
         let entries = lock.read_recover();

@@ -13,6 +13,7 @@ mod install;
 mod locks;
 mod mpegts;
 mod mqtt;
+mod retry;
 mod storage;
 mod update;
 
@@ -24,9 +25,10 @@ use camera::FfmpegPipeline;
 use config::Config;
 use locks::LockExt;
 use mqtt::{BridgeContext, MqttEvent, MQTT_EVENT_CAPACITY};
+use retry::{apply_jitter, jitter_source};
 use storage::{
     DetectionDebugStore, DetectionStore, EventRegistry, LocalDiskBackend, MotionStore,
-    StathostBackend, WarmStorageBackend,
+    RecordingMode, RecordingWatchdog, StathostBackend, WarmStorageBackend,
 };
 
 fn dispatch_subcommand() -> bool {
@@ -381,7 +383,62 @@ struct SpawnContext<'a> {
     /// Motion lifecycle events for the Home Assistant bridge; `None` when
     /// `[mqtt].enabled` is false.
     mqtt_tx: &'a Option<tokio::sync::mpsc::Sender<MqttEvent>>,
+    /// Notices a camera that is recording nothing, whatever the reason.
+    recording_watchdog: &'a Arc<RecordingWatchdog>,
     shutdown: &'a ShutdownSignal,
+}
+
+/// Say what this process is going to do with its footage, once, at startup.
+///
+/// The two states where nothing is written are the reason this is not just an
+/// info line: neither can be inferred later from an empty archive, and the
+/// recording watchdog deliberately stays quiet about both, so this is the only
+/// place they are ever said. Analytics without storage warns — events are
+/// detected, published to MQTT, and then discarded, which is a real setup for a
+/// motion sensor but an expensive mistake if recording was the point. Neither
+/// disabled is only an info line: nothing is being computed and thrown away,
+/// camon is a live-view proxy, and the operator asked for exactly that.
+fn log_recording_mode(config: &Config) {
+    match (config.storage.enabled, config.analytics.enabled) {
+        (true, true) => {
+            tracing::info!("event recording mode: motion and object events saved to disk")
+        }
+        (true, false) => tracing::info!(
+            retention_days = config.storage.continuous_retention_days,
+            "continuous recording mode (analytics disabled): every segment saved to \
+             continuous/, roughly 43 GB/day/camera at 4 Mbps"
+        ),
+        (false, true) => tracing::warn!(
+            "[storage] enabled = false: motion is detected and published, but no event is ever \
+             written and nothing is kept beyond the in-memory buffer. Set [storage] enabled = \
+             true if this camon is meant to be recording"
+        ),
+        (false, false) => tracing::info!(
+            "live-view only: recording and analytics are disabled, so nothing is written to \
+             disk and no camera is watched for silence"
+        ),
+    }
+}
+
+/// What a camera is expected to produce, which is what makes its silence
+/// suspicious or not — or `None` when nothing is expected of it.
+///
+/// With storage off no write can ever succeed, so a silence timer is guaranteed
+/// to fire and says nothing the configuration did not already say. Those states
+/// are reported once at startup by [`log_recording_mode`] and then left alone:
+/// a daily warning about a camera that was never asked to record only teaches
+/// the operator to ignore the ones about cameras that were.
+fn recording_mode(config: &Config) -> Option<RecordingMode> {
+    if !config.storage.enabled {
+        return None;
+    }
+    if config.analytics.enabled {
+        Some(RecordingMode::Event)
+    } else {
+        Some(RecordingMode::Continuous {
+            chunk: std::time::Duration::from_secs(config.storage.max_event_duration_secs),
+        })
+    }
 }
 
 fn spawn_cameras(ctx: &SpawnContext, cameras: Vec<config::CameraConfig>) -> CameraHandles {
@@ -395,9 +452,29 @@ fn spawn_cameras(ctx: &SpawnContext, cameras: Vec<config::CameraConfig>) -> Came
         buffers_map: HashMap::new(),
     };
 
+    let mode = recording_mode(ctx.config);
+
     for cam_config in cameras {
         let buffer = HotBuffer::new(cam_config.id.clone(), ctx.config.buffer.hot_duration_secs);
         let camera_id = cam_config.id.clone();
+
+        if let Some(mode) = mode {
+            // Seeded from what is already on disk, not from now: this process
+            // may be minutes old on a box that restarts nightly, and a silence
+            // that resets with it is never long enough to notice.
+            let already_silent_for = storage::watchdog::silence_before_startup(
+                ctx.storage
+                    .as_ref()
+                    .and_then(|backend| backend.newest_event_end_ns(&camera_id)),
+                storage::warm_index::wall_clock_ns(),
+            );
+            ctx.recording_watchdog.register(
+                &camera_id,
+                mode,
+                std::time::Instant::now(),
+                already_silent_for,
+            );
+        }
 
         let event_tx = if ctx.config.storage.enabled {
             let (tx, rx) = tokio::sync::mpsc::channel(EVENT_CHANNEL_CAPACITY);
@@ -405,7 +482,13 @@ fn spawn_cameras(ctx: &SpawnContext, cameras: Vec<config::CameraConfig>) -> Came
                 .storage
                 .clone()
                 .expect("storage backend present when storage enabled");
-            let writer = WarmWriter::new(rx, camera_id.clone(), &ctx.config.storage, backend);
+            let writer = WarmWriter::new(
+                rx,
+                camera_id.clone(),
+                &ctx.config.storage,
+                backend,
+                Arc::clone(ctx.recording_watchdog),
+            );
             handles.warm_handles.push(tokio::spawn(writer.run()));
             handles.event_senders.push(tx.clone());
             handles
@@ -431,14 +514,16 @@ fn spawn_cameras(ctx: &SpawnContext, cameras: Vec<config::CameraConfig>) -> Came
 
         // Continuous recording: storage on, analytics off. With no analyzer to
         // close motion runs, a dedicated task rolls fixed-length chunks straight
-        // from the hot buffer into the same warm writer.
-        if ctx.config.storage.enabled && !ctx.config.analytics.enabled {
+        // from the hot buffer into the same warm writer. Gated on the mode that
+        // the watchdog is told about, so the two cannot disagree about which
+        // combination is continuous.
+        if let Some(RecordingMode::Continuous { chunk }) = mode {
             if let Some(tx) = event_tx.clone() {
                 let recorder = run_continuous_recorder(
                     camera_id.clone(),
                     Arc::clone(&buffer),
                     tx,
-                    std::time::Duration::from_secs(ctx.config.storage.max_event_duration_secs),
+                    chunk,
                     Arc::clone(&ctx.shutdown.flag),
                 );
                 handles.continuous_handles.push(tokio::spawn(recorder));
@@ -684,17 +769,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let storage = init_storage(&config, &camera_ids).await;
     let motion_settings = init_motion_settings(&config, &camera_ids);
 
-    if config.storage.enabled {
-        if config.analytics.enabled {
-            tracing::info!("event recording mode: motion and object events saved to disk");
-        } else {
-            tracing::info!(
-                retention_days = config.storage.continuous_retention_days,
-                "continuous recording mode (analytics disabled): every segment saved to \
-                 continuous/, roughly 43 GB/day/camera at 4 Mbps"
-            );
-        }
-    }
+    log_recording_mode(&config);
 
     // Object detection runs on ONE global worker task with a small bounded
     // job queue — strictly serial, at most one in-flight Ollama request
@@ -732,6 +807,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         (None, None)
     };
 
+    // "This camera has recorded nothing" is the one symptom that every way of
+    // failing to record shares, so one watchdog covers them all. It watches
+    // only the cameras that are expected to record — see `recording_mode`.
+    let recording_watchdog = Arc::new(RecordingWatchdog::new());
+
     let spawn_ctx = SpawnContext {
         config: &config,
         motion_store: &motion_store,
@@ -741,6 +821,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         detect_tx: &detect_tx,
         event_registry: &event_registry,
         mqtt_tx: &mqtt_tx,
+        recording_watchdog: &recording_watchdog,
         shutdown: &shutdown,
     };
     let camera_handles = spawn_cameras(&spawn_ctx, config.cameras.clone());
@@ -820,8 +901,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
+    // No camera is registered when nothing is expected to record, and an empty
+    // watchdog has nothing to poll.
+    let watchdog_handle =
+        recording_mode(&config).map(|_| tokio::spawn(Arc::clone(&recording_watchdog).run()));
+
     let reason = wait_for_shutdown(&shutdown).await;
     server_handle.abort();
+    // Aborted rather than drained: it holds nothing that has to reach disk, and
+    // a camera being quiet is not news while the process is stopping.
+    if let Some(handle) = watchdog_handle {
+        handle.abort();
+    }
 
     spawn_restart_watchdog(Arc::clone(&shutdown.update_installed));
     graceful_shutdown(
@@ -851,23 +942,6 @@ const HEALTHY_RUN_SECS: u64 = 60;
 /// Next delay in the exponential backoff progression (5 -> 10 -> 20 -> 40 -> cap).
 fn next_backoff_secs(current: u64) -> u64 {
     (current * 2).min(RECONNECT_MAX_SECS)
-}
-
-/// Apply +/-20% jitter to a delay (in ms) using an externally supplied random value.
-fn apply_jitter(base_ms: u64, rand: u64) -> u64 {
-    if base_ms == 0 {
-        return 0;
-    }
-    let span = base_ms / 5; // 20%
-    let offset = (rand % (2 * span + 1)) as i64 - span as i64;
-    (base_ms as i64 + offset).max(0) as u64
-}
-
-/// A random-ish u64 from std only (RandomState is seeded per construction).
-fn jitter_source() -> u64 {
-    use std::collections::hash_map::RandomState;
-    use std::hash::{BuildHasher, Hasher};
-    RandomState::new().build_hasher().finish()
 }
 
 async fn run_camera(
@@ -967,22 +1041,6 @@ mod tests {
         assert_eq!(next_backoff_secs(60), 60);
     }
 
-    #[test]
-    fn jitter_stays_within_twenty_percent() {
-        let base_ms = 20_000;
-        let span = base_ms / 5;
-        for rand in [0u64, 1, 7, 12345, u64::MAX] {
-            let out = apply_jitter(base_ms, rand);
-            assert!(out >= base_ms - span, "{out} below lower bound");
-            assert!(out <= base_ms + span, "{out} above upper bound");
-        }
-    }
-
-    #[test]
-    fn jitter_zero_base_is_zero() {
-        assert_eq!(apply_jitter(0, 999), 0);
-    }
-
     /// A camera parked in its reconnect backoff used to hold the drain up for
     /// the whole delay — up to a minute plus jitter — because the sleep only
     /// ended on its own. Paused time: the assertion is on the virtual clock, so
@@ -1023,6 +1081,49 @@ mod tests {
 
     use std::sync::atomic::AtomicUsize;
     use std::time::Duration;
+
+    fn config_with(storage: bool, analytics: bool) -> Config {
+        let mut config: Config = toml::from_str("").expect("every config section has a default");
+        config.storage.enabled = storage;
+        config.analytics.enabled = analytics;
+        config
+    }
+
+    /// Only a camera that is expected to record is watched for silence. The two
+    /// storage-off states are said once at startup instead: a daily warning
+    /// about a camera nobody asked to record is noise that teaches the operator
+    /// to skip the warnings about the ones that were.
+    #[test]
+    fn only_cameras_expected_to_record_are_watched() {
+        assert_eq!(
+            recording_mode(&config_with(true, true)),
+            Some(RecordingMode::Event)
+        );
+        assert_eq!(
+            recording_mode(&config_with(true, false)),
+            Some(RecordingMode::Continuous {
+                chunk: Duration::from_secs(
+                    config_with(true, false).storage.max_event_duration_secs
+                )
+            })
+        );
+        assert_eq!(recording_mode(&config_with(false, true)), None);
+        assert_eq!(recording_mode(&config_with(false, false)), None);
+    }
+
+    /// The continuous limit is derived from the configured cap, not from the
+    /// default, so an operator who changes one changes the other.
+    #[test]
+    fn the_continuous_chunk_cap_comes_from_the_config() {
+        let mut config = config_with(true, false);
+        config.storage.max_event_duration_secs = 30;
+        assert_eq!(
+            recording_mode(&config),
+            Some(RecordingMode::Continuous {
+                chunk: Duration::from_secs(30)
+            })
+        );
+    }
 
     /// A stand-in for `update::check_and_update` that counts its calls and
     /// replays a scripted sequence of outcomes.
@@ -1104,7 +1205,13 @@ mod tests {
         ));
         let warm_config = config::WarmConfig::default();
         let (tx, rx) = tokio::sync::mpsc::channel(EVENT_CHANNEL_CAPACITY);
-        let writer = WarmWriter::new(rx, "cam".to_string(), &warm_config, backend);
+        let writer = WarmWriter::new(
+            rx,
+            "cam".to_string(),
+            &warm_config,
+            backend,
+            Arc::new(RecordingWatchdog::new()),
+        );
 
         let event = FinishedEvent {
             segments: vec![GopSegment {
