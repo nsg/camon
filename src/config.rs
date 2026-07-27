@@ -534,8 +534,12 @@ pub struct UpdateConfig {
     pub enabled: bool,
 }
 
+/// Opt-in: an update is only checked against the sha256sums.txt published
+/// beside it in the same GitHub release, which protects against a corrupt
+/// download but not against a tampered release, and the installed service runs
+/// as root.
 fn default_update_enabled() -> bool {
-    true
+    false
 }
 
 impl Default for UpdateConfig {
@@ -1013,13 +1017,13 @@ url = "rtsp://user:pass@10.0.0.6:554/stream1"
         let dir = write_temp("config.toml", TOML_SAMPLE);
         let overrides = [
             Override::parse("http.port=22666").unwrap(),
-            Override::parse("update.enabled=false").unwrap(),
+            Override::parse("update.enabled=true").unwrap(),
         ];
         let config =
             Config::load_from_with_overrides(dir.path().join("config.toml"), &overrides).unwrap();
-        // File said 9090 / default-true; the overrides win.
+        // File said 9090 / default-false; the overrides win.
         assert_eq!(config.http.port, 22666);
-        assert!(!config.update.enabled);
+        assert!(config.update.enabled);
     }
 
     #[test]
@@ -1030,6 +1034,16 @@ url = "rtsp://user:pass@10.0.0.6:554/stream1"
         assert_eq!(config.http.bind_addr(), IpAddr::from([0, 0, 0, 0]));
         assert!(config.http.token.is_none());
         assert!(!config.http.allow_open);
+    }
+
+    /// The updater installs an unsigned binary into a service that runs as
+    /// root, so it stays off until the operator asks for it.
+    #[test]
+    fn self_update_is_off_unless_asked_for() {
+        let dir = write_temp("config.toml", TOML_SAMPLE);
+        let config = Config::load_from_with_overrides(dir.path().join("config.toml"), &[]).unwrap();
+        assert!(!config.update.enabled);
+        assert!(!UpdateConfig::default().enabled);
     }
 
     #[test]

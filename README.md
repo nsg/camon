@@ -132,19 +132,31 @@ cargo build --release
 Create a `config.toml` in the working directory. Point Camon at a config anywhere with `--config <path>`, and override individual values at startup with one or more `--set <dotted.path>=<value>` flags (each value is parsed as bool, then integer, then float, else string; overrides win over the file):
 
 ```bash
-camon --config /etc/camon/config.toml --set http.port=9090 --set update.enabled=false
+camon --config /etc/camon/config.toml --set http.port=9090 --set update.enabled=true
 ```
 
 All sections are optional — defaults are shown below:
 
 ```toml
 [update]
-# Auto-update from GitHub Releases on startup (default: true).
+# Auto-update from GitHub Releases on startup and every 12 hours
+# (default: false — opt in by setting this to true).
 # A downloaded binary is checked against the release's sha256sums.txt and
 # rejected on mismatch (corruption protection, not a security guarantee), and
 # must be a valid ELF before it replaces the running binary. Releases published
-# without a sha256sums.txt are applied unverified with a warning.
-enabled = true
+# without a sha256sums.txt are applied unverified with a warning. Since the
+# installed service runs as root and nothing is signed, updating is off unless
+# you ask for it. An update installed while camon is running triggers the same
+# graceful shutdown as SIGTERM — recordings in flight are flushed — and the
+# service manager starts the new binary: `camon install service` writes a
+# systemd unit with Restart=always, or an OpenRC script supervised by
+# supervise-daemon. Started any other way, camon just exits after an update and
+# stays down. A drain still unfinished six minutes after the update is
+# abandoned: that guarantees the restart eventually happens even if the drain
+# has wedged, at the cost of losing what was left to write — which against a
+# very slow remote warm-storage server can be a drain that was still making
+# progress.
+enabled = false
 
 [buffer]
 # Hot buffer duration in seconds (default: 600 = 10 minutes)

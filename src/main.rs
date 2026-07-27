@@ -123,15 +123,75 @@ fn parse_override_or_exit(spec: &str) -> config::Override {
     }
 }
 
-async fn run_update_check_loop() {
-    let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(12 * 60 * 60));
+/// The one way anything inside the process asks for shutdown: the flag every
+/// worker already polls, plus a wakeup for the main task so the drain starts at
+/// once instead of on the next poll. Signals raise the same flag.
+#[derive(Clone)]
+struct ShutdownSignal {
+    flag: Arc<AtomicBool>,
+    wake: Arc<tokio::sync::Notify>,
+    /// Set once an update has replaced the binary on disk. Tracked separately
+    /// from the flag because it can become true at any point up to the end of
+    /// the drain — including after a signal already started one, from a check
+    /// that was in flight — and the restart watchdog keys off it.
+    update_installed: Arc<AtomicBool>,
+}
+
+impl ShutdownSignal {
+    fn new() -> Self {
+        Self {
+            flag: Arc::new(AtomicBool::new(false)),
+            wake: Arc::new(tokio::sync::Notify::new()),
+            update_installed: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn requested(&self) -> bool {
+        self.flag.load(Ordering::Relaxed)
+    }
+
+    /// `notify_one` leaves a permit behind when nobody is waiting yet, so the
+    /// wakeup cannot be lost to a race with the main task reaching it.
+    fn request_restart(&self) {
+        self.update_installed.store(true, Ordering::Relaxed);
+        self.flag.store(true, Ordering::Relaxed);
+        self.wake.notify_one();
+    }
+}
+
+const UPDATE_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(12 * 60 * 60);
+
+async fn run_update_check_loop(shutdown: ShutdownSignal) {
+    run_update_check_loop_with(UPDATE_CHECK_INTERVAL, shutdown, update::check_and_update).await;
+}
+
+/// An update installed while camon is running must not cut the recording short:
+/// it asks for the same graceful shutdown a signal does, so the analyzers,
+/// continuous recorders and warm writers drain before the process goes away.
+/// The loop is one-shot in that sense — after an install there is nothing left
+/// to check, the process is on its way out.
+async fn run_update_check_loop_with<F, Fut, E>(
+    interval_period: std::time::Duration,
+    shutdown: ShutdownSignal,
+    check: F,
+) where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = Result<bool, E>>,
+    E: std::fmt::Display,
+{
+    let mut interval = tokio::time::interval(interval_period);
     interval.tick().await; // skip immediate tick
     loop {
         interval.tick().await;
-        match update::check_and_update().await {
+        // Never start an install into a process that is already shutting down.
+        if shutdown.requested() {
+            return;
+        }
+        match check().await {
             Ok(true) => {
-                tracing::info!("update applied, exiting for restart");
-                std::process::exit(0);
+                tracing::info!("update applied, shutting down for restart");
+                shutdown.request_restart();
+                return;
             }
             Ok(false) => {}
             Err(e) => {
@@ -141,11 +201,13 @@ async fn run_update_check_loop() {
     }
 }
 
-async fn check_for_updates(config: &Config) {
+async fn check_for_updates(config: &Config, shutdown: &ShutdownSignal) {
     if !config.update.enabled {
         return;
     }
     match update::check_and_update().await {
+        // Nothing is recording yet at this point in startup, so there is
+        // nothing to drain and exiting inline is safe.
         Ok(true) => {
             tracing::info!("update applied, exiting for restart");
             std::process::exit(0);
@@ -155,7 +217,7 @@ async fn check_for_updates(config: &Config) {
             tracing::warn!(error = %e, "update check failed, continuing startup");
         }
     }
-    tokio::spawn(run_update_check_loop());
+    tokio::spawn(run_update_check_loop(shutdown.clone()));
 }
 
 fn log_object_detection_config(config: &Config) -> bool {
@@ -379,18 +441,75 @@ fn spawn_cameras(ctx: &SpawnContext, cameras: Vec<config::CameraConfig>) -> Came
     handles
 }
 
-async fn wait_for_signal(shutdown: &AtomicBool) {
+enum ShutdownReason {
+    Signal,
+    UpdateInstalled,
+}
+
+async fn wait_for_shutdown(shutdown: &ShutdownSignal) -> ShutdownReason {
     use tokio::signal::unix::{signal, SignalKind};
     let mut sigterm = signal(SignalKind::terminate()).expect("failed to register SIGTERM handler");
-    tokio::select! {
+    let reason = tokio::select! {
         _ = tokio::signal::ctrl_c() => {
             tracing::info!("SIGINT received, shutting down");
+            ShutdownReason::Signal
         }
         _ = sigterm.recv() => {
             tracing::info!("SIGTERM received, shutting down");
+            ShutdownReason::Signal
         }
-    }
-    shutdown.store(true, Ordering::Relaxed);
+        _ = shutdown.wake.notified() => ShutdownReason::UpdateInstalled,
+    };
+    shutdown.flag.store(true, Ordering::Relaxed);
+    reason
+}
+
+/// Last-resort liveness backstop for the drain that follows an installed
+/// update. The new binary is already on disk by then, so a drain that never
+/// finishes would leave the old process running the old code forever with
+/// nothing outside to notice: a signal shutdown is bounded by the service
+/// manager (`TimeoutStopSec` / OpenRC's `retry`, both set by
+/// `install::install_service`), an internally requested one is not.
+///
+/// It guarantees the restart *eventually* happens; it does not guarantee that
+/// what it terminates was stuck. No honest value could: against a black-holing
+/// stathost server a single event legitimately takes longer than any deadline
+/// worth having — the video is put with one retry (2 x `UPLOAD_TIMEOUT`),
+/// then the sidecar, then one put per filmstrip frame, all serial — and a
+/// writer queue can hold several events. So this can abandon a drain that is
+/// still making progress, losing the remainder. That is the accepted trade:
+/// the alternative is an NVR that silently never restarts.
+const RESTART_DRAIN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(360);
+
+/// How often the watchdog looks for an installed update while the drain runs.
+const WATCHDOG_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Spawned at the start of the drain on *both* shutdown paths, then armed by
+/// the `update_installed` state rather than by whichever `select!` arm woke the
+/// wait: when a signal and an update land together the arm that wins is
+/// pseudo-random, and an in-flight check can install the binary after a signal
+/// drain has already begun. Either way the process must still end.
+///
+/// A wedged `spawn_blocking` thread and a blocked `sync_all` are both
+/// uncancellable from async code, so this is a plain thread. Everything the
+/// operator needs is logged when it arms: past that point the thread only
+/// sleeps and terminates, because whatever wedged the drain could just as
+/// easily have wedged stderr. `_exit` runs no atexit handlers and no
+/// destructors — nothing that could block on the same wedge.
+fn spawn_restart_watchdog(update_installed: Arc<AtomicBool>) {
+    std::thread::spawn(move || {
+        while !update_installed.load(Ordering::Relaxed) {
+            std::thread::sleep(WATCHDOG_POLL_INTERVAL);
+        }
+        tracing::warn!(
+            deadline_secs = RESTART_DRAIN_DEADLINE.as_secs(),
+            "update installed: the process is terminated at this deadline whether or not the \
+             shutdown drain has finished, abandoning any recording still being flushed and \
+             every queued event, so the new binary can start"
+        );
+        std::thread::sleep(RESTART_DRAIN_DEADLINE);
+        unsafe { libc::_exit(0) };
+    });
 }
 
 /// How long shutdown waits for the MQTT bridge to publish its retained
@@ -500,7 +619,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             std::process::exit(1);
         }
     };
-    check_for_updates(&config).await;
+    // Created before the update check so the periodic checker can ask for the
+    // same graceful shutdown a signal does.
+    let shutdown = ShutdownSignal::new();
+    check_for_updates(&config, &shutdown).await;
 
     tracing::info!("loaded {} camera(s)", config.cameras.len());
 
@@ -545,8 +667,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None => (None, None),
     };
 
-    let shutdown = Arc::new(AtomicBool::new(false));
-
     // The MQTT bridge is fed by the analyzers (motion) and the detection worker
     // (verdicts), so its channel must exist before either is spawned.
     let (mqtt_tx, mqtt_rx) = if config.mqtt.enabled {
@@ -571,7 +691,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         detect_tx: &detect_tx,
         event_registry: &event_registry,
         mqtt_tx: &mqtt_tx,
-        shutdown: &shutdown,
+        shutdown: &shutdown.flag,
     };
     let camera_handles = spawn_cameras(&spawn_ctx, config.cameras.clone());
 
@@ -604,7 +724,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 buffers: Arc::new(camera_handles.buffers_map.clone()),
                 camera_ids: camera_ids.clone(),
                 classes,
-                shutdown: Arc::clone(&shutdown),
+                shutdown: Arc::clone(&shutdown.flag),
             },
             rx,
         )
@@ -637,12 +757,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    wait_for_signal(&shutdown).await;
+    let reason = wait_for_shutdown(&shutdown).await;
     server_handle.abort();
 
+    spawn_restart_watchdog(Arc::clone(&shutdown.update_installed));
     graceful_shutdown(camera_handles, detect_worker_handle, mqtt_handle).await;
 
-    tracing::info!("shutdown complete");
+    match reason {
+        ShutdownReason::Signal => tracing::info!("shutdown complete"),
+        ShutdownReason::UpdateInstalled => {
+            tracing::info!("shutdown complete, restarting into the updated binary")
+        }
+    }
     Ok(())
 }
 
@@ -782,5 +908,212 @@ mod tests {
     #[test]
     fn jitter_zero_base_is_zero() {
         assert_eq!(apply_jitter(0, 999), 0);
+    }
+
+    use std::sync::atomic::AtomicUsize;
+    use std::time::Duration;
+
+    /// A stand-in for `update::check_and_update` that counts its calls and
+    /// replays a scripted sequence of outcomes.
+    fn scripted_checker(
+        outcomes: Vec<Result<bool, std::io::Error>>,
+    ) -> (
+        impl Fn() -> std::future::Ready<Result<bool, std::io::Error>>,
+        Arc<AtomicUsize>,
+    ) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&calls);
+        let outcomes = Arc::new(std::sync::Mutex::new(outcomes.into_iter()));
+        let check = move || {
+            counter.fetch_add(1, Ordering::Relaxed);
+            let next = outcomes
+                .lock()
+                .expect("scripted checker poisoned")
+                .next()
+                .expect("checker called more times than scripted");
+            std::future::ready(next)
+        };
+        (check, calls)
+    }
+
+    /// Failed and empty checks keep the loop alive and must never look like an
+    /// installed update. Terminated by a stand-in signal rather than an
+    /// install, so that the install branch — the one that would take the whole
+    /// test binary down if it regressed — stays confined to the child process
+    /// in `applied_update_returns_instead_of_exiting`.
+    #[tokio::test]
+    async fn failed_update_checks_do_not_request_shutdown() {
+        let shutdown = ShutdownSignal::new();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&calls);
+        let signalled = shutdown.clone();
+        let check = move || {
+            let n = counter.fetch_add(1, Ordering::Relaxed) + 1;
+            if n == 3 {
+                signalled.flag.store(true, Ordering::Relaxed);
+            }
+            std::future::ready(match n {
+                1 => Err(std::io::Error::other("network down")),
+                _ => Ok(false),
+            })
+        };
+        run_update_check_loop_with(Duration::from_millis(1), shutdown.clone(), check).await;
+
+        assert_eq!(calls.load(Ordering::Relaxed), 3, "loop stopped checking");
+        assert!(
+            !shutdown.update_installed.load(Ordering::Relaxed),
+            "a failed check asked for a restart"
+        );
+    }
+
+    /// A shutdown already under way must not have an install started
+    /// underneath it — the binary would be swapped while the drain runs.
+    #[tokio::test]
+    async fn update_check_is_skipped_once_shutdown_is_requested() {
+        let shutdown = ShutdownSignal::new();
+        shutdown.flag.store(true, Ordering::Relaxed); // as a signal would
+        let (check, calls) = scripted_checker(vec![Ok(false)]);
+        run_update_check_loop_with(Duration::from_millis(1), shutdown.clone(), check).await;
+
+        assert_eq!(calls.load(Ordering::Relaxed), 0, "checked during shutdown");
+    }
+
+    /// Both shutdown paths end in this same drain, and its contract is that an
+    /// event already accepted by a warm writer reaches disk before the process
+    /// goes away — the footage the update path used to lose.
+    #[tokio::test]
+    async fn graceful_shutdown_drains_queued_events_to_disk() {
+        use buffer::warm::FinishedEvent;
+        use buffer::GopSegment;
+
+        let dir = tempfile::tempdir().unwrap();
+        let backend: Arc<dyn WarmStorageBackend> = Arc::new(LocalDiskBackend::new(
+            dir.path().to_path_buf(),
+            &["cam".to_string()],
+        ));
+        let warm_config = config::WarmConfig::default();
+        let (tx, rx) = tokio::sync::mpsc::channel(EVENT_CHANNEL_CAPACITY);
+        let writer = WarmWriter::new(rx, "cam".to_string(), &warm_config, backend);
+
+        let event = FinishedEvent {
+            segments: vec![GopSegment {
+                start_pts: 0,
+                duration_ns: 1_000_000_000,
+                data: Arc::new(vec![0x47; 188]),
+                frame_count: 1,
+            }],
+            first_pts: 0,
+            total_bytes: 188,
+            has_objects: false,
+            object_classes: Vec::new(),
+            filmstrip_frames: None,
+            backend: None,
+            model: None,
+            detection_details: Vec::new(),
+            continues: false,
+            is_continuous: false,
+        };
+        tx.send(WriterMessage::Event(event)).await.unwrap();
+
+        let handles = CameraHandles {
+            pipeline_handles: Vec::new(),
+            analyzer_handles: Vec::new(),
+            continuous_handles: Vec::new(),
+            warm_handles: vec![tokio::spawn(writer.run())],
+            event_senders: vec![tx.clone()],
+            event_sender_map: HashMap::from([("cam".to_string(), tx)]),
+            buffers_map: HashMap::new(),
+        };
+        // Bounded: the failure this guards against — a sender that outlives the
+        // drain, as in the 2026-07-24 deadlock — hangs rather than returns, and
+        // an unexplained CI timeout is a bad way to find that out.
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            graceful_shutdown(handles, None, None),
+        )
+        .await
+        .expect("graceful_shutdown deadlocked instead of draining");
+
+        let written = dir.path().join("cam").join("movements").join("0_1000.ts");
+        assert!(written.exists(), "queued event was not flushed to disk");
+    }
+
+    /// Set on the child process spawned by
+    /// [`applied_update_returns_instead_of_exiting`]; holds the path of the
+    /// marker file that only a normal return can produce.
+    const UPDATE_LOOP_MARKER_ENV: &str = "CAMON_TEST_UPDATE_LOOP_MARKER";
+
+    /// The regression itself: this branch used to call `process::exit(0)`,
+    /// skipping the drain. libtest cannot catch that in-process — all tests
+    /// share one process, so an `exit(0)` mid-run ends the binary with a
+    /// success status and the whole run is reported green — so the install
+    /// branch is exercised *only* here, in a child process that can write its
+    /// marker only by returning from the loop. No other test may install an
+    /// update, or it would take the binary down before this one runs.
+    #[test]
+    fn applied_update_returns_instead_of_exiting() {
+        if let Ok(marker) = std::env::var(UPDATE_LOOP_MARKER_ENV) {
+            let shutdown = ShutdownSignal::new();
+            let (check, calls) = scripted_checker(vec![Ok(true)]);
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(run_update_check_loop_with(
+                Duration::from_millis(1),
+                shutdown.clone(),
+                check,
+            ));
+
+            assert_eq!(calls.load(Ordering::Relaxed), 1, "update installed twice");
+            assert!(shutdown.requested(), "drain flag not raised");
+            assert!(
+                shutdown.update_installed.load(Ordering::Relaxed),
+                "watchdog would never arm"
+            );
+            // A stored permit, so the main task starts the drain even if it
+            // only reaches `notified()` after the update landed.
+            runtime.block_on(async {
+                tokio::time::timeout(Duration::from_secs(5), shutdown.wake.notified())
+                    .await
+                    .expect("main task would never have been woken");
+            });
+
+            std::fs::write(marker, "returned").unwrap();
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("returned");
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "--test-threads=1",
+                "tests::applied_update_returns_instead_of_exiting",
+            ])
+            .env(UPDATE_LOOP_MARKER_ENV, &marker)
+            // The child's own libtest chatter is noise here; its stderr is kept
+            // so a panic inside it is still readable.
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .expect("failed to re-run this test as a child process");
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if std::time::Instant::now() > deadline {
+                let _ = child.kill();
+                panic!("child process did not finish");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+
+        assert!(status.success(), "child test failed: {status}");
+        assert!(
+            marker.exists(),
+            "the update branch took the process down instead of returning"
+        );
     }
 }

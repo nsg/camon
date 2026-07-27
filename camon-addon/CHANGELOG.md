@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+- **Camon's automatic self-update is now opt-in.** `update.enabled`
+  defaults to `false`: a downloaded release is only checked against the
+  checksum file published beside it, which catches a corrupt download but
+  is not a signature, and the installed service runs as root. Nothing
+  changes for the add-on — `run.sh` has always forced
+  `update.enabled = false`, because updates flow through the Home
+  Assistant add-on store. Outside the add-on, put
+
+  ```toml
+  [update]
+  enabled = true
+  ```
+
+  in `config.toml` (or pass `--set update.enabled=true`) to get the old
+  behaviour back.
+- An update installed by that self-updater no longer cuts a recording
+  short. It now shuts camon down the same way a stop signal does — the
+  motion run in progress, any pending continuous chunk and every queued
+  event are written out first — and the service manager starts the new
+  binary.
 - **`camon.toml` is now checked strictly at startup, and a mistake stops
   the add-on instead of being ignored.** Previously any key camon did not
   recognise was skipped in silence, so a typo like

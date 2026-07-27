@@ -101,7 +101,8 @@ Five values are **forced by `run.sh`** via `camon --set`, overriding whatever
   disabled inside the add-on. The container filesystem is ephemeral and updates
   must flow through the Home Assistant add-on store, so an in-container binary
   swap would be pointless (lost on rebuild) and would fight Home Assistant's
-  own update mechanism.
+  own update mechanism. Camon defaults to this too, but the add-on pins it so
+  the key cannot be turned on from `camon.toml`.
 - **`http.port = 22666`.** The add-on is reached exclusively through ingress,
   which is wired to internal port 22666 — an uncommon port picked so it can
   never collide with another service even if host networking is ever enabled
