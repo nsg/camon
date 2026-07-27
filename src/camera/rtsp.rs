@@ -48,14 +48,23 @@ impl FfmpegPipeline {
 
         // Drain stderr so the pipe never fills and blocks ffmpeg. Runs on a
         // plain thread (this fn is inside spawn_blocking, no async runtime) and
-        // exits on EOF when the child is killed/exits below.
+        // exits on EOF when the child is killed/exits below. ffmpeg echoes the
+        // full RTSP URL in its messages, so the password is scrubbed before
+        // anything reaches the log.
         let stderr_thread = child.stderr.take().map(|stderr| {
             let camera_id = self.camera_id.clone();
+            let password = crate::config::url_password(&self.url).map(str::to_owned);
             std::thread::spawn(move || {
                 let reader = BufReader::new(stderr);
                 for line in reader.lines() {
                     match line {
-                        Ok(line) => tracing::debug!(camera = %camera_id, "ffmpeg: {}", line),
+                        Ok(line) => {
+                            let line = match &password {
+                                Some(pw) => line.replace(pw, "****"),
+                                None => line,
+                            };
+                            tracing::debug!(camera = %camera_id, "ffmpeg: {}", line);
+                        }
                         Err(_) => break,
                     }
                 }

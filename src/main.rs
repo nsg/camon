@@ -679,7 +679,7 @@ async fn run_camera(
     let mut backoff_secs = RECONNECT_BASE_SECS;
 
     while !shutdown.load(Ordering::Relaxed) {
-        tracing::info!(camera = %camera_id, url = %config.url, "connecting to camera");
+        tracing::info!(camera = %camera_id, url = %config.redacted_url(), "connecting to camera");
 
         let pipeline = match FfmpegPipeline::new(&config, Arc::clone(&buffer)) {
             Ok(p) => p,

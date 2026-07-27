@@ -108,6 +108,36 @@ pub struct CameraConfig {
     pub url: String,
 }
 
+impl CameraConfig {
+    /// The camera URL with any userinfo password masked, safe for logs.
+    pub fn redacted_url(&self) -> String {
+        match url_password_range(&self.url) {
+            Some(range) => {
+                let mut url = self.url.clone();
+                url.replace_range(range, "****");
+                url
+            }
+            None => self.url.clone(),
+        }
+    }
+}
+
+/// The password embedded in a URL's userinfo (`scheme://user:pass@host/...`),
+/// if any. Used to keep credentials out of logs.
+pub fn url_password(url: &str) -> Option<&str> {
+    url_password_range(url).map(|range| &url[range])
+}
+
+fn url_password_range(url: &str) -> Option<std::ops::Range<usize>> {
+    let userinfo_start = url.find("://")? + 3;
+    let rest = &url[userinfo_start..];
+    let authority = &rest[..rest.find('/').unwrap_or(rest.len())];
+    let userinfo = &authority[..authority.rfind('@')?];
+    let password_offset = userinfo.find(':')? + 1;
+    (password_offset < userinfo.len())
+        .then(|| userinfo_start + password_offset..userinfo_start + userinfo.len())
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct BufferConfig {
     #[serde(default = "default_hot_duration")]
@@ -811,5 +841,38 @@ url = "rtsp://10.0.0.6:554/stream1"
         )
         .unwrap();
         assert_eq!(config.cameras.len(), 2);
+    }
+
+    #[test]
+    fn url_password_extracts_userinfo_password() {
+        assert_eq!(
+            url_password("rtsp://ubnt:s3cret@10.0.0.5:554/s0"),
+            Some("s3cret")
+        );
+        assert_eq!(url_password("rtsp://10.0.0.5:554/s0"), None);
+        assert_eq!(url_password("rtsp://ubnt@10.0.0.5:554/s0"), None);
+        assert_eq!(url_password("rtsp://ubnt:@10.0.0.5:554/s0"), None);
+        assert_eq!(url_password("not a url"), None);
+    }
+
+    #[test]
+    fn redacted_url_masks_only_the_password() {
+        let camera = |url: &str| CameraConfig {
+            id: "cam".to_string(),
+            url: url.to_string(),
+        };
+        assert_eq!(
+            camera("rtsp://ubnt:s3cret@10.0.0.5:554/s0").redacted_url(),
+            "rtsp://ubnt:****@10.0.0.5:554/s0"
+        );
+        // Username identical to the password stays visible.
+        assert_eq!(
+            camera("rtsp://ubnt:ubnt@10.0.0.5:554/s0").redacted_url(),
+            "rtsp://ubnt:****@10.0.0.5:554/s0"
+        );
+        assert_eq!(
+            camera("rtsp://10.0.0.5:554/s0").redacted_url(),
+            "rtsp://10.0.0.5:554/s0"
+        );
     }
 }
