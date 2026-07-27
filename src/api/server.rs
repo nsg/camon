@@ -706,6 +706,9 @@ async fn warm_events_handler(
 
     let from = query.from.unwrap_or(0);
     let to = query.to.unwrap_or(u64::MAX);
+    if from > to {
+        return (StatusCode::BAD_REQUEST, "from must not be greater than to").into_response();
+    }
     let events = backend.query(&id, from, to);
 
     let response: Vec<WarmEventResponse> = events
@@ -1065,6 +1068,52 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         format!("http://{addr}")
+    }
+
+    /// Like [`serve`], but with warm storage enabled over an empty data dir.
+    /// The returned directory must outlive the server.
+    async fn serve_with_storage() -> (String, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let ids = vec!["cam".to_string()];
+        let buffers = HashMap::from([("cam".to_string(), HotBuffer::new("cam".to_string(), 60))]);
+        let storage = Arc::new(crate::storage::LocalDiskBackend::new(
+            dir.path().to_path_buf(),
+            &ids,
+        ));
+        let state = AppState::new(
+            buffers,
+            MotionStore::new(&ids),
+            DetectionStore::new(&ids),
+            DetectionDebugStore::new(&ids),
+            Some(storage),
+            None,
+        );
+        let app = build_router(state, None);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{addr}"), dir)
+    }
+
+    #[tokio::test]
+    async fn an_inverted_event_range_is_rejected() {
+        let (base, _dir) = serve_with_storage().await;
+
+        let response = reqwest::get(format!(
+            "{base}/api/cameras/cam/events?from=9999999999&to=0"
+        ))
+        .await
+        .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+
+        // The same route with the bounds the right way round still answers.
+        let response = reqwest::get(format!(
+            "{base}/api/cameras/cam/events?from=0&to=9999999999"
+        ))
+        .await
+        .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert!(response.json::<Vec<serde_json::Value>>().await.is_ok());
     }
 
     #[tokio::test]

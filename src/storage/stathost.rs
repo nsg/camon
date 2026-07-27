@@ -540,15 +540,29 @@ impl WarmStorageBackend for StathostBackend {
         // client-side.
     }
 
+    /// Every event overlapping `[from_ns, to_ns]`. An inverted range is empty.
+    ///
+    /// Entries are ordered by start PTS only, so the upper bound binary-searches
+    /// but the lower one cannot: a long event (a continuous chunk) can start
+    /// far before the window and still reach into it, and "ends after `from_ns`"
+    /// is not monotone in start order. The candidate prefix is filtered instead.
     fn query(&self, camera_id: &str, from_ns: u64, to_ns: u64) -> Vec<WarmEventEntry> {
+        if from_ns > to_ns {
+            return Vec::new();
+        }
         match self.cameras.get(camera_id) {
             Some(lock) => {
                 let entries = lock.read_recover();
-                let start = entries.partition_point(|e| {
-                    e.start_pts_ns + (e.duration_ms as u64) * NANOS_PER_MS < from_ns
-                });
                 let end = entries.partition_point(|e| e.start_pts_ns <= to_ns);
-                entries[start..end].to_vec()
+                entries[..end]
+                    .iter()
+                    .filter(|e| {
+                        e.start_pts_ns
+                            .saturating_add((e.duration_ms as u64) * NANOS_PER_MS)
+                            >= from_ns
+                    })
+                    .cloned()
+                    .collect()
             }
             None => Vec::new(),
         }
@@ -1386,5 +1400,81 @@ mod tests {
         assert_eq!(vs.range, ServedRange::Full);
         assert_eq!(vs.total_size, 40);
         assert_eq!(drain(vs).await.len(), 40);
+    }
+
+    const SEC: u64 = 1_000_000_000;
+
+    /// A backend whose index holds `spans` and which never talks to a host.
+    fn indexed(spans: &[(u64, u32)]) -> StathostBackend {
+        let backend = backend_for("http://127.0.0.1:1", "secret", 0);
+        for &(start_pts_ns, duration_ms) in spans {
+            backend.insert_entry(
+                "cam",
+                WarmEventEntry {
+                    start_pts_ns,
+                    duration_ms,
+                    event_type: EventType::Continuous,
+                    file_size: 0,
+                    object_classes: Vec::new(),
+                    backend: None,
+                    model: None,
+                    detections: Vec::new(),
+                    filmstrip_frames: 0,
+                    continues: false,
+                    recovered: false,
+                },
+            );
+        }
+        backend
+    }
+
+    #[test]
+    fn query_returns_long_events_that_started_before_the_window() {
+        // A 100s chunk starting at 0, then two 1s events that end long before
+        // the window: sorted by start, "ends before from" is false-then-true,
+        // so a binary search on it skips right past the chunk that does overlap.
+        let backend = indexed(&[(0, 100_000), (10 * SEC, 1_000), (20 * SEC, 1_000)]);
+        let hits = backend.query("cam", 50 * SEC, 60 * SEC);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].start_pts_ns, 0);
+    }
+
+    #[test]
+    fn query_returns_every_overlapping_event_in_start_order() {
+        let backend = indexed(&[(0, 100_000), (10 * SEC, 1_000), (20 * SEC, 1_000)]);
+        let starts: Vec<u64> = backend
+            .query("cam", 0, u64::MAX)
+            .iter()
+            .map(|e| e.start_pts_ns)
+            .collect();
+        assert_eq!(starts, vec![0, 10 * SEC, 20 * SEC]);
+        assert!(backend.query("unknown", 0, u64::MAX).is_empty());
+    }
+
+    #[test]
+    fn zero_duration_events_are_found_at_their_start() {
+        let backend = indexed(&[(10 * SEC, 0)]);
+        assert_eq!(backend.query("cam", 10 * SEC, 10 * SEC).len(), 1);
+        assert!(backend.query("cam", 10 * SEC + 1, 20 * SEC).is_empty());
+    }
+
+    #[test]
+    fn query_bounds_include_events_that_only_touch_them() {
+        let backend = indexed(&[(10 * SEC, 5_000)]);
+        // Ends exactly at from_ns.
+        assert_eq!(backend.query("cam", 15 * SEC, 20 * SEC).len(), 1);
+        assert!(backend.query("cam", 15 * SEC + 1, 20 * SEC).is_empty());
+        // Starts exactly at to_ns.
+        assert_eq!(backend.query("cam", 0, 10 * SEC).len(), 1);
+        assert!(backend.query("cam", 0, 10 * SEC - 1).is_empty());
+    }
+
+    #[test]
+    fn query_with_an_inverted_range_is_empty() {
+        // These bounds used to be computed independently and sliced, which
+        // panicked here with start > end.
+        let backend = indexed(&[(0, 100_000), (10 * SEC, 1_000)]);
+        assert!(backend.query("cam", u64::MAX, 0).is_empty());
+        assert!(backend.query("cam", 20 * SEC, 5 * SEC).is_empty());
     }
 }
