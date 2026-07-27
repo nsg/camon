@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.5.0
+
+- **The live view's detection surfaces merge into one timeline.** Motion
+  history draws directly on the scrubber as an intensity histogram, and
+  object detections sit on top as markers — tap one for the classified
+  crop with confidence, tap again to jump the video there. Dragging
+  anywhere on the track scrubs the hot buffer. Built phone-first, with
+  proper touch targets; the separate detection gallery and recent-motion
+  chips are gone.
+- **Stored events get per-day activity maps** below the live view: one
+  24-hour strip per day showing when movements (amber) and objects (red)
+  happened. Tapping a day opens the event browser at that day. Days follow
+  whatever the server has retained, so different movement/object retention
+  settings just work.
+- Live playback that quietly fell behind after a player stall now snaps
+  back to the live edge instead of drifting minutes into the past.
+
 ## 0.4.2
 
 - **Every occupancy sensor now has a matching snapshot camera** (e.g. "Cat
