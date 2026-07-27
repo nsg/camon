@@ -16,9 +16,7 @@ mod mqtt;
 mod storage;
 mod update;
 
-use analytics::{
-    AnalyzerContext, DetectionJob, DetectionWorker, OllamaClient, DETECT_QUEUE_CAPACITY,
-};
+use analytics::{detect_queue, AnalyzerContext, DetectQueueSender, DetectionWorker, OllamaClient};
 use api::AppState;
 use buffer::warm::{run_continuous_recorder, WarmWriter, WriterMessage};
 use buffer::HotBuffer;
@@ -279,7 +277,7 @@ struct SpawnContext<'a> {
     motion_settings: &'a Option<analytics::MotionSettingsStore>,
     /// Crop-job queue into the global detection worker; `None` when object
     /// detection is off.
-    detect_tx: &'a Option<tokio::sync::mpsc::Sender<DetectionJob>>,
+    detect_tx: &'a Option<DetectQueueSender>,
     event_registry: &'a Option<EventRegistry>,
     /// Motion lifecycle events for the Home Assistant bridge; `None` when
     /// `[mqtt].enabled` is false.
@@ -521,8 +519,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let (detect_tx, detect_rx) = match ollama_client {
         Some(_) => {
-            let (tx, rx) = tokio::sync::mpsc::channel(DETECT_QUEUE_CAPACITY);
-            (Some(tx), Some(rx))
+            let (tx, queue) = detect_queue();
+            (Some(tx), Some(queue))
         }
         None => (None, None),
     };

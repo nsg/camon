@@ -18,7 +18,7 @@ use crate::storage::{DetectionStore, EventRecord, EventRegistry, MotionEntry, Mo
 use super::decoder::{
     CropDecoder, DecodeOutcome, FrameDecoder, DETECTION_CROP_SIZE, THUMBNAIL_CROP_SIZE,
 };
-use super::detect_worker::{enqueue_job, DetectionJob};
+use super::detect_worker::{DetectQueueSender, DetectionJob};
 use super::motion::{MotionBox, MotionDetector};
 use super::run_tracker::{ClosedRun, RunTracker};
 
@@ -339,9 +339,9 @@ pub struct AnalyzerContext {
     pub motion_store: MotionStore,
     pub detection_store: Option<DetectionStore>,
     /// Crop jobs for the global (serial) detection worker. `None` when
-    /// object detection is disabled. The analyzer only ever `try_send`s —
-    /// motion detection never stalls on the vision model.
-    pub detect_tx: Option<tokio::sync::mpsc::Sender<DetectionJob>>,
+    /// object detection is disabled. Sends never block — motion detection
+    /// never stalls on the vision model.
+    pub detect_tx: Option<DetectQueueSender>,
     /// Recently written events, recorded here for the detection worker's
     /// post-hoc upgrade lookup. `None` when warm storage or detection is off.
     pub event_registry: Option<EventRegistry>,
@@ -377,7 +377,7 @@ pub struct MotionAnalyzer {
     /// detector above is deliberately not part of the decoder, so a respawn
     /// leaves the learned MOG2 background model intact.
     zero_frames: ZeroFrameTripwire,
-    detect_tx: Option<tokio::sync::mpsc::Sender<DetectionJob>>,
+    detect_tx: Option<DetectQueueSender>,
     event_registry: Option<EventRegistry>,
     last_processed: u64,
     motion_settings: MotionSettingsStore,
@@ -885,8 +885,8 @@ impl MotionAnalyzer {
     /// Extract, crop and JPEG-encode the color frames of one contiguous motion
     /// run. They become the filmstrip of the event the run belongs to, and —
     /// when object detection is on — a crop job for the global detection
-    /// worker. Handing that job off never blocks: it is `try_send`-queued, and
-    /// a full queue drops it with a warning, costing the object upgrade but
+    /// worker. Handing that job off never blocks: a camera past its queue cap
+    /// loses its oldest queued job instead, costing that object upgrade but
     /// never the event.
     fn process_run(&mut self, run: Vec<MotionSegment>, crop_decoder: &CropDecoder) {
         if run.is_empty() {
@@ -962,17 +962,14 @@ impl MotionAnalyzer {
         }
 
         if let Some(ref tx) = self.detect_tx {
-            enqueue_job(
-                tx,
-                DetectionJob {
-                    camera_id: self.camera_id.clone(),
-                    seqs: run.iter().map(|seg| seg.seq).collect(),
-                    crop_jpegs: filmstrip_jpegs.clone(),
-                    full_frame_jpeg,
-                    motion_rects: all_motion_rects,
-                    run_crop: run_crop.map(|c| (c.x, c.y, c.w, c.h)),
-                },
-            );
+            tx.send(DetectionJob {
+                camera_id: self.camera_id.clone(),
+                seqs: run.iter().map(|seg| seg.seq).collect(),
+                crop_jpegs: filmstrip_jpegs.clone(),
+                full_frame_jpeg,
+                motion_rects: all_motion_rects,
+                run_crop: run_crop.map(|c| (c.x, c.y, c.w, c.h)),
+            });
         }
 
         self.run_filmstrip.push(filmstrip_jpegs);
