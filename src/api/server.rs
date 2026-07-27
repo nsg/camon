@@ -17,7 +17,7 @@ use crate::analytics::motion_settings::{
     MotionSettings, MASK_COLS, MASK_ROWS, MIN_CONTOUR_AREA_MAX, MIN_CONTOUR_AREA_MIN,
     VAR_THRESHOLD_MAX, VAR_THRESHOLD_MIN,
 };
-use crate::analytics::{MotionSettingsStore, SettingsUpdate};
+use crate::analytics::{MotionSettingsStore, SettingsUpdate, UpdateError};
 use crate::buffer::HotBuffer;
 use crate::locks::LockExt;
 use crate::storage::{
@@ -550,12 +550,24 @@ async fn motion_settings_put_handler(
     Json(update): Json<SettingsUpdate>,
 ) -> Response {
     let store = match &state.motion_settings {
-        Some(s) => s,
+        Some(s) => s.clone(),
         None => return (StatusCode::NOT_FOUND, "motion settings not enabled").into_response(),
     };
-    match store.update(&id, update) {
-        Some(s) => axum::Json(MotionSettingsResponse::from(s)).into_response(),
-        None => (StatusCode::NOT_FOUND, "camera not found").into_response(),
+    // The update fsyncs and holds the camera's persistence lock while it does,
+    // so it runs off the async workers.
+    let result = tokio::task::spawn_blocking(move || store.update(&id, update)).await;
+    match result {
+        Ok(Ok(s)) => axum::Json(MotionSettingsResponse::from(s)).into_response(),
+        Ok(Err(UpdateError::UnknownCamera)) => {
+            (StatusCode::NOT_FOUND, "camera not found").into_response()
+        }
+        Ok(Err(e @ UpdateError::NotPersisted(_))) => {
+            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "motion settings update panicked");
+            (StatusCode::INTERNAL_SERVER_ERROR, "settings update failed").into_response()
+        }
     }
 }
 
@@ -1093,6 +1105,81 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         (format!("http://{addr}"), dir)
+    }
+
+    /// Serve with motion settings backed by `data_dir`.
+    async fn serve_with_motion_settings(data_dir: &std::path::Path) -> String {
+        let ids = vec!["cam".to_string()];
+        let buffers = HashMap::from([("cam".to_string(), HotBuffer::new("cam".to_string(), 60))]);
+        let state = AppState::new(
+            buffers,
+            MotionStore::new(&ids),
+            DetectionStore::new(&ids),
+            DetectionDebugStore::new(&ids),
+            None,
+            Some(MotionSettingsStore::new(&ids, data_dir, 16.0, 200.0)),
+        );
+        let app = build_router(state, None);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://{addr}")
+    }
+
+    /// A settings PUT that cannot be made durable must not answer 200 — the
+    /// operator would take a painted mask as saved and lose it on restart.
+    #[tokio::test]
+    async fn a_settings_put_that_cannot_be_persisted_is_not_a_success() {
+        let dir = tempfile::tempdir().unwrap();
+        // A regular file where the camera's directory belongs: nothing can be
+        // written underneath it, whatever user the test runs as.
+        std::fs::write(dir.path().join("cam"), b"not a directory").unwrap();
+        let base = serve_with_motion_settings(dir.path()).await;
+
+        let response = reqwest::Client::new()
+            .put(format!("{base}/api/cameras/cam/motion/settings"))
+            .json(&serde_json::json!({ "var_threshold": 32.0 }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert!(response.text().await.unwrap().contains("not saved"));
+
+        // The value is live regardless, and the GET says so.
+        let live: serde_json::Value =
+            reqwest::get(format!("{base}/api/cameras/cam/motion/settings"))
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+        assert_eq!(live["var_threshold"], 32.0);
+    }
+
+    #[tokio::test]
+    async fn settings_for_an_unknown_camera_are_a_404_not_a_500() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = serve_with_motion_settings(dir.path()).await;
+
+        let response = reqwest::Client::new()
+            .put(format!("{base}/api/cameras/nope/motion/settings"))
+            .json(&serde_json::json!({ "var_threshold": 32.0 }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
+
+        // The writable camera still answers 200 on the same route.
+        let response = reqwest::Client::new()
+            .put(format!("{base}/api/cameras/cam/motion/settings"))
+            .json(&serde_json::json!({ "var_threshold": 32.0 }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
     }
 
     #[tokio::test]

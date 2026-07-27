@@ -1,4 +1,4 @@
-use std::sync::{PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 /// Extension methods for `RwLock` that recover the guard on poison instead of
 /// panicking or silently skipping the work.
@@ -20,6 +20,17 @@ impl<T: ?Sized> LockExt<T> for RwLock<T> {
 
     fn write_recover(&self) -> RwLockWriteGuard<'_, T> {
         self.write().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// The same recovery-on-poison treatment for `Mutex`, for the same reason.
+pub trait MutexExt<T: ?Sized> {
+    fn lock_recover(&self) -> MutexGuard<'_, T>;
+}
+
+impl<T: ?Sized> MutexExt<T> for Mutex<T> {
+    fn lock_recover(&self) -> MutexGuard<'_, T> {
+        self.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
 

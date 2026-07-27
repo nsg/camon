@@ -10,11 +10,11 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 use serde::{Deserialize, Serialize};
 
-use crate::locks::LockExt;
+use crate::locks::{LockExt, MutexExt};
 
 /// Ignore-mask grid geometry. 16x12 over a 320x240 analysis frame gives 20x20px
 /// cells — the same resolution the old detection-grid overlay rendered at.
@@ -111,6 +111,17 @@ impl MotionSettings {
     }
 }
 
+/// Why an update did not fully succeed.
+#[derive(Debug, thiserror::Error)]
+pub enum UpdateError {
+    #[error("camera not found")]
+    UnknownCamera,
+    /// The new settings are live in the running detector but did not reach
+    /// disk, so they are lost on the next restart.
+    #[error("settings applied to the running detector but not saved: {0}")]
+    NotPersisted(#[source] std::io::Error),
+}
+
 /// Partial update accepted by the settings API. Absent fields are left
 /// unchanged.
 #[derive(Debug, Default, Deserialize)]
@@ -126,12 +137,23 @@ struct CameraSettings {
     path: PathBuf,
 }
 
+struct Camera {
+    state: RwLock<CameraSettings>,
+    /// Serializes update-then-persist for this camera. Held across the disk
+    /// write — which `state` deliberately is not, so the analyzer's per-tick
+    /// read never waits on I/O — so that the order updates are applied is the
+    /// order they reach disk. Without it two concurrent updates stage through
+    /// the same `.tmp` path, and the later mutation can lose the rename to the
+    /// earlier one, leaving the file disagreeing with the live settings.
+    persist: Mutex<()>,
+}
+
 /// Shared, `Arc`-backed store of per-camera motion settings. Cloned into both
 /// the analyzer (which reads it each tick) and the HTTP layer (which serves and
 /// updates it).
 #[derive(Clone)]
 pub struct MotionSettingsStore {
-    cameras: Arc<HashMap<String, RwLock<CameraSettings>>>,
+    cameras: Arc<HashMap<String, Camera>>,
 }
 
 impl MotionSettingsStore {
@@ -151,7 +173,13 @@ impl MotionSettingsStore {
             let settings = load(&path).unwrap_or_else(|| {
                 MotionSettings::from_defaults(default_var_threshold, default_min_contour_area)
             });
-            cameras.insert(id.clone(), RwLock::new(CameraSettings { settings, path }));
+            cameras.insert(
+                id.clone(),
+                Camera {
+                    state: RwLock::new(CameraSettings { settings, path }),
+                    persist: Mutex::new(()),
+                },
+            );
         }
         Self {
             cameras: Arc::new(cameras),
@@ -160,33 +188,56 @@ impl MotionSettingsStore {
 
     /// Current settings for a camera, or `None` if it is unknown.
     pub fn get(&self, camera_id: &str) -> Option<MotionSettings> {
-        let lock = self.cameras.get(camera_id)?;
-        Some(lock.read_recover().settings.clone())
+        let cam = self.cameras.get(camera_id)?;
+        Some(cam.state.read_recover().settings.clone())
     }
 
     /// Apply a partial update, clamp, persist to disk, and return the new
-    /// settings. `None` if the camera is unknown.
-    pub fn update(&self, camera_id: &str, update: SettingsUpdate) -> Option<MotionSettings> {
-        let lock = self.cameras.get(camera_id)?;
+    /// settings.
+    ///
+    /// The live state is updated before persistence and is *kept* even when the
+    /// write fails: a mask is a privacy control that has to take effect on the
+    /// next analysis tick, and refusing to apply it because the disk is full
+    /// would leave the operator unable to stop the model seeing a sensitive
+    /// area at all. `NotPersisted` says exactly that — applied now, gone on
+    /// restart — instead of the silent success this used to report.
+    pub fn update(
+        &self,
+        camera_id: &str,
+        update: SettingsUpdate,
+    ) -> Result<MotionSettings, UpdateError> {
+        let cam = self
+            .cameras
+            .get(camera_id)
+            .ok_or(UpdateError::UnknownCamera)?;
+        // Taken before the mutation, not just around the write, so that two
+        // concurrent updates are applied and persisted in the same order.
+        let _persist = cam.persist.lock_recover();
         let (path, settings) = {
-            let mut cam = lock.write_recover();
+            let mut state = cam.state.write_recover();
             if let Some(v) = update.var_threshold {
-                cam.settings.var_threshold = v;
+                state.settings.var_threshold = v;
             }
             if let Some(v) = update.min_contour_area {
-                cam.settings.min_contour_area = v;
+                state.settings.min_contour_area = v;
             }
             if let Some(m) = update.mask {
-                cam.settings.mask = m;
+                state.settings.mask = m;
             }
             if let Some(m) = update.detection_mask {
-                cam.settings.detection_mask = m;
+                state.settings.detection_mask = m;
             }
-            cam.settings.clamp();
-            (cam.path.clone(), cam.settings.clone())
+            state.settings.clamp();
+            (state.path.clone(), state.settings.clone())
         };
-        save(&path, &settings);
-        Some(settings)
+        match save(&path, &settings) {
+            Ok(()) => Ok(settings),
+            Err(e) => {
+                tracing::warn!(camera = %camera_id, path = %path.display(), error = %e,
+                    "failed to save motion settings");
+                Err(UpdateError::NotPersisted(e))
+            }
+        }
     }
 }
 
@@ -202,18 +253,56 @@ fn load(path: &Path) -> Option<MotionSettings> {
     Some(settings)
 }
 
-fn save(path: &Path, settings: &MotionSettings) {
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    match serde_json::to_string_pretty(settings) {
-        Ok(json) => {
-            if let Err(e) = std::fs::write(path, json) {
-                tracing::warn!(error = %e, "failed to save motion settings");
-            }
+/// Persist settings the way the storage layer commits an event: stage into
+/// `motion_settings.json.tmp`, fsync it, then rename. `load` falls back to
+/// unmasked defaults on any parse error, so a torn write would silently drop a
+/// privacy mask; the rename makes that unreachable — a crash can only leave a
+/// stale `.tmp` beside an intact previous file.
+///
+/// The containing directory is fsynced after the rename as well. `sync_all` on
+/// the staging file only makes its *contents* durable; the directory entry the
+/// rename swaps is not, so without this a crash just after a success response
+/// could still bring back the previous mask, or lose a first-ever settings file
+/// outright. Nothing sweeps a stray `motion_settings.json.tmp` at startup — the
+/// warm storage recovery pass only walks the per-event-type subdirectories — so
+/// there is no second chance here of the kind the event path has.
+fn save(path: &Path, settings: &MotionSettings) -> std::io::Result<()> {
+    let dir = path.parent().unwrap_or(Path::new("."));
+    // A directory that has just come into existence is itself only durable once
+    // its own parent is synced; the settings file inside it would go with it.
+    let dir_is_new = !dir.exists();
+    std::fs::create_dir_all(dir)?;
+    if dir_is_new {
+        if let Some(grandparent) = dir.parent() {
+            sync_dir(grandparent)?;
         }
-        Err(e) => tracing::warn!(error = %e, "failed to serialize motion settings"),
     }
+
+    let json = serde_json::to_string_pretty(settings).map_err(std::io::Error::other)?;
+    let tmp = tmp_path(path);
+    if let Err(e) = write_synced(&tmp, json.as_bytes()).and_then(|()| std::fs::rename(&tmp, path)) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    sync_dir(dir)
+}
+
+fn tmp_path(path: &Path) -> PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(".tmp");
+    path.with_file_name(name)
+}
+
+fn write_synced(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut f = std::fs::File::create(path)?;
+    f.write_all(data)?;
+    f.sync_all()
+}
+
+/// fsync a directory so a rename or creation inside it survives a crash.
+fn sync_dir(dir: &Path) -> std::io::Result<()> {
+    std::fs::File::open(dir)?.sync_all()
 }
 
 /// Delete the persisted state of the removed auto-tuner and detection grid.
@@ -421,7 +510,112 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let store = MotionSettingsStore::new(&["cam1".to_string()], dir.path(), 16.0, 200.0);
         assert!(store.get("nope").is_none());
-        assert!(store.update("nope", SettingsUpdate::default()).is_none());
+        assert!(matches!(
+            store.update("nope", SettingsUpdate::default()),
+            Err(UpdateError::UnknownCamera)
+        ));
+    }
+
+    /// A regular file where the camera directory belongs: nothing can be
+    /// persisted underneath it, whatever user the test runs as.
+    fn unwritable_store(dir: &TempDir) -> MotionSettingsStore {
+        std::fs::write(dir.path().join("cam1"), b"not a directory").unwrap();
+        MotionSettingsStore::new(&["cam1".to_string()], dir.path(), 16.0, 200.0)
+    }
+
+    #[test]
+    fn update_reports_persistence_failure_instead_of_success() {
+        let dir = TempDir::new().unwrap();
+        let store = unwritable_store(&dir);
+
+        let mut mask = default_mask();
+        mask[4] = true;
+        let err = store
+            .update(
+                "cam1",
+                SettingsUpdate {
+                    detection_mask: Some(mask),
+                    ..Default::default()
+                },
+            )
+            .expect_err("unsaved settings reported as success");
+        assert!(matches!(err, UpdateError::NotPersisted(_)), "{err}");
+
+        // Deliberate: the mask is live even though it is not durable, and the
+        // error is what says so.
+        assert!(store.get("cam1").unwrap().detection_mask[4]);
+    }
+
+    /// Every writer stages through the same `{name}.tmp`, so without the
+    /// per-camera persistence lock one could rename a file another was still
+    /// writing through — a live file holding a mix of two updates — or land an
+    /// older write after a newer one and leave the file disagreeing with the
+    /// settings the detector is using.
+    #[test]
+    fn concurrent_updates_persist_exactly_one_of_them() {
+        let dir = TempDir::new().unwrap();
+        let ids = vec!["cam1".to_string()];
+        let store = MotionSettingsStore::new(&ids, dir.path(), 16.0, 200.0);
+
+        let writers: Vec<_> = (0..8)
+            .map(|i| {
+                let store = store.clone();
+                std::thread::spawn(move || {
+                    // A whole-mask pattern keyed to the writer, so a file mixing
+                    // two of them cannot match any single writer's update.
+                    let mask: Vec<bool> = (0..MASK_CELLS).map(|c| c % 8 == i).collect();
+                    store
+                        .update(
+                            "cam1",
+                            SettingsUpdate {
+                                var_threshold: Some(20.0 + i as f64),
+                                detection_mask: Some(mask),
+                                ..Default::default()
+                            },
+                        )
+                        .unwrap();
+                })
+            })
+            .collect();
+        for w in writers {
+            w.join().unwrap();
+        }
+
+        let persisted =
+            load(&settings_path(dir.path(), "cam1")).expect("no readable settings file");
+        let i = (persisted.var_threshold - 20.0) as usize;
+        assert!(
+            i < 8,
+            "var_threshold {} is no writer's",
+            persisted.var_threshold
+        );
+        let expected: Vec<bool> = (0..MASK_CELLS).map(|c| c % 8 == i).collect();
+        assert_eq!(persisted.detection_mask, expected, "file mixes two updates");
+
+        // The last writer to persist is also the last to have mutated, so the
+        // file can never be an older update than what the detector is reading.
+        assert_eq!(persisted, store.get("cam1").unwrap());
+    }
+
+    #[test]
+    fn save_replaces_by_rename_and_never_writes_the_live_file() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("cam1").join("motion_settings.json");
+        let mut first = MotionSettings::default();
+        first.detection_mask[3] = true;
+        save(&path, &first).unwrap();
+        let before = std::fs::read_to_string(&path).unwrap();
+        assert!(!tmp_path(&path).exists(), "staging file left behind");
+
+        // A directory in the staging path blocks the write. Were the settings
+        // written in place instead of staged and renamed, this would succeed
+        // and `before` would change — and a crash at that point is exactly what
+        // truncates the file into an unmasked default.
+        std::fs::create_dir(tmp_path(&path)).unwrap();
+        let mut second = MotionSettings::default();
+        second.detection_mask[7] = true;
+        assert!(save(&path, &second).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
     }
 
     #[test]

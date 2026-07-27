@@ -14,6 +14,6 @@ pub mod run_tracker;
 pub use detect_worker::{detect_queue, DetectQueueSender, DetectionWorker};
 #[allow(unused_imports)]
 pub use motion::{MotionBox, MotionDetector};
-pub use motion_settings::{MotionSettingsStore, SettingsUpdate};
+pub use motion_settings::{MotionSettingsStore, SettingsUpdate, UpdateError};
 pub use ollama::OllamaClient;
 pub use pipeline::{spawn_analyzer, AnalyzerContext};
