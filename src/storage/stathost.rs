@@ -74,7 +74,8 @@ use crate::storage::backend::{
     WarmStorageBackend, WriteOutcome,
 };
 use crate::storage::warm_index::{
-    parse_event_filename, parse_sidecar_json, DetectionDetail, SidecarData,
+    cap_sweep_deletions, parse_event_filename, parse_sidecar_json, wall_clock_ns, DetectionDetail,
+    SidecarData,
 };
 use crate::storage::{EventType, WarmEventEntry};
 
@@ -177,6 +178,20 @@ impl StathostBackend {
             .binary_search_by_key(&start_pts_ns, |e| e.start_pts_ns)
             .ok()?;
         Some(entries.remove(idx))
+    }
+
+    /// Remember that this event resisted deletion, so the sweep's per-sweep
+    /// deletion cap stops being spent on it: a store that refuses one event for
+    /// good would otherwise block every deletion behind it, sweep after sweep.
+    /// The flag is in-RAM and a restart clears it, which is the retry.
+    fn mark_delete_failed(&self, camera_id: &str, start_pts_ns: u64) {
+        let Some(lock) = self.cameras.get(camera_id) else {
+            return;
+        };
+        let mut entries = lock.write_recover();
+        if let Ok(idx) = entries.binary_search_by_key(&start_pts_ns, |e| e.start_pts_ns) {
+            entries[idx].delete_failed = true;
+        }
     }
 
     /// Record that this event's type could not be established. `event_type` on
@@ -333,6 +348,11 @@ impl StathostBackend {
     /// `max_stored_bytes`, delete the oldest events cheapest-tier-first
     /// (continuous → movements → objects). A transport failure stops the pass
     /// (retried on the next tick). No-op when the budget is unlimited.
+    ///
+    /// Like the local low-space guard, this is deliberately outside the sweep's
+    /// [`cap_sweep_deletions`] cap — the budget is not clock-derived — so a
+    /// full budget during a held-back drain can delete the footage the sweep is
+    /// holding.
     async fn enforce_budget(&self, camera_id: &str) {
         if self.max_stored_bytes == 0 || self.used() <= self.max_stored_bytes {
             return;
@@ -577,10 +597,7 @@ impl WarmStorageBackend for StathostBackend {
         continuous_max_age_ns: u64,
         cancel: &std::sync::atomic::AtomicBool,
     ) {
-        let now_ns = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos() as u64;
+        let now_ns = wall_clock_ns();
         let max_age = |t: EventType| match t {
             EventType::Movement => movement_max_age_ns,
             EventType::Object => object_max_age_ns,
@@ -605,9 +622,9 @@ impl WarmStorageBackend for StathostBackend {
             // First give held events a chance to be typed, so one that resolves
             // is pruned on its real retention in this same sweep.
             self.resolve_unknown_types(camera_id, cancel).await;
-            let expired: Vec<WarmEventEntry> = {
+            let (indexed, expired) = {
                 let entries = lock.read_recover();
-                entries
+                let expired: Vec<WarmEventEntry> = entries
                     .iter()
                     .filter(|e| {
                         let limit = if self.has_unknown_type(camera_id, e.start_pts_ns) {
@@ -618,11 +635,13 @@ impl WarmStorageBackend for StathostBackend {
                         now_ns.saturating_sub(e.start_pts_ns) > limit
                     })
                     .cloned()
-                    .collect()
+                    .collect();
+                (entries.len(), expired)
             };
             if expired.is_empty() {
                 continue;
             }
+            let expired = cap_sweep_deletions(camera_id, indexed, expired);
 
             let mut deleted = 0u64;
             for entry in &expired {
@@ -635,6 +654,8 @@ impl WarmStorageBackend for StathostBackend {
                             .fetch_sub(removed.file_size, Ordering::Relaxed);
                     }
                     deleted += 1;
+                } else {
+                    self.mark_delete_failed(camera_id, entry.start_pts_ns);
                 }
             }
             if deleted > 0 {
@@ -1180,6 +1201,9 @@ mod tests {
         /// When set, GETs whose path ends with this suffix answer `500` — an
         /// unreadable object, as distinct from an absent one (`404`).
         fail_get_suffix: Arc<Mutex<Option<String>>>,
+        /// DELETEs of exactly these paths answer `500`: an object the store
+        /// refuses to drop, as distinct from one already gone (`404`).
+        fail_delete_paths: Arc<Mutex<HashSet<String>>>,
         /// When set, GET ignores an incoming `Range` and answers a full `200` —
         /// a legal HTTP response the client must handle by replaying in full.
         ignore_range: Arc<AtomicBool>,
@@ -1321,6 +1345,9 @@ mod tests {
                 if !authorized(&headers, &stub.token) {
                     return StatusCode::UNAUTHORIZED.into_response();
                 }
+                if stub.fail_delete_paths.lock().unwrap().contains(&path) {
+                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                }
                 if stub.files.lock().unwrap().remove(&path).is_some() {
                     StatusCode::OK.into_response()
                 } else {
@@ -1385,6 +1412,7 @@ mod tests {
             fail_writes: Arc::new(AtomicBool::new(false)),
             put_fault: Arc::new(Mutex::new(None)),
             fail_get_suffix: Arc::new(Mutex::new(None)),
+            fail_delete_paths: Arc::new(Mutex::new(HashSet::new())),
             ignore_range: Arc::new(AtomicBool::new(false)),
         };
         let app = Router::new()
@@ -1592,6 +1620,68 @@ mod tests {
         assert!(backend.find_event("cam", old_pts).is_none());
         assert!(stub.files.lock().unwrap().is_empty());
         assert_eq!(backend.used_bytes.load(Ordering::Relaxed), 0);
+    }
+
+    /// The per-sweep deletion cap is the remote store's protection against a
+    /// forward clock jump too: the whole index expiring at once must not empty
+    /// the bucket in one sweep.
+    #[tokio::test]
+    async fn prune_caps_how_much_one_sweep_deletes() {
+        let (url, _stub) = spawn_stub("secret").await;
+        let backend = backend_for(&url, "secret", 0);
+        for i in 0..40u64 {
+            backend
+                .write_event("cam", &movement_event(1_000_000_000 + i * 1_000_000, 10))
+                .await;
+        }
+
+        // Every event is expired; a quarter of the 40 indexed may go.
+        backend
+            .prune(1, u64::MAX, u64::MAX, &AtomicBool::new(false))
+            .await;
+        assert_eq!(backend.query("cam", 0, u64::MAX).len(), 30);
+
+        backend
+            .prune(1, u64::MAX, u64::MAX, &AtomicBool::new(false))
+            .await;
+        assert_eq!(backend.query("cam", 0, u64::MAX).len(), 22);
+    }
+
+    /// An event the store refuses to delete sits at the head of the sweep, so
+    /// without the cap exempting known failures it would spend the whole budget
+    /// on the same objects every hour and never reach the ones behind them.
+    #[tokio::test]
+    async fn an_undeletable_event_does_not_block_the_sweep_forever() {
+        let (url, stub) = spawn_stub("secret").await;
+        let backend = backend_for(&url, "secret", 0);
+        for i in 0..12u64 {
+            backend
+                .write_event("cam", &movement_event(1_000_000_000 + i * 1_000_000, 10))
+                .await;
+        }
+        // The four oldest videos — the whole cap for a 12-event index.
+        {
+            let mut refused = stub.fail_delete_paths.lock().unwrap();
+            for i in 0..4u64 {
+                refused.insert(format!("cam/{}_1000.ts", 1_000_000_000 + i * 1_000_000));
+            }
+        }
+
+        // First sweep: the entire budget goes on the four that refuse.
+        backend
+            .prune(1, u64::MAX, u64::MAX, &AtomicBool::new(false))
+            .await;
+        assert_eq!(backend.query("cam", 0, u64::MAX).len(), 12);
+
+        // Second: retrying those is free, so it reaches four behind them.
+        backend
+            .prune(1, u64::MAX, u64::MAX, &AtomicBool::new(false))
+            .await;
+        assert_eq!(
+            backend.query("cam", 0, u64::MAX).len(),
+            8,
+            "a stuck head of the queue blocked the whole sweep"
+        );
     }
 
     /// Shutdown reaches this backend as a raised flag, and one event here is

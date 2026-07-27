@@ -430,11 +430,15 @@ impl RetentionTask {
         warm_config: &WarmConfig,
         shutdown: Arc<AtomicBool>,
     ) -> Self {
+        // Config validation bounds the days well below the wrap, but a wrapped
+        // retention is a *short* one — it deletes footage — so saturate rather
+        // than depend on that bound staying correct.
+        let retention_ns = |days: u64| days.saturating_mul(86400).saturating_mul(NANOS_PER_SEC);
         Self {
             backend,
-            movement_retention_ns: warm_config.movement_retention_days * 86400 * NANOS_PER_SEC,
-            object_retention_ns: warm_config.object_retention_days * 86400 * NANOS_PER_SEC,
-            continuous_retention_ns: warm_config.continuous_retention_days * 86400 * NANOS_PER_SEC,
+            movement_retention_ns: retention_ns(warm_config.movement_retention_days),
+            object_retention_ns: retention_ns(warm_config.object_retention_days),
+            continuous_retention_ns: retention_ns(warm_config.continuous_retention_days),
             shutdown,
         }
     }

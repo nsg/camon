@@ -412,13 +412,29 @@ impl WarmEventIndex {
         movement_max_age_ns: u64,
         object_max_age_ns: u64,
         continuous_max_age_ns: u64,
+        cancel: F,
+    ) -> u64 {
+        self.prune_at(
+            wall_clock_ns(),
+            movement_max_age_ns,
+            object_max_age_ns,
+            continuous_max_age_ns,
+            cancel,
+        )
+        .await
+    }
+
+    /// [`prune`](Self::prune) with the clock handed in, so a sweep can be run
+    /// at an arbitrary "now" — including one on the far side of a clock jump —
+    /// without waiting for the hour or touching the system clock.
+    async fn prune_at<F: FnMut() -> bool>(
+        &self,
+        now_ns: u64,
+        movement_max_age_ns: u64,
+        object_max_age_ns: u64,
+        continuous_max_age_ns: u64,
         mut cancel: F,
     ) -> u64 {
-        let now_ns = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos() as u64;
-
         let max_age = |t: EventType| match t {
             EventType::Movement => movement_max_age_ns,
             EventType::Object => object_max_age_ns,
@@ -430,18 +446,20 @@ impl WarmEventIndex {
             if cancel() {
                 break;
             }
-            let expired: Vec<WarmEventEntry> = {
+            let (indexed, expired) = {
                 let entries = lock.read_recover();
-                entries
+                let expired: Vec<WarmEventEntry> = entries
                     .iter()
                     .filter(|e| now_ns.saturating_sub(e.start_pts_ns) > max_age(e.event_type))
                     .cloned()
-                    .collect()
+                    .collect();
+                (entries.len(), expired)
             };
 
             if expired.is_empty() {
                 continue;
             }
+            let expired = cap_sweep_deletions(camera_id, indexed, expired);
 
             let mut deleted = 0u64;
             let mut failed = 0u64;
@@ -562,6 +580,11 @@ impl WarmEventIndex {
     /// count, which would let the oldest few undeletable events starve every
     /// newer deletable one and stop recording outright.
     ///
+    /// This path is deliberately outside [`cap_sweep_deletions`]: space
+    /// pressure is not clock-derived, and a full disk stops recording
+    /// altogether. So a low-space pass during a held-back drain can delete the
+    /// very footage the sweep's cap is holding.
+    ///
     /// Candidates exclude events whose deletion has already failed once
     /// ([`WarmEventEntry::delete_failed`]). That is what bounds the work: this
     /// runs ahead of every single write, and re-attempting a file the
@@ -643,6 +666,118 @@ pub(crate) fn free_space_bytes(path: &std::path::Path) -> std::io::Result<u64> {
 /// the guard entirely.
 pub(crate) fn should_emergency_prune(free_bytes: u64, min_free_bytes: u64) -> bool {
     min_free_bytes > 0 && free_bytes < min_free_bytes
+}
+
+/// Wall-clock nanoseconds since the epoch: the clock event start times are
+/// stamped with, and so the only one their age can be measured against. A clock
+/// set before 1970 reads as 0 rather than panicking — a box booting with no
+/// idea what time it is, which is the scenario [`cap_sweep_deletions`] exists
+/// for, must not take the process down.
+pub(crate) fn wall_clock_ns() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64
+}
+
+/// Share of a camera's archive one sweep may delete — a quarter.
+const SWEEP_DELETE_SHARE: usize = 4;
+
+/// Floor under the share, so an archive of a handful of events still expires in
+/// one sweep. Losing four events is not the loss the cap exists to prevent, and
+/// dribbling them out an hour at a time would only make retention look broken
+/// on small installs.
+const SWEEP_DELETE_FLOOR: usize = 4;
+
+fn sweep_delete_limit(indexed: usize) -> usize {
+    indexed.div_ceil(SWEEP_DELETE_SHARE).max(SWEEP_DELETE_FLOOR)
+}
+
+/// Hold back the tail of an over-large expiry, so no single sweep can empty an
+/// archive.
+///
+/// An event's start time is wall clock at keyframe time and its age is
+/// `now - start`, so a forward clock correction of J ages every stored event by
+/// J at once. A box with no battery-backed RTC does exactly that on an ordinary
+/// boot: systemd-timesyncd (and fake-hwclock) restore the clock they saved at
+/// shutdown, so the box comes up as far behind as it was switched off and jumps
+/// forward when NTP lands — J is the off-time, and a box switched off over a
+/// weekend jumps a weekend. Once J reaches the retention window, every event
+/// ever recorded is expired in the same sweep. That sweep used to delete the
+/// lot, and report it at `info!`.
+///
+/// So one flat cap covers every expiry: at most [`sweep_delete_limit`] events
+/// per camera per sweep, oldest first, with a `warn!` naming the counts
+/// whenever anything is held back. The cap is deliberately blind to *why* an
+/// event expired. A clock jump, a shortened retention and a long outage are
+/// indistinguishable from inside a sweep, and every test that tries to tell
+/// them apart is a hole at the jump sizes it guesses wrong about — "how far
+/// past due is it" leaves J up to 1.25 retention windows uncapped, and "does
+/// anything recent survive" disengages the moment the first post-jump event is
+/// recorded, which is within seconds.
+///
+/// Ordinary retention never comes near the cap: an hourly sweep of an R-day
+/// retention expires 1/(24R) of an archive, under 4% at the one-day minimum
+/// camon accepts. What does reach it is a real mass expiry — retention cut from
+/// 30 days to 2, a camera whose whole archive aged out while it was offline —
+/// and that still drains completely, a quarter of what is left per sweep (never
+/// fewer than [`SWEEP_DELETE_FLOOR`]) until only what the retention keeps
+/// remains. It takes a working day instead of one pass, and says so at `warn!`
+/// the whole way down.
+///
+/// Two paths deliberately bypass the cap, because neither is clock-derived: the
+/// low-space emergency prune and the stathost storage budget. So a disk filling
+/// up during a held-back drain can still delete the footage this cap is holding
+/// — running out of space stops recording altogether, which is the more urgent
+/// failure.
+///
+/// Events whose deletion already failed do not count against the cap: they were
+/// let through an earlier sweep's cap and are only being retried, and charging
+/// them again would let a few undeletable events at the head of the queue
+/// starve every deletion behind them for good. That relies on the caller
+/// marking its failures ([`WarmEventEntry::delete_failed`]); both backends do.
+pub(crate) fn cap_sweep_deletions(
+    camera_id: &str,
+    indexed: usize,
+    expired: Vec<WarmEventEntry>,
+) -> Vec<WarmEventEntry> {
+    let expired_count = expired.len();
+    let limit = sweep_delete_limit(indexed);
+    let mut budget = limit;
+    let mut held_back = 0usize;
+    // Filtering in place keeps the index's oldest-first order, so the oldest
+    // footage goes first and a sweep cut short by shutdown has still deleted
+    // the events nearest their retention.
+    let deleting: Vec<WarmEventEntry> = expired
+        .into_iter()
+        .filter(|entry| {
+            if entry.delete_failed {
+                return true;
+            }
+            if budget > 0 {
+                budget -= 1;
+                return true;
+            }
+            held_back += 1;
+            false
+        })
+        .collect();
+
+    let deleting_count = deleting.len();
+    if held_back > 0 {
+        tracing::warn!(
+            camera = %camera_id,
+            indexed,
+            expired = expired_count,
+            deleting = deleting_count,
+            held_back,
+            "more warm events expired at once than one sweep may delete — a forward clock \
+             jump, a shortened retention and a long outage all look like this. Deleting the \
+             oldest {deleting_count} of {expired_count} expired; the {held_back} held back \
+             follow on later sweeps"
+        );
+    }
+    deleting
 }
 
 #[cfg(test)]
@@ -867,6 +1002,139 @@ mod tests {
             .join("continuous")
             .join(format!("{continuous_pts}_5000.ts"))
             .exists());
+    }
+
+    const DAY: u64 = 86_400 * SEC;
+    /// A plausible wall clock (2023-11-14), so the ages in these tests are the
+    /// ages a real sweep would compute.
+    const NOW: u64 = 1_700_000_000 * SEC;
+
+    /// One-second continuous chunks on disk at `starts`, indexed by a scan.
+    fn archive(dir: &std::path::Path, starts: &[u64]) -> WarmEventIndex {
+        for start in starts {
+            write_event_files(dir, "continuous", &format!("{start}_1000"), None);
+        }
+        let index = WarmEventIndex::new(&["cam".to_string()], dir.to_path_buf());
+        index.scan();
+        index
+    }
+
+    /// The catastrophic case: a box with no battery-backed RTC boots at the
+    /// clock timesyncd saved at shutdown and NTP jumps it forward by the
+    /// off-time, which ages every stored event at once. No jump size may empty
+    /// the archive in one sweep — least of all a jump the size of the retention
+    /// window itself, which is what being switched off for exactly that long
+    /// produces, and which an "how overdue is it" test would wave through.
+    #[tokio::test]
+    async fn no_forward_clock_jump_empties_the_archive() {
+        // Two days of footage, one chunk an hour, against a two-day retention.
+        let starts: Vec<u64> = (0..48).map(|i| NOW - (48 - i) * 3600 * SEC).collect();
+        let retention = 2 * DAY;
+        for jump in [
+            retention / 2,
+            retention,
+            retention + retention / 4,
+            2 * retention,
+            30 * 365 * DAY,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let index = archive(dir.path(), &starts);
+            // Nothing is due before the correction lands.
+            assert_eq!(
+                index
+                    .prune_at(NOW, retention, retention, retention, running())
+                    .await,
+                0
+            );
+
+            let deleted = index
+                .prune_at(NOW + jump, retention, retention, retention, running())
+                .await;
+            assert_eq!(deleted, 12, "jump {jump}: the cap is a quarter of 48");
+            assert_eq!(
+                entries(&index).len(),
+                36,
+                "jump {jump}: the sweep deleted past the cap"
+            );
+            // Oldest first, so what survives a jump is the newest footage.
+            assert_eq!(entries(&index)[0].start_pts_ns, starts[12], "jump {jump}");
+        }
+    }
+
+    /// The cap only slows a mass expiry down. An operator who cuts retention
+    /// from 30 days to 2 still gets their disk back, over sweeps rather than in
+    /// one silent pass.
+    #[tokio::test]
+    async fn a_shortened_retention_still_drains() {
+        let dir = tempfile::tempdir().unwrap();
+        // A month of footage, one chunk a day, ages 30 days down to 1. Against
+        // the new two-day retention all but the newest two are expired.
+        let starts: Vec<u64> = (0..30).map(|i| NOW - (30 - i) * DAY).collect();
+        let index = archive(dir.path(), &starts);
+
+        let sweep = || index.prune_at(NOW, 2 * DAY, 2 * DAY, 2 * DAY, running());
+        assert_eq!(sweep().await, 8, "28 expired, a quarter of 30 may go");
+
+        let mut sweeps = 1;
+        while entries(&index).len() > 2 {
+            sweep().await;
+            sweeps += 1;
+            assert!(sweeps < 20, "the retention change never drained");
+        }
+        assert_eq!(sweeps, 6, "the drain took an unexpected number of sweeps");
+        // What is left is exactly what the new retention keeps.
+        let kept: Vec<u64> = entries(&index).iter().map(|e| e.start_pts_ns).collect();
+        assert_eq!(kept, vec![starts[28], starts[29]]);
+    }
+
+    /// Ordinary retention never comes near the cap: an hourly sweep of an
+    /// R-day retention expires 1/(24R) of the archive, and the cap is a
+    /// quarter of it.
+    #[tokio::test]
+    async fn ordinary_hourly_expiry_is_not_capped() {
+        let dir = tempfile::tempdir().unwrap();
+        // Fifty hours of footage, one chunk an hour, against a two-day
+        // retention: the two oldest chunks aged out in the last two hours.
+        let starts: Vec<u64> = (1..=50).map(|i| NOW - i * 3600 * SEC).rev().collect();
+        let index = archive(dir.path(), &starts);
+
+        let retention = 2 * DAY;
+        let deleted = index
+            .prune_at(NOW, retention, retention, retention, running())
+            .await;
+        assert_eq!(deleted, 2);
+        assert_eq!(entries(&index).len(), 48);
+        assert_eq!(entries(&index)[0].start_pts_ns, starts[2]);
+    }
+
+    /// The cap must not be spent, sweep after sweep, on the same files that
+    /// refuse to be deleted — a stuck head of the queue would starve every
+    /// deletion behind it for as long as the failure lasts.
+    #[tokio::test]
+    async fn undeletable_events_do_not_consume_the_cap_forever() {
+        let dir = tempfile::tempdir().unwrap();
+        // Eight events, all long past due; the four oldest cannot be deleted.
+        for i in 0..4u64 {
+            write_undeletable_event(dir.path(), "continuous", &format!("{}_1000", 1000 + i));
+        }
+        for i in 4..8u64 {
+            write_event_files(
+                dir.path(),
+                "continuous",
+                &format!("{}_1000", 1000 + i),
+                None,
+            );
+        }
+        let index = WarmEventIndex::new(&["cam".to_string()], dir.path().to_path_buf());
+        index.scan();
+
+        // The first sweep spends its whole cap on the four that refuse to go.
+        assert_eq!(index.prune(1, 1, 1, running()).await, 0);
+        assert_eq!(entries(&index).len(), 8);
+
+        // Retrying those is free, so the next sweep reaches the four behind them.
+        assert_eq!(index.prune(1, 1, 1, running()).await, 4);
+        assert_eq!(entries(&index).len(), 4);
     }
 
     /// Put something undeletable where an event file belongs: on Linux

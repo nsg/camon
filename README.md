@@ -233,7 +233,9 @@ post_padding_secs = 10
 # chunking — fine with analytics on, rejected in continuous mode.
 # Timing is monotonic, immune to camera PTS jumps.
 max_event_duration_secs = 120
-# Retention for movement-only events in days (default: 2)
+# Retention for movement-only events in days (default: 2). All three retentions
+# are whole days from 1 to 3650; 0 is rejected, as it would expire every event
+# the moment it is written.
 movement_retention_days = 2
 # Retention for object detection events in days (default: 14)
 object_retention_days = 14

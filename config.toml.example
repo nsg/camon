@@ -117,7 +117,10 @@ post_padding_secs = 10
 # nothing would be written until shutdown. Timing is monotonic (wall clock), so
 # a camera PTS jump can't stall it.
 max_event_duration_secs = 120
-# Retention for movement-only events in days (default: 2)
+# Retention for movement-only events in days (default: 2). All three retentions
+# below are whole days from 1 to 3650. 0 is rejected: it does not mean "keep
+# forever" but "expired the moment it was written", so the next hourly sweep
+# would delete the whole archive.
 movement_retention_days = 2
 # Retention for object detection events in days (default: 14)
 object_retention_days = 14

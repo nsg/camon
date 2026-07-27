@@ -60,6 +60,21 @@ pub enum ConfigError {
     )]
     ContinuousChunkExceedsHotBuffer { cap: u64, hot: u64 },
     #[error(
+        "[storage] {key} is 0. Retention is in days, so 0 says every stored event is already \
+         past it and the next hourly sweep would delete the whole archive. Set at least 1 \
+         day, or turn recording off with [storage] enabled = false"
+    )]
+    ZeroRetentionDays { key: &'static str },
+    #[error(
+        "[storage] {key} is {days}, which is beyond the {max} days camon can hold: retention \
+         that long is really a disk-space limit, which is what min_free_bytes is for"
+    )]
+    RetentionDaysTooLarge {
+        key: &'static str,
+        days: u64,
+        max: u64,
+    },
+    #[error(
         "camera id {id:?} contains {character:?}, which is an MQTT topic wildcard; \
          rename the camera or disable [mqtt]"
     )]
@@ -441,6 +456,13 @@ fn default_continuous_retention_days() -> u64 {
     1
 }
 
+/// Upper bound on any `*_retention_days`. Retention is held in nanoseconds
+/// (`days * 86400 * 1e9`), which overflows `u64` around 213000 days and wraps
+/// into a *short* retention — the one failure mode that deletes footage instead
+/// of keeping it. 10 years is far past any real archive and leaves the product
+/// nowhere near the wrap.
+const MAX_RETENTION_DAYS: u64 = 3650;
+
 /// 2 GiB. Roughly an hour of footage at a typical 4 Mbps camera bitrate —
 /// enough slack for the hourly retention prune to catch up before the disk
 /// actually fills — while also keeping the filesystem out of the near-full
@@ -723,6 +745,31 @@ impl Config {
         // The cap is only read by the warm writer and the continuous recorder,
         // neither of which is spawned with storage off.
         if self.storage.enabled {
+            // Retention has no "off" value: 0 does not mean "keep forever", it
+            // expires everything ever recorded.
+            for (key, days) in [
+                (
+                    "movement_retention_days",
+                    self.storage.movement_retention_days,
+                ),
+                ("object_retention_days", self.storage.object_retention_days),
+                (
+                    "continuous_retention_days",
+                    self.storage.continuous_retention_days,
+                ),
+            ] {
+                if days == 0 {
+                    return Err(ConfigError::ZeroRetentionDays { key });
+                }
+                if days > MAX_RETENTION_DAYS {
+                    return Err(ConfigError::RetentionDaysTooLarge {
+                        key,
+                        days,
+                        max: MAX_RETENTION_DAYS,
+                    });
+                }
+            }
+
             let cap = self.storage.max_event_duration_secs;
             // Continuous recording (storage on, analytics off) has no motion
             // run to close a chunk, so the cap is the only thing that rolls
@@ -1386,6 +1433,51 @@ url = "rtsp://10.0.0.5:554/stream1"
         );
         let message = err.to_string();
         assert!(!message.contains("padding"), "got {message}");
+    }
+
+    /// 0 is not "keep forever": every stored event is instantly past a
+    /// zero-day retention, so the next hourly sweep would delete the archive.
+    #[test]
+    fn zero_retention_days_is_rejected_for_every_class() {
+        let cameras = one_camera("yard");
+        for key in [
+            "movement_retention_days",
+            "object_retention_days",
+            "continuous_retention_days",
+        ] {
+            let err = load_cameras(&format!("[storage]\n{key} = 0\n{cameras}")).unwrap_err();
+            assert!(
+                matches!(err, ConfigError::ZeroRetentionDays { key: k } if k == key),
+                "got {err:?}"
+            );
+            // Nothing sweeps with storage off, so nothing to refuse to boot for.
+            let off = format!("[storage]\nenabled = false\n{key} = 0\n{cameras}");
+            load_cameras(&off).unwrap_or_else(|e| panic!("{key} = 0 with storage off: {e}"));
+        }
+    }
+
+    /// Retention is held in nanoseconds, where a big enough value wraps into a
+    /// very short one — the only way this setting can delete footage.
+    #[test]
+    fn retention_days_past_the_bound_is_rejected() {
+        let cameras = one_camera("yard");
+        let toml = format!("[storage]\nobject_retention_days = 3651\n{cameras}");
+        let err = load_cameras(&toml).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ConfigError::RetentionDaysTooLarge {
+                    key: "object_retention_days",
+                    days: 3651,
+                    ..
+                }
+            ),
+            "got {err:?}"
+        );
+        for days in [1, MAX_RETENTION_DAYS] {
+            let toml = format!("[storage]\nobject_retention_days = {days}\n{cameras}");
+            load_cameras(&toml).unwrap_or_else(|e| panic!("{days} days rejected: {e}"));
+        }
     }
 
     /// With storage off no writer and no continuous recorder are spawned, so
