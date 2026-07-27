@@ -717,8 +717,9 @@ async fn write_event(
     let synced = crate::durable::sync_dir_async(&camera_dir).await;
     if let Err(e) = &synced {
         tracing::error!(camera = %camera_id, path = %camera_dir.display(), error = %e,
-            "failed to fsync warm storage directory: the event is on disk and served, but a \
-             power cut could still lose it");
+            "failed to fsync warm storage directory: the event's bytes are on disk and it is \
+             indexed and served, but the directory entry naming them is not durable, so a power \
+             cut could still lose it");
     }
 
     tracing::info!(
