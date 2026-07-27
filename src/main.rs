@@ -896,6 +896,7 @@ async fn run_camera(
     });
 
     let mut backoff_secs = RECONNECT_BASE_SECS;
+    let mut no_recording = camera::NoRecordingTracker::default();
 
     while !shutdown.requested() {
         tracing::info!(camera = %camera_id, url = %config.redacted_url(), "connecting to camera");
@@ -907,9 +908,18 @@ async fn run_camera(
         let result = tokio::task::spawn_blocking(move || pipeline.run(&shutdown_ref)).await;
         let ran_for = started.elapsed();
 
+        // Only the tracker's own outcomes move its streak: the other arms end a
+        // run without showing that anything was recorded, so clearing the count
+        // on them would let unrelated failures defer the diagnosis forever.
         match result {
             Ok(Ok(())) => {
                 tracing::info!(camera = %camera_id, "pipeline stopped normally");
+            }
+            // Reported by the tracker instead of here: a stream that records
+            // nothing fails on every reconnect, and the same error line once a
+            // minute forever tells an operator less than one that escalates.
+            Ok(Err(camera::RtspError::NoRecording(failure))) => {
+                no_recording.report(&camera_id, &failure);
             }
             Ok(Err(e)) => {
                 tracing::error!(camera = %camera_id, "pipeline error: {}", e);
