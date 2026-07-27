@@ -242,8 +242,7 @@ impl MpegTsSegmenter {
     }
 
     fn process_packet(&mut self, packet: &[u8]) {
-        let pid = ((packet[1] as u16 & 0x1F) << 8) | packet[2] as u16;
-        let has_adaptation = (packet[3] & 0x20) != 0;
+        let pid = crate::mpegts::packet_pid(packet);
 
         // Capture PAT
         if pid == 0 {
@@ -261,17 +260,10 @@ impl MpegTsSegmenter {
             self.parse_pmt(packet);
         }
 
-        // Detect keyframe from random_access_indicator
-        let is_keyframe = if has_adaptation && Some(pid) == self.video_pid {
-            let adaptation_len = packet[4] as usize;
-            if adaptation_len > 0 && adaptation_len < 184 {
-                (packet[5] & 0x40) != 0
-            } else {
-                false
-            }
-        } else {
-            false
-        };
+        // Detect keyframe from random_access_indicator. Shared with the
+        // analyzer's keyframe count, which must see exactly what this cuts on.
+        let is_keyframe =
+            Some(pid) == self.video_pid && crate::mpegts::has_random_access_indicator(packet);
 
         // Extract media PTS from video packets with PES header
         if Some(pid) == self.video_pid {

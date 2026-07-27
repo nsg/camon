@@ -7,6 +7,12 @@ use std::time::{Duration, Instant};
 const ANALYSIS_WIDTH: u32 = 320;
 const ANALYSIS_HEIGHT: u32 = 240;
 const FRAME_SIZE: usize = (ANALYSIS_WIDTH * ANALYSIS_HEIGHT) as usize;
+/// Safety net, not the normal exit path: how long a decode waits for frames
+/// the segment says are coming before giving up on them. A healthy decode
+/// returns as soon as the segment's own frames have arrived — single-digit
+/// milliseconds — because the expected count comes from the segment itself.
+/// Only a wedged ffmpeg, or one still probing its input after a spawn, waits
+/// this out, and it must never block the analyzer longer than that.
 const FRAME_READ_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// How long a segment hand-off may stay blocked before the pipe is declared
@@ -140,6 +146,98 @@ fn send_with_deadline(tx: &SyncSender<Vec<u8>>, data: Vec<u8>, deadline: Duratio
     }
 }
 
+/// Collect one segment's frames: at most `expected` of them, blocking only
+/// until they arrive or `deadline` passes.
+///
+/// `expected` is what the segment itself promises, so a healthy decode returns
+/// the moment ffmpeg has emitted it — the deadline is only reached when a
+/// promised frame never comes. Taking no more than the segment owns is what
+/// keeps a decoder that releases a backlog in one burst from having all of it
+/// averaged into whichever segment happened to be in flight.
+fn collect_frames(rx: &Receiver<Vec<u8>>, expected: usize, deadline: Instant) -> Vec<Vec<u8>> {
+    let mut frames = Vec::with_capacity(expected);
+    while frames.len() < expected {
+        match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            Ok(frame) => frames.push(frame),
+            Err(_) => break,
+        }
+    }
+    frames
+}
+
+/// Pull up to `count` frames out of the channel and throw them away, reporting
+/// how many were there. Blocks for them like [`collect_frames`] does: they are
+/// still inside ffmpeg, not in the channel, which is exactly why they have to
+/// be waited for.
+///
+/// These are frames earlier segments were promised and never received — a fresh
+/// ffmpeg holds several seconds of input back while it probes the stream. They
+/// are real footage, but the segments that own them are already past. Scoring
+/// them against whichever segment is in flight would put their motion in the
+/// wrong second of video and dilute that segment's own score; leaving them
+/// queued would do the same to every later segment. So they are taken out and
+/// dropped, which puts the next frame out of ffmpeg back in step with the next
+/// segment in.
+fn discard_frames(rx: &Receiver<Vec<u8>>, count: usize, deadline: Instant) -> usize {
+    let mut discarded = 0;
+    while discarded < count {
+        if rx
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .is_err()
+        {
+            break;
+        }
+        discarded += 1;
+    }
+    discarded
+}
+
+/// What one decode was owed and what turned up, split by who owed it: the
+/// arrears it inherited and the segment's own frames are separate claims and a
+/// decode can settle one without settling the other.
+struct FrameLedger {
+    arrears: usize,
+    /// Arrears that turned up and were discarded.
+    paid: usize,
+    /// Frames this segment's keyframes promise.
+    expected: usize,
+    /// Frames collected for this segment.
+    collected: usize,
+    /// Whether the collect phase had any of the deadline left to wait in. The
+    /// arrears can drain the whole budget, and a collect phase that never got
+    /// to wait proves nothing about the frames it did not see.
+    waited: bool,
+}
+
+/// Frames still owed after a decode, to be discarded rather than scored when
+/// they finally arrive.
+///
+/// Silence is the only evidence that missing frames are still coming: a freshly
+/// spawned ffmpeg emits nothing at all until it has probed several seconds of
+/// input, then releases that backlog in order, and only a decoder that
+/// remembers what it is owed can drop the backlog instead of scoring it against
+/// the wrong segments. Once frames *are* flowing, whatever failed to arrive
+/// alongside them is gone — ffmpeg dropped an undecodable keyframe — and
+/// waiting for it again would cost the safety timeout on every later segment.
+///
+/// The one exception is this segment's own frames when the arrears ate the
+/// budget before they could be waited for. Writing those off would hand them to
+/// the next segment and leave a one-segment lag that nothing afterwards can
+/// detect, since every later decode then finds a frame waiting and never times
+/// out.
+fn frames_still_unclaimed(ledger: &FrameLedger) -> usize {
+    let unpaid_arrears = ledger.arrears - ledger.paid;
+    let uncollected = ledger.expected - ledger.collected;
+    if ledger.paid + ledger.collected == 0 {
+        return unpaid_arrears + uncollected;
+    }
+    if ledger.waited {
+        0
+    } else {
+        uncollected
+    }
+}
+
 fn send_segment(pipe: &FfmpegPipe, data: &[u8]) -> SendOutcome {
     match pipe.segment_tx.as_ref() {
         Some(tx) => send_with_deadline(tx, data.to_vec(), SEND_DEADLINE),
@@ -149,10 +247,13 @@ fn send_segment(pipe: &FfmpegPipe, data: &[u8]) -> SendOutcome {
 
 /// What one call to [`FrameDecoder::decode_segment`] produced.
 pub enum DecodeOutcome {
-    /// The frames the segment yielded. Possibly empty: pipe buffering can push
-    /// a frame past the read timeout into the next segment's window, so a
-    /// single empty decode is normal. A *streak* of them is not — see the
-    /// analyzer's zero-frame tripwire.
+    /// The frames the segment yielded. Possibly empty: a freshly spawned
+    /// ffmpeg swallows several seconds of input while it probes the stream, so
+    /// the segments fed meanwhile decode to nothing and a frame that arrives
+    /// after its own decode gave up is dropped rather than credited to a later
+    /// segment. A single empty decode is therefore normal, and means *not
+    /// analyzed* rather than *no motion*. A streak of them is not normal — see
+    /// the analyzer's zero-frame tripwire.
     Frames(Vec<Vec<u8>>),
     /// ffmpeg is alive but stopped consuming stdin. Motion analysis cannot
     /// resume until the child is killed and respawned.
@@ -161,6 +262,12 @@ pub enum DecodeOutcome {
 
 pub struct FrameDecoder {
     pipe: FfmpegPipe,
+    /// Frames earlier segments were promised and never got. Whoever owned them
+    /// is past, so they are discarded on arrival rather than scored — see
+    /// [`discard_frames`]. Zero in the steady state; non-zero while a freshly
+    /// spawned ffmpeg holds its first seconds of input back, or while a blind
+    /// one emits nothing at all.
+    unclaimed_frames: usize,
 }
 
 impl FrameDecoder {
@@ -193,10 +300,13 @@ impl FrameDecoder {
             64,
         )?;
 
-        Ok(Self { pipe })
+        Ok(Self {
+            pipe,
+            unclaimed_frames: 0,
+        })
     }
 
-    pub fn decode_segment(&self, data: &[u8]) -> DecodeOutcome {
+    pub fn decode_segment(&mut self, data: &[u8]) -> DecodeOutcome {
         match send_segment(&self.pipe, data) {
             SendOutcome::Sent => {}
             // A closed pipe means the child already died; `is_alive` reports it
@@ -205,10 +315,40 @@ impl FrameDecoder {
             SendOutcome::Wedged => return DecodeOutcome::Wedged,
         }
 
-        let mut frames = Vec::with_capacity(2);
-        while let Ok(frame) = self.pipe.frame_rx.recv_timeout(FRAME_READ_TIMEOUT) {
-            frames.push(frame);
+        // The decoder keeps keyframes only, so the segment's own keyframe count
+        // is exactly how many frames it owns — no timer has to stand in for the
+        // end of the segment. A hot-buffer segment always opens on a keyframe,
+        // so a count of zero means the parse found no video PES at all: wait for
+        // one frame anyway, because expecting none would leave this segment's
+        // own frame to be discarded as another segment's arrears.
+        let expected = crate::mpegts::keyframe_count(data).max(1);
+        // One budget for the whole decode: what the analyzer must never exceed
+        // is the time it spends on a segment, not the time per phase.
+        let deadline = Instant::now() + FRAME_READ_TIMEOUT;
+        let discarded = discard_frames(&self.pipe.frame_rx, self.unclaimed_frames, deadline);
+        if discarded > 0 {
+            tracing::debug!(frames = discarded, "dropped frames no segment can claim");
         }
+        let waited = !deadline.saturating_duration_since(Instant::now()).is_zero();
+        let frames = collect_frames(&self.pipe.frame_rx, expected, deadline);
+        if frames.len() < expected {
+            // Every decode short of its keyframe count spends the full budget,
+            // and frames still flow, so neither the tripwire nor the throughput
+            // numbers show it. A steady stream of this line means the segment's
+            // keyframe count no longer matches what ffmpeg emits.
+            tracing::debug!(
+                expected,
+                collected = frames.len(),
+                "segment frames did not arrive"
+            );
+        }
+        self.unclaimed_frames = frames_still_unclaimed(&FrameLedger {
+            arrears: self.unclaimed_frames,
+            paid: discarded,
+            expected,
+            collected: frames.len(),
+            waited,
+        });
         DecodeOutcome::Frames(frames)
     }
 
@@ -217,6 +357,9 @@ impl FrameDecoder {
     /// the child recovers from on its own.
     pub fn kill(&mut self) {
         self.pipe.kill();
+        // Arrears belong to the dead child's stream; a replacement would spend
+        // them discarding the new stream's first frames.
+        self.unclaimed_frames = 0;
     }
 
     pub fn is_alive(&mut self) -> bool {
@@ -390,6 +533,256 @@ mod tests {
         assert_eq!(drainer.join().unwrap().0, vec![0]);
     }
 
+    fn frame(tag: u8) -> Vec<u8> {
+        vec![tag; 4]
+    }
+
+    /// A deadline no healthy path may ever reach.
+    fn generous() -> Instant {
+        Instant::now() + Duration::from_secs(30)
+    }
+
+    #[test]
+    fn collect_frames_returns_once_the_segment_is_done() {
+        let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(4);
+        tx.send(frame(1)).unwrap();
+        tx.send(frame(2)).unwrap();
+        let start = Instant::now();
+        let frames = collect_frames(&rx, 2, generous());
+        assert_eq!(frames, vec![frame(1), frame(2)]);
+        assert!(start.elapsed() < TEST_DEADLINE, "waited on the deadline");
+    }
+
+    #[test]
+    fn collect_frames_waits_for_a_frame_still_in_flight() {
+        let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(1);
+        let producer = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(20));
+            tx.send(frame(7)).unwrap();
+        });
+        assert_eq!(collect_frames(&rx, 1, generous()), vec![frame(7)]);
+        producer.join().unwrap();
+    }
+
+    #[test]
+    fn collect_frames_takes_no_more_than_the_segment_owns() {
+        // Frames beyond the segment's keyframe count are somebody else's:
+        // averaging them in would misplace the motion they hold and dilute this
+        // segment's own score. They stay queued for the arrears accounting.
+        let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(4);
+        for tag in 1..=3 {
+            tx.send(frame(tag)).unwrap();
+        }
+        let start = Instant::now();
+        assert_eq!(collect_frames(&rx, 1, generous()), vec![frame(1)]);
+        assert!(start.elapsed() < TEST_DEADLINE, "waited on the deadline");
+        assert_eq!(collect_frames(&rx, 2, generous()), vec![frame(2), frame(3)]);
+    }
+
+    #[test]
+    fn collect_frames_gives_up_at_the_deadline() {
+        // A wedged decoder owes a frame it will never send: the safety net has
+        // to end the decode, and only this path may reach it.
+        let (_tx, rx) = mpsc::sync_channel::<Vec<u8>>(1);
+        let start = Instant::now();
+        assert!(collect_frames(&rx, 1, Instant::now() + TEST_DEADLINE).is_empty());
+        let elapsed = start.elapsed();
+        assert!(elapsed >= TEST_DEADLINE, "gave up early: {elapsed:?}");
+        assert!(elapsed < TEST_DEADLINE * 5, "overshot: {elapsed:?}");
+    }
+
+    #[test]
+    fn discard_frames_takes_arrears_out_of_the_channel() {
+        // The frames a probing ffmpeg finally releases: they belong to segments
+        // already passed, so they are dropped — but they must leave the channel
+        // or the next segment is scored against them.
+        let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(4);
+        for tag in 1..=3 {
+            tx.send(frame(tag)).unwrap();
+        }
+        let start = Instant::now();
+        assert_eq!(discard_frames(&rx, 2, generous()), 2);
+        assert!(start.elapsed() < TEST_DEADLINE, "waited on the deadline");
+        // Only the arrears are dropped; the rest is the next segment's.
+        assert_eq!(collect_frames(&rx, 1, generous()), vec![frame(3)]);
+    }
+
+    #[test]
+    fn discard_frames_gives_up_at_the_deadline() {
+        let (_tx, rx) = mpsc::sync_channel::<Vec<u8>>(1);
+        let start = Instant::now();
+        assert_eq!(discard_frames(&rx, 3, Instant::now() + TEST_DEADLINE), 0);
+        assert!(start.elapsed() >= TEST_DEADLINE, "gave up early");
+        // Nothing owed is nothing to wait for.
+        let start = Instant::now();
+        assert_eq!(discard_frames(&rx, 0, generous()), 0);
+        assert!(start.elapsed() < TEST_DEADLINE, "waited for nothing");
+    }
+
+    fn ledger(arrears: usize, paid: usize, expected: usize, collected: usize) -> FrameLedger {
+        FrameLedger {
+            arrears,
+            paid,
+            expected,
+            collected,
+            waited: true,
+        }
+    }
+
+    #[test]
+    fn unclaimed_frames_survive_a_silent_decode() {
+        // Nothing at all came out: ffmpeg is still buffering, and what it owes
+        // has to be remembered so the backlog can be dropped when it arrives
+        // instead of scored against whichever segment is in flight then.
+        assert_eq!(frames_still_unclaimed(&ledger(0, 0, 1, 0)), 1);
+        assert_eq!(frames_still_unclaimed(&ledger(4, 0, 1, 0)), 5);
+        assert_eq!(frames_still_unclaimed(&ledger(0, 0, 0, 0)), 0);
+    }
+
+    #[test]
+    fn unclaimed_frames_are_written_off_once_frames_flow() {
+        // A settled decode owes nothing.
+        assert_eq!(frames_still_unclaimed(&ledger(2, 2, 1, 1)), 0);
+        // Frames arrived but not all of them: ffmpeg dropped an undecodable
+        // keyframe. Waiting for it again would cost the safety timeout on
+        // every later segment.
+        assert_eq!(frames_still_unclaimed(&ledger(0, 0, 2, 1)), 0);
+        assert_eq!(frames_still_unclaimed(&ledger(3, 1, 1, 1)), 0);
+    }
+
+    #[test]
+    fn unclaimed_frames_keep_a_segment_that_never_got_waited_for() {
+        // The arrears drained the whole budget, so the collect phase returned
+        // empty-handed without ever waiting. Writing this segment's frame off
+        // would hand it to the next segment and leave a one-segment lag that
+        // nothing afterwards can detect.
+        let starved = FrameLedger {
+            arrears: 5,
+            paid: 5,
+            expected: 1,
+            collected: 0,
+            waited: false,
+        };
+        assert_eq!(frames_still_unclaimed(&starved), 1);
+        // Having waited and seen nothing is evidence; the frame is gone.
+        assert_eq!(frames_still_unclaimed(&ledger(5, 5, 1, 0)), 0);
+    }
+
+    /// One-GOP MPEG-TS segments with an audio track, straight out of ffmpeg's
+    /// muxer — what the hot buffer holds, near enough. Needs an `ffmpeg`
+    /// binary, so only the `#[ignore]`d tests use it.
+    fn recorded_segments(count: usize) -> Vec<Vec<u8>> {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let status = Command::new("ffmpeg")
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "quiet",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=size=640x480:rate=25",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440",
+                "-t",
+                &count.to_string(),
+                "-c:v",
+                "libx264",
+                "-g",
+                "25",
+                "-keyint_min",
+                "25",
+                "-sc_threshold",
+                "0",
+                "-c:a",
+                "aac",
+                "-f",
+                "segment",
+                "-segment_time",
+                "1",
+            ])
+            .arg(dir.path().join("seg%03d.ts"))
+            .status()
+            .expect("run ffmpeg");
+        assert!(status.success(), "ffmpeg failed to generate segments");
+        (0..count)
+            .map(|i| std::fs::read(dir.path().join(format!("seg{i:03}.ts"))).expect("segment"))
+            .collect()
+    }
+
+    /// Fed the way the analyzer feeds them, real segments must pin the two
+    /// properties the count-based drain exists for: the keyframe count matches
+    /// what ffmpeg emits (the audio track's packets are *all* flagged as random
+    /// access points and must not be counted), and a decode ends on its frames
+    /// rather than on [`FRAME_READ_TIMEOUT`].
+    #[test]
+    #[ignore]
+    fn frame_decoder_ends_the_decode_when_the_frames_are_done() {
+        const SEGMENTS: usize = 10;
+        let segments = recorded_segments(SEGMENTS);
+
+        let mut decoder = FrameDecoder::new().expect("spawn ffmpeg");
+        let mut decodes = Vec::new();
+        for (i, segment) in segments.iter().enumerate() {
+            assert_eq!(
+                crate::mpegts::keyframe_count(segment),
+                1,
+                "segment {i} is one GOP"
+            );
+
+            let start = Instant::now();
+            let frames = match decoder.decode_segment(segment) {
+                DecodeOutcome::Frames(frames) => frames,
+                DecodeOutcome::Wedged => panic!("healthy decoder wedged"),
+            };
+            decodes.push((frames.len(), start.elapsed()));
+        }
+
+        // A freshly spawned ffmpeg swallows the first few seconds of input
+        // while it probes the stream and releases those frames in one burst;
+        // every decode after that is the steady state this fix is about.
+        let burst = decodes
+            .iter()
+            .position(|&(frames, _)| frames > 0)
+            .expect("decoder produced no frames at all");
+        assert!(burst < SEGMENTS - 2, "no steady state to measure");
+        for (i, &(frames, elapsed)) in decodes.iter().enumerate().skip(burst + 1) {
+            assert!(frames > 0, "segment {i} decoded nothing");
+            assert!(
+                elapsed < FRAME_READ_TIMEOUT / 2,
+                "segment {i} ended on the safety timeout: {elapsed:?}"
+            );
+        }
+    }
+
+    /// The safety net against a real ffmpeg that owes a frame and will never
+    /// send it: a stopped child still accepts one segment into the pipe, so the
+    /// send succeeds and only [`FRAME_READ_TIMEOUT`] can end the decode. The
+    /// segment must yield nothing rather than borrow a later frame — the
+    /// analyzer treats an empty decode as "not analyzed", never as "quiet".
+    /// Ignored by default: it needs an `ffmpeg` binary and burns the timeout.
+    #[test]
+    #[ignore]
+    fn frame_decoder_safety_net_ends_a_decode_that_owes_frames() {
+        let segment = recorded_segments(1).remove(0);
+        assert_eq!(crate::mpegts::keyframe_count(&segment), 1);
+
+        let mut decoder = FrameDecoder::new().expect("spawn ffmpeg");
+        let pid = decoder.pipe.child.as_ref().expect("child").id() as libc::pid_t;
+        assert_eq!(unsafe { libc::kill(pid, libc::SIGSTOP) }, 0, "SIGSTOP");
+
+        let start = Instant::now();
+        match decoder.decode_segment(&segment) {
+            DecodeOutcome::Frames(frames) => assert!(frames.is_empty(), "stopped ffmpeg emitted"),
+            DecodeOutcome::Wedged => panic!("one segment cannot fill the hand-off channel"),
+        }
+        let elapsed = start.elapsed();
+        assert!(elapsed >= FRAME_READ_TIMEOUT, "gave up early: {elapsed:?}");
+        assert!(elapsed < SEND_DEADLINE, "blocked past the read timeout");
+    }
+
     /// Wedge detection against a real ffmpeg child, stopped mid-flight with
     /// SIGSTOP — the closest stand-in for the descheduled-under-memory-pressure
     /// case the bounded send exists for. Ignored by default: it needs an
@@ -397,7 +790,7 @@ mod tests {
     #[test]
     #[ignore]
     fn frame_decoder_wedges_when_ffmpeg_stops_reading_stdin() {
-        let decoder = FrameDecoder::new().expect("spawn ffmpeg");
+        let mut decoder = FrameDecoder::new().expect("spawn ffmpeg");
         let pid = decoder.pipe.child.as_ref().expect("child").id() as libc::pid_t;
         assert_eq!(unsafe { libc::kill(pid, libc::SIGSTOP) }, 0, "SIGSTOP");
 

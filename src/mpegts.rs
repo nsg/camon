@@ -17,6 +17,9 @@ pub const TS_PACKET_SIZE: usize = 188;
 /// Every MPEG-TS packet starts with this sync byte.
 pub const SYNC_BYTE: u8 = 0x47;
 
+/// PID reserved for null (stuffing) packets, so never an elementary stream.
+const NULL_PID: u16 = 0x1FFF;
+
 /// 33-bit PTS values wrap at this modulus (~26.5 hours at 90 kHz).
 const PTS_MODULUS: u64 = 1 << 33;
 
@@ -104,6 +107,69 @@ pub fn last_pts(data: &[u8]) -> Option<u64> {
         .find_map(payload_unit_pts)
 }
 
+/// PID a TS packet belongs to. Short input yields no meaningful PID, so it maps
+/// to the null PID, which no elementary stream uses.
+pub fn packet_pid(packet: &[u8]) -> u16 {
+    if packet.len() < TS_PACKET_SIZE {
+        return NULL_PID;
+    }
+    (((packet[1] & 0x1F) as u16) << 8) | packet[2] as u16
+}
+
+/// Whether this packet starts a video PES packet (stream_id 0xE0-0xEF). Used
+/// to find the video PID without parsing the PMT.
+fn starts_video_pes(packet: &[u8]) -> bool {
+    if packet.len() < TS_PACKET_SIZE {
+        return false;
+    }
+    if (packet[1] & 0x40) == 0 || (packet[3] & 0x10) == 0 {
+        return false; // no PUSI, or no payload at all
+    }
+    let payload_start = if (packet[3] & 0x20) != 0 {
+        5 + packet[4] as usize
+    } else {
+        4
+    };
+    if payload_start + 4 > TS_PACKET_SIZE {
+        return false;
+    }
+    let p = &packet[payload_start..];
+    p[0] == 0x00 && p[1] == 0x00 && p[2] == 0x01 && (0xE0..=0xEF).contains(&p[3])
+}
+
+/// Whether the packet's adaptation field flags a random access point — a
+/// keyframe, on a video PID.
+///
+/// The live segmenter cuts a new segment on exactly this predicate, and
+/// [`keyframe_count`] counts the result, so the two must agree byte for byte:
+/// they share this one definition rather than a comment promising they match.
+pub fn has_random_access_indicator(packet: &[u8]) -> bool {
+    if packet.len() < TS_PACKET_SIZE || (packet[3] & 0x20) == 0 {
+        return false;
+    }
+    let adaptation_len = packet[4] as usize;
+    adaptation_len > 0 && adaptation_len < 184 && (packet[5] & 0x40) != 0
+}
+
+/// Number of video keyframes in a buffer of whole TS packets, read from the
+/// adaptation field's random_access_indicator — the same signal the live
+/// segmenter cuts on, so a hot-buffer segment contains exactly one.
+///
+/// The count is restricted to the video PID because ffmpeg's muxer flags
+/// *every* audio packet as a random access point; counting those would inflate
+/// the keyframe count several-fold. `0` when the buffer holds no video PES at
+/// all (an empty or garbled segment).
+pub fn keyframe_count(data: &[u8]) -> usize {
+    let packets = || data.chunks_exact(TS_PACKET_SIZE);
+    let video_pid = match packets().find(|p| starts_video_pes(p)) {
+        Some(packet) => packet_pid(packet),
+        None => return 0,
+    };
+    packets()
+        .filter(|p| packet_pid(p) == video_pid && has_random_access_indicator(p))
+        .count()
+}
+
 /// Milliseconds between two 90 kHz PTS values, tolerating one wrap of the
 /// 33-bit counter (which wraps about every 26.5 hours).
 pub fn pts_delta_ms(first: u64, last: u64) -> u64 {
@@ -143,6 +209,21 @@ pub(crate) mod testutil {
         p
     }
 
+    /// A PES packet carrying `stream_id` (0xE0 video, 0xC0 audio) whose
+    /// adaptation field flags a random access point — how a muxer marks a
+    /// keyframe.
+    pub fn keyframe_packet(pid: u16, pts: u64, stream_id: u8) -> [u8; TS_PACKET_SIZE] {
+        let mut p = pes_packet(pid, pts);
+        // Insert a one-byte adaptation field ahead of the PES header, which
+        // moves the payload from offset 4 to offset 6.
+        p.copy_within(4..TS_PACKET_SIZE - 2, 6);
+        p[3] = 0x30; // adaptation field + payload
+        p[4] = 0x01; // adaptation field length
+        p[5] = 0x40; // random_access_indicator
+        p[9] = stream_id;
+        p
+    }
+
     /// A null packet (PID 0x1FFF) — valid TS, no PES payload.
     pub fn null_packet() -> [u8; TS_PACKET_SIZE] {
         let mut p = [0xFFu8; TS_PACKET_SIZE];
@@ -156,8 +237,11 @@ pub(crate) mod testutil {
 
 #[cfg(test)]
 mod tests {
-    use super::testutil::{null_packet, pes_packet};
+    use super::testutil::{keyframe_packet, null_packet, pes_packet};
     use super::*;
+
+    const VIDEO: u8 = 0xE0;
+    const AUDIO: u8 = 0xC0;
 
     #[test]
     fn extract_pes_pts_round_trips_synthetic_packet() {
@@ -222,6 +306,66 @@ mod tests {
         assert_eq!(last_pts(&data), Some(95_000));
         assert_eq!(first_pts(&null_packet()[..]), None);
         assert_eq!(last_pts(&[]), None);
+    }
+
+    #[test]
+    fn keyframe_count_counts_one_per_segment_start() {
+        // A hot-buffer segment: keyframe, then plain video packets.
+        let mut data = Vec::new();
+        data.extend_from_slice(&keyframe_packet(0x100, 0, VIDEO));
+        for i in 1..5 {
+            data.extend_from_slice(&pes_packet(0x100, i * 3_000));
+        }
+        assert_eq!(keyframe_count(&data), 1);
+        // Two concatenated segments count as two.
+        data.extend_from_slice(&keyframe_packet(0x100, 90_000, VIDEO));
+        data.extend_from_slice(&pes_packet(0x100, 93_000));
+        assert_eq!(keyframe_count(&data), 2);
+    }
+
+    #[test]
+    fn keyframe_count_ignores_audio_random_access_points() {
+        // The muxer flags every audio packet as a random access point; only
+        // video keyframes may be counted.
+        let mut data = Vec::new();
+        data.extend_from_slice(&keyframe_packet(0x100, 0, VIDEO));
+        for i in 0..8 {
+            data.extend_from_slice(&keyframe_packet(0x101, i * 3_000, AUDIO));
+        }
+        assert_eq!(keyframe_count(&data), 1);
+    }
+
+    #[test]
+    fn random_access_indicator_is_the_segmenter_predicate() {
+        // What the live segmenter cuts on is what the analyzer counts.
+        assert!(has_random_access_indicator(&keyframe_packet(
+            0x100, 0, VIDEO
+        )));
+        // No adaptation field at all.
+        assert!(!has_random_access_indicator(&pes_packet(0x100, 0)));
+        // Adaptation field present, flag clear.
+        let mut p = keyframe_packet(0x100, 0, VIDEO);
+        p[5] = 0x00;
+        assert!(!has_random_access_indicator(&p));
+        // Adaptation field length out of range.
+        let mut p = keyframe_packet(0x100, 0, VIDEO);
+        p[4] = 0;
+        assert!(!has_random_access_indicator(&p));
+        p[4] = 200;
+        assert!(!has_random_access_indicator(&p));
+        // Short input must not panic on any of the packet accessors.
+        assert!(!has_random_access_indicator(&[0x47, 0x40]));
+        assert!(!starts_video_pes(&[0x47]));
+        assert_eq!(packet_pid(&[0x47, 0x40]), NULL_PID);
+    }
+
+    #[test]
+    fn keyframe_count_of_non_video_data_is_zero() {
+        assert_eq!(keyframe_count(&[]), 0);
+        assert_eq!(keyframe_count(&null_packet()[..]), 0);
+        assert_eq!(keyframe_count(&[0u8; 4 * TS_PACKET_SIZE]), 0);
+        // Video packets without a flagged random access point.
+        assert_eq!(keyframe_count(&pes_packet(0x100, 5_000)[..]), 0);
     }
 
     #[test]

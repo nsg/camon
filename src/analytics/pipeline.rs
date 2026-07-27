@@ -33,9 +33,9 @@ const MIN_CROP_FRACTION: f32 = 0.15;
 
 /// Consecutive zero-frame decodes tolerated before the decoder is declared
 /// blind. A segment is one GOP and always opens on a keyframe, so a healthy
-/// decode yields at least one I-frame — but pipe buffering can push a frame
-/// past the read timeout into the next segment's read window, so a single
-/// empty decode proves nothing. Only an unbroken streak does, and at roughly
+/// decode yields at least one I-frame — but a freshly spawned ffmpeg swallows
+/// several seconds of input while it probes the stream, so a single empty
+/// decode proves nothing. Only an unbroken streak does, and at roughly
 /// one segment per second thirty of them is about half a minute of blindness:
 /// long enough that no buffering hiccup explains it, short enough that little
 /// motion is missed before the respawn.
@@ -326,6 +326,102 @@ fn subsample_filmstrip(frames: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
         .collect()
 }
 
+/// One segment's motion verdict. Absent — `analyze_segment` returning `None` —
+/// means the decoder produced no frames for it, which is *not* the same as no
+/// motion: the segment was never looked at, and scoring it quiet would feed the
+/// run tracker evidence of stillness that nothing supports.
+struct SegmentAnalysis {
+    score: f32,
+    crop: Option<NormalizedRect>,
+    motion_rects: Vec<NormalizedRect>,
+}
+
+impl SegmentAnalysis {
+    fn has_motion(&self) -> bool {
+        self.score >= MOTION_THRESHOLD
+    }
+}
+
+/// Segments that left the hot buffer before the analyzer reached them. Their
+/// footage is never scored, so the skip is reported rather than absorbed.
+#[derive(Debug, PartialEq, Eq)]
+struct SkippedSegments {
+    count: u64,
+    from_seq: u64,
+    to_seq: u64,
+}
+
+impl SkippedSegments {
+    /// The gap between the next sequence the analyzer would have processed and
+    /// the oldest one still resident, or `None` when it has kept up.
+    fn between(last_processed: u64, first_resident: u64) -> Option<Self> {
+        if last_processed >= first_resident {
+            return None;
+        }
+        Some(Self {
+            count: first_resident - last_processed,
+            from_seq: last_processed,
+            to_seq: first_resident - 1,
+        })
+    }
+
+    /// The individual sequences that could not be read. Eviction takes the
+    /// oldest first, so these are contiguous in practice and the range says so;
+    /// `count` is exact either way.
+    fn of(sequences: &[u64]) -> Option<Self> {
+        Some(Self {
+            count: sequences.len() as u64,
+            from_seq: *sequences.iter().min()?,
+            to_seq: *sequences.iter().max()?,
+        })
+    }
+
+    fn merged(self, other: Self) -> Self {
+        Self {
+            count: self.count + other.count,
+            from_seq: self.from_seq.min(other.from_seq),
+            to_seq: self.to_seq.max(other.to_seq),
+        }
+    }
+}
+
+fn merge_skips(a: Option<SkippedSegments>, b: Option<SkippedSegments>) -> Option<SkippedSegments> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.merged(b)),
+        (a, b) => a.or(b),
+    }
+}
+
+/// Shortest gap between two skipped-footage warnings. An analyzer that stays
+/// behind skips something on most of its 200 ms polls, and warnings are the
+/// level this project keeps enabled in release, so the reports are accumulated
+/// and released as one line per interval instead of per poll.
+const SKIP_REPORT_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Accumulates skipped footage between warnings; see [`SKIP_REPORT_INTERVAL`].
+#[derive(Default)]
+struct SkipReporter {
+    pending: Option<SkippedSegments>,
+    last_report: Option<Instant>,
+}
+
+impl SkipReporter {
+    /// Fold one poll's skips in, returning the accumulated report when the
+    /// interval has passed. The first skip is always reported: a rare one-off
+    /// is exactly the case worth seeing immediately.
+    fn record(&mut self, skipped: SkippedSegments, now: Instant) -> Option<SkippedSegments> {
+        self.pending = Some(merge_skips(self.pending.take(), Some(skipped))?);
+        let due = self
+            .last_report
+            .is_none_or(|at| now.saturating_duration_since(at) >= SKIP_REPORT_INTERVAL);
+        if !due {
+            return None;
+        }
+        self.last_report = Some(now);
+        self.pending.take()
+    }
+}
+
 struct PendingSegment {
     seq: u64,
     data: Arc<Vec<u8>>,
@@ -380,6 +476,11 @@ pub struct MotionAnalyzer {
     detect_tx: Option<DetectQueueSender>,
     event_registry: Option<EventRegistry>,
     last_processed: u64,
+    /// Whether `last_processed` reflects a sequence this analyzer actually
+    /// reached, as opposed to the estimate it started from. Gates the
+    /// skipped-footage warnings; see [`MotionAnalyzer::report_skip`].
+    observed_sequences: bool,
+    skip_reporter: SkipReporter,
     motion_settings: MotionSettingsStore,
     /// Per-camera "detection mask": 16x12 row-major cells, `true` = blacked
     /// out of every frame sent to the vision model. Refreshed each tick in
@@ -416,6 +517,10 @@ impl MotionAnalyzer {
         let decoder = FrameDecoder::new()?;
         let frame_use = FrameUse::of(ctx.event_tx.is_some(), ctx.detect_tx.is_some());
 
+        // An estimate, not a record of what was analyzed: the motion store only
+        // ever sees motion-positive segments, so an analyzed quiet stretch
+        // leaves no trace here. `observed_sequences` keeps that estimate from
+        // being reported as skipped footage.
         let last_processed = ctx
             .motion_store
             .last_sequence(&ctx.camera_id)
@@ -434,6 +539,8 @@ impl MotionAnalyzer {
             detect_tx: ctx.detect_tx,
             event_registry: ctx.event_registry,
             last_processed,
+            observed_sequences: false,
+            skip_reporter: SkipReporter::default(),
             motion_settings: ctx.motion_settings,
             detection_mask,
             segment_crops: HashMap::new(),
@@ -508,8 +615,13 @@ impl MotionAnalyzer {
             (buffer.first_sequence(), buffer.last_sequence())
         };
 
-        self.cleanup_old_data(first_seq);
-        let segments = self.collect_pending_segments(last_seq)?;
+        let aged_out = self.cleanup_old_data(first_seq);
+        let (segments, evicted) = self.collect_pending_segments(last_seq)?;
+        // Both losses are the same event seen at two moments of the same poll,
+        // so they are reported together rather than as two warnings.
+        if let Some(skipped) = merge_skips(aged_out, evicted) {
+            self.report_skip(skipped);
+        }
         let (motion_segments, closed_runs) = self.run_motion_analysis(segments)?;
 
         if !motion_segments.is_empty() {
@@ -525,7 +637,9 @@ impl MotionAnalyzer {
         Ok(())
     }
 
-    fn cleanup_old_data(&mut self, first_seq: u64) {
+    /// Drop metadata for segments the hot buffer no longer holds, returning
+    /// what aged out before the analyzer reached it.
+    fn cleanup_old_data(&mut self, first_seq: u64) -> Option<SkippedSegments> {
         if first_seq > 0 {
             self.motion_store.cleanup(&self.camera_id, first_seq);
             if let Some(ref ds) = self.detection_store {
@@ -534,16 +648,53 @@ impl MotionAnalyzer {
             self.segment_crops.retain(|&seq, _| seq >= first_seq);
             self.segment_motion_rects.retain(|&seq, _| seq >= first_seq);
         }
-        if self.last_processed < first_seq {
-            self.last_processed = first_seq;
+        let skipped = SkippedSegments::between(self.last_processed, first_seq)?;
+        self.last_processed = first_seq;
+        Some(skipped)
+    }
+
+    /// Report footage that was never analyzed — but only once the analyzer has
+    /// actually observed a sequence. Until then `last_processed` is a
+    /// reconstruction from the motion store, which records motion-positive
+    /// segments only: a quiet segment that *was* analyzed is indistinguishable
+    /// there from one that never was, so an early range would be invented, not
+    /// measured.
+    fn report_skip(&mut self, skipped: SkippedSegments) {
+        if !self.observed_sequences {
+            tracing::debug!(
+                camera = %self.camera_id,
+                segments = skipped.count,
+                "skipping segments predating the analyzer's first pass"
+            );
+            return;
+        }
+        if let Some(total) = self.skip_reporter.record(skipped, Instant::now()) {
+            tracing::warn!(
+                camera = %self.camera_id,
+                segments = total.count,
+                from_seq = total.from_seq,
+                to_seq = total.to_seq,
+                "analyzer fell behind, segments passed through the hot buffer unanalyzed"
+            );
         }
     }
 
+    /// Read every pending segment still resident, along with any that were
+    /// evicted before this loop reached them.
+    #[allow(clippy::type_complexity)]
     fn collect_pending_segments(
         &self,
         last_seq: u64,
-    ) -> Result<Vec<PendingSegment>, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<
+        (Vec<PendingSegment>, Option<SkippedSegments>),
+        Box<dyn std::error::Error + Send + Sync>,
+    > {
         let mut segments = Vec::new();
+        // The hot buffer can evict while this loop runs: `first_sequence` was
+        // sampled before it, and each segment is fetched under its own lock.
+        // Sequences that vanish in between are gone unanalyzed and nothing
+        // later can notice — `last_processed` advances past the gap.
+        let mut evicted = Vec::new();
         for seq in self.last_processed..last_seq {
             let segment = {
                 let buffer = self.buffer.read_recover();
@@ -554,11 +705,12 @@ impl MotionAnalyzer {
                     duration_ns: s.duration_ns,
                 })
             };
-            if let Some(seg) = segment {
-                segments.push(seg);
+            match segment {
+                Some(seg) => segments.push(seg),
+                None => evicted.push(seq),
             }
         }
-        Ok(segments)
+        Ok((segments, SkippedSegments::of(&evicted)))
     }
 
     #[allow(clippy::type_complexity)]
@@ -574,15 +726,39 @@ impl MotionAnalyzer {
         let mut closed_runs = Vec::new();
 
         // Lifecycle timing is monotonic: the analyzer runs near real time, so
-        // the instant it observes a segment stands in for capture time. One
-        // reading per poll batch is enough — batches are ~one segment.
-        let now = Instant::now();
+        // the instant it observes a segment stands in for capture time. A
+        // backlog is the exception — after a decoder or writer stall a batch
+        // can hold minutes of footage at once — so each segment is dated by
+        // its own media duration instead of sharing one reading.
+        let observed_at = batch_instants(&segments, Instant::now());
 
-        for seg in segments {
-            let (score, crop, motion_rects) = self.analyze_segment(&seg.data)?;
+        for (seg, now) in segments.into_iter().zip(observed_at) {
+            let analysis = match self.analyze_segment(&seg.data)? {
+                Some(analysis) => analysis,
+                None => {
+                    // No frames came out for this segment, so nothing is known
+                    // about it: a quiet verdict here would count as evidence of
+                    // stillness and could close an open run on footage that was
+                    // never looked at. Skip it and move on — the zero-frame
+                    // tripwire is what notices a decoder that stays blind.
+                    tracing::debug!(
+                        camera = %self.camera_id,
+                        sequence = seg.seq,
+                        "segment decoded no frames, not analyzed"
+                    );
+                    self.observed_sequences = true;
+                    self.last_processed = seg.seq + 1;
+                    continue;
+                }
+            };
             self.publish_debug_maps();
 
-            let has_motion = score >= MOTION_THRESHOLD;
+            let has_motion = analysis.has_motion();
+            let SegmentAnalysis {
+                score,
+                crop,
+                motion_rects,
+            } = analysis;
             // The physical motion period, as opposed to the event chunking:
             // the duration cap closes one chunk and opens the next inside a
             // single `observe`, so a chunk boundary leaves the tracker open
@@ -622,6 +798,7 @@ impl MotionAnalyzer {
                 }
             }
 
+            self.observed_sequences = true;
             self.last_processed = seg.seq + 1;
         }
 
@@ -767,14 +944,12 @@ impl MotionAnalyzer {
         );
     }
 
-    #[allow(clippy::type_complexity)]
+    /// Score one segment, or `None` when the decoder produced no frames for it
+    /// — see [`SegmentAnalysis`].
     fn analyze_segment(
         &mut self,
         data: &[u8],
-    ) -> Result<
-        (f32, Option<NormalizedRect>, Vec<NormalizedRect>),
-        Box<dyn std::error::Error + Send + Sync>,
-    > {
+    ) -> Result<Option<SegmentAnalysis>, Box<dyn std::error::Error + Send + Sync>> {
         let raw_frames = match self.decoder.decode_segment(data) {
             DecodeOutcome::Frames(frames) => frames,
             DecodeOutcome::Wedged => {
@@ -786,7 +961,7 @@ impl MotionAnalyzer {
                 // streak the wedge interrupted says nothing about it.
                 self.zero_frames.reset();
                 self.decoder.kill();
-                return Ok((0.0, None, Vec::new()));
+                return Ok(None);
             }
         };
 
@@ -800,7 +975,7 @@ impl MotionAnalyzer {
         }
 
         if raw_frames.is_empty() {
-            return Ok((0.0, None, Vec::new()));
+            return Ok(None);
         }
 
         let (w, h) = (ANALYSIS_WIDTH as usize, ANALYSIS_HEIGHT as usize);
@@ -819,7 +994,11 @@ impl MotionAnalyzer {
 
         let crop = union_rects_padded(&all_rects, CROP_PADDING);
 
-        Ok((total_score / frame_count as f32, crop, all_rects))
+        Ok(Some(SegmentAnalysis {
+            score: total_score / frame_count as f32,
+            crop,
+            motion_rects: all_rects,
+        }))
     }
 
     // --- Phase 2: Generic frame extraction + detection ---
@@ -974,6 +1153,31 @@ impl MotionAnalyzer {
 
         self.run_filmstrip.push(filmstrip_jpegs);
     }
+}
+
+/// Monotonic capture instant per segment of one batch: the last segment ends
+/// at `now` and the others are placed back along their own media durations, so
+/// a batch of backlog spans the same time the footage did. Post-padding and the
+/// event duration cap then behave the same whether segments arrive one per poll
+/// or as a burst after a stall.
+///
+/// Walking backwards from `now` keeps every instant at or before it whatever
+/// the durations say. An instant in the future would be worse than the single
+/// shared reading this replaces: the tracker's elapsed math saturates at zero
+/// until wall time catches up, freezing both countdowns. Backlog older than the
+/// monotonic epoch (a hot buffer inherited by a just-started process) stops at
+/// that floor instead of wrapping.
+fn batch_instants(segments: &[PendingSegment], now: Instant) -> Vec<Instant> {
+    let mut times = Vec::with_capacity(segments.len());
+    let mut at = now;
+    for seg in segments.iter().rev() {
+        times.push(at);
+        at = at
+            .checked_sub(Duration::from_nanos(seg.duration_ns))
+            .unwrap_or(at);
+    }
+    times.reverse();
+    times
 }
 
 fn sample_indices(len: usize) -> Vec<usize> {
@@ -1524,6 +1728,264 @@ mod tests {
             !tripwire.observe(0),
             "reset streak needs the full run again"
         );
+    }
+
+    #[test]
+    fn skipped_segments_reports_the_dropped_range() {
+        let skipped = SkippedSegments::between(10, 14).unwrap();
+        assert_eq!(
+            skipped,
+            SkippedSegments {
+                count: 4,
+                from_seq: 10,
+                to_seq: 13,
+            }
+        );
+        // A single dropped segment still names itself.
+        let one = SkippedSegments::between(10, 11).unwrap();
+        assert_eq!(one.count, 1);
+        assert_eq!((one.from_seq, one.to_seq), (10, 10));
+    }
+
+    #[test]
+    fn skipped_segments_is_none_when_the_analyzer_kept_up() {
+        assert_eq!(SkippedSegments::between(10, 10), None);
+        // Ahead of the buffer's oldest resident segment: nothing was missed.
+        assert_eq!(SkippedSegments::between(12, 10), None);
+        assert_eq!(SkippedSegments::between(0, 0), None);
+    }
+
+    #[test]
+    fn skipped_segments_reports_what_vanished_mid_collection() {
+        // Evicted after the buffer snapshot, while later sequences survived.
+        assert_eq!(
+            SkippedSegments::of(&[10, 11, 12, 13, 14]),
+            Some(SkippedSegments {
+                count: 5,
+                from_seq: 10,
+                to_seq: 14,
+            })
+        );
+        // A hole that is not contiguous still reports an exact count.
+        let scattered = SkippedSegments::of(&[10, 14]).unwrap();
+        assert_eq!(scattered.count, 2);
+        assert_eq!((scattered.from_seq, scattered.to_seq), (10, 14));
+        assert_eq!(SkippedSegments::of(&[]), None);
+    }
+
+    #[test]
+    fn skip_reporter_coalesces_a_chronically_behind_analyzer() {
+        let mut reporter = SkipReporter::default();
+        let t0 = Instant::now();
+        // The first loss is reported at once: a one-off is worth seeing.
+        let first = reporter
+            .record(SkippedSegments::between(0, 3).unwrap(), t0)
+            .unwrap();
+        assert_eq!(first.count, 3);
+
+        // Every 200 ms poll after that skips something too, and warnings stay
+        // on in release — so they accumulate instead of printing.
+        let mut polls = 0;
+        for tick in 1..200u64 {
+            let at = t0 + Duration::from_millis(200 * tick);
+            let seq = 3 + tick;
+            if reporter
+                .record(SkippedSegments::between(seq, seq + 1).unwrap(), at)
+                .is_some()
+            {
+                polls += 1;
+            }
+        }
+        // 40 s of polling: one line per interval, not one per poll.
+        assert_eq!(polls, 1);
+    }
+
+    #[test]
+    fn skip_reporter_totals_everything_it_held_back() {
+        let mut reporter = SkipReporter::default();
+        let t0 = Instant::now();
+        reporter.record(SkippedSegments::between(0, 1).unwrap(), t0);
+        assert!(reporter
+            .record(SkippedSegments::between(1, 3).unwrap(), t0)
+            .is_none());
+        assert!(reporter
+            .record(SkippedSegments::between(3, 6).unwrap(), t0)
+            .is_none());
+        let total = reporter
+            .record(
+                SkippedSegments::between(6, 7).unwrap(),
+                t0 + SKIP_REPORT_INTERVAL,
+            )
+            .unwrap();
+        // Nothing suppressed is lost: the count and the range cover the lot.
+        assert_eq!(
+            total,
+            SkippedSegments {
+                count: 6,
+                from_seq: 1,
+                to_seq: 6,
+            }
+        );
+    }
+
+    #[test]
+    fn motion_verdict_needs_the_threshold() {
+        let scored = |score| SegmentAnalysis {
+            score,
+            crop: None,
+            motion_rects: Vec::new(),
+        };
+        assert!(!scored(0.0).has_motion());
+        assert!(!scored(MOTION_THRESHOLD - 0.001).has_motion());
+        assert!(scored(MOTION_THRESHOLD).has_motion());
+    }
+
+    /// A segment the decoder produced no frames for is not evidence of
+    /// stillness, so `run_motion_analysis` feeds the tracker nothing for it.
+    /// Scoring it quiet instead ends events on footage nobody looked at.
+    #[test]
+    fn unanalyzed_segments_do_not_end_an_event() {
+        const POST: Duration = Duration::from_secs(10);
+        const CAP: Duration = Duration::from_secs(300);
+        let segments: Vec<_> = (0..20).map(|seq| pending(seq, SECOND_NS)).collect();
+        let times = batch_instants(&segments, Instant::now());
+        // Motion at each end of a stretch the decoder produced nothing for.
+        let motion = |seq: u64| seq == 0 || seq == 16;
+
+        let mut tracker = RunTracker::new(POST, CAP);
+        let closed: Vec<_> = segments
+            .iter()
+            .zip(&times)
+            .filter(|(seg, _)| motion(seg.seq))
+            .filter_map(|(seg, &at)| tracker.observe(seg.seq, true, at))
+            .collect();
+        assert!(closed.is_empty(), "unanalyzed footage ended the event");
+        let run = tracker.flush().unwrap();
+        assert_eq!(run.first_motion_seq, 0);
+        assert_eq!(run.last_seq, 16);
+
+        // Scored quiet, the blind stretch invents the end of the event: post-
+        // padding elapses inside it and the second motion becomes a separate
+        // event.
+        let mut as_quiet = RunTracker::new(POST, CAP);
+        let closed: Vec<_> = segments
+            .iter()
+            .zip(&times)
+            .filter_map(|(seg, &at)| as_quiet.observe(seg.seq, motion(seg.seq), at))
+            .collect();
+        assert_eq!(closed.len(), 1);
+        assert_eq!(closed[0].last_seq, 10);
+        assert_eq!(as_quiet.flush().unwrap().first_motion_seq, 16);
+    }
+
+    fn pending(seq: u64, duration_ns: u64) -> PendingSegment {
+        PendingSegment {
+            seq,
+            data: Arc::new(Vec::new()),
+            start_pts: seq * duration_ns,
+            duration_ns,
+        }
+    }
+
+    const SECOND_NS: u64 = 1_000_000_000;
+
+    #[test]
+    fn batch_instants_space_segments_by_their_media_duration() {
+        let now = Instant::now();
+        let segments = vec![
+            pending(0, SECOND_NS),
+            pending(1, 2 * SECOND_NS),
+            pending(2, 0),
+        ];
+        let times = batch_instants(&segments, now);
+        // The batch ends now and reaches back over its own three seconds.
+        assert_eq!(times[0], now - Duration::from_secs(2));
+        assert_eq!(times[1], now);
+        assert_eq!(times[2], now);
+    }
+
+    #[test]
+    fn batch_instants_of_a_single_segment_is_now() {
+        let now = Instant::now();
+        assert_eq!(batch_instants(&[pending(7, SECOND_NS)], now), vec![now]);
+        assert!(batch_instants(&[], now).is_empty());
+    }
+
+    #[test]
+    fn batch_instants_never_run_past_now() {
+        let now = Instant::now();
+        // Backlog reaching further back than the monotonic clock goes, with a
+        // span no sum could hold. A capture instant in the future would freeze
+        // the tracker's countdowns instead of merely mis-dating the footage.
+        let segments = vec![
+            pending(0, u64::MAX),
+            pending(1, u64::MAX),
+            pending(2, SECOND_NS),
+            pending(3, SECOND_NS),
+        ];
+        let times = batch_instants(&segments, now);
+        assert!(times.iter().all(|&at| at <= now), "instant past now");
+        assert!(
+            times.windows(2).all(|w| w[0] <= w[1]),
+            "capture order reversed"
+        );
+        assert_eq!(*times.last().unwrap(), now);
+        assert_eq!(times[2], now - Duration::from_secs(1));
+    }
+
+    /// A batch of backlog must be scored as the footage it is: 90 seconds of
+    /// continuous motion produces the same chunking whether it arrives one
+    /// segment per poll or all at once after a stall.
+    #[test]
+    fn duration_cap_fires_inside_a_backlogged_batch() {
+        const POST: Duration = Duration::from_secs(10);
+        const CAP: Duration = Duration::from_secs(30);
+        let segments: Vec<_> = (0..90).map(|seq| pending(seq, SECOND_NS)).collect();
+
+        let mut tracker = RunTracker::new(POST, CAP);
+        let closed: Vec<_> = segments
+            .iter()
+            .zip(batch_instants(&segments, Instant::now()))
+            .filter_map(|(seg, at)| tracker.observe(seg.seq, true, at))
+            .collect();
+
+        assert_eq!(closed.len(), 2, "two chunks close, the third stays open");
+        assert_eq!(closed[0].first_motion_seq, 0);
+        assert_eq!(closed[0].last_seq, 29);
+        assert!(!closed[0].continues);
+        assert_eq!(closed[1].first_motion_seq, 30);
+        assert_eq!(closed[1].last_seq, 59);
+        assert!(closed[1].continues);
+        assert!(tracker.is_open());
+
+        // One shared instant for the whole batch is what this replaces: the
+        // cap cannot fire at all, and the run closes late and oversized.
+        let mut shared = RunTracker::new(POST, CAP);
+        let now = Instant::now();
+        assert!(segments
+            .iter()
+            .all(|seg| shared.observe(seg.seq, true, now).is_none()));
+    }
+
+    #[test]
+    fn post_padding_elapses_inside_a_backlogged_batch() {
+        const POST: Duration = Duration::from_secs(10);
+        const CAP: Duration = Duration::from_secs(300);
+        let segments: Vec<_> = (0..60).map(|seq| pending(seq, SECOND_NS)).collect();
+
+        let mut tracker = RunTracker::new(POST, CAP);
+        let closed: Vec<_> = segments
+            .iter()
+            .zip(batch_instants(&segments, Instant::now()))
+            // Motion in the first segment only; the rest is quiet footage.
+            .filter_map(|(seg, at)| tracker.observe(seg.seq, seg.seq == 0, at))
+            .collect();
+
+        assert_eq!(closed.len(), 1, "the run closes within the batch");
+        assert_eq!(closed[0].first_motion_seq, 0);
+        // Post-padding keeps the ten segments that followed the motion.
+        assert_eq!(closed[0].last_seq, 10);
+        assert!(!tracker.is_open());
     }
 
     #[test]
