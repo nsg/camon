@@ -75,6 +75,18 @@ pub enum ConfigError {
         max: u64,
     },
     #[error(
+        "[analytics.object_detection] classes is empty, so nothing could ever be detected. \
+         Remove the key to detect the defaults ({defaults}), or say so outright with \
+         enabled = false"
+    )]
+    EmptyObjectClasses { defaults: String },
+    #[error(
+        "[analytics.object_detection] classes contains a blank entry; it names no object, so \
+         the model can never return it, and it would still get Home Assistant entities of \
+         its own"
+    )]
+    BlankObjectClass,
+    #[error(
         "camera id {id:?} contains {character:?}, which is an MQTT topic wildcard; \
          rename the camera or disable [mqtt]"
     )]
@@ -98,18 +110,20 @@ pub enum ConfigError {
 
 /// A single `--set <dotted.path>=<value>` startup override, applied to the
 /// parsed config tree before it is deserialized into [`Config`]. Overrides win
-/// over the file's values and can create missing intermediate tables.
+/// over the file's values and can create missing intermediate tables. The
+/// value's TOML type comes from the setting it names rather than from how the
+/// text looks — see [`Override::reading_against`].
 #[derive(Debug, Clone)]
 pub struct Override {
     path: Vec<String>,
-    value: toml::Value,
+    raw: String,
 }
 
 impl Override {
     /// Parse a `dotted.path=value` argument. Splits on the first `=`; the value
-    /// is coerced to the first TOML scalar that accepts it — bool, then
-    /// integer, then float, otherwise a plain string. An argument without `=`,
-    /// with an empty key, or with an empty path segment is rejected.
+    /// stays raw text until it is typed against the config schema. An argument
+    /// without `=`, with an empty key, or with an empty path segment is
+    /// rejected.
     pub fn parse(arg: &str) -> Result<Self, String> {
         let (path, raw) = arg
             .split_once('=')
@@ -123,40 +137,92 @@ impl Override {
         }
         Ok(Self {
             path: segments,
-            value: parse_scalar(raw),
+            raw: raw.to_string(),
         })
     }
 
-    /// Apply this override into `root`, walking the dotted path and creating
-    /// (or replacing non-table) intermediate tables as needed.
-    fn apply(&self, root: &mut toml::Value) {
-        let (last, parents) = self
-            .path
-            .split_last()
-            .expect("Override::parse guarantees a non-empty path");
-        let mut current = root;
-        for segment in parents {
-            if !current.is_table() {
-                *current = toml::Value::Table(toml::map::Map::new());
-            }
-            current = current
-                .as_table_mut()
-                .expect("just ensured a table")
-                .entry(segment.clone())
-                .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
+    /// The value read by shape alone: bool, then integer, then float, else a
+    /// string. Where the schema has no answer this is what gets inserted, so
+    /// the load reports the real problem instead of a type camon invented.
+    fn guess(&self) -> toml::Value {
+        parse_scalar(&self.raw)
+    }
+
+    /// The raw text as-is, the other reading every value has.
+    fn text(&self) -> toml::Value {
+        toml::Value::String(self.raw.clone())
+    }
+
+    /// The TOML scalar this override should insert, or `None` when `base`
+    /// gives no answer.
+    ///
+    /// The type has to come from the target field. `--set http.port=8080` must
+    /// become an integer while `--set mqtt.password=8080` must stay a string,
+    /// and nothing about the text itself tells them apart — reading by shape
+    /// alone mistyped every all-digit secret. A hand-kept list of string keys
+    /// would instead mistype the next key someone adds, silently and only for
+    /// whoever overrides it.
+    ///
+    /// A reading is only ever taken from a [`Config`] that deserialized, so a
+    /// failure — here or anywhere else in `base` — is never mistaken for an
+    /// answer about this key. Callers pass a `base` that isolates the question
+    /// as far as it can be isolated; see [`Config::load_from_with_overrides`].
+    fn reading_against(&self, base: &toml::Value) -> Option<toml::Value> {
+        let guess = self.guess();
+        // A string reading is the last resort anyway: nothing else applies, so
+        // there is no question to answer.
+        if matches!(guess, toml::Value::String(_)) {
+            return Some(guess);
         }
-        if !current.is_table() {
-            *current = toml::Value::Table(toml::map::Map::new());
+        if self.accepted_by(base, &guess) {
+            return Some(guess);
         }
-        current
-            .as_table_mut()
-            .expect("just ensured a table")
-            .insert(last.clone(), self.value.clone());
+        let text = self.text();
+        self.accepted_by(base, &text).then_some(text)
+    }
+
+    /// Whether [`Config`] deserializes from `base` once `value` is set at this
+    /// path.
+    fn accepted_by(&self, base: &toml::Value, value: &toml::Value) -> bool {
+        let mut probe = base.clone();
+        insert_at(&mut probe, &self.path, value.clone());
+        probe.try_into::<Config>().is_ok()
     }
 }
 
-/// Coerce a raw `--set` value to a TOML scalar: bool, then integer, then float,
-/// otherwise a string.
+/// An empty tree: the base that isolates an override from everything else.
+fn empty_tree() -> toml::Value {
+    toml::Value::Table(toml::map::Map::new())
+}
+
+/// Insert `value` at a dotted path, creating (or replacing non-table)
+/// intermediate tables as needed.
+fn insert_at(root: &mut toml::Value, path: &[String], value: toml::Value) {
+    let (last, parents) = path
+        .split_last()
+        .expect("Override::parse guarantees a non-empty path");
+    let mut current = root;
+    for segment in parents {
+        if !current.is_table() {
+            *current = toml::Value::Table(toml::map::Map::new());
+        }
+        current = current
+            .as_table_mut()
+            .expect("just ensured a table")
+            .entry(segment.clone())
+            .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
+    }
+    if !current.is_table() {
+        *current = toml::Value::Table(toml::map::Map::new());
+    }
+    current
+        .as_table_mut()
+        .expect("just ensured a table")
+        .insert(last.clone(), value);
+}
+
+/// Read a raw `--set` value by shape alone: bool, then integer, then float,
+/// otherwise a string. Only a starting point — [`Override::resolve`] decides.
 fn parse_scalar(raw: &str) -> toml::Value {
     if let Ok(b) = raw.parse::<bool>() {
         toml::Value::Boolean(b)
@@ -684,18 +750,70 @@ impl Config {
 
     /// Load from an explicit TOML path, applying each `--set` override into the
     /// parsed value tree before deserializing. Overrides win over file values.
+    ///
+    /// An override's TOML type is read from the setting it names, in two
+    /// passes that keep the answer independent of everything else — of the
+    /// other overrides, of the order they were given in, and of any unrelated
+    /// defect in the file:
+    ///
+    /// 1. Against an empty tree, so the only thing the schema can complain
+    ///    about is the key under test. This answers for every setting whose
+    ///    enclosing tables are all `#[serde(default)]` — which is all of them
+    ///    but `[storage.stathost]`, whose `url`/`bucket`/`token` are required.
+    /// 2. For the leftovers, against the whole config once every override is
+    ///    in place and retired keys are gone, so the required siblings exist.
+    ///    That tree is built from pass-1 readings alone, so it does not depend
+    ///    on the order the overrides were given in either.
+    ///
+    /// A reading is only ever taken from a `Config` that deserialized, so a
+    /// failure elsewhere can never be mistaken for an answer: it leaves the
+    /// plain reading in place, and the load reports the real problem.
     pub fn load_from_with_overrides<P: AsRef<Path>>(
         path: P,
         overrides: &[Override],
     ) -> Result<Self, ConfigError> {
         let content = std::fs::read_to_string(path)?;
         let mut value: toml::Value = toml::from_str(&content)?;
-        for ov in overrides {
-            ov.apply(&mut value);
+
+        let bare = empty_tree();
+        let mut undecided = Vec::new();
+        for (index, ov) in overrides.iter().enumerate() {
+            match ov.reading_against(&bare) {
+                Some(reading) => insert_at(&mut value, &ov.path, reading),
+                None => {
+                    insert_at(&mut value, &ov.path, ov.guess());
+                    undecided.push(index);
+                }
+            }
         }
+
         for (key, advice) in strip_retired_keys(&mut value) {
             tracing::warn!(key = %key, "ignoring retired config key: {advice}");
         }
+
+        if !undecided.is_empty() {
+            // A key can only be judged against a tree the rest of which
+            // parses, so the leftovers get two views of the finished config:
+            // one holding them at their plain reading, one holding all of them
+            // as text — with several numeric-looking secrets in the same
+            // table, the first view never parses.
+            let plain = value.clone();
+            let mut as_text = value.clone();
+            for &index in &undecided {
+                let ov = &overrides[index];
+                insert_at(&mut as_text, &ov.path, ov.text());
+            }
+            for index in undecided {
+                let ov = &overrides[index];
+                if let Some(reading) = ov
+                    .reading_against(&plain)
+                    .or_else(|| ov.reading_against(&as_text))
+                {
+                    insert_at(&mut value, &ov.path, reading);
+                }
+            }
+        }
+
         let mut config: Config = value.try_into()?;
         config.normalize();
         config.validate()?;
@@ -707,11 +825,13 @@ impl Config {
     /// verbatim by the MQTT bridge, so `classes = ["Person"]` would otherwise
     /// yield an occupancy sensor that can never turn on. Deduplicating is part
     /// of the same fix: once folded, `["Person", "person"]` would produce two
-    /// discovery payloads sharing one unique id.
+    /// discovery payloads sharing one unique id. Surrounding whitespace goes
+    /// for the same reason — `" person"` reaches the topic verbatim but comes
+    /// back from the model trimmed.
     fn normalize(&mut self) {
         let classes = &mut self.analytics.object_detection.classes;
         for class in classes.iter_mut() {
-            *class = class.to_lowercase();
+            *class = class.trim().to_lowercase();
         }
         let mut seen = HashSet::new();
         classes.retain(|class| seen.insert(class.clone()));
@@ -819,6 +939,24 @@ impl Config {
                         .hot_duration_secs
                         .saturating_sub(self.storage.pre_padding_secs),
                 );
+            }
+        }
+
+        // An empty allowlist reads as either "detect the defaults" or "detect
+        // nothing" depending on who is asked, and both readings are already
+        // spelled out unambiguously elsewhere: omit the key, or set
+        // enabled = false. Rejecting it keeps the detector and the MQTT bridge
+        // from ever disagreeing about what is being looked for.
+        if self.analytics.enabled && self.analytics.object_detection.enabled {
+            let classes = &self.analytics.object_detection.classes;
+            if classes.is_empty() {
+                return Err(ConfigError::EmptyObjectClasses {
+                    defaults: default_classes().join(", "),
+                });
+            }
+            // Blank after normalize()'s trim: an empty list one entry down.
+            if classes.iter().any(String::is_empty) {
+                return Err(ConfigError::BlankObjectClass);
             }
         }
 
@@ -1033,37 +1171,200 @@ url = "rtsp://user:pass@10.0.0.6:554/stream1"
         assert!(matches!(err, ConfigError::NoCameras), "got {err:?}");
     }
 
+    /// Type and insert one override the way the first pass of
+    /// `load_from_with_overrides` does: judged against nothing but itself.
+    fn apply_override(spec: &str, tree: &mut toml::Value) {
+        let ov = Override::parse(spec).unwrap();
+        let reading = ov.reading_against(&empty_tree()).unwrap_or_else(|| {
+            // Pass 2 answers these; the callers below never use one.
+            ov.guess()
+        });
+        insert_at(tree, &ov.path, reading);
+    }
+
+    fn load_with_overrides(toml: &str, specs: &[&str]) -> Result<Config, ConfigError> {
+        let dir = write_temp("config.toml", toml);
+        let overrides: Vec<Override> = specs
+            .iter()
+            .map(|spec| Override::parse(spec).unwrap())
+            .collect();
+        Config::load_from_with_overrides(dir.path().join("config.toml"), &overrides)
+    }
+
     #[test]
     fn override_sets_a_bool() {
         let mut v: toml::Value = toml::from_str("[update]\nenabled = true\n").unwrap();
-        Override::parse("update.enabled=false")
-            .unwrap()
-            .apply(&mut v);
+        apply_override("update.enabled=false", &mut v);
         assert_eq!(v["update"]["enabled"].as_bool(), Some(false));
     }
 
     #[test]
     fn override_sets_an_integer() {
         let mut v: toml::Value = toml::from_str("[http]\nport = 8080\n").unwrap();
-        Override::parse("http.port=22666").unwrap().apply(&mut v);
+        apply_override("http.port=22666", &mut v);
         assert_eq!(v["http"]["port"].as_integer(), Some(22666));
     }
 
     #[test]
     fn override_sets_a_string() {
         let mut v: toml::Value = toml::from_str("[storage]\ndata_dir = \"/var/camon\"\n").unwrap();
-        Override::parse("storage.data_dir=/data/storage")
-            .unwrap()
-            .apply(&mut v);
+        apply_override("storage.data_dir=/data/storage", &mut v);
         assert_eq!(v["storage"]["data_dir"].as_str(), Some("/data/storage"));
+    }
+
+    /// The add-on forwards Supervisor-generated MQTT credentials through
+    /// `--set`, and those are regularly all digits.
+    #[test]
+    fn override_of_a_string_key_stays_a_string_when_it_looks_numeric() {
+        let mut v: toml::Value = toml::from_str("").unwrap();
+        apply_override("mqtt.password=12345", &mut v);
+        apply_override("mqtt.username=0042", &mut v);
+        apply_override("http.token=1e5", &mut v);
+        assert_eq!(v["mqtt"]["password"].as_str(), Some("12345"));
+        assert_eq!(v["mqtt"]["username"].as_str(), Some("0042"));
+        assert_eq!(v["http"]["token"].as_str(), Some("1e5"));
+    }
+
+    /// The first pass judges an override against a tree holding nothing else,
+    /// which only works while every table in `Config` has a serde default. Add
+    /// a required field to one and its keys silently fall through to the
+    /// second pass instead — which is weaker, so this is worth knowing about.
+    /// `[storage.stathost]` is the one table that is already like that.
+    #[test]
+    fn every_setting_in_the_example_can_be_judged_on_its_own() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("config.toml.example");
+        let example: toml::Value = toml::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        let mut settings = Vec::new();
+        collect_scalars(&example, &mut Vec::new(), &mut settings);
+        assert!(settings.len() > 20, "only found {}", settings.len());
+
+        for (path, value) in settings {
+            // The known exception, documented above; the example has no
+            // stathost section today, so this is here for the day it does.
+            if path.starts_with("storage.stathost.") {
+                continue;
+            }
+            let segments: Vec<String> = path.split('.').map(str::to_string).collect();
+            let mut probe = empty_tree();
+            insert_at(&mut probe, &segments, value);
+            assert!(
+                probe.try_into::<Config>().is_ok(),
+                "{path} can no longer be judged on its own: a table on the way to it must \
+                 have gained a field without a serde default"
+            );
+        }
+    }
+
+    /// Every scalar in `value` as a dotted path and its value, skipping
+    /// arrays: `[[cameras]]` and `classes` are not reachable with `--set`.
+    fn collect_scalars(
+        value: &toml::Value,
+        prefix: &mut Vec<String>,
+        out: &mut Vec<(String, toml::Value)>,
+    ) {
+        let Some(table) = value.as_table() else {
+            return;
+        };
+        for (key, child) in table {
+            prefix.push(key.clone());
+            match child {
+                toml::Value::Table(_) => collect_scalars(child, prefix, out),
+                toml::Value::Array(_) => {}
+                _ => out.push((prefix.join("."), child.clone())),
+            }
+            prefix.pop();
+        }
+    }
+
+    /// `[storage.stathost]`'s `url`/`bucket`/`token` are required, so none of
+    /// its keys can be judged alone — the second pass answers for them once
+    /// the rest of the table is in place, whether it comes from the file...
+    #[test]
+    fn override_of_a_string_key_in_a_table_with_required_fields_stays_a_string() {
+        let toml = format!(
+            "[storage.stathost]\nurl = \"https://host\"\nbucket = \"camon\"\n\
+             token = \"placeholder\"\n{}",
+            one_camera("yard")
+        );
+        let config = load_with_overrides(&toml, &["storage.stathost.token=12345"]).unwrap();
+        assert_eq!(config.storage.stathost.unwrap().token, "12345");
+    }
+
+    /// ...or from the overrides themselves. Keeping a bearer token out of the
+    /// config file is the reason to reach for `--set` here, so the table has
+    /// to be constructible this way.
+    #[test]
+    fn a_table_with_required_fields_can_be_built_from_overrides_alone() {
+        let config = load_with_overrides(
+            &one_camera("yard"),
+            &[
+                "storage.stathost.url=https://host",
+                "storage.stathost.bucket=camon",
+                "storage.stathost.token=12345",
+            ],
+        )
+        .unwrap();
+        let stathost = config.storage.stathost.unwrap();
+        assert_eq!(stathost.token, "12345");
+        assert_eq!(stathost.bucket, "camon");
+    }
+
+    /// Typing may not depend on the order the flags were written in — the
+    /// numeric-looking token is as likely to be written first as last — nor on
+    /// how many of the values in one table look numeric.
+    #[test]
+    fn override_typing_is_independent_of_argument_order() {
+        let forwards = [
+            "storage.stathost.url=12345",
+            "storage.stathost.bucket=camon",
+            "storage.stathost.token=67890",
+        ];
+        let mut backwards = forwards;
+        backwards.reverse();
+
+        for order in [forwards, backwards] {
+            let config = load_with_overrides(&one_camera("yard"), &order).unwrap();
+            let stathost = config.storage.stathost.unwrap();
+            assert_eq!(stathost.url, "12345", "order {order:?}");
+            assert_eq!(stathost.token, "67890", "order {order:?}");
+        }
+    }
+
+    /// Retired keys are stripped before anything is typed against the whole
+    /// config, so a leftover from an older camon cannot decide a type. Both
+    /// halves matter: the config still boots, and the token is still a string.
+    #[test]
+    fn a_retired_key_does_not_affect_typing() {
+        let toml = format!(
+            "[analytics.object_detection]\nmodel_path = \"/opt/yolo26.onnx\"\n\n\
+             [storage.stathost]\nurl = \"https://host\"\nbucket = \"camon\"\n\
+             token = \"placeholder\"\n{}",
+            one_camera("yard")
+        );
+        let config = load_with_overrides(&toml, &["storage.stathost.token=12345"]).unwrap();
+        assert_eq!(config.storage.stathost.unwrap().token, "12345");
+    }
+
+    #[test]
+    fn override_of_a_float_key_accepts_a_whole_number() {
+        let config =
+            load_with_overrides(TOML_SAMPLE, &["analytics.motion.var_threshold=20"]).unwrap();
+        assert_eq!(config.analytics.motion.var_threshold, 20.0);
+    }
+
+    /// A path the schema rejects whatever its type keeps its plain reading, so
+    /// the load fails with the real complaint rather than an invented type.
+    #[test]
+    fn override_of_an_unknown_key_keeps_its_plain_reading() {
+        let mut v: toml::Value = toml::from_str("").unwrap();
+        apply_override("http.prot=9090", &mut v);
+        assert_eq!(v["http"]["prot"].as_integer(), Some(9090));
     }
 
     #[test]
     fn override_creates_missing_intermediate_tables() {
         let mut v: toml::Value = toml::from_str("").unwrap();
-        Override::parse("analytics.object_detection.enabled=true")
-            .unwrap()
-            .apply(&mut v);
+        apply_override("analytics.object_detection.enabled=true", &mut v);
         assert_eq!(
             v["analytics"]["object_detection"]["enabled"].as_bool(),
             Some(true)
@@ -1528,36 +1829,74 @@ url = "rtsp://10.0.0.5:554/stream1"
         assert_eq!(config.buffer.hot_duration_secs, 600);
     }
 
-    /// Mirrors the `--set` list in `camon-addon/run.sh:90-96` (plus the
-    /// conditional MQTT block above it), which the add-on forces on every
-    /// start. A key renamed here is a container that will not boot.
+    /// The `--set` arguments `run.sh` really passes, read from the script
+    /// itself so this cannot drift from it, with the Supervisor's shell
+    /// variables filled in. Comment lines are skipped: the header explains
+    /// `--set` in prose.
+    fn addon_run_sh_overrides() -> Vec<String> {
+        const RUN_SH: &str = include_str!("../camon-addon/run.sh");
+        // Values the Supervisor generates. The password is all digits on
+        // purpose — those are generated too, and one read as an integer stops
+        // the add-on from starting.
+        const SUPERVISOR: [(&str, &str); 4] = [
+            ("${MQTT_HOST}", "core-mosquitto"),
+            ("${MQTT_PORT}", "1883"),
+            ("${MQTT_USERNAME}", "addons"),
+            ("${MQTT_PASSWORD}", "48151623"),
+        ];
+
+        let mut out = Vec::new();
+        for line in RUN_SH.lines().filter(|l| !l.trim_start().starts_with('#')) {
+            let mut tokens = line.split_whitespace();
+            while let Some(token) = tokens.next() {
+                // Ends with rather than equals: the MQTT block builds an array,
+                // so the first flag on those lines reads `MQTT_ARGS+=(--set`.
+                if !token.ends_with("--set") {
+                    continue;
+                }
+                let mut arg = tokens
+                    .next()
+                    .expect("--set in run.sh without an argument")
+                    .trim_matches(|c| c == '"' || c == ')')
+                    .to_string();
+                for (variable, value) in SUPERVISOR {
+                    arg = arg.replace(variable, value);
+                }
+                assert!(arg.contains('='), "unparsed --set argument {arg:?}");
+                out.push(arg);
+            }
+        }
+        out
+    }
+
+    /// The add-on forces these on every start, so a key renamed in camon is a
+    /// container that will not boot. The file underneath sets every one of
+    /// them to something else, so an override that stopped being applied is a
+    /// failure here rather than a value that happens to match a default.
     #[test]
     fn addon_overrides_still_apply() {
-        let dir = write_temp("config.toml", TOML_SAMPLE);
-        let overrides: Vec<Override> = [
-            "update.enabled=false",
-            "http.port=22666",
-            "http.bind=0.0.0.0",
-            "http.allow_open=true",
-            "storage.data_dir=/data/storage",
-            "mqtt.enabled=true",
-            "mqtt.host=core-mosquitto",
-            "mqtt.port=1883",
-            "mqtt.username=addons",
-            "mqtt.password=s3cr3t",
-        ]
-        .iter()
-        .map(|a| Override::parse(a).unwrap())
-        .collect();
-        let config =
-            Config::load_from_with_overrides(dir.path().join("config.toml"), &overrides).unwrap();
+        let specs = addon_run_sh_overrides();
+        assert_eq!(specs.len(), 10, "run.sh changed: {specs:?}");
+        let file = format!(
+            "[update]\nenabled = true\n\n[http]\nport = 9090\nbind = \"127.0.0.1\"\n\
+             allow_open = false\n\n[storage]\ndata_dir = \"/var/lib/camon\"\n\n\
+             [mqtt]\nenabled = false\nhost = \"mqtt.example\"\nport = 1884\n\
+             username = \"fileuser\"\npassword = \"filepass\"\n{}",
+            one_camera("yard")
+        );
+        let refs: Vec<&str> = specs.iter().map(String::as_str).collect();
+        let config = load_with_overrides(&file, &refs).unwrap();
+
         assert!(!config.update.enabled);
         assert_eq!(config.http.port, 22666);
+        assert_eq!(config.http.bind, "0.0.0.0");
         assert!(config.http.allow_open);
         assert_eq!(config.storage.data_dir, "/data/storage");
         assert!(config.mqtt.enabled);
         assert_eq!(config.mqtt.host, "core-mosquitto");
+        assert_eq!(config.mqtt.port, 1883);
         assert_eq!(config.mqtt.username.as_deref(), Some("addons"));
+        assert_eq!(config.mqtt.password.as_deref(), Some("48151623"));
     }
 
     /// Retired keys have to stay bootable: rejecting them would strand an
@@ -1634,6 +1973,86 @@ url = "rtsp://10.0.0.5:554/stream1"
             config.analytics.object_detection.classes,
             vec!["person".to_string(), "cat".to_string()]
         );
+    }
+
+    /// The detector and the MQTT bridge would otherwise read an empty list
+    /// differently: built-in defaults for one, no entities at all for the
+    /// other.
+    #[test]
+    fn empty_object_classes_is_rejected_while_detection_is_on() {
+        let toml = format!(
+            "[analytics]\nenabled = true\n\n\
+             [analytics.object_detection]\nenabled = true\nclasses = []\n{}",
+            one_camera("yard")
+        );
+        let err = load_cameras(&toml).unwrap_err();
+        assert!(
+            matches!(err, ConfigError::EmptyObjectClasses { .. }),
+            "got {err:?}"
+        );
+        assert!(err.to_string().contains("person, car, truck, dog, cat"));
+    }
+
+    /// With nothing asking for classes there is nothing to disagree about —
+    /// and both halves of the gate turn the detector off, so both are allowed
+    /// to leave the list empty.
+    #[test]
+    fn empty_object_classes_is_accepted_while_nothing_detects() {
+        for analytics in [
+            "[analytics]\nenabled = true\n\n[analytics.object_detection]\nenabled = false",
+            "[analytics]\nenabled = false\n\n[analytics.object_detection]\nenabled = true",
+        ] {
+            let toml = format!("{analytics}\nclasses = []\n{}", one_camera("yard"));
+            let config =
+                load_cameras(&toml).unwrap_or_else(|e| panic!("rejected with {analytics:?}: {e}"));
+            assert!(config.analytics.object_detection.classes.is_empty());
+        }
+    }
+
+    /// A blank entry is an empty list one step down: the model can never
+    /// return it, and it would still get entities of its own.
+    #[test]
+    fn blank_object_classes_are_rejected_while_detection_is_on() {
+        for classes in [r#"[""]"#, r#"["  "]"#, r#"["person", "\t"]"#] {
+            let toml = format!(
+                "[analytics]\nenabled = true\n\n\
+                 [analytics.object_detection]\nenabled = true\nclasses = {classes}\n{}",
+                one_camera("yard")
+            );
+            let err = load_cameras(&toml).unwrap_err();
+            assert!(
+                matches!(err, ConfigError::BlankObjectClass),
+                "{classes} got {err:?}"
+            );
+        }
+    }
+
+    /// Padding is folded away rather than rejected, like the case folding it
+    /// travels with: the topic and the prompt have to spell a class the same.
+    #[test]
+    fn padded_object_classes_are_trimmed() {
+        let toml = format!(
+            "[analytics.object_detection]\nclasses = [\" Person \", \"person\"]\n{}",
+            one_camera("yard")
+        );
+        let config = load_cameras(&toml).unwrap();
+        assert_eq!(
+            config.analytics.object_detection.classes,
+            vec!["person".to_string()]
+        );
+    }
+
+    /// Omitting the key is the documented way to ask for the built-in list,
+    /// and it must stay distinct from writing an empty one.
+    #[test]
+    fn omitted_object_classes_are_the_defaults() {
+        let toml = format!(
+            "[analytics]\nenabled = true\n\n\
+             [analytics.object_detection]\nenabled = true\n{}",
+            one_camera("yard")
+        );
+        let config = load_cameras(&toml).unwrap();
+        assert_eq!(config.analytics.object_detection.classes, default_classes());
     }
 
     #[test]

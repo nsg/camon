@@ -143,7 +143,7 @@ cargo build --release
 
 ## Configuration
 
-Create a `config.toml` in the working directory. Point Camon at a config anywhere with `--config <path>`, and override individual values at startup with one or more `--set <dotted.path>=<value>` flags (each value is parsed as bool, then integer, then float, else string; overrides win over the file):
+Create a `config.toml` in the working directory. Point Camon at a config anywhere with `--config <path>`, and override individual values at startup with one or more `--set <dotted.path>=<value>` flags (overrides win over the file). The value is typed from the setting it names rather than from how it looks, so a numeric-looking string stays a string — `--set http.port=8080` sets a number, `--set mqtt.password=8080` sets text:
 
 ```bash
 camon --config /etc/camon/config.toml --set http.port=9090 --set update.enabled=true
@@ -213,10 +213,12 @@ sample_fps = 5
 enabled = true
 # Minimum confidence threshold (default: 0.5)
 confidence_threshold = 0.5
-# Object classes to detect (default: person, car, truck, dog, cat).
-# Also constrains the model's structured JSON output. Lower-cased and
-# deduplicated at load, and while [mqtt] is enabled a class may not contain
-# "+" or "#" — it reaches the occupancy topic verbatim.
+# Object classes to detect. Omit the key for the defaults (person, car,
+# truck, dog, cat). While detection is enabled the list may not be empty and
+# no entry may be blank — "detect nothing" is what enabled = false says.
+# Also constrains the model's structured JSON output. Trimmed, lower-cased
+# and deduplicated at load, and while [mqtt] is enabled a class may not
+# contain "+" or "#" — it reaches the occupancy topic verbatim.
 classes = ["person", "car", "truck", "dog", "cat"]
 
 [analytics.object_detection.ollama]

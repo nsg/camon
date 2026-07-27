@@ -3,6 +3,8 @@
 # Camon loads this file as ./config.toml by default. Point it anywhere with
 # --config, and override individual values at startup with --set:
 #   camon --config /path/to/config.toml --set http.port=9090
+# A --set value is typed from the setting it names, not from how it looks, so
+# a numeric-looking string stays a string (--set mqtt.password=12345).
 # (The Home Assistant add-on uses both; see HOMEASSISTANT.md.)
 #
 # The whole file is validated before anything starts, and camon exits with the
@@ -76,10 +78,13 @@ min_contour_area = 200
 enabled = true
 # Minimum confidence threshold (default: 0.5)
 confidence_threshold = 0.5
-# Object classes to detect (default: person, car, truck, dog, cat).
+# Object classes to detect. Omit the key for the defaults (person, car,
+# truck, dog, cat). While enabled = true above, the list may not be empty and
+# no entry may be blank: "detect nothing" is what enabled = false says, and
+# camon will not guess which of the two an empty list meant.
 # Also constrains the model's structured JSON output — only these classes can
-# be returned. Folded to lower case and deduplicated at load, so the Home
-# Assistant entities and the model prompt always agree on the spelling.
+# be returned. Trimmed, folded to lower case and deduplicated at load, so the
+# Home Assistant entities and the model prompt always agree on the spelling.
 classes = ["person", "car", "truck", "dog", "cat"]
 
 [analytics.object_detection.ollama]
