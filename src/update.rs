@@ -1,5 +1,8 @@
+use std::cmp::Ordering;
+use std::ffi::{OsStr, OsString};
 use std::os::unix::fs::PermissionsExt;
-use std::path::PathBuf;
+use std::os::unix::io::AsRawFd;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use sha2::{Digest, Sha256};
@@ -19,6 +22,31 @@ const READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// deliberately has none: a slow link may need minutes for it.
 const METADATA_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// How long the staged binary gets to say what version it is. It prints one
+/// short line and exits, so this is a hang detector rather than a budget.
+const VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long the probe waits for a process group it has just killed to be
+/// reaped.
+const PROBE_REAP_TIMEOUT: Duration = Duration::from_secs(5);
+/// Hard caps on what the probe reads from a binary it does not trust yet. The
+/// version line is about forty bytes; a release that writes a diagnostic dump
+/// to stdout instead must not be able to grow this process, which is recording
+/// while the probe runs and may be on a box with a history of OOM kills.
+const PROBE_STDOUT_LIMIT: u64 = 4096;
+const PROBE_STDERR_LIMIT: u64 = 4096;
+
+/// How many times the same release version may be installed before camon stops
+/// installing it.
+///
+/// An install that works needs exactly one attempt: the restarted process finds
+/// its own version equal to the release and never reaches this code again. A
+/// second attempt therefore means the restart did not take effect — the service
+/// manager starts a different binary than the one that was replaced, or
+/// something puts the old one back — and that is a restart loop, not an update.
+/// Two spare attempts are allowed for the case where the new process died
+/// before it could check anything.
+const MAX_INSTALL_ATTEMPTS: u32 = 3;
+
 #[derive(serde::Deserialize)]
 struct Release {
     tag_name: String,
@@ -32,8 +60,35 @@ struct Asset {
 }
 
 pub async fn check_and_update() -> Result<bool, Box<dyn std::error::Error>> {
-    let current_version = env!("CARGO_PKG_VERSION");
-    tracing::info!(version = %current_version, "checking for updates");
+    let current_text = env!("CARGO_PKG_VERSION");
+    tracing::info!(version = %current_text, "checking for updates");
+    let current = Version::parse(current_text).ok_or_else(|| {
+        format!("this build's own version ({current_text}) is not a semantic version")
+    })?;
+
+    let paths = UpdatePaths::for_exe(&std::env::current_exe()?);
+
+    // Everything from here to the swap runs under one lock, so two camon
+    // processes sharing an installation cannot both pass the attempt check,
+    // both install, and both count the same attempt once.
+    let lock = UpdateLock::acquire(&paths.lock).map_err(|e| {
+        format!(
+            "could not take the update lock at {}: {e} — camon cannot write beside its own binary, \
+             so it could not install an update either",
+            paths.lock.display()
+        )
+    })?;
+    let _lock = match lock {
+        Some(lock) => lock,
+        None => {
+            tracing::info!(
+                lock = %paths.lock.display(),
+                "another camon process is already updating this installation, skipping this check"
+            );
+            return Ok(false);
+        }
+    };
+    let guard = read_guard(&paths.guard);
 
     let client = reqwest::Client::builder()
         .connect_timeout(CONNECT_TIMEOUT)
@@ -41,7 +96,7 @@ pub async fn check_and_update() -> Result<bool, Box<dyn std::error::Error>> {
         .build()?;
     let release: Release = client
         .get(GITHUB_API_URL)
-        .header("User-Agent", format!("camon/{current_version}"))
+        .header("User-Agent", format!("camon/{current_text}"))
         .header("Accept", "application/vnd.github.v3+json")
         .timeout(METADATA_TIMEOUT)
         .send()
@@ -50,28 +105,46 @@ pub async fn check_and_update() -> Result<bool, Box<dyn std::error::Error>> {
         .json()
         .await?;
 
-    let latest_version = release
-        .tag_name
-        .strip_prefix('v')
-        .unwrap_or(&release.tag_name);
+    let latest = Version::parse(&release.tag_name).ok_or_else(|| {
+        format!(
+            "release tag {} is not a version camon can compare with its own — not updating",
+            release.tag_name
+        )
+    })?;
+    // Normalized, so `v0.6.0` and `0.6.0` are one guard key rather than two.
+    let latest_text = latest.to_string();
 
-    if latest_version == current_version {
-        tracing::info!(version = %current_version, "already up to date");
-        return Ok(false);
+    match latest.cmp(&current) {
+        Ordering::Equal => {
+            tracing::info!(version = %current_text, "already up to date");
+            return Ok(false);
+        }
+        Ordering::Less => {
+            tracing::info!(
+                current = %current_text,
+                latest = %latest_text,
+                "current version is newer or equal"
+            );
+            return Ok(false);
+        }
+        Ordering::Greater => {}
     }
 
-    if !is_newer(latest_version, current_version) {
-        tracing::info!(
-            current = %current_version,
-            latest = %latest_version,
-            "current version is newer or equal"
+    // Asked before the download: a version camon has given up on must not cost
+    // a multi-megabyte fetch every twelve hours to keep refusing it.
+    if let Some(reason) = blocked_reason(guard.as_ref(), &latest_text, current_text, unix_now()) {
+        tracing::error!(
+            current = %current_text,
+            latest = %latest_text,
+            guard = %paths.guard.display(),
+            "{reason}"
         );
         return Ok(false);
     }
 
     tracing::info!(
-        current = %current_version,
-        latest = %latest_version,
+        current = %current_text,
+        latest = %latest_text,
         "newer version available, updating"
     );
 
@@ -84,7 +157,7 @@ pub async fn check_and_update() -> Result<bool, Box<dyn std::error::Error>> {
 
     let bytes = client
         .get(&asset.browser_download_url)
-        .header("User-Agent", format!("camon/{current_version}"))
+        .header("User-Agent", format!("camon/{current_text}"))
         .send()
         .await?
         .error_for_status()?
@@ -92,15 +165,14 @@ pub async fn check_and_update() -> Result<bool, Box<dyn std::error::Error>> {
         .await?;
 
     // Corruption protection (not a security boundary — an attacker able to swap
-    // the binary asset can swap the checksum too). Releases published before
-    // sha256sums.txt existed have no such asset: we warn and proceed unverified
-    // so self-update does not brick, but once the asset is present it must
-    // verify. Presence/absence of the CHECKSUMS_ASSET asset is the distinction.
+    // the binary asset can swap the checksum too). A failure here is never
+    // recorded as a refusal: a mismatch is what a truncated or corrupted
+    // download looks like, and the next attempt may well succeed.
     let checksums = match release.assets.iter().find(|a| a.name == CHECKSUMS_ASSET) {
         Some(sums_asset) => {
             let text = client
                 .get(&sums_asset.browser_download_url)
-                .header("User-Agent", format!("camon/{current_version}"))
+                .header("User-Agent", format!("camon/{current_text}"))
                 .timeout(METADATA_TIMEOUT)
                 .send()
                 .await?
@@ -114,28 +186,608 @@ pub async fn check_and_update() -> Result<bool, Box<dyn std::error::Error>> {
 
     verify_download(&bytes, &asset.name, checksums.as_deref())?;
 
-    let current_exe = std::env::current_exe()?;
-    let temp_path = temp_path_for(&current_exe);
+    std::fs::write(&paths.staging, &bytes)?;
+    if let Err(e) = std::fs::set_permissions(&paths.staging, std::fs::Permissions::from_mode(0o755))
+    {
+        // Every path out of here from now on takes the staging file with it —
+        // it is a complete, executable copy of a release binary sitting next to
+        // the real one, and nothing else ever cleans it up.
+        let _ = std::fs::remove_file(&paths.staging);
+        return Err(e.into());
+    }
 
-    std::fs::write(&temp_path, &bytes)?;
-    std::fs::set_permissions(&temp_path, std::fs::Permissions::from_mode(0o755))?;
-    std::fs::rename(&temp_path, &current_exe)?;
+    // The tag is a label a human typed; what the binary says about itself is
+    // what decides whether the process started after the restart will download
+    // this same asset all over again. Asked while the download is still staged,
+    // so an asset that is not what its tag claims is refused rather than
+    // installed and then discovered a restart later.
+    let staged = match probe_version(&paths.staging, VERSION_PROBE_TIMEOUT).await {
+        Ok(version) => version,
+        Err(e) => {
+            let _ = std::fs::remove_file(&paths.staging);
+            return Ok(refuse(
+                &paths,
+                guard.as_ref(),
+                &latest_text,
+                format!(
+                    "the binary in release {latest_text} could not say what version it is: {e}"
+                ),
+            ));
+        }
+    };
+    if let Err(reason) = assess_staged(&staged, &latest, &current) {
+        let _ = std::fs::remove_file(&paths.staging);
+        return Ok(refuse(&paths, guard.as_ref(), &latest_text, reason));
+    }
 
-    tracing::info!(version = %latest_version, "update applied successfully");
+    // Written before the swap, not after: from here the process is on its way
+    // out, and a count that only landed once the new binary was running would
+    // never be written in the one case it exists for.
+    let attempt = match record_attempt(&paths.guard, &latest_text, guard.as_ref()) {
+        Ok(attempt) => attempt,
+        Err(e) => {
+            // Removed like every other refusal: a leftover staging file whose
+            // inode is still being executed cannot be written over (ETXTBSY),
+            // so it would wedge the next attempt too.
+            let _ = std::fs::remove_file(&paths.staging);
+            return Err(format!(
+                "could not record the update attempt in {}: {e} — not installing, because without \
+                 that record a release that fails to restart would reinstall itself forever",
+                paths.guard.display()
+            )
+            .into());
+        }
+    };
+
+    if let Err(e) = std::fs::rename(&paths.staging, &paths.exe) {
+        // Nothing was installed, so the attempt must not stand — three failed
+        // swaps would otherwise block a version that never ran.
+        restore_guard(&paths.guard, guard.as_ref());
+        let _ = std::fs::remove_file(&paths.staging);
+        return Err(format!(
+            "could not replace {} with the {latest_text} binary: {e}",
+            paths.exe.display()
+        )
+        .into());
+    }
+
+    tracing::info!(version = %latest_text, attempt, "update applied successfully");
     Ok(true)
 }
 
-fn temp_path_for(exe: &std::path::Path) -> PathBuf {
-    let mut temp = exe.to_path_buf();
-    temp.set_extension("update.tmp");
-    temp
+/// Refuse this release for good: say why, and write it down so the asset is not
+/// downloaded again every twelve hours to reach the same verdict. Everything
+/// recorded here is a property of the artifact, which only a new release can
+/// change — unlike a checksum mismatch, which is what a corrupt download looks
+/// like and is always retried.
+///
+/// Returns `false` for the caller to hand on: nothing was installed.
+fn refuse(
+    paths: &UpdatePaths,
+    previous: Option<&InstallGuard>,
+    version: &str,
+    reason: String,
+) -> bool {
+    tracing::error!(
+        version,
+        guard = %paths.guard.display(),
+        "{reason} — camon will not install this release; publish a fixed one, or delete the \
+         guard file to try it again"
+    );
+    if let Err(e) = record_refusal(&paths.guard, version, &reason, previous) {
+        tracing::warn!(
+            path = %paths.guard.display(),
+            error = %e,
+            "could not record the refusal; this release will be downloaded again on the next check"
+        );
+    }
+    false
 }
 
-fn is_newer(latest: &str, current: &str) -> bool {
-    let parse = |v: &str| -> Vec<u64> { v.split('.').filter_map(|s| s.parse().ok()).collect() };
-    let l = parse(latest);
-    let c = parse(current);
-    l > c
+/// May the staged binary replace the running one?
+///
+/// Both conditions are about the *next* process rather than this one: it will
+/// compare the release tag against whatever version the installed binary
+/// reports, so an asset that is not the version its tag claims leaves the tag
+/// looking newer than what is installed — the restart loop, one cycle later.
+/// Requiring equality rather than merely "not older than the tag" is the honest
+/// expectation, since a release is built from its tag.
+fn assess_staged(staged: &Version, tag: &Version, current: &Version) -> Result<(), String> {
+    if staged <= current {
+        return Err(format!(
+            "release {tag} ships a binary that reports itself as {staged}, which is not newer than \
+             the running {current}"
+        ));
+    }
+    if staged != tag {
+        return Err(format!(
+            "release {tag} ships a binary that reports itself as {staged}: the tag does not match \
+             the asset, so installing it would leave {tag} still looking newer and camon would \
+             fetch it again after every restart"
+        ));
+    }
+    Ok(())
+}
+
+/// Ask a binary what version it is, by running it.
+///
+/// The bare `version` subcommand rather than `--version`: a camon from before
+/// either existed rejects an unknown subcommand and exits immediately, while it
+/// ignores an unknown flag and would start a second NVR out of the staging
+/// file. Being unable to answer is a refusal, not a fallback — a binary that
+/// cannot state its version cannot be checked against the tag, and it is also
+/// one that may not run at all on this machine.
+///
+/// What this bounds: how long the binary runs, how much of its output is kept,
+/// and its process group, which is killed once it has had its say so anything
+/// it forked cannot outlive it. A descendant that leaves the group on purpose
+/// (`setsid`) is beyond that, as it would be for any supervisor — this bounds
+/// accidents, not a hostile binary. What runs here has passed the release
+/// checksum, and if it installs, the service manager starts it as root moments
+/// later anyway.
+async fn probe_version(binary: &Path, timeout: Duration) -> Result<Version, String> {
+    use tokio::io::AsyncReadExt as _;
+
+    let mut child = tokio::process::Command::new(binary)
+        .arg("version")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        // Its own group, so everything it spawns can be killed as one.
+        .process_group(0)
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|e| format!("it could not be run: {e}"))?;
+
+    let group = child.id().ok_or("it exited before it could be probed")?;
+    let mut stdout = child.stdout.take().expect("stdout is piped");
+    let mut stderr = child.stderr.take().expect("stderr is piped");
+    let mut out = Vec::new();
+    let mut err = Vec::new();
+
+    let mut capped_out = (&mut stdout).take(PROBE_STDOUT_LIMIT);
+    let mut capped_err = (&mut stderr).take(PROBE_STDERR_LIMIT);
+    let read = async {
+        let _ = tokio::join!(
+            capped_out.read_to_end(&mut out),
+            capped_err.read_to_end(&mut err),
+        );
+    };
+    let timed_out = tokio::time::timeout(timeout, read).await.is_err();
+
+    // Sound only here, before the child is reaped: until then its pid — and
+    // with it the group id, since it leads the group — cannot be handed to
+    // anything else. Reaching this point without timing out means both pipes
+    // hit EOF, which for an ordinary process happens inside exit, past the
+    // point where its status is already decided, so this cannot turn a healthy
+    // exit into a killed one.
+    kill_group(group);
+    let status = tokio::time::timeout(PROBE_REAP_TIMEOUT, child.wait()).await;
+
+    if out.len() as u64 >= PROBE_STDOUT_LIMIT || err.len() as u64 >= PROBE_STDERR_LIMIT {
+        return Err(format!(
+            "it printed more than {PROBE_STDOUT_LIMIT} bytes instead of one version line"
+        ));
+    }
+    if timed_out {
+        return Err(format!("it did not answer within {}s", timeout.as_secs()));
+    }
+    match status {
+        Ok(Ok(status)) if status.success() => {}
+        Ok(Ok(status)) => {
+            return Err(format!(
+                "it exited with {status}: {}",
+                String::from_utf8_lossy(&err).trim()
+            ))
+        }
+        Ok(Err(e)) => return Err(format!("it could not be waited for: {e}")),
+        Err(_) => return Err("it could not be stopped".to_string()),
+    }
+
+    let stdout = String::from_utf8_lossy(&out);
+    parse_version_output(&stdout)
+        .ok_or_else(|| format!("its output was not a version line: {:?}", stdout.trim()))
+}
+
+/// SIGKILL whatever is left of a probe. The usual outcome is `ESRCH` — the
+/// group is already gone — so the result is deliberately ignored.
+fn kill_group(group: u32) {
+    unsafe { libc::killpg(group as libc::pid_t, libc::SIGKILL) };
+}
+
+/// Pull the version out of what `camon version` prints (`camon <version> …`).
+///
+/// The trailing field is the git describe string, which is not a version and is
+/// never compared; only the second field is read, through the same parser as
+/// every other version camon handles.
+fn parse_version_output(stdout: &str) -> Option<Version> {
+    let mut fields = stdout.lines().next()?.split_whitespace();
+    if fields.next()? != "camon" {
+        return None;
+    }
+    Version::parse(fields.next()?)
+}
+
+/// A semantic version, as far as precedence is concerned.
+///
+/// Hand-written because comparing versions wrongly is how an updater loops or
+/// stalls, and the rules are short: the numeric core fields compare as numbers,
+/// a pre-release is *older* than the release it precedes, and build metadata
+/// does not count at all — `1.0.0+a` and `1.0.0` are the same version, which is
+/// why it is kept for display only and left out of the comparison.
+#[derive(Debug, Clone)]
+struct Version {
+    major: u64,
+    minor: u64,
+    patch: u64,
+    pre: Vec<PreRelease>,
+    build: Option<String>,
+}
+
+/// A dot-separated pre-release identifier. The derived order is the specified
+/// one: numeric identifiers rank below alphanumeric ones, numbers compare as
+/// numbers, and text compares by ASCII.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum PreRelease {
+    Numeric(u64),
+    Text(String),
+}
+
+impl Version {
+    /// Strict on purpose: anything camon cannot compare exactly it refuses
+    /// loudly rather than comparing approximately. A `v` prefix is accepted
+    /// because release tags carry one.
+    fn parse(text: &str) -> Option<Self> {
+        let text = text.strip_prefix('v').unwrap_or(text);
+        let (text, build) = match text.split_once('+') {
+            Some((version, build)) => (version, Some(build)),
+            None => (text, None),
+        };
+        if let Some(build) = build {
+            if !build.split('.').all(is_identifier) {
+                return None;
+            }
+        }
+        let (core, pre) = match text.split_once('-') {
+            Some((core, pre)) => (core, Some(pre)),
+            None => (text, None),
+        };
+
+        let mut fields = core.split('.');
+        let major = parse_numeric(fields.next()?)?;
+        let minor = parse_numeric(fields.next()?)?;
+        let patch = parse_numeric(fields.next()?)?;
+        if fields.next().is_some() {
+            return None;
+        }
+
+        let pre = match pre {
+            None => Vec::new(),
+            Some(pre) => pre
+                .split('.')
+                .map(|id| {
+                    if !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()) {
+                        parse_numeric(id).map(PreRelease::Numeric)
+                    } else if is_identifier(id) {
+                        Some(PreRelease::Text(id.to_string()))
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Option<Vec<_>>>()?,
+        };
+
+        Some(Self {
+            major,
+            minor,
+            patch,
+            pre,
+            build: build.map(str::to_string),
+        })
+    }
+}
+
+/// A core or numeric pre-release field: digits only, no leading zero, and small
+/// enough to be a number — an overflowing field is refused, not dropped.
+fn parse_numeric(field: &str) -> Option<u64> {
+    if field.is_empty() || !field.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    if field.len() > 1 && field.starts_with('0') {
+        return None;
+    }
+    field.parse().ok()
+}
+
+fn is_identifier(field: &str) -> bool {
+    !field.is_empty()
+        && field
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+}
+
+impl Ord for Version {
+    fn cmp(&self, other: &Self) -> Ordering {
+        (self.major, self.minor, self.patch)
+            .cmp(&(other.major, other.minor, other.patch))
+            .then_with(|| match (self.pre.is_empty(), other.pre.is_empty()) {
+                (true, true) => Ordering::Equal,
+                // A release outranks any pre-release of itself.
+                (true, false) => Ordering::Greater,
+                (false, true) => Ordering::Less,
+                (false, false) => self.pre.cmp(&other.pre),
+            })
+    }
+}
+
+impl PartialOrd for Version {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for Version {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+
+impl Eq for Version {}
+
+impl std::fmt::Display for Version {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}.{}.{}", self.major, self.minor, self.patch)?;
+        for (i, id) in self.pre.iter().enumerate() {
+            let separator = if i == 0 { '-' } else { '.' };
+            match id {
+                PreRelease::Numeric(n) => write!(f, "{separator}{n}")?,
+                PreRelease::Text(t) => write!(f, "{separator}{t}")?,
+            }
+        }
+        match &self.build {
+            Some(build) => write!(f, "+{build}"),
+            None => Ok(()),
+        }
+    }
+}
+
+/// The files the updater keeps beside the binary it maintains.
+struct UpdatePaths {
+    exe: PathBuf,
+    staging: PathBuf,
+    guard: PathBuf,
+    lock: PathBuf,
+}
+
+impl UpdatePaths {
+    fn for_exe(exe: &Path) -> Self {
+        Self {
+            exe: exe.to_path_buf(),
+            // Process-unique: two updaters must not write one staging file, and
+            // a leftover whose inode is still being executed cannot be written
+            // over at all (ETXTBSY).
+            staging: sibling(exe, &format!(".update.{}.tmp", std::process::id())),
+            guard: sibling(exe, ".update-guard"),
+            lock: sibling(exe, ".update-lock"),
+        }
+    }
+}
+
+/// Append to the file name rather than `Path::set_extension`, which replaces an
+/// existing extension: `camon.debug` and `camon.release` are two installations
+/// and may not share one guard or one lock.
+fn sibling(path: &Path, suffix: &str) -> PathBuf {
+    let mut name: OsString = path
+        .file_name()
+        .unwrap_or_else(|| OsStr::new("camon"))
+        .to_os_string();
+    name.push(suffix);
+    path.with_file_name(name)
+}
+
+/// Exclusive lock over one installation's update, held from before the guard is
+/// read until after the binary is swapped.
+///
+/// `flock` rather than a pid file: the kernel drops it when the holder dies,
+/// however it dies, so a crashed updater cannot leave updates wedged forever.
+struct UpdateLock {
+    _file: std::fs::File,
+}
+
+impl UpdateLock {
+    /// `Ok(None)` means another process holds it — not an error, just not this
+    /// process's turn.
+    fn acquire(path: &Path) -> std::io::Result<Option<Self>> {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(path)?;
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            let error = std::io::Error::last_os_error();
+            return match error.kind() {
+                std::io::ErrorKind::WouldBlock => Ok(None),
+                _ => Err(error),
+            };
+        }
+        Ok(Some(Self { _file: file }))
+    }
+}
+
+/// What camon last did about a release, and why.
+///
+/// Kept on disk because the failure it bounds is a *restart* loop: every count
+/// held in memory is thrown away by the very restart that would repeat the
+/// install. It lives beside the binary rather than in the data dir — the
+/// updater already needs write access there to replace the binary, and it has
+/// no config to learn a data dir from — and it is deliberately plain enough to
+/// read and delete by hand, which is how an operator retries a version camon
+/// has given up on.
+#[derive(Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct InstallGuard {
+    /// The release version every other field is about. A record for one version
+    /// says nothing about another, so a genuinely newer release is never held
+    /// back by it.
+    version: String,
+    /// Installs *attempted* — written before the swap, since a count that only
+    /// landed afterwards would never be written when it matters.
+    attempts: u32,
+    /// Why this version is refused outright, if it is: something about the
+    /// artifact that only a new release can change.
+    #[serde(default)]
+    refused: Option<String>,
+    /// When this record was last written, so a repeated verdict can say how old
+    /// it is rather than reading as news.
+    last_attempt_unix: u64,
+}
+
+/// Read the guard, treating "not there" and "not readable" alike as no record.
+///
+/// Fail-safe by design: a guard camon cannot read must not be able to stop
+/// updates, since that is a state a truncated write or a stray edit can produce
+/// and there would be nothing to restart into to fix it. The very next write
+/// replaces it with a well-formed one, so a corrupt file costs at most the
+/// attempts it had counted.
+fn read_guard(path: &Path) -> Option<InstallGuard> {
+    let text = std::fs::read_to_string(path).ok()?;
+    match serde_json::from_str(&text) {
+        Ok(guard) => Some(guard),
+        Err(e) => {
+            tracing::warn!(
+                path = %path.display(),
+                error = %e,
+                "update guard file is unreadable and is being ignored"
+            );
+            None
+        }
+    }
+}
+
+/// Why this version must not be fetched and installed again, if it must not.
+fn blocked_reason(
+    guard: Option<&InstallGuard>,
+    version: &str,
+    current: &str,
+    now: u64,
+) -> Option<String> {
+    let guard = guard.filter(|guard| guard.version == version)?;
+    let ago = describe_age(now.saturating_sub(guard.last_attempt_unix));
+    if let Some(refused) = &guard.refused {
+        return Some(format!(
+            "release {version} was refused {ago} and nothing about it can have changed since: \
+             {refused}"
+        ));
+    }
+    if guard.attempts >= MAX_INSTALL_ATTEMPTS {
+        return Some(format!(
+            "release {version} has been installed {} times, most recently {ago}, and this process \
+             is still running {current}: the restart is not taking effect, so installing it again \
+             would only repeat. Check that the service starts the binary the updater replaces",
+            guard.attempts
+        ));
+    }
+    None
+}
+
+/// Count this install of `version` and persist the count. Returns the attempt
+/// number the caller is about to make.
+fn record_attempt(
+    path: &Path,
+    version: &str,
+    previous: Option<&InstallGuard>,
+) -> std::io::Result<u32> {
+    let attempts = match previous {
+        Some(guard) if guard.version == version => guard.attempts + 1,
+        _ => 1,
+    };
+    write_guard(
+        path,
+        &InstallGuard {
+            version: version.to_string(),
+            attempts,
+            refused: None,
+            last_attempt_unix: unix_now(),
+        },
+    )?;
+    Ok(attempts)
+}
+
+fn record_refusal(
+    path: &Path,
+    version: &str,
+    reason: &str,
+    previous: Option<&InstallGuard>,
+) -> std::io::Result<()> {
+    let attempts = match previous {
+        Some(guard) if guard.version == version => guard.attempts,
+        _ => 0,
+    };
+    write_guard(
+        path,
+        &InstallGuard {
+            version: version.to_string(),
+            attempts,
+            refused: Some(reason.to_string()),
+            last_attempt_unix: unix_now(),
+        },
+    )
+}
+
+/// Put back what the guard said before an attempt that turned out not to have
+/// happened. Best effort by definition — it is already an error path — and a
+/// failure here only over-counts, which costs retries rather than safety.
+fn restore_guard(path: &Path, previous: Option<&InstallGuard>) {
+    let restored = match previous {
+        Some(guard) => write_guard(path, guard),
+        None => std::fs::remove_file(path),
+    };
+    if let Err(e) = restored {
+        tracing::warn!(
+            path = %path.display(),
+            error = %e,
+            "could not undo the update attempt counted for an install that did not happen"
+        );
+    }
+}
+
+fn write_guard(path: &Path, guard: &InstallGuard) -> std::io::Result<()> {
+    let text = serde_json::to_string(guard).map_err(std::io::Error::other)?;
+    // Staged, flushed, renamed, and the directory flushed too, like every other
+    // file camon has to find again after an unclean stop.
+    let temp = sibling(path, &format!(".{}.tmp", std::process::id()));
+    {
+        use std::io::Write as _;
+        let mut file = std::fs::File::create(&temp)?;
+        file.write_all(text.as_bytes())?;
+        file.sync_all()?;
+    }
+    std::fs::rename(&temp, path)?;
+    sync_parent(path)
+}
+
+fn sync_parent(path: &Path) -> std::io::Result<()> {
+    match path.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => std::fs::File::open(dir)?.sync_all(),
+        _ => Ok(()),
+    }
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or_default()
+}
+
+/// Rough but honest: what matters is whether the verdict being repeated is
+/// minutes or months old.
+fn describe_age(seconds: u64) -> String {
+    match seconds {
+        0..=90 => "just now".to_string(),
+        s if s < 5400 => format!("{} minutes ago", s / 60),
+        s if s < 172_800 => format!("{} hours ago", s / 3600),
+        s => format!("{} days ago", s / 86400),
+    }
 }
 
 /// Result of looking up an asset in a `sha256sums.txt` document.
@@ -220,11 +872,14 @@ fn sha256_hex(bytes: &[u8]) -> String {
     out
 }
 
-/// Validate downloaded bytes before they replace the running binary.
+/// Validate downloaded bytes before they are written anywhere or run.
 ///
-/// Always enforces the ELF tripwire. When a `sha256sums.txt` document is
-/// available it must list this asset with a matching hash; a missing document
-/// (legacy release) is allowed through with a warning.
+/// The ELF tripwire and the release's own `sha256sums.txt` are both required. A
+/// release that publishes no checksums is refused rather than installed
+/// unverified: every release since that document was introduced has one, and
+/// camon only ever installs a version newer than the one running, so a newer
+/// release without it is a broken publish — and an unverified install is a
+/// worse answer to that than refusing to update until it is fixed.
 fn verify_download(bytes: &[u8], asset_name: &str, checksums: Option<&str>) -> Result<(), String> {
     if !is_valid_elf(bytes) {
         return Err(format!(
@@ -234,11 +889,9 @@ fn verify_download(bytes: &[u8], asset_name: &str, checksums: Option<&str>) -> R
     }
 
     let Some(checksums) = checksums else {
-        tracing::warn!(
-            asset = %asset_name,
-            "release has no {CHECKSUMS_ASSET}; proceeding with update unverified"
-        );
-        return Ok(());
+        return Err(format!(
+            "release has no {CHECKSUMS_ASSET} to check {asset_name} against — aborting update"
+        ));
     };
 
     match find_expected_hash(checksums, asset_name) {
@@ -266,14 +919,65 @@ fn verify_download(bytes: &[u8], asset_name: &str, checksums: Option<&str>) -> R
 mod tests {
     use super::*;
 
+    fn version(text: &str) -> Version {
+        Version::parse(text).unwrap_or_else(|| panic!("{text} should parse"))
+    }
+
     #[test]
-    fn test_is_newer() {
-        assert!(is_newer("1.0.1", "1.0.0"));
-        assert!(is_newer("1.1.0", "1.0.9"));
-        assert!(is_newer("2.0.0", "1.9.9"));
-        assert!(!is_newer("1.0.0", "1.0.0"));
-        assert!(!is_newer("1.0.0", "1.0.1"));
-        assert!(!is_newer("0.1.0", "0.1.0"));
+    fn test_version_ordering() {
+        assert!(version("1.0.1") > version("1.0.0"));
+        assert!(version("1.1.0") > version("1.0.9"));
+        assert!(version("2.0.0") > version("1.9.9"));
+        assert!(version("1.0.10") > version("1.0.9"));
+        assert_eq!(version("1.0.0"), version("1.0.0"));
+        assert!(version("1.0.0") < version("1.0.1"));
+        assert_eq!(version("v0.5.0"), version("0.5.0"));
+    }
+
+    /// The two rules a plain dotted-number compare gets backwards, and the
+    /// reason the parser is worth writing: a release is newer than its own
+    /// pre-releases, and build metadata is not a version difference at all.
+    #[test]
+    fn test_version_ordering_of_prereleases_and_build_metadata() {
+        assert!(version("1.0.0") > version("1.0.0-rc.1"));
+        assert!(version("1.0.0-rc.2") > version("1.0.0-rc.1"));
+        assert!(version("1.0.0-rc.11") > version("1.0.0-rc.2"));
+        assert!(version("1.0.0-alpha") < version("1.0.0-beta"));
+        assert!(version("1.0.0-alpha") < version("1.0.0-alpha.1"));
+        assert!(version("1.0.0-alpha.1") < version("1.0.0-alpha.beta"));
+        assert!(version("1.0.0-rc.1") > version("0.9.9"));
+
+        assert_eq!(version("1.0.0+build"), version("1.0.0"));
+        assert_eq!(version("1.0.0+build.999"), version("1.0.0+other"));
+        assert!(version("1.2.3+build.999") < version("1.2.4"));
+        // Kept for display even though it takes no part in the comparison.
+        assert_eq!(version("1.0.0+build.9").to_string(), "1.0.0+build.9");
+        assert_eq!(version("v1.0.0-rc.1").to_string(), "1.0.0-rc.1");
+    }
+
+    /// Anything camon cannot compare exactly it refuses rather than
+    /// approximates: the old comparison silently dropped fields it could not
+    /// read, which made nonsense of every comparison involving them.
+    #[test]
+    fn test_version_parsing_refuses_what_it_cannot_compare() {
+        for bad in [
+            "",
+            "1",
+            "1.0",
+            "1.0.0.0",
+            "1.0.x",
+            "one.0.0",
+            "1.0.0-",
+            "1.0.0+",
+            "1.0.0-rc.01",              // leading zero in a numeric identifier
+            "01.0.0",                   // leading zero in a core field
+            "1.0.0-rc_1",               // underscore is not an identifier character
+            "1.0.0+build_1",            // nor in build metadata
+            "18446744073709551616.0.0", // overflows u64 instead of being dropped
+            "dev",
+        ] {
+            assert!(Version::parse(bad).is_none(), "{bad:?} should not parse");
+        }
     }
 
     // Known SHA-256 test vectors (FIPS 180-2 / NIST).
@@ -403,10 +1107,13 @@ mod tests {
         assert!(err.contains("checksum mismatch"), "got: {err}");
     }
 
+    /// Nothing is installed — let alone executed — without the release's own
+    /// checksum to check it against.
     #[test]
-    fn test_verify_download_legacy_no_checksums_proceeds() {
+    fn test_verify_download_without_checksums_aborts() {
         let bytes = fake_elf();
-        assert!(verify_download(&bytes, "camon-linux-glibc", None).is_ok());
+        let err = verify_download(&bytes, "camon-linux-glibc", None).unwrap_err();
+        assert!(err.contains("has no sha256sums.txt"), "got: {err}");
     }
 
     #[test]
@@ -418,9 +1125,425 @@ mod tests {
     }
 
     #[test]
-    fn test_verify_download_non_elf_aborts_even_without_checksums() {
+    fn test_verify_download_non_elf_aborts_even_with_checksums() {
         let bytes = b"this is not a binary".to_vec();
-        let err = verify_download(&bytes, "camon-linux-glibc", None).unwrap_err();
+        let doc = format!("{}  camon-linux-glibc\n", sha256_hex(&bytes));
+        let err = verify_download(&bytes, "camon-linux-glibc", Some(&doc)).unwrap_err();
         assert!(err.contains("not a valid ELF"), "got: {err}");
+    }
+
+    /// The updater and `camon version` are one contract: what main prints has
+    /// to be what the probe reads back, or every update is refused.
+    #[test]
+    fn the_version_command_output_is_what_the_probe_parses() {
+        assert_eq!(
+            parse_version_output(&crate::version_line()),
+            Version::parse(env!("CARGO_PKG_VERSION"))
+        );
+    }
+
+    #[test]
+    fn test_parse_version_output() {
+        assert_eq!(
+            parse_version_output("camon 0.6.0 (v0.6.0-2-gdeadbee)\n"),
+            Version::parse("0.6.0")
+        );
+        assert_eq!(
+            parse_version_output("camon 0.7.0-rc.1 (v0.7.0-rc.1)\n"),
+            Version::parse("0.7.0-rc.1")
+        );
+        for bad in [
+            "camon dev",
+            "camon",
+            "",
+            "ffmpeg 6.1.1",
+            "unknown command: version",
+        ] {
+            assert!(parse_version_output(bad).is_none(), "{bad:?}");
+        }
+    }
+
+    /// Stand-in for a downloaded binary: a shell script camon can run.
+    fn fake_binary(dir: &Path, name: &str, script: &str) -> PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, format!("#!/bin/sh\n{script}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    /// Also pins the argument: the script answers only to the bare `version`
+    /// subcommand, which is the spelling an older camon rejects instead of
+    /// starting a second NVR out of the staging file.
+    #[tokio::test]
+    async fn test_probe_version_reads_the_binarys_own_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = fake_binary(
+            dir.path(),
+            "camon",
+            "[ \"$1\" = version ] || { echo \"unknown command: $1\" >&2; exit 1; }\n\
+             echo 'camon 9.9.9 (v9.9.9)'",
+        );
+        assert_eq!(
+            probe_version(&bin, VERSION_PROBE_TIMEOUT).await,
+            Ok(version("9.9.9"))
+        );
+    }
+
+    /// Every way a staged binary can fail to identify itself is a refusal: it
+    /// cannot be checked against the tag, and it may not even run here.
+    #[tokio::test]
+    async fn test_probe_version_refuses_a_binary_that_cannot_identify_itself() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // A camon from before the `version` subcommand existed. It reports on
+        // stderr, as the real one does, so what camon logs is its own words.
+        let old = fake_binary(
+            dir.path(),
+            "old",
+            "echo 'unknown command: version' >&2\nexit 1",
+        );
+        let err = probe_version(&old, VERSION_PROBE_TIMEOUT)
+            .await
+            .unwrap_err();
+        assert!(err.contains("exited with"), "got: {err}");
+        assert!(err.contains("unknown command: version"), "got: {err}");
+
+        let mute = fake_binary(dir.path(), "mute", "echo 'not a version at all'");
+        let err = probe_version(&mute, VERSION_PROBE_TIMEOUT)
+            .await
+            .unwrap_err();
+        assert!(err.contains("not a version line"), "got: {err}");
+
+        let absent = dir.path().join("absent");
+        let err = probe_version(&absent, VERSION_PROBE_TIMEOUT)
+            .await
+            .unwrap_err();
+        assert!(err.contains("could not be run"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn test_probe_version_gives_up_on_a_binary_that_hangs() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = fake_binary(dir.path(), "hangs", "sleep 30");
+        let err = probe_version(&bin, Duration::from_millis(300))
+            .await
+            .unwrap_err();
+        assert!(err.contains("did not answer within"), "got: {err}");
+    }
+
+    /// An unbounded read here is a memory bomb inside a process that is
+    /// recording: the probe stops reading long before that, and says so.
+    #[tokio::test]
+    async fn test_probe_version_refuses_a_binary_that_floods_stdout() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = fake_binary(dir.path(), "loud", "head -c 1000000 /dev/zero | tr '\\0' x");
+        let err = probe_version(&bin, Duration::from_millis(500))
+            .await
+            .unwrap_err();
+        assert!(err.contains("printed more than"), "got: {err}");
+    }
+
+    /// A binary that forks leaves nothing behind: the probe kills its process
+    /// group, not just the process it started.
+    #[tokio::test]
+    async fn test_probe_version_kills_what_the_binary_forked() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("alive");
+        let bin = fake_binary(
+            dir.path(),
+            "forks",
+            &format!(
+                "sh -c 'while :; do echo x >> {}; sleep 0.05; done' &\nsleep 30",
+                marker.display()
+            ),
+        );
+        let err = probe_version(&bin, Duration::from_millis(300))
+            .await
+            .unwrap_err();
+        assert!(err.contains("did not answer within"), "got: {err}");
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let after_kill = std::fs::metadata(&marker).map(|m| m.len()).unwrap_or(0);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let later = std::fs::metadata(&marker).map(|m| m.len()).unwrap_or(0);
+        assert_eq!(after_kill, later, "a forked descendant outlived the probe");
+    }
+
+    /// The case that makes the probe worth having, and the one an "is it newer
+    /// than me" check misses: installing 0.6.0 under the tag 0.7.0 passes that
+    /// check — it *is* newer — and the next process finds 0.7.0 newer all over
+    /// again, which is the loop.
+    #[test]
+    fn a_release_whose_asset_is_not_its_tag_is_refused() {
+        let reason = assess_staged(&version("0.6.0"), &version("0.7.0"), &version("0.5.0"))
+            .expect_err("a mis-tagged release was accepted");
+        assert!(reason.contains("does not match"), "got: {reason}");
+
+        // Equally wrong the other way: an asset built from a later commit than
+        // the tag it is published under.
+        assert!(assess_staged(&version("0.8.0"), &version("0.7.0"), &version("0.5.0")).is_err());
+    }
+
+    #[test]
+    fn a_release_that_is_not_actually_newer_is_refused() {
+        let reason = assess_staged(&version("0.5.0"), &version("0.5.0"), &version("0.5.0"))
+            .expect_err("a same-version install was accepted");
+        assert!(reason.contains("not newer"), "got: {reason}");
+        assert!(assess_staged(&version("0.4.0"), &version("0.4.0"), &version("0.5.0")).is_err());
+    }
+
+    #[test]
+    fn an_honest_release_installs() {
+        assert_eq!(
+            assess_staged(&version("0.6.0"), &version("0.6.0"), &version("0.5.0")),
+            Ok(())
+        );
+        // Including a pre-release, which the project has to stay able to ship.
+        assert_eq!(
+            assess_staged(
+                &version("0.6.0-rc.1"),
+                &version("v0.6.0-rc.1"),
+                &version("0.5.0")
+            ),
+            Ok(())
+        );
+    }
+
+    /// The loop this whole guard exists for: a release that installs, restarts,
+    /// and comes back to the same decision. Each pass reads the guard from disk
+    /// exactly as a freshly started process does — nothing carries over in
+    /// memory, because in the real failure nothing can.
+    #[test]
+    fn the_same_version_is_not_installed_indefinitely() {
+        let dir = tempfile::tempdir().unwrap();
+        let guard_path = UpdatePaths::for_exe(&dir.path().join("camon")).guard;
+
+        let mut installs = 0;
+        for _ in 0..10 {
+            let guard = read_guard(&guard_path);
+            if blocked_reason(guard.as_ref(), "0.6.0", "0.5.0", unix_now()).is_some() {
+                break;
+            }
+            record_attempt(&guard_path, "0.6.0", guard.as_ref()).unwrap();
+            installs += 1;
+        }
+
+        assert_eq!(installs, MAX_INSTALL_ATTEMPTS, "the loop was not bounded");
+        let reason = blocked_reason(
+            read_guard(&guard_path).as_ref(),
+            "0.6.0",
+            "0.5.0",
+            unix_now(),
+        )
+        .expect("the loop was not stopped");
+        assert!(reason.contains("restart is not taking effect"), "{reason}");
+        assert!(
+            reason.contains("just now"),
+            "the age is not reported: {reason}"
+        );
+    }
+
+    /// A refused release is not fetched again to be refused again — and the
+    /// reason survives, so the operator reads the same explanation every time.
+    #[test]
+    fn a_refused_release_is_not_downloaded_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let guard_path = UpdatePaths::for_exe(&dir.path().join("camon")).guard;
+
+        record_refusal(
+            &guard_path,
+            "0.7.0",
+            "the tag does not match the asset",
+            None,
+        )
+        .unwrap();
+        let reason = blocked_reason(
+            read_guard(&guard_path).as_ref(),
+            "0.7.0",
+            "0.5.0",
+            unix_now() + 86_400 * 3,
+        )
+        .expect("a refused release was fetched again");
+        assert!(
+            reason.contains("the tag does not match the asset"),
+            "{reason}"
+        );
+        assert!(
+            reason.contains("3 days ago"),
+            "the age is not reported: {reason}"
+        );
+        // And it says nothing about any other version.
+        assert!(blocked_reason(
+            read_guard(&guard_path).as_ref(),
+            "0.7.1",
+            "0.5.0",
+            unix_now()
+        )
+        .is_none());
+    }
+
+    /// The guard may never stand in the way of a real update: a version camon
+    /// has given up on says nothing about the next one.
+    #[test]
+    fn a_newer_version_still_installs_after_one_was_given_up_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let guard_path = UpdatePaths::for_exe(&dir.path().join("camon")).guard;
+        for _ in 0..MAX_INSTALL_ATTEMPTS {
+            let guard = read_guard(&guard_path);
+            record_attempt(&guard_path, "0.6.0", guard.as_ref()).unwrap();
+        }
+        let guard = read_guard(&guard_path);
+        assert!(blocked_reason(guard.as_ref(), "0.6.0", "0.5.0", unix_now()).is_some());
+
+        assert!(blocked_reason(guard.as_ref(), "0.6.1", "0.5.0", unix_now()).is_none());
+        // And the count starts over rather than inheriting the dead version's.
+        assert_eq!(
+            record_attempt(&guard_path, "0.6.1", guard.as_ref()).unwrap(),
+            1
+        );
+        assert!(blocked_reason(
+            read_guard(&guard_path).as_ref(),
+            "0.6.1",
+            "0.5.0",
+            unix_now()
+        )
+        .is_none());
+    }
+
+    /// Only the file matters — a process that starts, counts an attempt and
+    /// dies must leave the count behind for the next one.
+    #[test]
+    fn the_attempt_count_survives_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let guard_path = UpdatePaths::for_exe(&dir.path().join("camon")).guard;
+
+        assert_eq!(record_attempt(&guard_path, "0.6.0", None).unwrap(), 1);
+        // A new process: everything it knows it reads back off the disk.
+        let reloaded = read_guard(&guard_path).expect("guard did not survive");
+        assert_eq!(reloaded.version, "0.6.0");
+        assert_eq!(reloaded.attempts, 1);
+        assert!(reloaded.last_attempt_unix > 0);
+        assert_eq!(
+            record_attempt(&guard_path, "0.6.0", Some(&reloaded)).unwrap(),
+            2
+        );
+        assert_eq!(read_guard(&guard_path).unwrap().attempts, 2);
+    }
+
+    /// An install that was counted and then did not happen gives the attempt
+    /// back, so three failed swaps cannot block a version that never ran.
+    #[test]
+    fn a_swap_that_fails_gives_the_attempt_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let guard_path = UpdatePaths::for_exe(&dir.path().join("camon")).guard;
+
+        // Nothing was recorded before: the guard goes away entirely.
+        record_attempt(&guard_path, "0.6.0", None).unwrap();
+        restore_guard(&guard_path, None);
+        assert_eq!(read_guard(&guard_path), None);
+
+        record_attempt(&guard_path, "0.6.0", None).unwrap();
+        let first = read_guard(&guard_path).unwrap();
+        record_attempt(&guard_path, "0.6.0", Some(&first)).unwrap();
+        restore_guard(&guard_path, Some(&first));
+        assert_eq!(read_guard(&guard_path).unwrap().attempts, 1);
+    }
+
+    /// Fail safe, in both directions: no guard and an unreadable guard leave
+    /// updates working, and the next install replaces the unreadable one.
+    #[test]
+    fn a_missing_or_corrupt_guard_does_not_brick_updates() {
+        let dir = tempfile::tempdir().unwrap();
+        let guard_path = UpdatePaths::for_exe(&dir.path().join("camon")).guard;
+
+        assert_eq!(read_guard(&guard_path), None);
+        assert!(blocked_reason(None, "0.6.0", "0.5.0", unix_now()).is_none());
+
+        for corrupt in ["", "{", "not json", "{\"version\":\"0.6.0\"}"] {
+            std::fs::write(&guard_path, corrupt).unwrap();
+            let guard = read_guard(&guard_path);
+            assert_eq!(guard, None, "for {corrupt:?}");
+            assert!(
+                blocked_reason(guard.as_ref(), "0.6.0", "0.5.0", unix_now()).is_none(),
+                "for {corrupt:?}"
+            );
+        }
+
+        assert_eq!(record_attempt(&guard_path, "0.6.0", None).unwrap(), 1);
+        assert_eq!(read_guard(&guard_path).unwrap().attempts, 1);
+    }
+
+    /// A guard written before `refused` existed has to keep working, or an
+    /// update to this very code would read as a corrupt guard.
+    #[test]
+    fn a_guard_from_an_older_camon_still_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let guard_path = UpdatePaths::for_exe(&dir.path().join("camon")).guard;
+        std::fs::write(
+            &guard_path,
+            "{\"version\":\"0.6.0\",\"attempts\":3,\"last_attempt_unix\":1753600000}",
+        )
+        .unwrap();
+        let guard = read_guard(&guard_path).expect("an older guard was discarded");
+        assert_eq!(guard.attempts, 3);
+        assert_eq!(guard.refused, None);
+        assert!(blocked_reason(Some(&guard), "0.6.0", "0.5.0", unix_now()).is_some());
+    }
+
+    /// The updater's files hang off the binary's *name*, not its extension:
+    /// `camon.debug` and `camon.release` are separate installations and must
+    /// not share an attempt budget, which `set_extension` would have made them
+    /// do by rewriting both to `camon.update-guard`.
+    #[test]
+    fn each_installation_has_its_own_guard() {
+        let debug = UpdatePaths::for_exe(Path::new("/opt/camon.debug"));
+        let release = UpdatePaths::for_exe(Path::new("/opt/camon.release"));
+        assert_eq!(debug.guard, PathBuf::from("/opt/camon.debug.update-guard"));
+        assert_eq!(
+            release.guard,
+            PathBuf::from("/opt/camon.release.update-guard")
+        );
+        assert_ne!(debug.lock, release.lock);
+        assert_ne!(debug.staging, release.staging);
+
+        let plain = UpdatePaths::for_exe(Path::new("/usr/local/bin/camon"));
+        assert_eq!(
+            plain.guard,
+            PathBuf::from("/usr/local/bin/camon.update-guard")
+        );
+        // Staging is process-unique, so two updaters cannot write one file.
+        assert!(plain
+            .staging
+            .to_string_lossy()
+            .contains(&std::process::id().to_string()));
+    }
+
+    /// Two updaters on one installation would otherwise both read attempts = 2,
+    /// both pass the check, and both write 3 — two installs on a budget of one.
+    #[test]
+    fn only_one_updater_at_a_time_touches_an_installation() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = UpdatePaths::for_exe(&dir.path().join("camon"));
+
+        let held = UpdateLock::acquire(&paths.lock)
+            .unwrap()
+            .expect("first updater did not get the lock");
+        assert!(
+            UpdateLock::acquire(&paths.lock).unwrap().is_none(),
+            "a second updater ran concurrently with the first"
+        );
+
+        // Released with the holder, however it goes away.
+        drop(held);
+        assert!(UpdateLock::acquire(&paths.lock).unwrap().is_some());
+    }
+
+    #[test]
+    fn test_describe_age() {
+        assert_eq!(describe_age(0), "just now");
+        assert_eq!(describe_age(90), "just now");
+        assert_eq!(describe_age(600), "10 minutes ago");
+        assert_eq!(describe_age(7200), "2 hours ago");
+        assert_eq!(describe_age(86_400 * 5), "5 days ago");
     }
 }

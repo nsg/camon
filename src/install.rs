@@ -100,6 +100,11 @@ fn install_systemd(exe: &Path, working_dir: &Path) -> Result<(), String> {
 /// supervise-daemon's own defaults and the OpenRC guide, and "give up after ten
 /// crashes in five minutes" is a real crash loop rather than ten updates over
 /// the service's lifetime. `pidfile` is the supervisor's pid here, not camon's.
+/// Those limits are not what keeps a bad release from restarting camon forever
+/// — they would answer an update loop by leaving the service down, and only
+/// when its cycle is fast enough to fit ten restarts into the period, and
+/// systemd's equivalent never trips at all with `RestartSec=5`. That is bounded
+/// where it is caused, in [`crate::update`].
 fn openrc_script(exe: &Path, working_dir: &Path) -> String {
     format!(
         "\

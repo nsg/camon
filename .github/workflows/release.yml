@@ -14,6 +14,21 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Check the tag matches the version in Cargo.toml
+        # The self-updater runs a downloaded binary as `camon version` before it
+        # installs it and refuses the release unless it reports exactly the tag
+        # it was published under — a mismatch here would ship a release that no
+        # camon installs (and, unchecked, one that every camon re-downloads
+        # after every restart). Pre-release and build suffixes are fine; they
+        # just have to be in both places.
+        run: |
+          tagged="${GITHUB_REF_NAME#v}"
+          built=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
+          if [ "$tagged" != "$built" ]; then
+            echo "tag ${GITHUB_REF_NAME} does not match Cargo.toml version ${built}" >&2
+            exit 1
+          fi
+
       - name: Setup Rust toolchain
         run: rustup default stable
 

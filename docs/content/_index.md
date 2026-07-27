@@ -62,6 +62,16 @@ A reconnect loop on its own says nothing about *why* nothing is being recorded, 
 
 An analyzer that falls behind loses segments to the hot buffer's eviction; those are reported as skipped footage — count and sequence range, at most one line per 30 seconds — rather than passing unnoticed.
 
+## Self-update
+
+Camon can replace its own binary from GitHub Releases (`[update] enabled`, off by default, since the installed service runs as root and releases are not signed). It checks at startup and every 12 hours; an update installed while it is running asks for the same graceful shutdown a SIGTERM does, and the service manager starts the new binary.
+
+Because that restart is what completes an update, the updater is built so a bad release cannot turn it into a loop. A download must be a valid ELF and must match the release's `sha256sums.txt`; a release that publishes no checksums is refused rather than installed unverified, which is a change of stance made possible by every release since that file was introduced having one. What passes is then written beside the binary it would replace and run as `camon version` — bounded in how long it may take, how much output is kept, and by its own process group, which is killed afterwards so nothing it forked outlives it. It has to report exactly the version its release is tagged with. The tag is a label a human typed; the binary's own answer is what the *next* process compares against that tag, so an asset that is not the version it is published as would leave the tag still looking newer once installed, and camon would fetch it again after every restart. Refusing it before the swap is what makes that loop impossible rather than merely short. A binary that cannot answer is refused as well: it cannot be checked, and it may not run on this machine either. Refusals are recorded, so a broken release is not re-downloaded every twelve hours to reach the same verdict.
+
+Versions are compared as semantic versions rather than as dotted numbers — a release outranks its own pre-releases, build metadata is not a difference, and anything camon cannot compare exactly it refuses instead of guessing — so a pre-release can be shipped and installed like any other version.
+
+One failure remains that no check of the artifact can see: an install that works and never comes back, because the service starts a different binary than the updater replaces. For that, camon records each install in a `camon.update-guard` file beside the binary and installs the same version at most three times, then says so and stops. Any newer release resets the count and a record for one version says nothing about another, so the guard can only ever hold back a version that has already proven it does not take; deleting the file retries. One updater at a time touches an installation, held off by a lock file beside the binary, so two camon processes cannot each spend the same attempt.
+
 ## System Dependencies
 
 Camon builds into a single self-contained binary with a plain stable Rust toolchain — no OpenCV, no C++ toolchain, no native vision libraries. The motion detector (MOG2, morphology, connected components) and all image handling (cropping, JPEG encoding via the pure-Rust `image` crate) are Rust. Runtime requires FFmpeg for RTSP ingestion, H.264 handling, and motion analysis frame decoding. On Ubuntu/Debian:

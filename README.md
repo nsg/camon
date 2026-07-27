@@ -127,7 +127,7 @@ chmod +x camon-linux-glibc
 ./camon-linux-glibc
 ```
 
-Camon loads `config.toml` from the current working directory.
+Camon loads `config.toml` from the current working directory. `camon version` — or `--version` / `-V`, recognised as the **first** argument, since anywhere else they are unknown flags and ignored — prints the release version and the exact build it came from, and does nothing else: it answers before the config is even read, because the self-updater uses it to ask a freshly downloaded binary what it really is.
 
 > **Note:** Pre-built binaries are linked against glibc. musl-based systems are not supported.
 
@@ -157,12 +157,31 @@ All sections are optional — defaults are shown below:
 [update]
 # Auto-update from GitHub Releases on startup and every 12 hours
 # (default: false — opt in by setting this to true).
-# A downloaded binary is checked against the release's sha256sums.txt and
-# rejected on mismatch (corruption protection, not a security guarantee), and
-# must be a valid ELF before it replaces the running binary. Releases published
-# without a sha256sums.txt are applied unverified with a warning. Since the
+# A downloaded binary must be a valid ELF and must match the release's
+# sha256sums.txt; a release that publishes no sha256sums.txt is refused rather
+# than installed unverified. That is corruption protection, not a security
+# guarantee — whoever can swap the asset can swap the checksums — and since the
 # installed service runs as root and nothing is signed, updating is off unless
-# you ask for it. An update installed while camon is running triggers the same
+# you ask for it.
+# Because the restart is what completes an update, a bad release must not be
+# able to turn it into a loop, so two things bound it. First, the download is
+# asked what version it is — run as `camon version` while still staged beside
+# the binary it would replace, with its output, runtime and process group all
+# bounded — and it must report exactly the version its release is tagged with.
+# A release whose tag does not match its asset is refused, since installing it
+# would leave the tag looking newer and camon would fetch it again after every
+# restart. A binary that cannot answer is refused too. Refusals are recorded,
+# so the asset is not re-downloaded every 12 hours to reach the same verdict.
+# Second, camon counts installs in a `camon.update-guard` file beside the
+# binary and stops after three of the same version. That covers the case the
+# version check cannot see: an install that works but never comes back, because
+# the service starts a different binary than the updater replaces. Both
+# refusals are logged loudly with what to fix; deleting the guard file retries,
+# and any newer release resets it, so nothing can hold a genuine update back.
+# One updater at a time touches an installation (a lock file beside the
+# binary), and the release tag must equal the version in the binary's
+# Cargo.toml — the release workflow checks this.
+# An update installed while camon is running triggers the same
 # graceful shutdown as SIGTERM — recordings in flight are flushed — and the
 # service manager starts the new binary: `camon install service` writes a
 # systemd unit with Restart=always, or an OpenRC script supervised by

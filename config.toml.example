@@ -15,8 +15,20 @@
 
 [update]
 # Auto-update from GitHub Releases on startup and every 12 hours (default:
-# false). Downloads are only checked against the release's sha256sums.txt,
-# which catches a corrupt download but is not a signature, so this is opt-in.
+# false). A download is checked against the release's sha256sums.txt and a
+# release that publishes none is refused; that catches a corrupt download but
+# is not a signature, so this stays opt-in.
+# Before the running binary is replaced, the downloaded one is run as
+# `camon version` and must report exactly the version its release is tagged
+# with — a tag that does not match its asset would leave the tag still looking
+# newer after the restart, and camon would fetch it again after every restart.
+# Such a release is refused, and the refusal is remembered so the asset is not
+# downloaded again on every check. Installs are also counted in a
+# `camon.update-guard` file beside the binary, and the same version is
+# installed at most three times: that stops an update that installs but never
+# comes back — a service starting a different binary than the updater replaces
+# — from restarting camon indefinitely. Camon logs which of the two it hit and
+# what to fix; deleting the guard file retries, and any newer release resets it.
 enabled = false
 
 [buffer]
