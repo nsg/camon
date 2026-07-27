@@ -28,6 +28,24 @@ const ANALYSIS_HEIGHT: i32 = 240;
 const MOTION_THRESHOLD: f32 = 0.05;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
+
+/// How long to wait before trying a dead decoder again.
+const DECODER_RESTART_BACKOFF: Duration = Duration::from_secs(5);
+
+/// Sleep up to `total`, returning early once shutdown is requested, so a backoff
+/// never holds the drain up. The analyzer body runs on a blocking thread and so
+/// cannot select against the shutdown notify the async tasks use; polling the
+/// same flag it already polls every tick is the equivalent.
+fn sleep_unless_shutdown(total: Duration, shutdown: &AtomicBool) {
+    let deadline = Instant::now() + total;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() || shutdown.load(Ordering::Relaxed) {
+            return;
+        }
+        thread::sleep(remaining.min(POLL_INTERVAL));
+    }
+}
 const CROP_PADDING: f32 = 0.2;
 const MIN_CROP_FRACTION: f32 = 0.15;
 
@@ -558,7 +576,7 @@ impl MotionAnalyzer {
         tracing::info!(camera = %self.camera_id, "motion analyzer started");
 
         while !shutdown.load(Ordering::Relaxed) {
-            if !self.ensure_decoder_alive() {
+            if !self.ensure_decoder_alive(&shutdown) {
                 continue;
             }
 
@@ -577,7 +595,7 @@ impl MotionAnalyzer {
         tracing::info!(camera = %self.camera_id, "motion analyzer stopped");
     }
 
-    fn ensure_decoder_alive(&mut self) -> bool {
+    fn ensure_decoder_alive(&mut self, shutdown: &AtomicBool) -> bool {
         if self.decoder.is_alive() {
             return true;
         }
@@ -589,7 +607,7 @@ impl MotionAnalyzer {
             }
             Err(e) => {
                 tracing::error!(camera = %self.camera_id, error = %e, "failed to restart decoder");
-                thread::sleep(Duration::from_secs(5));
+                sleep_unless_shutdown(DECODER_RESTART_BACKOFF, shutdown);
                 false
             }
         }
@@ -1304,6 +1322,40 @@ pub fn spawn_analyzer(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The decoder-restart backoff must not outlive a shutdown request: the
+    /// analyzer is joined by the drain, and five seconds per camera is time the
+    /// service manager does not always give.
+    #[test]
+    fn decoder_restart_backoff_ends_when_shutdown_is_requested() {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let signaller = Arc::clone(&shutdown);
+        std::thread::spawn(move || {
+            thread::sleep(Duration::from_millis(20));
+            signaller.store(true, Ordering::Relaxed);
+        });
+
+        let started = Instant::now();
+        sleep_unless_shutdown(DECODER_RESTART_BACKOFF, &shutdown);
+        assert!(
+            started.elapsed() < DECODER_RESTART_BACKOFF / 2,
+            "backoff outlived the shutdown request"
+        );
+    }
+
+    #[test]
+    fn decoder_restart_backoff_is_skipped_when_shutdown_is_already_requested() {
+        let started = Instant::now();
+        sleep_unless_shutdown(DECODER_RESTART_BACKOFF, &AtomicBool::new(true));
+        assert!(started.elapsed() < Duration::from_millis(100));
+    }
+
+    #[test]
+    fn decoder_restart_backoff_runs_to_completion_without_a_shutdown() {
+        let started = Instant::now();
+        sleep_unless_shutdown(Duration::from_millis(250), &AtomicBool::new(false));
+        assert!(started.elapsed() >= Duration::from_millis(250));
+    }
 
     #[test]
     fn normalize_rect_maps_to_unit_coords() {

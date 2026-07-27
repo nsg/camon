@@ -32,12 +32,12 @@ pub struct FfmpegPipeline {
 }
 
 impl FfmpegPipeline {
-    pub fn new(config: &CameraConfig, buffer: Arc<RwLock<HotBuffer>>) -> Result<Self, RtspError> {
-        Ok(Self {
+    pub fn new(config: &CameraConfig, buffer: Arc<RwLock<HotBuffer>>) -> Self {
+        Self {
             camera_id: config.id.clone(),
             url: config.url.clone(),
             buffer,
-        })
+        }
     }
 
     pub fn run(&self, shutdown: &std::sync::atomic::AtomicBool) -> Result<(), RtspError> {

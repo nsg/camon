@@ -130,6 +130,11 @@ fn parse_override_or_exit(spec: &str) -> config::Override {
 struct ShutdownSignal {
     flag: Arc<AtomicBool>,
     wake: Arc<tokio::sync::Notify>,
+    /// Broadcast wakeup for workers that would otherwise only notice the flag
+    /// on their next poll — a camera task parked in its reconnect backoff can
+    /// be a minute away from one. Separate from `wake`, which carries a single
+    /// permit meant for the main task.
+    drain: Arc<tokio::sync::Notify>,
     /// Set once an update has replaced the binary on disk. Tracked separately
     /// from the flag because it can become true at any point up to the end of
     /// the drain — including after a signal already started one, from a check
@@ -142,6 +147,7 @@ impl ShutdownSignal {
         Self {
             flag: Arc::new(AtomicBool::new(false)),
             wake: Arc::new(tokio::sync::Notify::new()),
+            drain: Arc::new(tokio::sync::Notify::new()),
             update_installed: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -150,12 +156,39 @@ impl ShutdownSignal {
         self.flag.load(Ordering::Relaxed)
     }
 
+    /// Raise the flag and wake every worker waiting on it. `notify_waiters`
+    /// reaches all of them at once but leaves no permit behind for one that
+    /// arrives afterwards, hence the flag re-check in `sleep_or_shutdown`.
+    fn request(&self) {
+        self.flag.store(true, Ordering::Relaxed);
+        self.drain.notify_waiters();
+    }
+
     /// `notify_one` leaves a permit behind when nobody is waiting yet, so the
     /// wakeup cannot be lost to a race with the main task reaching it.
     fn request_restart(&self) {
         self.update_installed.store(true, Ordering::Relaxed);
-        self.flag.store(true, Ordering::Relaxed);
+        self.request();
         self.wake.notify_one();
+    }
+
+    /// Sleep for `duration`, cut short the moment shutdown is requested, so a
+    /// pending delay never holds the drain up.
+    ///
+    /// The `Notified` is created before the flag is read, and tokio guarantees
+    /// it receives every `notify_waiters` that happens after its creation, even
+    /// one landing before it is first polled. A request is therefore either
+    /// already visible in the flag or still to come and caught by the notify —
+    /// there is no ordering in which this sleeps the full duration.
+    async fn sleep_or_shutdown(&self, duration: std::time::Duration) {
+        let notified = self.drain.notified();
+        if self.requested() {
+            return;
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(duration) => {}
+            _ = notified => {}
+        }
     }
 }
 
@@ -344,7 +377,7 @@ struct SpawnContext<'a> {
     /// Motion lifecycle events for the Home Assistant bridge; `None` when
     /// `[mqtt].enabled` is false.
     mqtt_tx: &'a Option<tokio::sync::mpsc::Sender<MqttEvent>>,
-    shutdown: &'a Arc<AtomicBool>,
+    shutdown: &'a ShutdownSignal,
 }
 
 fn spawn_cameras(ctx: &SpawnContext, cameras: Vec<config::CameraConfig>) -> CameraHandles {
@@ -384,7 +417,7 @@ fn spawn_cameras(ctx: &SpawnContext, cameras: Vec<config::CameraConfig>) -> Came
             .insert(camera_id.clone(), Arc::clone(&buffer));
 
         let buffer_clone = Arc::clone(&buffer);
-        let shutdown_clone = Arc::clone(ctx.shutdown);
+        let shutdown_clone = ctx.shutdown.clone();
         let handle = tokio::spawn(async move {
             run_camera(cam_config, buffer_clone, shutdown_clone).await;
         });
@@ -402,7 +435,7 @@ fn spawn_cameras(ctx: &SpawnContext, cameras: Vec<config::CameraConfig>) -> Came
                     Arc::clone(&buffer),
                     tx,
                     std::time::Duration::from_secs(ctx.config.storage.max_event_duration_secs),
-                    Arc::clone(ctx.shutdown),
+                    Arc::clone(&ctx.shutdown.flag),
                 );
                 handles.continuous_handles.push(tokio::spawn(recorder));
             }
@@ -432,7 +465,7 @@ fn spawn_cameras(ctx: &SpawnContext, cameras: Vec<config::CameraConfig>) -> Came
                         ctx.config.storage.max_event_duration_secs,
                     ),
                 },
-                Arc::clone(ctx.shutdown),
+                Arc::clone(&ctx.shutdown.flag),
             );
             handles.analyzer_handles.push(analyzer_handle);
         }
@@ -460,7 +493,7 @@ async fn wait_for_shutdown(shutdown: &ShutdownSignal) -> ShutdownReason {
         }
         _ = shutdown.wake.notified() => ShutdownReason::UpdateInstalled,
     };
-    shutdown.flag.store(true, Ordering::Relaxed);
+    shutdown.request();
     reason
 }
 
@@ -704,7 +737,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         detect_tx: &detect_tx,
         event_registry: &event_registry,
         mqtt_tx: &mqtt_tx,
-        shutdown: &shutdown.flag,
+        shutdown: &shutdown,
     };
     let camera_handles = spawn_cameras(&spawn_ctx, config.cameras.clone());
 
@@ -836,13 +869,13 @@ fn jitter_source() -> u64 {
 async fn run_camera(
     config: config::CameraConfig,
     buffer: Arc<RwLock<HotBuffer>>,
-    shutdown: Arc<AtomicBool>,
+    shutdown: ShutdownSignal,
 ) {
     let camera_id = config.id.clone();
 
     let buffer_ref = Arc::clone(&buffer);
     let camera_id_clone = camera_id.clone();
-    let shutdown_clone = Arc::clone(&shutdown);
+    let shutdown_clone = Arc::clone(&shutdown.flag);
 
     let stats_handle = tokio::spawn(async move {
         let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(30));
@@ -860,19 +893,11 @@ async fn run_camera(
 
     let mut backoff_secs = RECONNECT_BASE_SECS;
 
-    while !shutdown.load(Ordering::Relaxed) {
+    while !shutdown.requested() {
         tracing::info!(camera = %camera_id, url = %config.redacted_url(), "connecting to camera");
 
-        let pipeline = match FfmpegPipeline::new(&config, Arc::clone(&buffer)) {
-            Ok(p) => p,
-            Err(e) => {
-                tracing::error!(camera = %camera_id, "failed to create pipeline: {}", e);
-                tokio::time::sleep(tokio::time::Duration::from_secs(RECONNECT_BASE_SECS)).await;
-                continue;
-            }
-        };
-
-        let shutdown_ref = Arc::clone(&shutdown);
+        let pipeline = FfmpegPipeline::new(&config, Arc::clone(&buffer));
+        let shutdown_ref = Arc::clone(&shutdown.flag);
 
         let started = std::time::Instant::now();
         let result = tokio::task::spawn_blocking(move || pipeline.run(&shutdown_ref)).await;
@@ -890,7 +915,7 @@ async fn run_camera(
             }
         }
 
-        if shutdown.load(Ordering::Relaxed) {
+        if shutdown.requested() {
             break;
         }
 
@@ -905,7 +930,9 @@ async fn run_camera(
             "reconnecting in {:.1} seconds",
             delay_ms as f64 / 1000.0
         );
-        tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
+        shutdown
+            .sleep_or_shutdown(std::time::Duration::from_millis(delay_ms))
+            .await;
 
         backoff_secs = next_backoff_secs(backoff_secs);
     }
@@ -940,6 +967,44 @@ mod tests {
     #[test]
     fn jitter_zero_base_is_zero() {
         assert_eq!(apply_jitter(0, 999), 0);
+    }
+
+    /// A camera parked in its reconnect backoff used to hold the drain up for
+    /// the whole delay — up to a minute plus jitter — because the sleep only
+    /// ended on its own. Paused time: the assertion is on the virtual clock, so
+    /// a regression reads as a full 60s rather than as a slow test.
+    #[tokio::test(start_paused = true)]
+    async fn reconnect_backoff_ends_as_soon_as_shutdown_is_requested() {
+        let shutdown = ShutdownSignal::new();
+        let signaller = shutdown.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            signaller.request();
+        });
+
+        let started = tokio::time::Instant::now();
+        shutdown
+            .sleep_or_shutdown(Duration::from_secs(RECONNECT_MAX_SECS))
+            .await;
+        assert_eq!(
+            started.elapsed(),
+            Duration::from_millis(20),
+            "backoff outlived the shutdown request"
+        );
+    }
+
+    /// The flag can already be up when the sleep is reached — the pipeline it
+    /// follows may have exited because of it.
+    #[tokio::test(start_paused = true)]
+    async fn reconnect_backoff_is_skipped_when_shutdown_is_already_requested() {
+        let shutdown = ShutdownSignal::new();
+        shutdown.request();
+
+        let started = tokio::time::Instant::now();
+        shutdown
+            .sleep_or_shutdown(Duration::from_secs(RECONNECT_MAX_SECS))
+            .await;
+        assert_eq!(started.elapsed(), Duration::ZERO);
     }
 
     use std::sync::atomic::AtomicUsize;
