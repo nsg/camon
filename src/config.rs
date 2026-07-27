@@ -1,5 +1,5 @@
 use serde::Deserialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::path::Path;
 use thiserror::Error;
@@ -24,6 +24,41 @@ pub enum ConfigError {
          give it a real value, e.g. `openssl rand -hex 32`"
     )]
     HttpTokenEmpty,
+    #[error("a [[cameras]] entry has a blank id; every camera needs an id with something in it")]
+    BlankCameraId,
+    #[error(
+        "camera id {id:?} has leading or trailing whitespace; it would be invisible \
+         everywhere the id is shown — write it as {trimmed:?}"
+    )]
+    PaddedCameraId { id: String, trimmed: String },
+    #[error(
+        "camera id {id:?} contains {character:?}; an id is used verbatim as a directory name \
+         under the storage data_dir, so it must be a single path component"
+    )]
+    InvalidCameraIdCharacter { id: String, character: char },
+    #[error(
+        "camera id {id:?} is not a usable directory name; an id is used verbatim as a \
+         directory name under the storage data_dir"
+    )]
+    ReservedCameraId { id: String },
+    #[error(
+        "camera id {id:?} is used by more than one [[cameras]] entry; duplicates share one \
+         storage directory and only one of them is reachable over the API"
+    )]
+    DuplicateCameraId { id: String },
+    #[error(
+        "[storage] max_event_duration_secs is 0, which means \"never chunk\" — but with \
+         [analytics] disabled camon records continuously and rolls a chunk only when the cap \
+         is reached, so nothing would be written until shutdown; set a real cap, e.g. 120"
+    )]
+    ZeroMaxEventDurationInContinuousMode,
+    #[error(
+        "[storage] max_event_duration_secs ({cap}) must be below [buffer] hot_duration_secs \
+         ({hot}): continuous chunks are cut straight from the hot buffer, so a chunk that \
+         long loses its oldest segments to eviction before the recorder rolls it. Raise \
+         hot_duration_secs, or lower max_event_duration_secs — it is 120 unless you set it"
+    )]
+    ContinuousChunkExceedsHotBuffer { cap: u64, hot: u64 },
     #[error(
         "camera id {id:?} contains {character:?}, which is an MQTT topic wildcard; \
          rename the camera or disable [mqtt]"
@@ -114,6 +149,7 @@ fn parse_scalar(raw: &str) -> toml::Value {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CameraConfig {
     pub id: String,
     pub url: String,
@@ -150,6 +186,7 @@ fn url_password_range(url: &str) -> Option<std::ops::Range<usize>> {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BufferConfig {
     #[serde(default = "default_hot_duration")]
     pub hot_duration_secs: u64,
@@ -179,6 +216,7 @@ impl Default for BufferConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HttpConfig {
     #[serde(default = "default_http_port")]
     pub port: u16,
@@ -251,6 +289,7 @@ fn default_ollama_timeout_secs() -> u64 {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OllamaServerConfig {
     #[serde(default = "default_ollama_url")]
     pub url: String,
@@ -259,6 +298,7 @@ pub struct OllamaServerConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OllamaConfig {
     #[serde(default = "default_ollama_url")]
     pub url: String,
@@ -282,6 +322,7 @@ impl Default for OllamaConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ObjectDetectionConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -317,6 +358,7 @@ fn default_motion_min_contour_area() -> f64 {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MotionConfig {
     /// MOG2 var_threshold. Higher = less sensitive.
     #[serde(default = "default_motion_var_threshold")]
@@ -336,6 +378,7 @@ impl Default for MotionConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AnalyticsConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -409,6 +452,7 @@ fn default_stathost_enabled() -> bool {
 /// `true` — switches the warm backend from local disk to this static file host.
 /// Analytics, motion settings, and the hot buffer always stay local.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StathostConfig {
     /// Base URL of the host, e.g. `https://files.example.com`.
     pub url: String,
@@ -428,6 +472,7 @@ pub struct StathostConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WarmConfig {
     #[serde(default = "default_warm_enabled")]
     pub enabled: bool,
@@ -442,7 +487,11 @@ pub struct WarmConfig {
     #[serde(default = "default_warm_post_padding_secs")]
     pub post_padding_secs: u64,
     /// Cap on the wall-clock length of a single event. A run exceeding this is
-    /// split into chained, independently playable chunks. 0 disables the cap.
+    /// split into chained, independently playable chunks. 0 disables chunking,
+    /// which continuous recording cannot do — there it is the only thing that
+    /// rolls a chunk. A recording has to fit in the hot buffer: fatal in
+    /// continuous mode, a warning in event mode, where
+    /// [`pre_padding_secs`](Self::pre_padding_secs) counts too.
     #[serde(default = "default_max_event_duration_secs")]
     pub max_event_duration_secs: u64,
     #[serde(default = "default_movement_retention_days")]
@@ -479,6 +528,7 @@ impl Default for WarmConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UpdateConfig {
     #[serde(default = "default_update_enabled")]
     pub enabled: bool,
@@ -534,6 +584,7 @@ fn default_mqtt_occupancy_hold_secs() -> u64 {
 /// standalone, and an unreachable broker should never be a startup concern for
 /// users who don't run HA.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MqttConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -575,6 +626,7 @@ impl Default for MqttConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     #[serde(default)]
     pub update: UpdateConfig,
@@ -609,14 +661,33 @@ impl Config {
         for ov in overrides {
             ov.apply(&mut value);
         }
-        let config: Config = value.try_into()?;
+        for (key, advice) in strip_retired_keys(&mut value) {
+            tracing::warn!(key = %key, "ignoring retired config key: {advice}");
+        }
+        let mut config: Config = value.try_into()?;
+        config.normalize();
         config.validate()?;
         Ok(config)
     }
 
+    /// Canonicalize values that several consumers have to agree on. Object
+    /// classes are matched case-insensitively by the Ollama client but compared
+    /// verbatim by the MQTT bridge, so `classes = ["Person"]` would otherwise
+    /// yield an occupancy sensor that can never turn on. Deduplicating is part
+    /// of the same fix: once folded, `["Person", "person"]` would produce two
+    /// discovery payloads sharing one unique id.
+    fn normalize(&mut self) {
+        let classes = &mut self.analytics.object_detection.classes;
+        for class in classes.iter_mut() {
+            *class = class.to_lowercase();
+        }
+        let mut seen = HashSet::new();
+        classes.retain(|class| seen.insert(class.clone()));
+    }
+
     /// Post-parse checks that TOML deserialization can't express. Failing here
-    /// is deliberate: with the MQTT bridge on, a bad camera id costs entities
-    /// that silently never update, which is worse than refusing to start.
+    /// is deliberate: a bad camera id or an unrollable event cap costs silently
+    /// lost footage, which is worse than refusing to start.
     fn validate(&self) -> Result<(), ConfigError> {
         if self.cameras.is_empty() {
             return Err(ConfigError::NoCameras);
@@ -639,12 +710,77 @@ impl Config {
             return Err(ConfigError::HttpTokenEmpty);
         }
 
-        // Camera ids only reach MQTT topics and Home Assistant unique ids when
-        // the bridge is enabled; otherwise they stay free-form.
+        // The cap is only read by the warm writer and the continuous recorder,
+        // neither of which is spawned with storage off.
+        if self.storage.enabled {
+            let cap = self.storage.max_event_duration_secs;
+            // Continuous recording (storage on, analytics off) has no motion
+            // run to close a chunk, so the cap is the only thing that rolls
+            // one. In event mode 0 is a real setting: don't chunk, and let
+            // motion end close the event.
+            if cap == 0 {
+                if !self.analytics.enabled {
+                    return Err(ConfigError::ZeroMaxEventDurationInContinuousMode);
+                }
+            } else if !self.analytics.enabled {
+                // Continuous chunks are cut straight from the buffer with no
+                // padding at all, so the cap is the whole span. Fatal because
+                // `plan_continuous_roll` can then never fire: nothing at all
+                // is written, rather than something imperfect.
+                if cap >= self.buffer.hot_duration_secs {
+                    return Err(ConfigError::ContinuousChunkExceedsHotBuffer {
+                        cap,
+                        hot: self.buffer.hot_duration_secs,
+                    });
+                }
+            } else if let Some(total) = event_span_overrun(
+                cap,
+                self.storage.pre_padding_secs,
+                self.buffer.hot_duration_secs,
+            ) {
+                // A warning, not an error: unlike continuous mode this still
+                // records, it just loses the head of events that run long —
+                // the degradation camon already has today. Refusing to boot
+                // over it would be the worse trade, since the cap is 120 by
+                // default (so it may never have been written), trimming
+                // hot_duration_secs is exactly what a RAM-pressured box would
+                // do, and config load precedes the updater, so an auto-updating
+                // install would stay down until someone read the log.
+                tracing::warn!(
+                    cap,
+                    pre_padding_secs = self.storage.pre_padding_secs,
+                    total,
+                    hot_duration_secs = self.buffer.hot_duration_secs,
+                    "[storage] max_event_duration_secs ({cap}) plus pre_padding_secs ({}) is \
+                     {total}s, which does not fit in [buffer] hot_duration_secs ({}): events \
+                     running longer than about {}s will lose their opening seconds to \
+                     eviction. Raise hot_duration_secs, or lower max_event_duration_secs — it \
+                     is 120 unless you set it",
+                    self.storage.pre_padding_secs,
+                    self.buffer.hot_duration_secs,
+                    self.buffer
+                        .hot_duration_secs
+                        .saturating_sub(self.storage.pre_padding_secs),
+                );
+            }
+        }
+
+        let mut seen: HashSet<&str> = HashSet::new();
+        for camera in &self.cameras {
+            validate_camera_id(&camera.id)?;
+            if !seen.insert(camera.id.as_str()) {
+                return Err(ConfigError::DuplicateCameraId {
+                    id: camera.id.clone(),
+                });
+            }
+        }
+
+        // Wildcards and slug collisions are purely MQTT concerns: both shapes
+        // are legal ids and legal directory names, so without the bridge there
+        // is nothing to break.
         if !self.mqtt.enabled {
             return Ok(());
         }
-
         let mut slugs: HashMap<String, &str> = HashMap::new();
         for camera in &self.cameras {
             if let Some(character) = camera.id.chars().find(|c| matches!(c, '+' | '#')) {
@@ -664,6 +800,88 @@ impl Config {
         }
 
         Ok(())
+    }
+}
+
+/// The span of an event that will not fit in the hot buffer, or `None` when it
+/// fits. Only `pre` widens an event — it reaches back before the first motion
+/// segment at assembly time — while post-padding cannot, because
+/// `RunTracker::observe` tests the post-padding close before the cap, so a
+/// chunk still ends at the cap. The comparison is strict because both the
+/// recorder's tick and segment rounding overshoot slightly; with integer
+/// seconds that leaves at least a second of slack.
+fn event_span_overrun(cap: u64, pre: u64, hot: u64) -> Option<u64> {
+    let total = cap.saturating_add(pre);
+    (total >= hot).then_some(total)
+}
+
+/// Keys camon itself shipped and later removed, with the advice to print when
+/// one turns up. They are dropped with a warning rather than rejected by the
+/// strict unknown-field check: a config that booted before must keep booting.
+/// An install that auto-updated into a stricter camon would otherwise be stuck
+/// — config load happens before the updater runs, so it could never start long
+/// enough to update out of the failure.
+const RETIRED_KEYS: &[(&[&str], &str)] = &[
+    (
+        &["analytics", "object_detection", "backend"],
+        "object detection has been Ollama-only since 0.2.1; the server is configured under \
+         [analytics.object_detection.ollama]",
+    ),
+    (
+        &["analytics", "object_detection", "model_path"],
+        "the bundled ONNX model was removed in 0.2.1; set `model` under \
+         [analytics.object_detection.ollama] instead",
+    ),
+];
+
+/// Remove every [`RETIRED_KEYS`] entry present in `root`, returning the dotted
+/// key and its advice for each one actually found.
+fn strip_retired_keys(root: &mut toml::Value) -> Vec<(String, &'static str)> {
+    let mut found = Vec::new();
+    for (path, advice) in RETIRED_KEYS {
+        let (last, parents) = path.split_last().expect("retired key paths are non-empty");
+        let mut current = Some(&mut *root);
+        for segment in parents {
+            current = current
+                .and_then(toml::Value::as_table_mut)
+                .and_then(|table| table.get_mut(*segment));
+        }
+        let removed = current
+            .and_then(toml::Value::as_table_mut)
+            .and_then(|table| table.remove(*last));
+        if removed.is_some() {
+            found.push((path.join("."), *advice));
+        }
+    }
+    found
+}
+
+/// A camera id is used verbatim as a directory name under the storage
+/// `data_dir`, so it must be a single path component. This is footgun
+/// protection rather than a security boundary — ids reaching `data_dir.join()`
+/// come only from operator config, and API handlers resolve a request to a
+/// known camera before any path is built — so it denies the few shapes that
+/// misbehave and accepts everything else, punctuation and non-ASCII included.
+fn validate_camera_id(id: &str) -> Result<(), ConfigError> {
+    let trimmed = id.trim();
+    if trimmed.is_empty() {
+        return Err(ConfigError::BlankCameraId);
+    }
+    if trimmed != id {
+        return Err(ConfigError::PaddedCameraId {
+            id: id.to_string(),
+            trimmed: trimmed.to_string(),
+        });
+    }
+    if id == "." || id == ".." {
+        return Err(ConfigError::ReservedCameraId { id: id.to_string() });
+    }
+    match id.chars().find(|c| matches!(c, '/' | '\\' | '\0')) {
+        Some(character) => Err(ConfigError::InvalidCameraIdCharacter {
+            id: id.to_string(),
+            character,
+        }),
+        None => Ok(()),
     }
 }
 
@@ -936,6 +1154,8 @@ url = "rtsp://10.0.0.6:554/stream1"
 
     #[test]
     fn disabled_mqtt_leaves_camera_ids_unconstrained() {
+        // Wildcards and colliding slugs are legal ids and legal directory
+        // names; only the bridge cares.
         load_with_mqtt(WILDCARD_CAMERAS, false).unwrap();
         load_with_mqtt(COLLIDING_CAMERAS, false).unwrap();
     }
@@ -949,6 +1169,322 @@ url = "rtsp://10.0.0.6:554/stream1"
         )
         .unwrap();
         assert_eq!(config.cameras.len(), 2);
+    }
+
+    fn load_cameras(cameras: &str) -> Result<Config, ConfigError> {
+        let dir = write_temp("config.toml", cameras);
+        Config::load_from_with_overrides(dir.path().join("config.toml"), &[])
+    }
+
+    fn one_camera(id: &str) -> String {
+        format!("[[cameras]]\nid = {id:?}\nurl = \"rtsp://10.0.0.5:554/stream1\"\n")
+    }
+
+    #[test]
+    fn blank_camera_ids_are_rejected() {
+        for id in ["", "   ", "\t"] {
+            let err = load_cameras(&one_camera(id)).unwrap_err();
+            assert!(matches!(err, ConfigError::BlankCameraId), "got {err:?}");
+        }
+    }
+
+    #[test]
+    fn space_padded_camera_ids_are_rejected() {
+        let err = load_cameras(&one_camera(" yard ")).unwrap_err();
+        assert!(
+            matches!(err, ConfigError::PaddedCameraId { .. }),
+            "got {err:?}"
+        );
+        assert!(err.to_string().contains("\"yard\""), "got {err}");
+    }
+
+    #[test]
+    fn path_like_camera_ids_are_rejected() {
+        for id in ["../other", "/var/camon", "a/b", "a\\b"] {
+            let err = load_cameras(&one_camera(id)).unwrap_err();
+            assert!(
+                matches!(err, ConfigError::InvalidCameraIdCharacter { .. }),
+                "got {err:?} for {id:?}"
+            );
+            assert!(
+                err.to_string().contains(&format!("{id:?}")),
+                "got {err} for {id:?}"
+            );
+        }
+        for id in [".", ".."] {
+            let err = load_cameras(&one_camera(id)).unwrap_err();
+            assert!(
+                matches!(err, ConfigError::ReservedCameraId { .. }),
+                "got {err:?} for {id:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn duplicate_camera_ids_are_rejected() {
+        let toml = format!("{}{}", one_camera("yard"), one_camera("yard"));
+        let err = load_cameras(&toml).unwrap_err();
+        assert!(
+            matches!(err, ConfigError::DuplicateCameraId { .. }),
+            "got {err:?}"
+        );
+        assert!(err.to_string().contains("yard"), "got {err}");
+    }
+
+    /// Non-ASCII and punctuation are explicitly in scope: the repo owner uses
+    /// Swedish camera names, and every one of these is a fine directory name.
+    #[test]
+    fn ordinary_camera_ids_are_accepted() {
+        for id in [
+            "front-door",
+            "Front Door",
+            "Trädgård",
+            "Entré",
+            "Garage (side)",
+            "door:west",
+            "user@door",
+            "cam+garage",
+            "cam_1",
+            "cam.1",
+            "..a",
+        ] {
+            load_cameras(&one_camera(id)).unwrap_or_else(|e| panic!("{id:?} rejected: {e}"));
+        }
+    }
+
+    /// Continuous mode (storage on, analytics off) rolls a chunk only when the
+    /// cap is reached, so 0 would write nothing until shutdown.
+    #[test]
+    fn zero_max_event_duration_is_rejected_only_in_continuous_mode() {
+        let cameras = one_camera("yard");
+        let continuous = format!(
+            "[analytics]\nenabled = false\n[storage]\nmax_event_duration_secs = 0\n{cameras}"
+        );
+        let err = load_cameras(&continuous).unwrap_err();
+        assert!(
+            matches!(err, ConfigError::ZeroMaxEventDurationInContinuousMode),
+            "got {err:?}"
+        );
+
+        // Event mode: 0 means "don't chunk", and motion end still closes runs.
+        let event_mode = format!(
+            "[analytics]\nenabled = true\n[storage]\nmax_event_duration_secs = 0\n{cameras}"
+        );
+        let config = load_cameras(&event_mode).unwrap();
+        assert_eq!(config.storage.max_event_duration_secs, 0);
+    }
+
+    /// Event mode still records when the span overruns — it only loses the
+    /// head of long events — so this warns and boots rather than refusing.
+    #[test]
+    fn event_longer_than_the_hot_buffer_still_loads() {
+        let dir = write_temp("config.toml", TOML_SAMPLE);
+        for cap in [600, 900] {
+            let overrides =
+                [Override::parse(&format!("storage.max_event_duration_secs={cap}")).unwrap()];
+            let config =
+                Config::load_from_with_overrides(dir.path().join("config.toml"), &overrides)
+                    .unwrap_or_else(|e| panic!("cap {cap} rejected: {e}"));
+            assert_eq!(config.storage.max_event_duration_secs, cap);
+        }
+    }
+
+    /// Only pre_padding widens an event. post_padding cannot: `observe` tests
+    /// the post-padding close before the cap, so the chunk still ends at the
+    /// cap.
+    #[test]
+    fn the_event_span_counts_pre_padding_only() {
+        // 594 + 5 = 599 < 600 fits; 595 + 5 = 600 does not.
+        assert_eq!(event_span_overrun(594, 5, 600), None);
+        assert_eq!(event_span_overrun(595, 5, 600), Some(600));
+        // post_padding is not an input at all, so it cannot move the boundary.
+        assert_eq!(event_span_overrun(590, 0, 600), None);
+        assert_eq!(event_span_overrun(u64::MAX, 5, 600), Some(u64::MAX));
+    }
+
+    /// Continuous chunks are cut straight from the buffer with no padding, so
+    /// the cap alone is the span.
+    #[test]
+    fn the_continuous_bound_is_the_cap_alone() {
+        let cameras = one_camera("yard");
+        let load = |cap: u64| {
+            let toml = format!(
+                "[buffer]\nhot_duration_secs = 600\n[analytics]\nenabled = false\n\
+                 [storage]\nmax_event_duration_secs = {cap}\npre_padding_secs = 5\n\
+                 post_padding_secs = 10\n{cameras}"
+            );
+            load_cameras(&toml)
+        };
+        // 590 works in the current release and must keep working; 599 is the
+        // last accepted value.
+        load(590).unwrap();
+        load(599).unwrap();
+        let err = load(600).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ConfigError::ContinuousChunkExceedsHotBuffer { cap: 600, hot: 600 }
+            ),
+            "got {err:?}"
+        );
+        let message = err.to_string();
+        assert!(!message.contains("padding"), "got {message}");
+    }
+
+    /// With storage off no writer and no continuous recorder are spawned, so
+    /// the cap is never read and must not be able to block startup.
+    #[test]
+    fn disabled_storage_skips_the_duration_checks() {
+        let cameras = one_camera("yard");
+        for storage in [
+            "enabled = false\nmax_event_duration_secs = 0",
+            "enabled = false\nmax_event_duration_secs = 9000",
+        ] {
+            let toml = format!("[buffer]\nhot_duration_secs = 60\n[storage]\n{storage}\n{cameras}");
+            load_cameras(&toml).unwrap_or_else(|e| panic!("{storage:?} rejected: {e}"));
+        }
+    }
+
+    #[test]
+    fn unknown_config_key_is_rejected() {
+        let toml = format!(
+            "[storage]\nmovment_retention_days = 3\n{}",
+            one_camera("yard")
+        );
+        let err = load_cameras(&toml).unwrap_err();
+        assert!(matches!(err, ConfigError::Parse(_)), "got {err:?}");
+        assert!(
+            err.to_string().contains("movment_retention_days"),
+            "got {err}"
+        );
+    }
+
+    #[test]
+    fn unknown_override_key_is_rejected() {
+        let dir = write_temp("config.toml", TOML_SAMPLE);
+        let overrides = [Override::parse("http.prot=9090").unwrap()];
+        let err = Config::load_from_with_overrides(dir.path().join("config.toml"), &overrides)
+            .unwrap_err();
+        assert!(matches!(err, ConfigError::Parse(_)), "got {err:?}");
+    }
+
+    /// Every key documented in `config.toml.example` must still parse — with
+    /// `deny_unknown_fields` a stale example is a startup failure, not a
+    /// no-op.
+    #[test]
+    fn example_config_parses() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("config.toml.example");
+        let config = Config::load_from_with_overrides(&path, &[]).unwrap();
+        assert_eq!(config.cameras.len(), 1);
+        assert_eq!(config.buffer.hot_duration_secs, 600);
+    }
+
+    /// Mirrors the `--set` list in `camon-addon/run.sh:90-96` (plus the
+    /// conditional MQTT block above it), which the add-on forces on every
+    /// start. A key renamed here is a container that will not boot.
+    #[test]
+    fn addon_overrides_still_apply() {
+        let dir = write_temp("config.toml", TOML_SAMPLE);
+        let overrides: Vec<Override> = [
+            "update.enabled=false",
+            "http.port=22666",
+            "http.bind=0.0.0.0",
+            "http.allow_open=true",
+            "storage.data_dir=/data/storage",
+            "mqtt.enabled=true",
+            "mqtt.host=core-mosquitto",
+            "mqtt.port=1883",
+            "mqtt.username=addons",
+            "mqtt.password=s3cr3t",
+        ]
+        .iter()
+        .map(|a| Override::parse(a).unwrap())
+        .collect();
+        let config =
+            Config::load_from_with_overrides(dir.path().join("config.toml"), &overrides).unwrap();
+        assert!(!config.update.enabled);
+        assert_eq!(config.http.port, 22666);
+        assert!(config.http.allow_open);
+        assert_eq!(config.storage.data_dir, "/data/storage");
+        assert!(config.mqtt.enabled);
+        assert_eq!(config.mqtt.host, "core-mosquitto");
+        assert_eq!(config.mqtt.username.as_deref(), Some("addons"));
+    }
+
+    /// Retired keys have to stay bootable: rejecting them would strand an
+    /// install that auto-updated into strict parsing, since config load runs
+    /// before the updater.
+    #[test]
+    fn retired_keys_are_dropped_with_advice_instead_of_rejected() {
+        let toml = format!(
+            "[analytics.object_detection]\nenabled = true\nbackend = \"onnx\"\n\
+             model_path = \"/opt/yolo26.onnx\"\n{}",
+            one_camera("yard")
+        );
+        let config = load_cameras(&toml).unwrap();
+        assert!(config.analytics.object_detection.enabled);
+
+        let mut value: toml::Value = toml::from_str(&toml).unwrap();
+        let found = strip_retired_keys(&mut value);
+        let keys: Vec<&str> = found.iter().map(|(key, _)| key.as_str()).collect();
+        assert_eq!(
+            keys,
+            [
+                "analytics.object_detection.backend",
+                "analytics.object_detection.model_path"
+            ]
+        );
+        for (_, advice) in &found {
+            assert!(advice.contains("ollama"), "got {advice}");
+        }
+        // Removed from the tree, so the strict unknown-field check never sees
+        // them, and a second pass finds nothing.
+        assert!(strip_retired_keys(&mut value).is_empty());
+    }
+
+    /// A retired key must stay distinguishable from a typo — the latter is
+    /// still a hard error.
+    #[test]
+    fn a_typo_next_to_a_retired_key_is_still_rejected() {
+        let toml = format!(
+            "[analytics.object_detection]\nmodel_path = \"/opt/yolo26.onnx\"\n\
+             confidance_threshold = 0.5\n{}",
+            one_camera("yard")
+        );
+        let err = load_cameras(&toml).unwrap_err();
+        assert!(matches!(err, ConfigError::Parse(_)), "got {err:?}");
+        assert!(
+            err.to_string().contains("confidance_threshold"),
+            "got {err}"
+        );
+    }
+
+    #[test]
+    fn object_classes_are_lowercased_at_load() {
+        let toml = format!(
+            "[analytics.object_detection]\nenabled = true\nclasses = [\"Person\", \"CAR\"]\n{}",
+            one_camera("yard")
+        );
+        let config = load_cameras(&toml).unwrap();
+        assert_eq!(
+            config.analytics.object_detection.classes,
+            vec!["person".to_string(), "car".to_string()]
+        );
+    }
+
+    /// Two spellings of one class would otherwise become two discovery
+    /// payloads sharing a unique id.
+    #[test]
+    fn object_classes_are_deduplicated_after_folding() {
+        let toml = format!(
+            "[analytics.object_detection]\nclasses = [\"Person\", \"person\", \"Cat\"]\n{}",
+            one_camera("yard")
+        );
+        let config = load_cameras(&toml).unwrap();
+        assert_eq!(
+            config.analytics.object_detection.classes,
+            vec!["person".to_string(), "cat".to_string()]
+        );
     }
 
     #[test]

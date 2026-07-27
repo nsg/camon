@@ -1,5 +1,43 @@
 # Changelog
 
+## Unreleased
+
+- **`camon.toml` is now checked strictly at startup, and a mistake stops
+  the add-on instead of being ignored.** Previously any key camon did not
+  recognise was skipped in silence, so a typo like
+  `movment_retention_days` left the default quietly in force and looked
+  like a setting that did nothing. Every unknown key is now an error
+  naming the key, on the first start after this update. If the add-on
+  stops with a config error, fix the named key in
+  `/addon_configs/<repo>_camon/camon.toml` and start it again.
+  - Keys from camon 0.2.0 and earlier are the exception: `backend` and
+    `model_path` under `[analytics.object_detection]` were removed when
+    object detection became Ollama-only, and are ignored with a warning in
+    the log rather than treated as errors. Delete them at your
+    convenience; the model is set with `model` under
+    `[analytics.object_detection.ollama]`.
+- `storage.max_event_duration_secs = 0` is no longer accepted when
+  `analytics.enabled = false`. It half-worked before: with analytics on it
+  means "never split an event", which is still allowed, but in continuous
+  recording it left nothing to roll a chunk, so no footage was written
+  until the add-on shut down.
+- A recording that cannot fit in the hot buffer is now called out at
+  startup. In continuous recording, `storage.max_event_duration_secs` must
+  be below `buffer.hot_duration_secs` or the add-on stops — nothing rolls
+  a chunk, so no footage would be written at all. With analytics enabled
+  it is a warning in the log instead of an error: recording continues,
+  but events running longer than roughly `hot_duration_secs` minus
+  `pre_padding_secs` lose their opening seconds. Either way the message
+  names the values involved.
+- Camera ids are validated: they must be unique and usable as a folder
+  name (no `/` or `\`, not `.` or `..`, not blank or space-padded).
+  Accented and punctuated names such as `Trädgård` or `Garage (side)`
+  work as before. Duplicate ids used to start two recorders writing over
+  each other in one folder.
+- Object classes in `analytics.object_detection.classes` are lowercased
+  and deduplicated when loaded, so `classes = ["Person"]` now creates a
+  working occupancy sensor instead of one that could never turn on.
+
 ## 0.5.0
 
 - **The live view's detection surfaces merge into one timeline.** Motion

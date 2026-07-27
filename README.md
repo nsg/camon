@@ -215,7 +215,10 @@ pre_padding_secs = 5
 post_padding_secs = 10
 # Cap on a single event's length in seconds (default: 120). Longer runs are
 # split into chained, independently playable chunks (follow-ons flagged
-# "continues"). In continuous mode this is the length of each chunk. 0 disables.
+# "continues"). In continuous mode this is the length of each chunk. A recording
+# must fit inside buffer.hot_duration_secs: cap + pre_padding_secs with analytics
+# on (a warning), the cap alone in continuous mode (an error). 0 disables
+# chunking — fine with analytics on, rejected in continuous mode.
 # Timing is monotonic, immune to camera PTS jumps.
 max_event_duration_secs = 120
 # Retention for movement-only events in days (default: 2)
@@ -269,7 +272,10 @@ snapshot_interval_secs = 5
 # Seconds an occupancy sensor stays "on" after the last sighting (default: 60)
 occupancy_hold_secs = 60
 
-# Add one [[cameras]] block per camera
+# Add one [[cameras]] block per camera. Each id must be unique and is used
+# verbatim as a directory name under storage.data_dir, so it must be a single
+# path component: no "/", "\" or NUL, not "." or "..", not blank, no
+# leading/trailing whitespace. Accents and punctuation are fine ("Trädgård").
 [[cameras]]
 id = "front-door"
 url = "rtsp://admin:password@192.168.1.100:554/stream1"

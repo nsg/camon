@@ -101,8 +101,19 @@ post_padding_secs = 10
 # Cap on a single event's length in seconds (default: 120). A run longer than
 # this is split into chained, independently playable chunks — the follow-on
 # chunks are flagged "continues" in their sidecar. In continuous mode this is
-# also the length of each recording chunk. 0 disables the cap. Timing is
-# monotonic (wall clock), so a camera PTS jump can't stall it.
+# also the length of each recording chunk. A recording must fit inside
+# buffer.hot_duration_secs above, or its oldest segments are evicted before it
+# can be written. With analytics enabled that means max_event_duration_secs +
+# pre_padding_secs (an event reaches back that far before its first motion), and
+# camon warns but keeps recording — long events just lose their opening seconds.
+# In continuous mode it is the cap alone, since chunks are cut straight from the
+# buffer with no padding, and camon refuses to start: nothing would roll a chunk,
+# so no footage would be written at all. post_padding_secs never counts — it
+# cannot push a chunk past the cap. 0 disables chunking:
+# allowed with analytics enabled (motion end still closes each event), rejected
+# in continuous mode, where the cap is the only thing that rolls a chunk and
+# nothing would be written until shutdown. Timing is monotonic (wall clock), so
+# a camera PTS jump can't stall it.
 max_event_duration_secs = 120
 # Retention for movement-only events in days (default: 2)
 movement_retention_days = 2
@@ -198,7 +209,13 @@ snapshot_interval_secs = 5
 # class before it clears (default: 60)
 occupancy_hold_secs = 60
 
-# Camera definitions — add one [[cameras]] block per camera
+# Camera definitions — add one [[cameras]] block per camera.
+# Each id must be unique and is used verbatim as a directory name under
+# storage.data_dir, so it must be a single path component: no "/", "\" or NUL,
+# not "." or ".." on their own, not blank, and no leading/trailing whitespace.
+# Anything else is fine, accents and punctuation included ("Trädgård",
+# "Garage (side)"). See the [mqtt] notes above for the extra rules that apply
+# only while the bridge is enabled.
 
 [[cameras]]
 id = "front-door"
