@@ -6,6 +6,11 @@ document.addEventListener('DOMContentLoaded', async () => {
     const grid = document.getElementById('camera-grid');
     const noCameras = document.getElementById('no-cameras');
 
+    // Token prompt (shown only when the API answers 401)
+    const tokenPrompt = document.getElementById('token-prompt');
+    const tokenInput = document.getElementById('token-input');
+    const tokenSubmit = document.getElementById('token-submit');
+
     // View 1: Live Monitor
     const liveView = document.getElementById('live-view');
     const detailVideo = document.getElementById('detail-video');
@@ -154,10 +159,65 @@ document.addEventListener('DOMContentLoaded', async () => {
         }
     }
 
+    // === API Auth ===
+    // Optional server-side ([http] token in config.toml). When the server
+    // requires one, every fetch and hls.js request carries it as a bearer
+    // header; <img> and native <video> sources, which cannot set headers, fall
+    // back to ?token=. A 401 means what we have is missing or stale, so we ask
+    // for a new one and reload — every request then starts out authenticated.
+    const TOKEN_STORAGE_KEY = 'camon.token';
+    let apiToken = localStorage.getItem(TOKEN_STORAGE_KEY) || '';
+
+    function authHeaders(extra) {
+        const headers = Object.assign({}, extra);
+        if (apiToken) headers['Authorization'] = `Bearer ${apiToken}`;
+        return headers;
+    }
+
+    function authUrl(url) {
+        if (!apiToken) return url;
+        return `${url}${url.includes('?') ? '&' : '?'}token=${encodeURIComponent(apiToken)}`;
+    }
+
+    async function apiFetch(url, options = {}) {
+        const response = await fetch(url, Object.assign({}, options, {
+            headers: authHeaders(options.headers),
+        }));
+        if (response.status === 401) showTokenPrompt();
+        return response;
+    }
+
+    function hlsAuthConfig() {
+        return {
+            xhrSetup: (xhr) => {
+                if (apiToken) xhr.setRequestHeader('Authorization', `Bearer ${apiToken}`);
+            },
+        };
+    }
+
+    function showTokenPrompt() {
+        if (!tokenPrompt.hidden) return;
+        tokenPrompt.hidden = false;
+        tokenInput.focus();
+    }
+
+    function submitToken() {
+        const value = tokenInput.value.trim();
+        if (!value) return;
+        localStorage.setItem(TOKEN_STORAGE_KEY, value);
+        location.reload();
+    }
+
+    tokenSubmit.addEventListener('click', submitToken);
+    tokenInput.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') submitToken();
+    });
+
     // === Initialize ===
     try {
-        const response = await fetch('api/cameras');
-        cameras = await response.json();
+        const response = await apiFetch('api/cameras');
+        // A 401 already raised the token prompt, which covers the view.
+        cameras = response.ok ? await response.json() : [];
 
         if (cameras.length === 0) {
             noCameras.hidden = false;
@@ -712,7 +772,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         const loading = video.parentElement.querySelector('.loading');
 
         if (typeof Hls !== 'undefined' && Hls.isSupported()) {
-            const hls = new Hls({ enableWorker: false });
+            const hls = new Hls({ enableWorker: false, ...hlsAuthConfig() });
             gridHlsInstances.set(cameraId, hls);
             hls.loadSource(src);
             hls.attachMedia(video);
@@ -735,7 +795,7 @@ document.addEventListener('DOMContentLoaded', async () => {
                 }
             });
         } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
-            video.src = src;
+            video.src = authUrl(src);
             video.addEventListener('loadedmetadata', () => {
                 loading.hidden = true;
                 video.play().catch(e => console.error(`Play failed for ${cameraId}:`, e));
@@ -754,6 +814,7 @@ document.addEventListener('DOMContentLoaded', async () => {
                 liveBackBufferLength: 600,
                 backBufferLength: 600,
                 liveDurationInfinity: false,
+                ...hlsAuthConfig(),
             });
             detailHls.loadSource(src);
             detailHls.attachMedia(detailVideo);
@@ -779,7 +840,7 @@ document.addEventListener('DOMContentLoaded', async () => {
                 }
             });
         } else if (detailVideo.canPlayType('application/vnd.apple.mpegurl')) {
-            detailVideo.src = src;
+            detailVideo.src = authUrl(src);
             detailVideo.addEventListener('loadedmetadata', () => {
                 detailLoading.hidden = true;
                 detailVideo.play().catch(e => console.error(`Play failed for ${cameraId}:`, e));
@@ -799,7 +860,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         playbackLoading.hidden = false;
 
         if (typeof Hls !== 'undefined' && Hls.isSupported()) {
-            playbackHls = new Hls({ enableWorker: false });
+            playbackHls = new Hls({ enableWorker: false, ...hlsAuthConfig() });
             playbackHls.loadSource(src);
             playbackHls.attachMedia(playbackVideo);
 
@@ -817,7 +878,7 @@ document.addEventListener('DOMContentLoaded', async () => {
                 }
             });
         } else if (playbackVideo.canPlayType('application/vnd.apple.mpegurl')) {
-            playbackVideo.src = src;
+            playbackVideo.src = authUrl(src);
             playbackVideo.addEventListener('loadedmetadata', () => {
                 playbackLoading.hidden = true;
                 playbackVideo.play().catch(e => console.error('Playback failed:', e));
@@ -963,22 +1024,22 @@ document.addEventListener('DOMContentLoaded', async () => {
         const img = new Image();
         img.onload = () => { stabilityImage = img; drawStability(); };
         img.onerror = () => {};
-        img.src = `api/cameras/${cam}/motion/stability?t=${t}`;
+        img.src = authUrl(`api/cameras/${cam}/motion/stability?t=${t}`);
 
         const raw = new Image();
         raw.onload = () => { rawMog2Image = raw; drawStability(); };
         raw.onerror = () => {};
-        raw.src = `api/cameras/${cam}/motion/stability/raw?t=${t}`;
+        raw.src = authUrl(`api/cameras/${cam}/motion/stability/raw?t=${t}`);
 
         const noShadow = new Image();
         noShadow.onload = () => { noShadowImage = noShadow; drawStability(); };
         noShadow.onerror = () => {};
-        noShadow.src = `api/cameras/${cam}/motion/stability/no-shadow?t=${t}`;
+        noShadow.src = authUrl(`api/cameras/${cam}/motion/stability/no-shadow?t=${t}`);
 
         const morph = new Image();
         morph.onload = () => { morphImage = morph; drawStability(); };
         morph.onerror = () => {};
-        morph.src = `api/cameras/${cam}/motion/stability/morph?t=${t}`;
+        morph.src = authUrl(`api/cameras/${cam}/motion/stability/morph?t=${t}`);
     }
 
     function drawStability() {
@@ -1040,7 +1101,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         const img = new Image();
         img.onload = () => { bgImage = img; drawBackground(); };
         img.onerror = () => {};
-        img.src = `api/cameras/${encodeURIComponent(currentDetailCameraId)}/motion/background?t=${Date.now()}`;
+        img.src = authUrl(`api/cameras/${encodeURIComponent(currentDetailCameraId)}/motion/background?t=${Date.now()}`);
     }
 
     function drawBackground() {
@@ -1059,7 +1120,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     // === Live Monitor: Motion Settings + Ignore Mask ===
 
     function fetchMotionSettings(cameraId) {
-        fetch(`api/cameras/${encodeURIComponent(cameraId)}/motion/settings`)
+        apiFetch(`api/cameras/${encodeURIComponent(cameraId)}/motion/settings`)
             .then(r => r.ok ? r.json() : null)
             .then(data => {
                 if (!data || currentDetailCameraId !== cameraId) return;
@@ -1090,7 +1151,7 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     function putMotionSettings(partial) {
         if (!currentDetailCameraId) return;
-        fetch(`api/cameras/${encodeURIComponent(currentDetailCameraId)}/motion/settings`, {
+        apiFetch(`api/cameras/${encodeURIComponent(currentDetailCameraId)}/motion/settings`, {
             method: 'PUT',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(partial),
@@ -1193,7 +1254,7 @@ document.addEventListener('DOMContentLoaded', async () => {
 
         async function poll() {
             try {
-                const response = await fetch(`api/cameras/${encodeURIComponent(cameraId)}/motion`);
+                const response = await apiFetch(`api/cameras/${encodeURIComponent(cameraId)}/motion`);
                 if (currentDetailCameraId !== cameraId) return;
                 if (response.ok) {
                     const data = await response.json();
@@ -1230,7 +1291,7 @@ document.addEventListener('DOMContentLoaded', async () => {
 
         async function poll() {
             try {
-                const response = await fetch(`api/cameras/${encodeURIComponent(cameraId)}/detections`);
+                const response = await apiFetch(`api/cameras/${encodeURIComponent(cameraId)}/detections`);
                 if (currentDetailCameraId !== cameraId) return;
                 if (response.ok) {
                     const data = await response.json();
@@ -1265,7 +1326,7 @@ document.addEventListener('DOMContentLoaded', async () => {
 
         async function poll() {
             try {
-                const response = await fetch(`api/cameras/${encodeURIComponent(cameraId)}/events`);
+                const response = await apiFetch(`api/cameras/${encodeURIComponent(cameraId)}/events`);
                 if (currentDetailCameraId !== cameraId) return;
                 if (response.ok) {
                     const raw = await response.json();
@@ -1323,7 +1384,7 @@ document.addEventListener('DOMContentLoaded', async () => {
 
             const rows = cluster.dets.slice(0, 3).map(det => {
                 const conf = Math.round(det.confidence * 100);
-                const src = `api/cameras/${encodeURIComponent(currentDetailCameraId)}/detections/${det.id}/frame`;
+                const src = authUrl(`api/cameras/${encodeURIComponent(currentDetailCameraId)}/detections/${det.id}/frame`);
                 return `<div class="tl-card-row" data-t="${det.t}">
                     <img src="${src}" loading="lazy" alt="${det.object_class}">
                     <div class="tl-card-text">
@@ -1518,7 +1579,7 @@ document.addEventListener('DOMContentLoaded', async () => {
                 const item = document.createElement('div');
                 item.className = 'event-list-item';
 
-                const thumbSrc = `api/cameras/${encodeURIComponent(currentDetailCameraId)}/events/${ev.start_pts_ns}/thumbnail`;
+                const thumbSrc = authUrl(`api/cameras/${encodeURIComponent(currentDetailCameraId)}/events/${ev.start_pts_ns}/thumbnail`);
                 const evDate = new Date(ev.start_ms);
                 const timeStr = evDate.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
                 const durSec = (ev.duration_ms / 1000).toFixed(1);
@@ -1540,7 +1601,7 @@ document.addEventListener('DOMContentLoaded', async () => {
                 if (ev.filmstrip_frames > 0) {
                     const cid = encodeURIComponent(currentDetailCameraId);
                     thumbHtml = `<div class="event-filmstrip">` +
-                        Array.from({ length: ev.filmstrip_frames }, (_, i) => `<img class="filmstrip-frame" src="api/cameras/${cid}/events/${ev.start_pts_ns}/filmstrip/${i}" loading="lazy" alt="" onerror="this.style.display='none'">`).join('') +
+                        Array.from({ length: ev.filmstrip_frames }, (_, i) => `<img class="filmstrip-frame" src="${authUrl(`api/cameras/${cid}/events/${ev.start_pts_ns}/filmstrip/${i}`)}" loading="lazy" alt="" onerror="this.style.display='none'">`).join('') +
                         `</div>`;
                 } else {
                     thumbHtml = `<img class="event-list-thumb" src="${thumbSrc}" loading="lazy" alt="">`;
@@ -1619,7 +1680,7 @@ document.addEventListener('DOMContentLoaded', async () => {
             prevEventBtn.hidden = false;
             const prevDate = new Date(nav.prev.start_ms);
             prevEventText.textContent = prevDate.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-            prevEventThumb.src = `api/cameras/${encodeURIComponent(currentDetailCameraId)}/events/${nav.prev.start_pts_ns}/thumbnail`;
+            prevEventThumb.src = authUrl(`api/cameras/${encodeURIComponent(currentDetailCameraId)}/events/${nav.prev.start_pts_ns}/thumbnail`);
         } else {
             prevEventBtn.hidden = true;
         }
@@ -1628,7 +1689,7 @@ document.addEventListener('DOMContentLoaded', async () => {
             nextEventBtn.hidden = false;
             const nextDate = new Date(nav.next.start_ms);
             nextEventText.textContent = nextDate.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-            nextEventThumb.src = `api/cameras/${encodeURIComponent(currentDetailCameraId)}/events/${nav.next.start_pts_ns}/thumbnail`;
+            nextEventThumb.src = authUrl(`api/cameras/${encodeURIComponent(currentDetailCameraId)}/events/${nav.next.start_pts_ns}/thumbnail`);
         } else {
             nextEventBtn.hidden = true;
         }
@@ -1665,7 +1726,7 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     async function fetchDebugEntries(cameraId) {
         try {
-            const res = await fetch(`api/cameras/${encodeURIComponent(cameraId)}/detection-debug`);
+            const res = await apiFetch(`api/cameras/${encodeURIComponent(cameraId)}/detection-debug`);
             if (!res.ok) return;
             const entries = await res.json();
             renderDebugList(cameraId, entries);
@@ -1696,7 +1757,7 @@ document.addEventListener('DOMContentLoaded', async () => {
             const fullFrameHtml = entry.has_full_frame
                 ? `<div class="debug-full-frame-container">
                     <div class="debug-full-frame-wrap">
-                        <img class="debug-full-frame-image" data-entry-id="${entry.id}" src="api/cameras/${encodedId}/detection-debug/${entry.id}/full-frame" alt="Full frame" loading="lazy">
+                        <img class="debug-full-frame-image" data-entry-id="${entry.id}" src="${authUrl(`api/cameras/${encodedId}/detection-debug/${entry.id}/full-frame`)}" alt="Full frame" loading="lazy">
                         <canvas class="debug-overlay-canvas" data-entry-id="${entry.id}"></canvas>
                     </div>
                     <div class="debug-overlay-legend">
@@ -1713,7 +1774,7 @@ document.addEventListener('DOMContentLoaded', async () => {
                     .replace(/</g, '&lt;')
                     .replace(/>/g, '&gt;');
                 return `<div class="debug-frame-pair">
-                    <img class="debug-frame-image" src="api/cameras/${encodedId}/detection-debug/${entry.id}/frame/${i}" alt="Frame ${i + 1}" loading="lazy">
+                    <img class="debug-frame-image" src="${authUrl(`api/cameras/${encodedId}/detection-debug/${entry.id}/frame/${i}`)}" alt="Frame ${i + 1}" loading="lazy">
                     <pre class="debug-raw-response">${response}</pre>
                 </div>`;
             }).join('');

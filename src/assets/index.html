@@ -221,6 +221,17 @@
             </div>
         </div>
     </main>
+    <!-- Token prompt. Shown only when the API answers 401 — the UI shell is
+         served unauthenticated precisely so this can load and collect the
+         token, which is then kept in localStorage. -->
+    <div id="token-prompt" hidden>
+        <div class="token-card">
+            <h2>Access token required</h2>
+            <p>This server is protected by a token (<code>[http] token</code> in config.toml).</p>
+            <input type="password" id="token-input" placeholder="Token" autocomplete="current-password" spellcheck="false">
+            <button id="token-submit" class="settings-action-btn">Unlock</button>
+        </div>
+    </div>
     <footer>__VERSION__</footer>
     <script src="assets/hls.min.js"></script>
     <script src="assets/app.js"></script>

@@ -94,7 +94,7 @@ add-on. Until `camon.toml` exists the add-on logs these instructions and exits.
 
 ### Values forced at startup
 
-Three values are **forced by `run.sh`** via `camon --set`, overriding whatever
+Five values are **forced by `run.sh`** via `camon --set`, overriding whatever
 `camon.toml` says — they are non-negotiable inside the container:
 
 - **`update.enabled = false`.** Camon's built-in GitHub self-updater is
@@ -107,6 +107,15 @@ Three values are **forced by `run.sh`** via `camon --set`, overriding whatever
   never collide with another service even if host networking is ever enabled
   (with ingress-only access, no host port is bound at all). The port is pinned
   so that wiring can't be broken from the config file.
+- **`http.bind = 0.0.0.0`.** Ingress reaches the add-on over the container
+  network, so the listener has to accept connections from it. A `bind` of
+  `127.0.0.1` in `camon.toml` would silently break ingress, hence the pin.
+- **`http.allow_open = true`.** Standalone camon warns loudly at startup when
+  its API is reachable over the network without an `[http] token`. In the
+  add-on that warning does not apply: nothing outside the container can reach
+  port 22666, and Home Assistant authenticates every user before proxying them
+  through ingress — HA *is* the authentication layer here. Setting an `[http]
+  token` as well is supported and harmless, but not needed.
 - **`storage.data_dir = /data/storage`.** `/data` is the add-on's own
   persistent volume — always mounted and preserved across restarts/updates — so
   recordings survive there automatically.

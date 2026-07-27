@@ -4,15 +4,21 @@
 # The add-on is configured EXACTLY like a native install: a camon.toml file in
 # the add-on's config folder (/addon_configs/..._camon, mounted here at
 # /config). There is no options UI — run.sh just points Camon at that file and
-# forces three values that are non-negotiable inside the container:
+# forces five values that are non-negotiable inside the container:
 #
 #   * update.enabled = false — in-container self-update is wrong for an add-on.
 #     The container filesystem is ephemeral and updates flow through Home
 #     Assistant's add-on store, so Camon's GitHub self-updater is disabled.
 #   * http.port = 22666 — the add-on is reached exclusively through ingress,
 #     which is wired to this internal port (ingress_port in config.yaml).
+#   * http.bind = 0.0.0.0 — ingress reaches the container over the container
+#     network, so binding loopback (or anything else) silently breaks it.
 #   * storage.data_dir = /data/storage — /data is the add-on's persistent
 #     volume, so recordings survive restarts/updates.
+#   * http.allow_open = true — ingress IS the authentication layer here (Home
+#     Assistant authenticates the user before proxying), and the internal port
+#     is only reachable from the container network, so Camon's warning about an
+#     unauthenticated API does not apply.
 #
 # These are applied with `--set` at startup, overriding whatever the file says.
 #
@@ -55,7 +61,7 @@ EOF
   exit 1
 fi
 
-echo "[camon-addon] using $CONFIG (update.enabled/http.port/storage.data_dir forced)"
+echo "[camon-addon] using $CONFIG (update.enabled/http.port/http.bind/http.allow_open/storage.data_dir forced)"
 
 # --- MQTT auto-configuration from a Supervisor-managed broker --------------
 # config.yaml requests `services: - mqtt:want`, which grants access to the
@@ -84,5 +90,7 @@ fi
 exec camon --config "$CONFIG" \
   --set update.enabled=false \
   --set http.port=22666 \
+  --set http.bind=0.0.0.0 \
+  --set http.allow_open=true \
   --set storage.data_dir=/data/storage \
   "${MQTT_ARGS[@]}"

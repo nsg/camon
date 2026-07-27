@@ -487,9 +487,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let args = parse_cli_args();
-    let config = match args.config {
-        Some(path) => Config::load_from_with_overrides(path, &args.overrides)?,
-        None => Config::load(&args.overrides)?,
+    let loaded = match args.config {
+        Some(path) => Config::load_from_with_overrides(path, &args.overrides),
+        None => Config::load(&args.overrides),
+    };
+    // Display, not the `?` operator's Debug: a config error is for the operator
+    // to read and fix.
+    let config = match loaded {
+        Ok(config) => config,
+        Err(e) => {
+            eprintln!("error: {e}");
+            std::process::exit(1);
+        }
     };
     check_for_updates(&config).await;
 
@@ -615,9 +624,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         storage,
         motion_settings,
     );
-    let http_port = config.http.port;
+    let http_addr = std::net::SocketAddr::new(config.http.bind_addr(), config.http.port);
+    let http_token = config.http.token.clone();
+    api::warn_if_open(
+        http_addr.ip(),
+        http_token.as_deref(),
+        config.http.allow_open,
+    );
     let server_handle = tokio::spawn(async move {
-        if let Err(e) = api::start_server(app_state, http_port).await {
+        if let Err(e) = api::start_server(app_state, http_addr, http_token).await {
             tracing::error!("HTTP server error: {}", e);
         }
     });

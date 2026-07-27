@@ -1,14 +1,17 @@
 use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, RwLock};
 
 use axum::body::Body;
-use axum::extract::{Path, Query, State};
-use axum::http::{header, HeaderMap, StatusCode};
+use axum::extract::{Path, Query, Request, State};
+use axum::http::{header, HeaderMap, Method, StatusCode};
+use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use rust_embed::Embed;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::analytics::motion_settings::{
     MotionSettings, MASK_COLS, MASK_ROWS, MIN_CONTOUR_AREA_MAX, MIN_CONTOUR_AREA_MIN,
@@ -93,10 +96,108 @@ struct PlaylistQuery {
     live: Option<bool>,
 }
 
-pub async fn start_server(state: AppState, port: u16) -> Result<(), std::io::Error> {
-    let app = Router::new()
+/// SHA-256 of the configured `[http] token`. The presented token is hashed the
+/// same way before comparison: `==` on `[u8; 32]` is not guaranteed to be
+/// constant-time, but it runs over two fixed-width digests, so how far it gets
+/// says nothing usable about the secret's length or content.
+#[derive(Clone)]
+struct TokenAuth(Arc<[u8; 32]>);
+
+fn token_digest(token: &str) -> [u8; 32] {
+    Sha256::digest(token.as_bytes()).into()
+}
+
+/// The `?token=` fallback, for requests that cannot carry headers: `<img>`
+/// sources (thumbnails, filmstrips, debug maps) and native video elements.
+/// Those are reads, so the fallback is confined to GET and HEAD — anything
+/// that changes state must present the header.
+#[derive(Deserialize)]
+struct TokenQuery {
+    token: Option<String>,
+}
+
+fn bearer_token(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(header::AUTHORIZATION)?
+        .to_str()
+        .ok()?
+        .strip_prefix("Bearer ")
+}
+
+async fn require_token(State(auth): State<TokenAuth>, request: Request, next: Next) -> Response {
+    let query_fallback_allowed = matches!(*request.method(), Method::GET | Method::HEAD);
+    let presented = match bearer_token(request.headers()) {
+        Some(token) => Some(token.to_string()),
+        None if query_fallback_allowed => Query::<TokenQuery>::try_from_uri(request.uri())
+            .ok()
+            .and_then(|q| q.0.token),
+        None => None,
+    };
+
+    match presented {
+        Some(token) if token_digest(&token) == *auth.0 => next.run(request).await,
+        _ => (
+            StatusCode::UNAUTHORIZED,
+            [(header::WWW_AUTHENTICATE, "Bearer")],
+            "unauthorized",
+        )
+            .into_response(),
+    }
+}
+
+/// True when the API can be reached from another machine with no token — the
+/// configuration [`warn_if_open`] shouts about.
+fn is_open_to_network(bind: IpAddr, token: Option<&str>) -> bool {
+    token.is_none() && !bind.is_loopback()
+}
+
+/// Warn loudly at startup when the API is reachable off-box without a token.
+/// `allow_open` silences it for deployments that authenticate one layer out.
+pub fn warn_if_open(bind: IpAddr, token: Option<&str>, allow_open: bool) {
+    if allow_open || !is_open_to_network(bind, token) {
+        return;
+    }
+    tracing::warn!(
+        %bind,
+        "THE API IS OPEN: anyone who can reach this address can watch all footage and \
+         change motion settings. Set [http] token to require a token, or [http] bind to \
+         \"127.0.0.1\" to keep it on this machine. Set [http] allow_open = true to silence \
+         this if something in front of camon already authenticates."
+    );
+}
+
+/// The UI shell (`/` and `/assets/*`) stays unauthenticated so the token prompt
+/// can load; everything under `/api` needs the token once one is configured.
+pub fn build_router(state: AppState, token: Option<&str>) -> Router {
+    let mut api = api_routes().with_state(state);
+    if let Some(token) = token {
+        api = api.route_layer(middleware::from_fn_with_state(
+            TokenAuth(Arc::new(token_digest(token))),
+            require_token,
+        ));
+    }
+
+    Router::new()
         .route("/", get(index_handler))
         .route("/assets/{*path}", get(static_handler))
+        .merge(api)
+}
+
+pub async fn start_server(
+    state: AppState,
+    addr: SocketAddr,
+    token: Option<String>,
+) -> Result<(), std::io::Error> {
+    let app = build_router(state, token.as_deref());
+
+    tracing::info!("starting HTTP server on http://{}", addr);
+
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    axum::serve(listener, app).await
+}
+
+fn api_routes() -> Router<AppState> {
+    Router::new()
         .route("/api/cameras", get(cameras_handler))
         .route("/api/cameras/{id}/motion", get(motion_handler))
         .route(
@@ -164,13 +265,6 @@ pub async fn start_server(state: AppState, port: u16) -> Result<(), std::io::Err
         )
         .route("/api/stream/{id}/playlist.m3u8", get(playlist_handler))
         .route("/api/stream/{id}/segment/{n}", get(segment_handler))
-        .with_state(state);
-
-    let addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
-    tracing::info!("starting HTTP server on http://{}", addr);
-
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app).await
 }
 
 async fn index_handler() -> impl IntoResponse {
@@ -949,6 +1043,168 @@ async fn warm_filmstrip_handler(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const TOKEN: &str = "s3cr3t token";
+
+    /// Bind the router to an ephemeral loopback port and return its base URL.
+    /// Requests go over real HTTP so the middleware is exercised exactly as it
+    /// is in production, headers and query string included.
+    async fn serve(token: Option<&str>) -> String {
+        let ids = vec!["cam".to_string()];
+        let buffers = HashMap::from([("cam".to_string(), HotBuffer::new("cam".to_string(), 60))]);
+        let state = AppState::new(
+            buffers,
+            MotionStore::new(&ids),
+            DetectionStore::new(&ids),
+            DetectionDebugStore::new(&ids),
+            None,
+            None,
+        );
+        let app = build_router(state, token);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn api_rejects_requests_without_the_token() {
+        let base = serve(Some(TOKEN)).await;
+        let client = reqwest::Client::new();
+
+        let status = client
+            .get(format!("{base}/api/cameras"))
+            .send()
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(status, reqwest::StatusCode::UNAUTHORIZED);
+
+        let status = client
+            .get(format!("{base}/api/cameras"))
+            .bearer_auth("wrong")
+            .send()
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(status, reqwest::StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn bearer_header_carries_the_token() {
+        let base = serve(Some(TOKEN)).await;
+        let response = reqwest::Client::new()
+            .get(format!("{base}/api/cameras"))
+            .bearer_auth(TOKEN)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert_eq!(response.json::<Vec<String>>().await.unwrap(), ["cam"]);
+    }
+
+    #[tokio::test]
+    async fn query_token_carries_it_where_headers_cannot() {
+        let base = serve(Some(TOKEN)).await;
+        // Media route with a query parameter of its own: the token must coexist
+        // with it, and arrive percent-decoded.
+        let response = reqwest::get(format!(
+            "{base}/api/stream/cam/playlist.m3u8?live=true&token=s3cr3t%20token"
+        ))
+        .await
+        .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert!(response.text().await.unwrap().starts_with("#EXTM3U"));
+    }
+
+    #[tokio::test]
+    async fn a_wrong_query_token_is_rejected() {
+        let base = serve(Some(TOKEN)).await;
+        let status = reqwest::get(format!("{base}/api/cameras?token=wrong"))
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(status, reqwest::StatusCode::UNAUTHORIZED);
+    }
+
+    /// State-changing routes are behind the same layer, and the `?token=`
+    /// fallback — meant for `<img>` and native video, which only ever GET —
+    /// does not reach them: a write must present the header.
+    #[tokio::test]
+    async fn writes_require_the_header_and_never_the_query_token() {
+        let base = serve(Some(TOKEN)).await;
+        let url = format!("{base}/api/cameras/cam/motion/settings");
+        let client = reqwest::Client::new();
+
+        let status = client
+            .put(&url)
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(status, reqwest::StatusCode::UNAUTHORIZED);
+
+        let status = client
+            .put(format!("{url}?token=s3cr3t%20token"))
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(status, reqwest::StatusCode::UNAUTHORIZED);
+
+        // The header still works for writes; 404 is this build's answer once
+        // authorized (motion settings are disabled in the test state), and
+        // crucially it is not a 401.
+        let status = client
+            .put(&url)
+            .bearer_auth(TOKEN)
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(status, reqwest::StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn ui_shell_loads_without_a_token() {
+        let base = serve(Some(TOKEN)).await;
+        let client = reqwest::Client::new();
+
+        let response = client.get(&base).send().await.unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert!(response.text().await.unwrap().contains("<title>"));
+
+        let status = client
+            .get(format!("{base}/assets/app.js"))
+            .send()
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(status, reqwest::StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn no_configured_token_leaves_the_api_open() {
+        let base = serve(None).await;
+        let status = reqwest::get(format!("{base}/api/cameras"))
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(status, reqwest::StatusCode::OK);
+    }
+
+    #[test]
+    fn open_api_warning_covers_exactly_the_unprotected_network_case() {
+        let all = IpAddr::from([0, 0, 0, 0]);
+        let loopback = IpAddr::from([127, 0, 0, 1]);
+        assert!(is_open_to_network(all, None));
+        assert!(!is_open_to_network(all, Some(TOKEN)));
+        assert!(!is_open_to_network(loopback, None));
+        assert!(!is_open_to_network("::1".parse().unwrap(), None));
+    }
 
     #[test]
     fn parse_range_header_accepts_every_single_range_form() {

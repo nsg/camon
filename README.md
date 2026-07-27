@@ -153,6 +153,21 @@ hot_duration_secs = 600
 [http]
 # HTTP server port for web UI and API (default: 8080)
 port = 8080
+# Address to bind to (default: "0.0.0.0" = every interface, reachable from the
+# LAN). "127.0.0.1" keeps the server on this machine only.
+bind = "0.0.0.0"
+# Access token for the API (default: none = anyone who can reach the port can
+# watch all footage and change motion settings). When set, every request under
+# /api must present it as an "Authorization: Bearer <token>" header; GET and
+# HEAD may instead use a "?token=<token>" query parameter, which is how image
+# and video URLs that cannot set headers authenticate. The web UI prompts for
+# it once and keeps it in the browser's local storage; the UI shell itself
+# stays unauthenticated so that prompt can load.
+# token = "s3cr3t-token"
+# Silence the startup warning about an unauthenticated API on a non-loopback
+# bind (default: false). Set true only when something in front of camon already
+# authenticates — e.g. the Home Assistant add-on, where ingress does.
+allow_open = false
 
 [analytics]
 # Enable MOG2 motion detection (default: false)

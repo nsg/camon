@@ -1,5 +1,6 @@
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::path::Path;
 use thiserror::Error;
 
@@ -13,6 +14,16 @@ pub enum ConfigError {
     Parse(#[from] toml::de::Error),
     #[error("no cameras configured")]
     NoCameras,
+    #[error(
+        "invalid [http] bind {value:?}: expected an IP address, e.g. \"0.0.0.0\" (all \
+         interfaces) or \"127.0.0.1\" (this machine only)"
+    )]
+    HttpBind { value: String },
+    #[error(
+        "[http] token is set but empty; remove the key to run without authentication, or \
+         give it a real value, e.g. `openssl rand -hex 32`"
+    )]
+    HttpTokenEmpty,
     #[error(
         "camera id {id:?} contains {character:?}, which is an MQTT topic wildcard; \
          rename the camera or disable [mqtt]"
@@ -152,6 +163,13 @@ fn default_http_port() -> u16 {
     8080
 }
 
+/// All interfaces. The Home Assistant add-on is reached through ingress over
+/// the container network, and standalone installs are reached over the LAN, so
+/// loopback would break both out of the box.
+fn default_http_bind() -> String {
+    "0.0.0.0".to_string()
+}
+
 impl Default for BufferConfig {
     fn default() -> Self {
         Self {
@@ -164,12 +182,36 @@ impl Default for BufferConfig {
 pub struct HttpConfig {
     #[serde(default = "default_http_port")]
     pub port: u16,
+    /// Address the listener binds to. Validated as an [`IpAddr`] at load time.
+    #[serde(default = "default_http_bind")]
+    pub bind: String,
+    /// Shared secret required on every `/api` request. `None` (the default)
+    /// leaves the API open to anyone who can reach the port.
+    #[serde(default)]
+    pub token: Option<String>,
+    /// Suppresses the open-API startup warning for deployments where an outer
+    /// layer authenticates (e.g. Home Assistant ingress).
+    #[serde(default)]
+    pub allow_open: bool,
+}
+
+impl HttpConfig {
+    /// The parsed [`bind`](Self::bind) address. `Config::validate` rejects an
+    /// unparseable value at load time, so this cannot fail on a loaded config.
+    pub fn bind_addr(&self) -> IpAddr {
+        self.bind
+            .parse()
+            .expect("bind address validated at config load")
+    }
 }
 
 impl Default for HttpConfig {
     fn default() -> Self {
         Self {
             port: default_http_port(),
+            bind: default_http_bind(),
+            token: None,
+            allow_open: false,
         }
     }
 }
@@ -580,6 +622,23 @@ impl Config {
             return Err(ConfigError::NoCameras);
         }
 
+        if self.http.bind.parse::<IpAddr>().is_err() {
+            return Err(ConfigError::HttpBind {
+                value: self.http.bind.clone(),
+            });
+        }
+
+        // An empty token is worse than no token: it silences the open-API
+        // warning while `?token=` or a bare `Bearer ` satisfies the check.
+        if self
+            .http
+            .token
+            .as_ref()
+            .is_some_and(|t| t.trim().is_empty())
+        {
+            return Err(ConfigError::HttpTokenEmpty);
+        }
+
         // Camera ids only reach MQTT topics and Home Assistant unique ids when
         // the bridge is enabled; otherwise they stay free-form.
         if !self.mqtt.enabled {
@@ -743,6 +802,55 @@ url = "rtsp://user:pass@10.0.0.6:554/stream1"
         // File said 9090 / default-true; the overrides win.
         assert_eq!(config.http.port, 22666);
         assert!(!config.update.enabled);
+    }
+
+    #[test]
+    fn http_defaults_to_open_on_all_interfaces() {
+        let dir = write_temp("config.toml", TOML_SAMPLE);
+        let config = Config::load_from_with_overrides(dir.path().join("config.toml"), &[]).unwrap();
+        assert_eq!(config.http.bind, "0.0.0.0");
+        assert_eq!(config.http.bind_addr(), IpAddr::from([0, 0, 0, 0]));
+        assert!(config.http.token.is_none());
+        assert!(!config.http.allow_open);
+    }
+
+    #[test]
+    fn http_auth_keys_are_settable_from_the_command_line() {
+        let dir = write_temp("config.toml", TOML_SAMPLE);
+        let overrides = [
+            Override::parse("http.token=s3cr3t").unwrap(),
+            Override::parse("http.bind=127.0.0.1").unwrap(),
+            Override::parse("http.allow_open=true").unwrap(),
+        ];
+        let config =
+            Config::load_from_with_overrides(dir.path().join("config.toml"), &overrides).unwrap();
+        assert_eq!(config.http.token.as_deref(), Some("s3cr3t"));
+        assert_eq!(config.http.bind_addr(), IpAddr::from([127, 0, 0, 1]));
+        assert!(config.http.allow_open);
+    }
+
+    #[test]
+    fn empty_http_token_is_rejected() {
+        let dir = write_temp("config.toml", TOML_SAMPLE);
+        for empty in ["", "   "] {
+            let overrides = [Override::parse(&format!("http.token={empty}")).unwrap()];
+            let err = Config::load_from_with_overrides(dir.path().join("config.toml"), &overrides)
+                .unwrap_err();
+            assert!(
+                matches!(err, ConfigError::HttpTokenEmpty),
+                "got {err:?} for {empty:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn unparseable_bind_is_rejected() {
+        let dir = write_temp("config.toml", TOML_SAMPLE);
+        let overrides = [Override::parse("http.bind=localhost").unwrap()];
+        let err = Config::load_from_with_overrides(dir.path().join("config.toml"), &overrides)
+            .unwrap_err();
+        assert!(matches!(err, ConfigError::HttpBind { .. }), "got {err:?}");
+        assert!(err.to_string().contains("localhost"), "got {err}");
     }
 
     #[test]

@@ -36,7 +36,7 @@ Cameras stream H.264 via RTSP into the hot buffer. Keyframes are sampled for ana
 
 ## API
 
-HTTP REST API for playback and search. Supports live and historical video playback by time offset, and event search by time range and camera. Authentication, semantic query, and clip export are planned.
+HTTP REST API for playback and search. Supports live and historical video playback by time offset, and event search by time range and camera. Setting `[http] token` puts every `/api` route behind a shared secret, sent as an `Authorization: Bearer` header — or, for GET and HEAD requests such as image and video URLs that cannot set headers, as a `?token=` query parameter. The token is optional: leaving it unset keeps the API open, and camon warns at startup when that is combined with a non-loopback `[http] bind`. Semantic query and clip export are planned.
 
 ## Web Interface
 
