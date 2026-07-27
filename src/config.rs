@@ -65,6 +65,12 @@ pub enum ConfigError {
     )]
     MqttWildcardCameraId { id: String, character: char },
     #[error(
+        "object detection class {class:?} contains {character:?}, which is an MQTT topic \
+         wildcard; its occupancy topic could never be published — rename the class or \
+         disable [mqtt]"
+    )]
+    MqttWildcardClass { class: String, character: char },
+    #[error(
         "camera ids {first:?} and {second:?} both normalize to MQTT slug {slug:?}; \
          rename one so Home Assistant entities don't collide"
     )]
@@ -803,6 +809,18 @@ impl Config {
             }
         }
 
+        // Classes reach the topic verbatim too, so the same wildcard rules
+        // apply: an occupancy topic holding one is rejected by the client on
+        // every attempt, and the bridge would retry it for ever.
+        for class in &self.analytics.object_detection.classes {
+            if let Some(character) = class.chars().find(|c| matches!(c, '+' | '#')) {
+                return Err(ConfigError::MqttWildcardClass {
+                    class: class.clone(),
+                    character,
+                });
+            }
+        }
+
         Ok(())
     }
 }
@@ -1151,6 +1169,31 @@ url = "rtsp://10.0.0.6:554/stream1"
         let message = err.to_string();
         assert!(message.contains("cam+1"), "got {message}");
         assert!(message.contains('+'), "got {message}");
+    }
+
+    const WILDCARD_CLASS: &str = r##"
+[analytics.object_detection]
+classes = ["person", "#"]
+
+[[cameras]]
+id = "yard"
+url = "rtsp://10.0.0.5:554/stream1"
+"##;
+
+    #[test]
+    fn mqtt_rejects_wildcard_object_class() {
+        let err = load_with_mqtt(WILDCARD_CLASS, true).unwrap_err();
+        assert!(
+            matches!(err, ConfigError::MqttWildcardClass { .. }),
+            "got {err:?}"
+        );
+        let message = err.to_string();
+        assert!(message.contains('#'), "got {message}");
+    }
+
+    #[test]
+    fn disabled_mqtt_leaves_object_classes_unconstrained() {
+        load_with_mqtt(WILDCARD_CLASS, false).unwrap();
     }
 
     #[test]
