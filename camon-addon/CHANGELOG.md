@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- **An all-digit MQTT password no longer stops the add-on from starting.**
+  The Supervisor's generated credentials are handed to camon with
+  `--set`, and a value that looked like a number used to be read as one —
+  so a password of `48151623` was rejected as "expected a string" and the
+  add-on never came up. A `--set` value is now typed from the setting it
+  is given for, not from how the text looks: `http.port=8080` is still a
+  number, `mqtt.password=8080` is text.
 - **Camon's automatic self-update is now opt-in.** `update.enabled`
   defaults to `false`: a downloaded release is only checked against the
   checksum file published beside it, which catches a corrupt download but
@@ -57,6 +64,18 @@
 - Object classes in `analytics.object_detection.classes` are lowercased
   and deduplicated when loaded, so `classes = ["Person"]` now creates a
   working occupancy sensor instead of one that could never turn on.
+- **`classes = []` is no longer accepted while object detection is on**,
+  and neither is a blank entry. An empty list used to mean two different
+  things at once: the detector fell back to a built-in list of ten and
+  looked for people and cars, while Home Assistant got no occupancy
+  sensors for any of them. Leave the key out to detect the defaults
+  (person, car, truck, dog, cat), or set `[analytics.object_detection]
+  enabled = false` to detect nothing. Class names are also trimmed now, so
+  `" Person"` and `"person"` are one class rather than two, one of which
+  could never turn on. **If your `camon.toml` has an empty list with
+  detection enabled, the add-on will stop with that message on the first
+  start after this update** — there is no safe repair camon could apply
+  for you, since the two readings mean opposite things.
 
 ## 0.5.0
 

@@ -15,20 +15,6 @@
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 
-/// Fallback class list when the config allowlist is empty.
-const DEFAULT_CLASSES: [&str; 10] = [
-    "person",
-    "car",
-    "truck",
-    "dog",
-    "cat",
-    "bird",
-    "bicycle",
-    "motorcycle",
-    "bus",
-    "boat",
-];
-
 /// TCP connect timeout. A down or unreachable server fails in seconds instead
 /// of eating the whole request timeout.
 const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
@@ -116,7 +102,10 @@ pub struct OllamaClient {
     primary: OllamaServer,
     fallback: Option<OllamaServer>,
     confidence_threshold: f32,
-    /// Lowercased allowlist; never empty (defaults applied at construction).
+    /// The configured allowlist, lowercased. Taken as given — no substitution,
+    /// so the classes asked of the model are exactly the ones the MQTT bridge
+    /// publishes occupancy entities for. `Config::validate` rejects an empty
+    /// list while object detection is on.
     allowed_classes: Vec<String>,
 }
 
@@ -143,14 +132,10 @@ impl OllamaClient {
             model: model.to_string(),
         });
 
-        let allowed_classes = if allowed_classes.is_empty() {
-            DEFAULT_CLASSES.iter().map(|c| c.to_string()).collect()
-        } else {
-            allowed_classes
-                .into_iter()
-                .map(|c| c.to_lowercase())
-                .collect()
-        };
+        let allowed_classes = allowed_classes
+            .into_iter()
+            .map(|c| c.to_lowercase())
+            .collect();
 
         Ok(Self {
             client,
@@ -163,6 +148,12 @@ impl OllamaClient {
 
     pub fn model(&self) -> &str {
         &self.primary.model
+    }
+
+    /// The classes this client will ask the model about, for callers that have
+    /// to publish the same set (the MQTT bridge's occupancy entities).
+    pub fn allowed_classes(&self) -> &[String] {
+        &self.allowed_classes
     }
 
     /// Startup sanity check: ask each configured server for its pulled models
@@ -626,20 +617,14 @@ mod tests {
         assert!(prompt.contains("detections"));
     }
 
+    /// Config validation makes this unreachable in production; the point is
+    /// that the client invents no classes of its own, so it can never look for
+    /// something the MQTT bridge has no entity for.
     #[test]
-    fn empty_class_list_falls_back_to_defaults() {
+    fn empty_class_list_is_not_substituted() {
         let client =
             OllamaClient::new("http://localhost:11434", "test", 90, 0.5, vec![], None).unwrap();
-        let prompt = client.build_prompt();
-        assert!(prompt.contains("person, car, truck, dog, cat, bird"));
-        let schema = build_format_schema(&client.allowed_classes);
-        assert_eq!(
-            schema["properties"]["detections"]["items"]["properties"]["class"]["enum"]
-                .as_array()
-                .unwrap()
-                .len(),
-            10
-        );
+        assert!(client.allowed_classes.is_empty());
     }
 
     #[test]

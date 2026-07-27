@@ -326,6 +326,16 @@ fn init_motion_settings(
     ))
 }
 
+/// The classes the MQTT bridge publishes occupancy entities for: read off the
+/// detector itself, so an entity can never exist for a class nothing looks for
+/// or the other way round. No client means no detections at all — object
+/// detection is off, or its client could not be built — and so no entities.
+fn mqtt_object_classes(client: Option<&OllamaClient>) -> Vec<String> {
+    client
+        .map(|c| c.allowed_classes().to_vec())
+        .unwrap_or_default()
+}
+
 fn create_ollama_client(config: &Config) -> Option<OllamaClient> {
     let od = &config.analytics.object_detection;
     let fallback = od
@@ -779,6 +789,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         None
     };
+    let object_classes = mqtt_object_classes(ollama_client.as_ref());
     let event_registry = if ollama_client.is_some() && config.storage.enabled {
         Some(EventRegistry::new(&camera_ids))
     } else {
@@ -855,19 +866,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let mqtt_handle = mqtt_rx.map(|rx| {
-        // Occupancy sensors only exist for classes the model is actually asked
-        // about; with object detection off there are none.
-        let classes = if config.analytics.enabled && config.analytics.object_detection.enabled {
-            config.analytics.object_detection.classes.clone()
-        } else {
-            Vec::new()
-        };
         mqtt::spawn_bridge(
             BridgeContext {
                 config: config.mqtt.clone(),
                 buffers: Arc::new(camera_handles.buffers_map.clone()),
                 camera_ids: camera_ids.clone(),
-                classes,
+                classes: object_classes,
                 shutdown: Arc::clone(&shutdown.flag),
             },
             rx,
@@ -1333,5 +1337,45 @@ mod tests {
             marker.exists(),
             "the update branch took the process down instead of returning"
         );
+    }
+
+    const ONE_CAMERA: &str = "\n[[cameras]]\nid = \"yard\"\nurl = \"rtsp://10.0.0.5:554/s0\"\n";
+
+    fn config_from(toml: &str) -> Config {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, toml).unwrap();
+        Config::load_from_with_overrides(&path, &[]).unwrap()
+    }
+
+    /// The classes the model is asked about and the classes Home Assistant
+    /// gets occupancy entities for are one list. Two gates that drifted apart
+    /// is how `classes = []` came to mean opposite things.
+    #[test]
+    fn both_consumers_are_handed_the_same_object_classes() {
+        let config = config_from(&format!(
+            "[analytics]\nenabled = true\n\n[analytics.object_detection]\nenabled = true\n\
+             classes = [\"Person\", \"cat\"]\n{ONE_CAMERA}"
+        ));
+        let client = create_ollama_client(&config).expect("client");
+        let expected = vec!["person".to_string(), "cat".to_string()];
+        assert_eq!(client.allowed_classes(), expected);
+        assert_eq!(mqtt_object_classes(Some(&client)), expected);
+    }
+
+    /// Either half of the gate off means no detector runs, so the bridge must
+    /// publish no occupancy entities either.
+    #[test]
+    fn no_object_classes_reach_the_bridge_when_nothing_detects() {
+        for flags in [
+            "[analytics]\nenabled = true\n\n[analytics.object_detection]\nenabled = false",
+            "[analytics]\nenabled = false\n\n[analytics.object_detection]\nenabled = true",
+        ] {
+            let config = config_from(&format!("{flags}\n{ONE_CAMERA}"));
+            assert!(!log_object_detection_config(&config));
+            // Startup builds no client in this state, and without one the
+            // bridge is handed nothing.
+            assert!(mqtt_object_classes(None).is_empty(), "with {flags:?}");
+        }
     }
 }
