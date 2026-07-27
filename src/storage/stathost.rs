@@ -16,7 +16,10 @@
 //! `{start_pts_ns}_{duration_ms}.ts`, a `.json` sidecar, and eager
 //! `{stem}_thumb_{i}.jpg` filmstrip frames. **The event type lives in the
 //! sidecar** (`"event_type"`), not in a directory, so a sidecar is *always*
-//! uploaded (unlike local mode, where it is conditional).
+//! uploaded (unlike local mode, where it is conditional) and — for every event
+//! except the plain movement one that a sidecar-less `.ts` already scans back
+//! as — *required*: a write that cannot store it is failed rather than
+//! reported as written.
 //!
 //! Notable divergences from [`LocalDiskBackend`], all deliberate:
 //!
@@ -28,11 +31,26 @@
 //! * **Thumbnails are eager.** Filmstrip frame 0 doubles as the poster; there
 //!   is no ffmpeg on remote bytes. [`read_thumbnail`] fetches `thumb_0` or
 //!   returns a clear error when the event has no frames.
-//! * **Interrupted-upload hygiene.** The `.ts` is uploaded first, sidecar and
-//!   thumbs after, so a crash mid-sequence leaves at worst a `.ts` without a
-//!   sidecar — indexed as a plain movement event on the next scan. stathost's
-//!   uploads are atomic server-side, so a truncated object can't be served; a
-//!   zero-byte `.ts` in the listing still gets a warning at scan time.
+//! * **The `.ts` upload is the commit point**, the way the staging rename is in
+//!   local mode: the sidecar goes up first, the video second, thumbs last. A
+//!   `.ts` that outlived its sidecar would scan back as a plain movement and
+//!   expire on the wrong retention (2 days instead of 14), so no video is
+//!   uploaded until its metadata is durable. Nothing is rolled back afterwards:
+//!   a failed upload can still have landed (a timeout or a proxy error says
+//!   nothing about what the origin committed), and both leftovers are benign —
+//!   an orphan `.json` is invisible to the scan, which walks `.ts` objects
+//!   only, and a phantom `.ts` still has the sidecar that types it correctly.
+//!   stathost's uploads are atomic server-side, so a truncated object can't be
+//!   served; a zero-byte `.ts` in the listing still gets a warning at scan time.
+//! * **An unreadable sidecar is not a movement event.** The scan applies the
+//!   movement default only to a *confirmed* 404; anything else — a transport
+//!   failure, unparsable bytes, valid JSON naming no type — leaves the type
+//!   unknown. Such an event is still indexed and served, but every decision
+//!   that would need its type errs toward keeping it: age-based pruning
+//!   measures it against the longest configured retention, and budget eviction
+//!   tiers it with the objects. The prune tick re-reads its sidecar, which is
+//!   the only in-process retry there is — [`scan`](StathostBackend::scan) runs
+//!   once at startup.
 //! * **`read_video` streams the object with Range support.** The body is never
 //!   fully buffered; a forwarded `Range` header yields a `206`. A `200` to a
 //!   range request is legal HTTP and degrades to streaming the full body (the
@@ -55,7 +73,9 @@ use crate::storage::backend::{
     deduplicate_detections, RangeRequest, ServedRange, ThumbnailError, VideoStream,
     WarmStorageBackend, WriteOutcome,
 };
-use crate::storage::warm_index::{parse_event_filename, parse_sidecar_json, DetectionDetail};
+use crate::storage::warm_index::{
+    parse_event_filename, parse_sidecar_json, DetectionDetail, SidecarData,
+};
 use crate::storage::{EventType, WarmEventEntry};
 
 const NANOS_PER_MS: u64 = 1_000_000;
@@ -71,9 +91,9 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 /// Total per-request ceiling for uploads: event videos reach tens of MB, which
 /// [`REQUEST_TIMEOUT`] would drop on a slow uplink. This bounds one request,
-/// not one event — `write_event` retries the video once, then uploads a sidecar
-/// and each thumbnail, so a half-broken link can hold the warm writer for a
-/// multiple of this.
+/// not one event — `write_event` uploads a sidecar and a video, each retried
+/// once, then thumbnails up to the first failure, so a half-broken link can
+/// hold the warm writer for a multiple of this.
 const UPLOAD_TIMEOUT: Duration = Duration::from_secs(300);
 /// Idle budget for the streaming client only. reqwest arms it flat until the
 /// response headers arrive, then per response frame with a reset on each — the
@@ -89,6 +109,10 @@ pub struct StathostBackend {
     /// Per-camera event lists, each sorted by `start_pts_ns` (the query/find
     /// key). Kept coherent on write/upgrade/prune.
     cameras: HashMap<String, RwLock<Vec<WarmEventEntry>>>,
+    /// Start PTSs whose sidecar the scan could not read, per camera. Their
+    /// [`WarmEventEntry::event_type`] is a placeholder, not a fact — see
+    /// [`Self::mark_unknown_type`].
+    unknown_type: HashMap<String, RwLock<HashSet<u64>>>,
     /// Sum of indexed `file_size` — the figure the budget is measured against.
     used_bytes: AtomicU64,
 }
@@ -101,8 +125,10 @@ impl StathostBackend {
             config.bucket.trim_matches('/')
         );
         let mut cameras = HashMap::new();
+        let mut unknown_type = HashMap::new();
         for id in camera_ids {
             cameras.insert(id.clone(), RwLock::new(Vec::new()));
+            unknown_type.insert(id.clone(), RwLock::new(HashSet::new()));
         }
         Self {
             http: Http {
@@ -120,6 +146,7 @@ impl StathostBackend {
             },
             max_stored_bytes: config.max_stored_bytes,
             cameras,
+            unknown_type,
             used_bytes: AtomicU64::new(0),
         }
     }
@@ -143,6 +170,7 @@ impl StathostBackend {
     /// Remove one event from the index by its start PTS, returning the removed
     /// entry so the caller can reconcile `used_bytes`.
     fn remove_entry(&self, camera_id: &str, start_pts_ns: u64) -> Option<WarmEventEntry> {
+        self.clear_unknown_type(camera_id, start_pts_ns);
         let lock = self.cameras.get(camera_id)?;
         let mut entries = lock.write_recover();
         let idx = entries
@@ -151,7 +179,75 @@ impl StathostBackend {
         Some(entries.remove(idx))
     }
 
+    /// Record that this event's type could not be established. `event_type` on
+    /// the entry is then a display placeholder, not a retention class: pruning
+    /// it as a movement would delete an object event twelve days early. Instead
+    /// [`WarmStorageBackend::prune`] gives it the longest *configured*
+    /// retention, which cannot expire before its own whatever its true type is,
+    /// and still expires — a permanently unreadable sidecar would otherwise pin
+    /// its footage forever on a store whose budget is unlimited by default.
+    fn mark_unknown_type(&self, camera_id: &str, start_pts_ns: u64) {
+        if let Some(lock) = self.unknown_type.get(camera_id) {
+            lock.write_recover().insert(start_pts_ns);
+        }
+    }
+
+    fn has_unknown_type(&self, camera_id: &str, start_pts_ns: u64) -> bool {
+        self.unknown_type
+            .get(camera_id)
+            .is_some_and(|lock| lock.read_recover().contains(&start_pts_ns))
+    }
+
+    /// Drop the marker once the type is settled or the event is gone. Only
+    /// [`Self::scan`] ever sets one, and it runs once per process, so in
+    /// practice this fires when an entry leaves the index; it also keeps
+    /// `upgrade_event` from leaving a "type unknown" marker on an event it just
+    /// proved to be an object.
+    fn clear_unknown_type(&self, camera_id: &str, start_pts_ns: u64) {
+        if let Some(lock) = self.unknown_type.get(camera_id) {
+            lock.write_recover().remove(&start_pts_ns);
+        }
+    }
+
     // ---- object-store helpers ----
+
+    /// Read and parse one event's sidecar, retried once — the same allowance
+    /// the write path gives it, and worth it here because the alternative to a
+    /// readable sidecar is a guessed retention class.
+    async fn read_sidecar(&self, camera_id: &str, stem: &str) -> SidecarRead {
+        let key = format!("{camera_id}/{stem}.json");
+        for attempt in 0..2 {
+            match self.http.get_optional(&key).await {
+                Ok(None) => return SidecarRead::Absent,
+                Ok(Some(bytes)) => {
+                    return match serde_json::from_slice::<serde_json::Value>(&bytes) {
+                        Ok(value) => {
+                            // Bytes that name no type are not bytes that say
+                            // "movement" either.
+                            let data = parse_sidecar_json(&value);
+                            match data.event_type {
+                                Some(_) => SidecarRead::Parsed(data),
+                                None => SidecarRead::Typeless(data),
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(key = %key, error = %e, "unparsable stathost sidecar");
+                            SidecarRead::Unreadable
+                        }
+                    };
+                }
+                // Debug, not warn: the prune tick retries every held event
+                // hourly, and a store that is down would log one line per
+                // event per sweep. The scan's aggregate warn carries the news.
+                Err(e) if attempt == 1 => {
+                    tracing::debug!(key = %key, error = %e, "could not read stathost sidecar");
+                    return SidecarRead::Unreadable;
+                }
+                Err(_) => {}
+            }
+        }
+        SidecarRead::Unreadable
+    }
 
     fn ts_key(camera_id: &str, entry: &WarmEventEntry) -> String {
         format!(
@@ -189,6 +285,50 @@ impl StathostBackend {
         true
     }
 
+    /// Re-read the sidecars of events whose type an earlier scan could not
+    /// establish, and index what they say.
+    ///
+    /// [`WarmStorageBackend::scan`] runs exactly once per process, so without
+    /// this a hold would last until a restart however quickly the store
+    /// recovered. The scheduled sweep is the only place in-process where a
+    /// retry can happen at all; it costs one GET per held event, and a store
+    /// with nothing held issues none.
+    async fn resolve_unknown_types(&self, camera_id: &str, cancel: &std::sync::atomic::AtomicBool) {
+        let held: Vec<u64> = match self.unknown_type.get(camera_id) {
+            Some(lock) => lock.read_recover().iter().copied().collect(),
+            None => return,
+        };
+        let mut resolved = 0u64;
+        for start_pts_ns in held {
+            if cancel.load(Ordering::Relaxed) {
+                break;
+            }
+            let Some(entry) = self.find_event(camera_id, start_pts_ns) else {
+                self.clear_unknown_type(camera_id, start_pts_ns);
+                continue;
+            };
+            let stem = format!("{start_pts_ns}_{}", entry.duration_ms);
+            let sidecar = match self.read_sidecar(camera_id, &stem).await {
+                SidecarRead::Parsed(s) => Some(s),
+                SidecarRead::Absent => None,
+                // Still unreadable, or still naming no type: keep the hold.
+                SidecarRead::Unreadable | SidecarRead::Typeless(_) => continue,
+            };
+            if let Some(lock) = self.cameras.get(camera_id) {
+                let mut entries = lock.write_recover();
+                if let Ok(i) = entries.binary_search_by_key(&start_pts_ns, |e| e.start_pts_ns) {
+                    apply_sidecar(&mut entries[i], sidecar.as_ref());
+                }
+            }
+            self.clear_unknown_type(camera_id, start_pts_ns);
+            resolved += 1;
+        }
+        if resolved > 0 {
+            tracing::info!(camera = %camera_id, resolved,
+                "read event types that an earlier scan could not; normal retention resumes");
+        }
+    }
+
     /// Enforce the client-side storage budget: while tracked usage exceeds
     /// `max_stored_bytes`, delete the oldest events cheapest-tier-first
     /// (continuous → movements → objects). A transport failure stops the pass
@@ -209,7 +349,17 @@ impl StathostBackend {
                 candidates.extend(
                     entries
                         .iter()
-                        .filter(|e| e.event_type == tier)
+                        // An event of unknown type is evicted with the objects,
+                        // the tier kept longest: its placeholder says movement,
+                        // and evicting on that guess would throw away footage
+                        // this whole path exists to keep.
+                        .filter(|e| {
+                            if self.has_unknown_type(cam, e.start_pts_ns) {
+                                tier == EventType::Object
+                            } else {
+                                e.event_type == tier
+                            }
+                        })
                         .cloned()
                         .map(|e| (cam.clone(), e)),
                 );
@@ -255,8 +405,44 @@ impl WarmStorageBackend for StathostBackend {
         let file_size = data.len() as u64;
         let event_type = event.event_type();
 
-        // Step 1: the video, first — one retry, then drop (logged) so a failed
-        // write is never lost silently.
+        // Step 1: the sidecar, before the video. It is the sole carrier of the
+        // event type, so an event whose sidecar is missing is not a slightly
+        // poorer event — it is the wrong kind of event, expiring on the wrong
+        // retention after the next scan. One retry, then fail the write before
+        // the video is uploaded at all.
+        let sidecar_key = format!("{camera_id}/{stem}.json");
+        let sidecar = sidecar_json(
+            event_type,
+            event.backend.as_deref(),
+            event.model.as_deref(),
+            &event.detection_details,
+            event.continues,
+        )
+        .into_bytes();
+        if self.http.put(&sidecar_key, sidecar.clone()).await.is_err() {
+            tracing::warn!(camera = %camera_id, stem = %stem,
+                "stathost sidecar upload failed, retrying once");
+            if self.http.put(&sidecar_key, sidecar).await.is_err() {
+                if sidecar_required(event) {
+                    tracing::error!(
+                        camera = %camera_id,
+                        first_pts = event.first_pts,
+                        bytes = event.total_bytes,
+                        "dropping event: stathost sidecar upload failed after retry"
+                    );
+                    return WriteOutcome::Failed;
+                }
+                tracing::warn!(camera = %camera_id, stem = %stem,
+                    "stathost sidecar upload failed after retry; \
+                     a scan rebuilds this movement event unchanged without it");
+            }
+        }
+
+        // Step 2: the video — one retry, then drop (logged) so a failed write
+        // is never lost silently. Nothing is rolled back: a PUT that reports
+        // failure may still have committed server-side, and deleting the
+        // sidecar of such a phantom .ts would leave precisely the bare video
+        // this order exists to prevent. The residue is harmless either way.
         let ts_key = format!("{camera_id}/{stem}.ts");
         if self.http.put(&ts_key, data.clone()).await.is_err() {
             tracing::warn!(camera = %camera_id, stem = %stem,
@@ -272,38 +458,21 @@ impl WarmStorageBackend for StathostBackend {
             }
         }
 
-        // Step 2: the sidecar — ALWAYS, since it is the sole carrier of the
-        // event type and detections. Non-fatal on failure (video wins; the
-        // scan indexes a sidecar-less .ts as a plain movement event).
-        let sidecar = sidecar_json(
-            event_type,
-            event.backend.as_deref(),
-            event.model.as_deref(),
-            &event.detection_details,
-            event.continues,
-        );
-        if self
-            .http
-            .put(&format!("{camera_id}/{stem}.json"), sidecar.into_bytes())
-            .await
-            .is_err()
-        {
-            tracing::warn!(camera = %camera_id, stem = %stem,
-                "failed to upload event sidecar to stathost");
-        }
-
         // Step 3: eager filmstrip thumbnails; frame 0 doubles as the poster.
+        // Non-fatal — the UI hides frames that fail to load. The scan counts
+        // frames contiguously from 0, so a gap stops the upload: what is
+        // indexed now is what a scan would rebuild later.
         let filmstrip_frames = match &event.filmstrip_frames {
             Some(frames) => {
                 let mut wrote = 0;
                 for (i, jpeg) in frames.iter().enumerate() {
                     let key = format!("{camera_id}/{stem}_thumb_{i}.jpg");
                     if self.http.put(&key, jpeg.clone()).await.is_err() {
-                        tracing::warn!(camera = %camera_id, stem = %stem,
+                        tracing::warn!(camera = %camera_id, stem = %stem, frame = i,
                             "failed to upload filmstrip thumbnail to stathost");
-                    } else {
-                        wrote += 1;
+                        break;
                     }
+                    wrote += 1;
                 }
                 wrote
             }
@@ -328,6 +497,7 @@ impl WarmStorageBackend for StathostBackend {
             },
         );
         self.used_bytes.fetch_add(file_size, Ordering::Relaxed);
+        self.clear_unknown_type(camera_id, event.first_pts);
 
         tracing::info!(
             camera = %camera_id,
@@ -380,8 +550,17 @@ impl WarmStorageBackend for StathostBackend {
                 entry.detections = upgrade.detections.clone();
                 entry.backend = Some(upgrade.backend.clone());
                 entry.model = Some(upgrade.model.clone());
+                // The sidecar just written carries the upgrade's `continues`;
+                // the index has to say the same thing (LocalDisk rebuilds the
+                // whole entry here, which is where this was being lost).
+                entry.continues = upgrade.continues;
             }
         }
+        // The type is now established. An upgrade only ever targets an event
+        // written by this process, so it cannot reach one the scan held — but
+        // this and `write_event` are the two places a type becomes a fact, and
+        // neither may leave a "type unknown" marker behind it.
+        self.clear_unknown_type(camera_id, upgrade.start_pts_ns);
 
         tracing::info!(
             camera = %camera_id,
@@ -407,6 +586,13 @@ impl WarmStorageBackend for StathostBackend {
             EventType::Object => object_max_age_ns,
             EventType::Continuous => continuous_max_age_ns,
         };
+        // An event whose type the scan could not read is measured against the
+        // longest configured retention instead of its placeholder's: no true
+        // type can expire later than that, so nothing is ever deleted early,
+        // and unlike an indefinite hold it does terminate.
+        let unknown_max_age = movement_max_age_ns
+            .max(object_max_age_ns)
+            .max(continuous_max_age_ns);
 
         // Deleting one event here is several sequential HTTP requests, each
         // able to sit on a request timeout, so shutdown gets checked between
@@ -416,11 +602,21 @@ impl WarmStorageBackend for StathostBackend {
             if stop() {
                 break;
             }
+            // First give held events a chance to be typed, so one that resolves
+            // is pruned on its real retention in this same sweep.
+            self.resolve_unknown_types(camera_id, cancel).await;
             let expired: Vec<WarmEventEntry> = {
                 let entries = lock.read_recover();
                 entries
                     .iter()
-                    .filter(|e| now_ns.saturating_sub(e.start_pts_ns) > max_age(e.event_type))
+                    .filter(|e| {
+                        let limit = if self.has_unknown_type(camera_id, e.start_pts_ns) {
+                            unknown_max_age
+                        } else {
+                            max_age(e.event_type)
+                        };
+                        now_ns.saturating_sub(e.start_pts_ns) > limit
+                    })
                     .cloned()
                     .collect()
             };
@@ -480,6 +676,8 @@ impl WarmStorageBackend for StathostBackend {
         // Full path set, so filmstrip frames can be counted without extra GETs.
         let all_paths: HashSet<&str> = items.iter().map(|i| i.path.as_str()).collect();
         let mut total = 0usize;
+        let mut unknown_type = 0usize;
+        let mut typeless = 0usize;
 
         for item in &items {
             let Some((camera_id, stem)) = split_ts_key(&item.path) else {
@@ -497,18 +695,22 @@ impl WarmStorageBackend for StathostBackend {
                     "zero-byte .ts on stathost (interrupted upload?)");
             }
 
-            // Fetch the sibling sidecar; a missing/garbled one → movement event.
-            let sidecar = match self.http.get(&format!("{camera_id}/{stem}.json")).await {
-                Ok(bytes) => serde_json::from_slice::<serde_json::Value>(&bytes)
-                    .ok()
-                    .map(|v| parse_sidecar_json(&v)),
-                Err(_) => None,
+            // Fetch the sibling sidecar. Only a confirmed absence means
+            // "movement" — that is the one event written without a sidecar.
+            let (sidecar, type_known) = match self.read_sidecar(camera_id, stem).await {
+                SidecarRead::Parsed(s) => (Some(s), true),
+                SidecarRead::Absent => (None, true),
+                SidecarRead::Unreadable => (None, false),
+                SidecarRead::Typeless(s) => {
+                    // Deterministic, so no later scan will clear this by
+                    // itself: name the object so it can actually be fixed.
+                    tracing::warn!(path = %item.path,
+                        "stathost sidecar names no event type; retention falls back to the \
+                         longest configured age until the sidecar is repaired");
+                    typeless += 1;
+                    (Some(s), false)
+                }
             };
-            let event_type = sidecar
-                .as_ref()
-                .and_then(|s| s.event_type)
-                .unwrap_or(EventType::Movement);
-
             let mut filmstrip_frames = 0usize;
             while all_paths
                 .contains(format!("{camera_id}/{stem}_thumb_{filmstrip_frames}.jpg").as_str())
@@ -516,31 +718,39 @@ impl WarmStorageBackend for StathostBackend {
                 filmstrip_frames += 1;
             }
 
-            let entry = WarmEventEntry {
+            let mut entry = WarmEventEntry {
                 start_pts_ns,
                 duration_ms,
-                event_type,
+                event_type: EventType::Movement,
                 file_size: item.size,
-                object_classes: sidecar
-                    .as_ref()
-                    .map(|s| s.classes.clone())
-                    .unwrap_or_default(),
-                backend: sidecar.as_ref().and_then(|s| s.backend.clone()),
-                model: sidecar.as_ref().and_then(|s| s.model.clone()),
-                detections: sidecar
-                    .as_ref()
-                    .map(|s| s.detections.clone())
-                    .unwrap_or_default(),
+                object_classes: Vec::new(),
+                backend: None,
+                model: None,
+                detections: Vec::new(),
                 filmstrip_frames,
-                continues: sidecar.as_ref().map(|s| s.continues).unwrap_or(false),
-                recovered: sidecar.as_ref().map(|s| s.recovered).unwrap_or(false),
+                continues: false,
+                recovered: false,
                 delete_failed: false,
             };
+            apply_sidecar(&mut entry, sidecar.as_ref());
             self.used_bytes.fetch_add(item.size, Ordering::Relaxed);
             self.insert_entry(camera_id, entry);
+            if !type_known {
+                self.mark_unknown_type(camera_id, start_pts_ns);
+                unknown_type += 1;
+            }
             total += 1;
         }
 
+        if unknown_type > 0 {
+            tracing::warn!(
+                unknown_type,
+                typeless,
+                "events indexed without a known type: shown as movement but pruned on the \
+                 longest configured retention. `typeless` of them need their sidecar fixed; \
+                 the rest may resolve on a later start"
+            );
+        }
         tracing::info!(
             total_events = total,
             elapsed_ms = start.elapsed().as_millis() as u64,
@@ -704,6 +914,23 @@ struct Http {
     token: String,
 }
 
+/// What the scan learned about one event's sidecar. The two failure variants
+/// both mean "type unknown" but differ in whether looking again can help.
+enum SidecarRead {
+    Parsed(SidecarData),
+    /// A confirmed 404: the event was written without a sidecar, which only a
+    /// plain movement event ever is — see [`sidecar_required`].
+    Absent,
+    /// Unreachable or unparsable — a transient condition, so a later scan may
+    /// well resolve it.
+    Unreadable,
+    /// Valid JSON naming no recognized `event_type` (`{}`, `null`, a typo).
+    /// Deterministic content: re-reading it will never say anything different,
+    /// so this one needs an operator, not a retry. The rest of the sidecar is
+    /// still used — it is only the *type* that is missing.
+    Typeless(SidecarData),
+}
+
 enum DeleteOutcome {
     Deleted,
     /// The object was already absent (404) — treated as success for pruning.
@@ -762,6 +989,23 @@ impl Http {
             .await?
             .error_for_status()?;
         Ok(resp.bytes().await?.to_vec())
+    }
+
+    /// Fetch an object, separating a confirmed absence (`Ok(None)`) from a
+    /// failure to find out (`Err`). The scan needs that difference: a missing
+    /// sidecar is information, an unreachable one is not.
+    async fn get_optional(&self, path: &str) -> Result<Option<Vec<u8>>, reqwest::Error> {
+        let resp = self
+            .client
+            .get(self.url(path))
+            .bearer_auth(&self.token)
+            .timeout(REQUEST_TIMEOUT)
+            .send()
+            .await?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        Ok(Some(resp.error_for_status()?.bytes().await?.to_vec()))
     }
 
     /// Start a streamed GET, optionally forwarding a single `Range`. The raw
@@ -827,6 +1071,35 @@ fn concatenate_segments(segments: &[GopSegment], capacity: usize) -> Vec<u8> {
 fn split_ts_key(path: &str) -> Option<(&str, &str)> {
     let rest = path.strip_suffix(".ts")?;
     rest.rsplit_once('/')
+}
+
+/// Write the sidecar-derived half of an index entry, `None` meaning "no sidecar
+/// exists" — the plain movement event. Shared by the scan and the prune tick's
+/// re-read of held events so the two can never disagree about what a sidecar
+/// says; the fields not set here (size, filmstrip count) come from the listing.
+fn apply_sidecar(entry: &mut WarmEventEntry, sidecar: Option<&SidecarData>) {
+    entry.event_type = sidecar
+        .and_then(|s| s.event_type)
+        .unwrap_or(EventType::Movement);
+    entry.object_classes = sidecar.map(|s| s.classes.clone()).unwrap_or_default();
+    entry.backend = sidecar.and_then(|s| s.backend.clone());
+    entry.model = sidecar.and_then(|s| s.model.clone());
+    entry.detections = sidecar.map(|s| s.detections.clone()).unwrap_or_default();
+    entry.continues = sidecar.is_some_and(|s| s.continues);
+    entry.recovered = sidecar.is_some_and(|s| s.recovered);
+}
+
+/// Whether this event's sidecar carries anything a sidecar-less scan would not
+/// already assume. It does not for a plain movement event: `has_objects` is set
+/// from a non-empty detection list, and `backend`/`model` are `Some` only
+/// alongside detections, so the sidecar of a first-chunk movement event says
+/// only "movement, no detections" — exactly the scan's default for a bare
+/// `.ts`. Losing it is therefore invisible, while losing any other event's
+/// sidecar rewrites its retention class. Local mode draws the same line one
+/// field earlier (it writes a sidecar iff `has_objects || continues`); the
+/// delta is `continuous`, which has no directory to fall back on here.
+fn sidecar_required(event: &FinishedEvent) -> bool {
+    event.event_type() != EventType::Movement || event.continues
 }
 
 /// Sidecar JSON for the remote backend — identical to the local sidecar plus a
@@ -902,9 +1175,46 @@ mod tests {
         files: Arc<Mutex<HashMap<String, Vec<u8>>>>,
         token: String,
         fail_writes: Arc<AtomicBool>,
+        /// Breaks one object of an event while the others go through.
+        put_fault: Arc<Mutex<Option<PutFault>>>,
+        /// When set, GETs whose path ends with this suffix answer `500` — an
+        /// unreadable object, as distinct from an absent one (`404`).
+        fail_get_suffix: Arc<Mutex<Option<String>>>,
         /// When set, GET ignores an incoming `Range` and answers a full `200` —
         /// a legal HTTP response the client must handle by replaying in full.
         ignore_range: Arc<AtomicBool>,
+    }
+
+    /// A PUT failure injected by path suffix. `stored` decides whether the
+    /// object lands anyway before the error is returned — the shape of an
+    /// upload timeout or a proxy 5xx over a body the origin already committed,
+    /// which a client cannot tell from an upload that never happened.
+    #[derive(Clone)]
+    struct PutFault {
+        suffix: String,
+        stored: bool,
+    }
+
+    impl Stub {
+        fn fail_puts(&self, suffix: &str, stored: bool) {
+            *self.put_fault.lock().unwrap() = Some(PutFault {
+                suffix: suffix.to_string(),
+                stored,
+            });
+        }
+
+        fn fail_gets(&self, suffix: &str) {
+            *self.fail_get_suffix.lock().unwrap() = Some(suffix.to_string());
+        }
+
+        fn clear_faults(&self) {
+            *self.put_fault.lock().unwrap() = None;
+            *self.fail_get_suffix.lock().unwrap() = None;
+        }
+
+        fn has(&self, path: &str) -> bool {
+            self.files.lock().unwrap().contains_key(path)
+        }
     }
 
     /// Drain a [`VideoStream`] body to bytes (test-only).
@@ -997,6 +1307,13 @@ mod tests {
                 if stub.fail_writes.load(Ordering::Relaxed) {
                     return StatusCode::INTERNAL_SERVER_ERROR.into_response();
                 }
+                let fault = stub.put_fault.lock().unwrap().clone();
+                if let Some(fault) = fault.filter(|f| path.ends_with(&f.suffix)) {
+                    if fault.stored {
+                        stub.files.lock().unwrap().insert(path, body.to_vec());
+                    }
+                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                }
                 stub.files.lock().unwrap().insert(path, body.to_vec());
                 StatusCode::OK.into_response()
             }
@@ -1012,6 +1329,10 @@ mod tests {
             }
             // GET is public.
             _ => {
+                let fail_get = stub.fail_get_suffix.lock().unwrap().clone();
+                if fail_get.is_some_and(|s| path.ends_with(&s)) {
+                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                }
                 let bytes = match stub.files.lock().unwrap().get(&path) {
                     Some(bytes) => bytes.clone(),
                     None => return StatusCode::NOT_FOUND.into_response(),
@@ -1062,6 +1383,8 @@ mod tests {
             files: Arc::new(Mutex::new(HashMap::new())),
             token: token.to_string(),
             fail_writes: Arc::new(AtomicBool::new(false)),
+            put_fault: Arc::new(Mutex::new(None)),
+            fail_get_suffix: Arc::new(Mutex::new(None)),
             ignore_range: Arc::new(AtomicBool::new(false)),
         };
         let app = Router::new()
@@ -1113,6 +1436,19 @@ mod tests {
             continues: false,
             is_continuous: false,
         }
+    }
+
+    /// A movement event carrying a detection — the type only the sidecar can
+    /// record on a store without directories.
+    fn object_event(first_pts: u64, size: usize) -> FinishedEvent {
+        let mut e = movement_event(first_pts, size);
+        e.has_objects = true;
+        e.object_classes = vec!["car".to_string()];
+        e.detection_details = vec![DetectionDetail {
+            class: "car".to_string(),
+            confidence: 0.8,
+        }];
+        e
     }
 
     fn continuous_event(first_pts: u64, size: usize) -> FinishedEvent {
@@ -1186,14 +1522,7 @@ mod tests {
         let (url, _stub) = spawn_stub("secret").await;
         let backend = backend_for(&url, "secret", 0);
 
-        let mut event = movement_event(4_000, 20);
-        event.has_objects = true;
-        event.object_classes = vec!["car".to_string()];
-        event.detection_details = vec![DetectionDetail {
-            class: "car".to_string(),
-            confidence: 0.8,
-        }];
-        backend.write_event("cam", &event).await;
+        backend.write_event("cam", &object_event(4_000, 20)).await;
 
         let scanned = backend_for(&url, "secret", 0);
         scanned.scan().await;
@@ -1213,10 +1542,16 @@ mod tests {
         let ts_key = "cam/5000_1000.ts";
         let before = stub.files.lock().unwrap().get(ts_key).cloned().unwrap();
 
-        backend.upgrade_event("cam", &upgrade_for(5_000)).await;
+        // The upgrade carries the original event's chain flag into the sidecar
+        // it rewrites, so the index has to take it too — LocalDisk rebuilds the
+        // whole entry here and cannot drift, this one mutates in place.
+        let mut upgrade = upgrade_for(5_000);
+        upgrade.continues = true;
+        backend.upgrade_event("cam", &upgrade).await;
 
         // The index flipped to Object...
         let e = backend.find_event("cam", 5_000).unwrap();
+        assert!(e.continues);
         assert_eq!(e.event_type, EventType::Object);
         assert_eq!(e.object_classes, vec!["person".to_string()]);
         // ...the video object is byte-for-byte unchanged (no re-upload)...
@@ -1235,6 +1570,7 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&sidecar).unwrap();
         assert_eq!(json["event_type"], serde_json::json!("object"));
         assert_eq!(json["detections"][0]["class"], serde_json::json!("person"));
+        assert_eq!(json["continues"], serde_json::json!(true));
     }
 
     #[tokio::test]
@@ -1312,7 +1648,8 @@ mod tests {
     #[tokio::test]
     async fn scan_tolerates_ts_without_sidecar() {
         let (url, stub) = spawn_stub("secret").await;
-        // A lone .ts with no sidecar (as an interrupted upload would leave).
+        // A lone .ts, as a plain movement event whose sidecar upload failed
+        // leaves (an interruption cannot: the sidecar precedes the video).
         stub.files
             .lock()
             .unwrap()
@@ -1321,7 +1658,8 @@ mod tests {
         let backend = backend_for(&url, "secret", 0);
         backend.scan().await;
         let e = backend.find_event("cam", 9_000).unwrap();
-        // No sidecar → indexed as a plain movement event.
+        // A confirmed-absent sidecar is what a plain movement event is written
+        // with, so the default is a fact about the write path, not a fallback.
         assert_eq!(e.event_type, EventType::Movement);
         assert_eq!(e.filmstrip_frames, 0);
         assert!(e.object_classes.is_empty());
@@ -1338,6 +1676,308 @@ mod tests {
         // The event was not indexed and nothing landed on the host.
         assert!(backend.find_event("cam", 6_000).is_none());
         assert!(stub.files.lock().unwrap().is_empty());
+    }
+
+    /// The sidecar is the only record of an event's type here, so a write that
+    /// could not store one must not report success: the in-RAM index would keep
+    /// serving the object event until a restart, after which the scan would
+    /// call the leftover `.ts` a movement and expire it 12 days early.
+    #[tokio::test]
+    async fn a_failed_sidecar_fails_the_write_before_the_video() {
+        let (url, stub) = spawn_stub("secret").await;
+        let backend = backend_for(&url, "secret", 0);
+        stub.fail_puts(".json", false);
+
+        let outcome = backend.write_event("cam", &object_event(11_000, 30)).await;
+
+        assert_eq!(outcome, WriteOutcome::Failed);
+        assert!(backend.find_event("cam", 11_000).is_none());
+        assert_eq!(backend.used_bytes.load(Ordering::Relaxed), 0);
+        // The video was never attempted, so there is no bare .ts for a later
+        // scan to call a movement event.
+        assert!(!stub.has("cam/11000_1000.ts"));
+        let scanned = backend_for(&url, "secret", 0);
+        scanned.scan().await;
+        assert!(scanned.find_event("cam", 11_000).is_none());
+    }
+
+    /// A plain movement event is the one event a sidecar-less `.ts` already
+    /// scans back as unchanged, so its sidecar is not worth the footage.
+    #[tokio::test]
+    async fn a_failed_sidecar_does_not_cost_a_movement_event() {
+        let (url, stub) = spawn_stub("secret").await;
+        let backend = backend_for(&url, "secret", 0);
+        stub.fail_puts(".json", false);
+
+        let outcome = backend
+            .write_event("cam", &movement_event(15_000, 30))
+            .await;
+
+        assert_eq!(outcome, WriteOutcome::Written);
+        assert!(stub.has("cam/15000_1000.ts"));
+        assert!(!stub.has("cam/15000_1000.json"));
+    }
+
+    /// The exemption above is only sound while a sidecar-less scan rebuilds a
+    /// movement event *exactly*. This fails the day a field is added to
+    /// `sidecar_json` or a scan default changes — which is the whole reason a
+    /// blanket "always require the sidecar" rule was tempting.
+    #[tokio::test]
+    async fn a_movement_event_scans_back_identically_without_its_sidecar() {
+        let (url, stub) = spawn_stub("secret").await;
+        let backend = backend_for(&url, "secret", 0);
+        backend
+            .write_event("cam", &movement_event(16_000, 30))
+            .await;
+        let written = backend.find_event("cam", 16_000).unwrap();
+
+        stub.files.lock().unwrap().remove("cam/16000_1000.json");
+        let scanned = backend_for(&url, "secret", 0);
+        scanned.scan().await;
+
+        assert_eq!(scanned.find_event("cam", 16_000).unwrap(), written);
+    }
+
+    /// A PUT that reports failure may still have committed — an upload timeout
+    /// or a proxy 5xx says nothing about the origin. The video is therefore
+    /// never rolled back: deleting the sidecar of a phantom `.ts` would leave
+    /// exactly the bare video this write order exists to prevent.
+    #[tokio::test]
+    async fn a_video_that_lands_despite_a_failed_put_keeps_its_type() {
+        let (url, stub) = spawn_stub("secret").await;
+        let backend = backend_for(&url, "secret", 0);
+        stub.fail_puts(".ts", true); // committed server-side, 500 to the client
+
+        let outcome = backend.write_event("cam", &object_event(12_000, 30)).await;
+
+        assert_eq!(outcome, WriteOutcome::Failed);
+        assert!(backend.find_event("cam", 12_000).is_none());
+        // Both objects are still there, so the next scan adopts the phantom
+        // video as the object event it is — not as a movement event on a
+        // two-day retention.
+        stub.clear_faults();
+        let scanned = backend_for(&url, "secret", 0);
+        scanned.scan().await;
+        let e = scanned.find_event("cam", 12_000).unwrap();
+        assert_eq!(e.event_type, EventType::Object);
+        assert_eq!(e.object_classes, vec!["car".to_string()]);
+    }
+
+    /// The mirror case: the video genuinely did not land. The orphan sidecar
+    /// left behind is invisible to the scan, which walks `.ts` objects only.
+    #[tokio::test]
+    async fn an_orphan_sidecar_indexes_nothing() {
+        let (url, stub) = spawn_stub("secret").await;
+        let backend = backend_for(&url, "secret", 0);
+        stub.fail_puts(".ts", false);
+
+        let outcome = backend.write_event("cam", &object_event(17_000, 30)).await;
+
+        assert_eq!(outcome, WriteOutcome::Failed);
+        assert!(stub.has("cam/17000_1000.json"));
+        stub.clear_faults();
+        let scanned = backend_for(&url, "secret", 0);
+        scanned.scan().await;
+        assert!(scanned.find_event("cam", 17_000).is_none());
+    }
+
+    /// Thumbnails are decoration — the UI hides frames that fail to load — so
+    /// losing them must not cost the footage.
+    #[tokio::test]
+    async fn a_failed_thumbnail_is_not_fatal() {
+        let (url, stub) = spawn_stub("secret").await;
+        let backend = backend_for(&url, "secret", 0);
+        stub.fail_puts(".jpg", false);
+
+        let outcome = backend.write_event("cam", &object_event(13_000, 30)).await;
+
+        assert_eq!(outcome, WriteOutcome::Written);
+        let entry = backend.find_event("cam", 13_000).unwrap();
+        assert_eq!(entry.event_type, EventType::Object);
+        assert_eq!(entry.filmstrip_frames, 0);
+
+        // ...and the index a restart rebuilds agrees with the one in RAM.
+        let scanned = backend_for(&url, "secret", 0);
+        scanned.scan().await;
+        let e = scanned.find_event("cam", 13_000).unwrap();
+        assert_eq!(e.event_type, EventType::Object);
+        assert_eq!(e.filmstrip_frames, 0);
+        assert!(backend.read_thumbnail("cam", &entry).await.is_err());
+    }
+
+    /// 1s after the epoch: older than any retention a test configures.
+    const OLD_PTS: u64 = 1_000_000_000;
+
+    /// One flaky GET during startup must not decide a retention class. An
+    /// unreadable sidecar leaves the type *unknown*, and an unknown type is
+    /// not a movement type — the old scan collapsed both onto Movement, which
+    /// deletes an object event twelve days early from the read side alone.
+    #[tokio::test]
+    async fn an_unreadable_sidecar_is_not_pruned_as_a_movement_event() {
+        let (url, stub) = spawn_stub("secret").await;
+        backend_for(&url, "secret", 0)
+            .write_event("cam", &object_event(OLD_PTS, 30))
+            .await;
+
+        // A restart that cannot read the sidecar: 500, not 404.
+        stub.fail_gets(".json");
+        let scanned = backend_for(&url, "secret", 0);
+        scanned.scan().await;
+
+        // Indexed and visible (losing the footage from the UI would be its own
+        // bug), but not deleted by the sweep its placeholder type invites.
+        assert!(scanned.find_event("cam", OLD_PTS).is_some());
+        scanned
+            .prune(1, u64::MAX, u64::MAX, &AtomicBool::new(false))
+            .await;
+        assert!(scanned.find_event("cam", OLD_PTS).is_some());
+        assert!(stub.has("cam/1000000000_1000.ts"));
+
+        // The hold is a longer retention, not an immortal one: once every
+        // configured age has passed, an event nobody can type still goes.
+        scanned.prune(1, 1, 1, &AtomicBool::new(false)).await;
+        assert!(scanned.find_event("cam", OLD_PTS).is_none());
+        assert!(!stub.has("cam/1000000000_1000.ts"));
+    }
+
+    /// `scan` runs once per process, so the sweep is the only place a held
+    /// event can ever be typed without a restart.
+    #[tokio::test]
+    async fn a_prune_tick_resolves_a_held_event() {
+        let (url, stub) = spawn_stub("secret").await;
+        backend_for(&url, "secret", 0)
+            .write_event("cam", &object_event(OLD_PTS, 30))
+            .await;
+        stub.fail_gets(".json");
+        let backend = backend_for(&url, "secret", 0);
+        backend.scan().await;
+        assert!(backend.has_unknown_type("cam", OLD_PTS));
+
+        // The store recovers; the next sweep reads the sidecar it could not.
+        stub.clear_faults();
+        backend
+            .prune(1, u64::MAX, u64::MAX, &AtomicBool::new(false))
+            .await;
+
+        let entry = backend.find_event("cam", OLD_PTS).unwrap();
+        assert_eq!(entry.event_type, EventType::Object);
+        assert_eq!(entry.object_classes, vec!["car".to_string()]);
+        assert!(!backend.has_unknown_type("cam", OLD_PTS));
+
+        // Typed again, it prunes on its own retention: kept as an object...
+        backend.prune(1, u64::MAX, 1, &AtomicBool::new(false)).await;
+        assert!(backend.find_event("cam", OLD_PTS).is_some());
+        // ...and gone once the object retention itself expires.
+        backend.prune(1, 1, 1, &AtomicBool::new(false)).await;
+        assert!(backend.find_event("cam", OLD_PTS).is_none());
+    }
+
+    /// Valid JSON that names no type is not a movement event either — and
+    /// unlike a failed read it will never resolve itself, so it must be held
+    /// rather than quietly given a two-day retention.
+    #[tokio::test]
+    async fn a_sidecar_naming_no_type_is_held_not_assumed() {
+        let (url, stub) = spawn_stub("secret").await;
+        stub.files
+            .lock()
+            .unwrap()
+            .insert("cam/1000000000_1000.ts".to_string(), vec![0u8; 10]);
+        stub.files
+            .lock()
+            .unwrap()
+            .insert("cam/1000000000_1000.json".to_string(), b"{}".to_vec());
+
+        let backend = backend_for(&url, "secret", 0);
+        backend.scan().await;
+        assert!(backend.has_unknown_type("cam", OLD_PTS));
+
+        backend
+            .prune(1, u64::MAX, u64::MAX, &AtomicBool::new(false))
+            .await;
+        // A re-read says the same thing, so the hold survives the sweep.
+        assert!(backend.find_event("cam", OLD_PTS).is_some());
+        assert!(backend.has_unknown_type("cam", OLD_PTS));
+    }
+
+    /// Bytes that are not JSON are a failed read, not an absent sidecar: the
+    /// distinction is the difference between holding the event and pruning it
+    /// as a movement.
+    #[tokio::test]
+    async fn an_unparsable_sidecar_is_held_not_treated_as_absent() {
+        let (url, stub) = spawn_stub("secret").await;
+        stub.files
+            .lock()
+            .unwrap()
+            .insert("cam/1000000000_1000.ts".to_string(), vec![0u8; 10]);
+        stub.files
+            .lock()
+            .unwrap()
+            .insert("cam/1000000000_1000.json".to_string(), b"not json".to_vec());
+
+        let backend = backend_for(&url, "secret", 0);
+        backend.scan().await;
+        assert!(backend.has_unknown_type("cam", OLD_PTS));
+
+        backend
+            .prune(1, u64::MAX, u64::MAX, &AtomicBool::new(false))
+            .await;
+        assert!(backend.find_event("cam", OLD_PTS).is_some());
+    }
+
+    /// Eviction order is the other decision that reads the event type. A held
+    /// event's placeholder says movement; evicting on that would spend the
+    /// footage the hold exists to protect.
+    #[tokio::test]
+    async fn budget_eviction_tiers_an_unknown_type_with_the_objects() {
+        let (url, stub) = spawn_stub("secret").await;
+        let writer = backend_for(&url, "secret", 0);
+        writer.write_event("cam", &object_event(1_000, 40)).await;
+        writer.write_event("cam", &movement_event(2_000, 40)).await;
+
+        // The object event's sidecar is unreadable on the next start...
+        stub.fail_gets("1000_1000.json");
+        let backend = backend_for(&url, "secret", 60);
+        backend.scan().await;
+        assert!(backend.has_unknown_type("cam", 1_000));
+
+        // ...so the budget must still evict the genuine movement event first,
+        // even though the held one is older and labelled movement too.
+        backend.guard_free_space("cam", 0).await;
+        assert!(backend.find_event("cam", 2_000).is_none());
+        assert!(backend.find_event("cam", 1_000).is_some());
+    }
+
+    /// A thumbnail gap stops the uploads: the scan counts frames contiguously
+    /// from 0, so continuing past a failure would index frames it will never
+    /// see again and leave the extra objects stranded on the host.
+    #[tokio::test]
+    async fn a_thumbnail_gap_stops_the_filmstrip() {
+        let (url, stub) = spawn_stub("secret").await;
+        let backend = backend_for(&url, "secret", 0);
+        let mut event = movement_event(18_000, 30);
+        event.filmstrip_frames = Some(Arc::new(vec![vec![0x01], vec![0x02], vec![0x03]]));
+        stub.fail_puts("_thumb_1.jpg", false);
+
+        backend.write_event("cam", &event).await;
+
+        assert_eq!(
+            backend.find_event("cam", 18_000).unwrap().filmstrip_frames,
+            1
+        );
+        assert!(stub.has("cam/18000_1000_thumb_0.jpg"));
+        assert!(!stub.has("cam/18000_1000_thumb_2.jpg"));
+    }
+
+    /// The movement exemption rests on the sidecar of a plain movement event
+    /// saying nothing the scan does not already assume. Pinning the literal
+    /// bytes catches a field added to `sidecar_json` — which the entry-equality
+    /// test above cannot, since a new field would be default in both halves.
+    #[test]
+    fn a_plain_movement_sidecar_carries_nothing_but_its_type() {
+        assert_eq!(
+            sidecar_json(EventType::Movement, None, None, &[], false),
+            r#"{"detections":[],"event_type":"movement"}"#
+        );
     }
 
     #[tokio::test]

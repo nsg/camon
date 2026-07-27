@@ -43,13 +43,13 @@ impl EventType {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct DetectionDetail {
     pub class: String,
     pub confidence: f32,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 #[allow(dead_code)]
 pub struct WarmEventEntry {
     pub start_pts_ns: u64,

@@ -142,9 +142,12 @@ min_free_bytes = 2147483648
 # retention (the *_retention_days above) still applies, via DELETE.
 #
 # Requires stathost 0.2.0 or later (atomic uploads, detailed listing, Range
-# requests); there is no fallback for older servers. camon uploads the video
-# first and the sidecar/thumbnails after, so an interruption at worst leaves a
-# video with no sidecar (indexed as a plain movement event on the next scan).
+# requests); there is no fallback for older servers. There are no directories
+# on the host, so the .json sidecar is the only record of an event's type: it
+# is uploaded before the video, which commits the event. An event whose sidecar
+# cannot be stored is dropped rather than kept as a video that a later scan
+# would read as a plain movement and delete on the wrong retention — except a
+# plain movement event, which is what a sidecar-less video already reads as.
 #
 # [storage.stathost]
 # # Base URL of the host.
