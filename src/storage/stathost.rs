@@ -38,14 +38,23 @@
 //!   uploaded until its metadata is durable. Nothing is rolled back afterwards:
 //!   a failed upload can still have landed (a timeout or a proxy error says
 //!   nothing about what the origin committed), and both leftovers are benign —
-//!   an orphan `.json` is invisible to the scan, which walks `.ts` objects
-//!   only, and a phantom `.ts` still has the sidecar that types it correctly.
+//!   an orphan `.json` is invisible to the scan's index, which walks `.ts`
+//!   objects only (the scan collects it separately, see below), and a phantom
+//!   `.ts` still has the sidecar that types it correctly.
 //!   stathost's uploads are atomic server-side, so a truncated object can't be
 //!   served; a zero-byte `.ts` in the listing still gets a warning at scan time.
 //!   There is nothing here matching local mode's fsync of the video and of the
 //!   directory it is committed into: this backend owns no filesystem, and a
 //!   `PUT` that has been acknowledged is durable or not by the *server's*
 //!   rules. Nothing camon can do from the client side changes that.
+//! * **A write is an overwrite.** `PUT` of a key that already exists replaces
+//!   it, so re-writing a stem re-writes one event rather than creating a
+//!   second: the index replaces the entry under that stem, the budget is
+//!   charged the difference, and thumbnails the shorter event has no frame for
+//!   are deleted. See [`event_key`] for what identifies an event here.
+//! * **Metadata whose video never landed is collected at startup.** Nothing
+//!   else can: the index walks `.ts` objects, and an event's siblings are only
+//!   deleted with it. See [`StathostBackend::sweep_orphaned_metadata`].
 //! * **An unreadable sidecar is not a movement event.** The scan applies the
 //!   movement default only to a *confirmed* 404; anything else — a transport
 //!   failure, unparsable bytes, valid JSON naming no type — leaves the type
@@ -85,6 +94,57 @@ use crate::storage::{EventType, WarmEventEntry};
 
 const NANOS_PER_MS: u64 = 1_000_000;
 
+/// What identifies one indexed event, and with it exactly one set of objects on
+/// the host: the stem every one of its keys is built from,
+/// `{camera_id}/{start_pts_ns}_{duration_ms}.*`.
+///
+/// The start PTS alone does not — nothing enforces its uniqueness, here or in
+/// the local index — so unindexing on it would drop a surviving entry on the
+/// strength of some other entry's delete, and refund the wrong number of bytes
+/// to the budget.
+///
+/// Local disk keys on `(start, event_type, duration)` because the type is a
+/// directory there and so part of the path. It is *not* part of any path here:
+/// the type lives inside the sidecar, an upgrade rewrites that sidecar without
+/// moving a single object, and two entries differing only in type would name
+/// the same objects. Both keys say the same thing — "the one stored event these
+/// bytes belong to" — spelled in the layout each backend actually has.
+type EventKey = (u64, u32);
+
+fn event_key(entry: &WarmEventEntry) -> EventKey {
+    (entry.start_pts_ns, entry.duration_ms)
+}
+
+fn key_stem(key: EventKey) -> String {
+    format!("{}_{}", key.0, key.1)
+}
+
+/// Position of the entry with this key. Entries are sorted by start PTS, which
+/// repeats across durations, so the run of equal starts is walked rather than
+/// trusting a single binary-search hit.
+fn position(entries: &[WarmEventEntry], key: EventKey) -> Option<usize> {
+    let from = entries.partition_point(|e| e.start_pts_ns < key.0);
+    entries[from..]
+        .iter()
+        .take_while(|e| e.start_pts_ns == key.0)
+        .position(|e| e.duration_ms == key.1)
+        .map(|i| from + i)
+}
+
+/// What deleting one event's objects achieved. Mirrors the local backend's
+/// `Removal`: the three outcomes mean different things to the budget, and only
+/// [`Removal::Deleted`] reclaimed any remote bytes.
+enum Removal {
+    /// The video object is gone; its bytes are back.
+    Deleted,
+    /// The video object was already absent. Nothing was reclaimed, but the
+    /// index entry has to go too — it describes an object that does not exist.
+    Missing,
+    /// The store refused or could not be reached. The entry stays indexed so a
+    /// later tick retries it instead of leaking the objects.
+    Failed,
+}
+
 /// Writes, deletes and the scan are awaited inline by the serial per-camera
 /// warm writer, so an unbounded request stalls that camera's recording and its
 /// shutdown. Both clients bound the connect phase; the rest differs by call
@@ -114,10 +174,10 @@ pub struct StathostBackend {
     /// Per-camera event lists, each sorted by `start_pts_ns` (the query/find
     /// key). Kept coherent on write/upgrade/prune.
     cameras: HashMap<String, RwLock<Vec<WarmEventEntry>>>,
-    /// Start PTSs whose sidecar the scan could not read, per camera. Their
+    /// Events whose sidecar the scan could not read, per camera. Their
     /// [`WarmEventEntry::event_type`] is a placeholder, not a fact — see
     /// [`Self::mark_unknown_type`].
-    unknown_type: HashMap<String, RwLock<HashSet<u64>>>,
+    unknown_type: HashMap<String, RwLock<HashSet<EventKey>>>,
     /// Sum of indexed `file_size` — the figure the budget is measured against.
     used_bytes: AtomicU64,
 }
@@ -162,40 +222,90 @@ impl StathostBackend {
 
     // ---- in-RAM index (self-contained; mirrors WarmEventIndex's RAM half) ----
 
-    fn insert_entry(&self, camera_id: &str, entry: WarmEventEntry) {
-        if let Some(lock) = self.cameras.get(camera_id) {
-            let mut entries = lock.write_recover();
-            let pos = entries
-                .binary_search_by_key(&entry.start_pts_ns, |e| e.start_pts_ns)
-                .unwrap_or_else(|p| p);
-            entries.insert(pos, entry);
+    /// Index one event, replacing whatever entry held the same stem and
+    /// returning it. A `PUT` is an upload *or* an update, so a second entry for
+    /// a stem that already has one would describe objects that do not exist.
+    fn insert_entry(&self, camera_id: &str, entry: WarmEventEntry) -> Option<WarmEventEntry> {
+        let lock = self.cameras.get(camera_id)?;
+        let mut entries = lock.write_recover();
+        match position(&entries, event_key(&entry)) {
+            Some(i) => Some(std::mem::replace(&mut entries[i], entry)),
+            None => {
+                let pos = entries.partition_point(|e| e.start_pts_ns < entry.start_pts_ns);
+                entries.insert(pos, entry);
+                None
+            }
         }
     }
 
-    /// Remove one event from the index by its start PTS, returning the removed
-    /// entry so the caller can reconcile `used_bytes`.
-    fn remove_entry(&self, camera_id: &str, start_pts_ns: u64) -> Option<WarmEventEntry> {
-        self.clear_unknown_type(camera_id, start_pts_ns);
+    /// Index one event and charge the budget for it, refunding whatever entry
+    /// it replaced. Every insertion goes through here, so tracked usage cannot
+    /// drift from the index it is supposed to be the sum of.
+    ///
+    /// A replacement moves usage by the *difference*, in one atomic operation:
+    /// an add followed by a subtract would let a concurrent reader — the budget
+    /// guard runs on every camera's writer task — see a total inflated by the
+    /// old entry's whole size and evict against it.
+    fn index_entry(&self, camera_id: &str, entry: WarmEventEntry) -> Option<WarmEventEntry> {
+        let file_size = entry.file_size;
+        let replaced = self.insert_entry(camera_id, entry);
+        match replaced.as_ref().map(|previous| previous.file_size) {
+            Some(previous) if previous > file_size => {
+                self.used_bytes
+                    .fetch_sub(previous - file_size, Ordering::Relaxed);
+            }
+            Some(previous) => {
+                self.used_bytes
+                    .fetch_add(file_size - previous, Ordering::Relaxed);
+            }
+            None => {
+                self.used_bytes.fetch_add(file_size, Ordering::Relaxed);
+            }
+        }
+        replaced
+    }
+
+    /// Remove one event from the index and refund its bytes, returning the
+    /// removed entry.
+    fn remove_entry(&self, camera_id: &str, key: EventKey) -> Option<WarmEventEntry> {
+        self.clear_unknown_type(camera_id, key);
         let lock = self.cameras.get(camera_id)?;
         let mut entries = lock.write_recover();
-        let idx = entries
-            .binary_search_by_key(&start_pts_ns, |e| e.start_pts_ns)
-            .ok()?;
-        Some(entries.remove(idx))
+        let idx = position(&entries, key)?;
+        let removed = entries.remove(idx);
+        self.used_bytes
+            .fetch_sub(removed.file_size, Ordering::Relaxed);
+        Some(removed)
+    }
+
+    /// Mutate the entry with this key in place (the sort key never changes).
+    /// `None` when no such event is indexed.
+    fn update_entry<R>(
+        &self,
+        camera_id: &str,
+        key: EventKey,
+        f: impl FnOnce(&mut WarmEventEntry) -> R,
+    ) -> Option<R> {
+        let lock = self.cameras.get(camera_id)?;
+        let mut entries = lock.write_recover();
+        let idx = position(&entries, key)?;
+        Some(f(&mut entries[idx]))
+    }
+
+    fn is_indexed(&self, camera_id: &str, key: EventKey) -> bool {
+        self.cameras
+            .get(camera_id)
+            .is_some_and(|lock| position(&lock.read_recover(), key).is_some())
     }
 
     /// Remember that this event resisted deletion, so the sweep's per-sweep
     /// deletion cap stops being spent on it: a store that refuses one event for
     /// good would otherwise block every deletion behind it, sweep after sweep.
+    /// It also takes the event out of budget eviction, which runs ahead of
+    /// every write and would otherwise spend each pass re-attempting it.
     /// The flag is in-RAM and a restart clears it, which is the retry.
-    fn mark_delete_failed(&self, camera_id: &str, start_pts_ns: u64) {
-        let Some(lock) = self.cameras.get(camera_id) else {
-            return;
-        };
-        let mut entries = lock.write_recover();
-        if let Ok(idx) = entries.binary_search_by_key(&start_pts_ns, |e| e.start_pts_ns) {
-            entries[idx].delete_failed = true;
-        }
+    fn mark_delete_failed(&self, camera_id: &str, key: EventKey) {
+        self.update_entry(camera_id, key, |entry| entry.delete_failed = true);
     }
 
     /// Record that this event's type could not be established. `event_type` on
@@ -205,16 +315,16 @@ impl StathostBackend {
     /// retention, which cannot expire before its own whatever its true type is,
     /// and still expires — a permanently unreadable sidecar would otherwise pin
     /// its footage forever on a store whose budget is unlimited by default.
-    fn mark_unknown_type(&self, camera_id: &str, start_pts_ns: u64) {
+    fn mark_unknown_type(&self, camera_id: &str, key: EventKey) {
         if let Some(lock) = self.unknown_type.get(camera_id) {
-            lock.write_recover().insert(start_pts_ns);
+            lock.write_recover().insert(key);
         }
     }
 
-    fn has_unknown_type(&self, camera_id: &str, start_pts_ns: u64) -> bool {
+    fn has_unknown_type(&self, camera_id: &str, key: EventKey) -> bool {
         self.unknown_type
             .get(camera_id)
-            .is_some_and(|lock| lock.read_recover().contains(&start_pts_ns))
+            .is_some_and(|lock| lock.read_recover().contains(&key))
     }
 
     /// Drop the marker once the type is settled or the event is gone. Only
@@ -222,9 +332,9 @@ impl StathostBackend {
     /// practice this fires when an entry leaves the index; it also keeps
     /// `upgrade_event` from leaving a "type unknown" marker on an event it just
     /// proved to be an object.
-    fn clear_unknown_type(&self, camera_id: &str, start_pts_ns: u64) {
+    fn clear_unknown_type(&self, camera_id: &str, key: EventKey) {
         if let Some(lock) = self.unknown_type.get(camera_id) {
-            lock.write_recover().remove(&start_pts_ns);
+            lock.write_recover().remove(&key);
         }
     }
 
@@ -275,33 +385,206 @@ impl StathostBackend {
         )
     }
 
-    /// Delete every object belonging to one event. Returns whether the video
-    /// object is gone (deleted or already absent) — the signal for whether the
-    /// index entry may be dropped. A genuine transport failure returns `false`
-    /// so the entry survives for the next prune tick.
-    async fn delete_event_objects(&self, camera_id: &str, entry: &WarmEventEntry) -> bool {
-        let stem = format!("{}_{}", entry.start_pts_ns, entry.duration_ms);
-        let ts_gone = match self.http.delete(&format!("{camera_id}/{stem}.ts")).await {
-            DeleteOutcome::Deleted | DeleteOutcome::Missing => true,
-            DeleteOutcome::Failed => {
-                tracing::warn!(camera = %camera_id, stem = %stem,
-                    "failed to delete event video from stathost, will retry next prune tick");
-                false
-            }
-        };
-        if !ts_gone {
-            return false;
-        }
-        // Best-effort cleanup of the siblings; a lingering sidecar/thumb is
-        // harmless once the video is gone.
-        let _ = self.http.delete(&format!("{camera_id}/{stem}.json")).await;
+    /// Delete every object belonging to one event — sidecar and thumbnails
+    /// first, the video last. The video's outcome is the event's outcome: only
+    /// once it is gone (or was already) may the index entry go.
+    ///
+    /// That order mirrors local disk's unlink order, and is the reverse of this
+    /// Delete every object belonging to one event: **thumbnails, then the
+    /// video, then the sidecar**. The video's outcome is the event's outcome —
+    /// only once it is gone (or was already) may the index entry go, and only
+    /// then is the sidecar deleted at all.
+    ///
+    /// Local disk unlinks metadata first and the `.ts` last, and this used to
+    /// copy that. The reason it does not is that the two backends fail
+    /// differently on either side of the video:
+    ///
+    /// * *Before* the video, only thumbnails go. They are decoration and carry
+    ///   nothing; the local order's whole point — that an interruption must not
+    ///   strand metadata nothing looks for — is preserved for them by the
+    ///   startup sweep, which local disk cannot have (see
+    ///   [`Self::sweep_orphaned_metadata`]).
+    /// * *After* the video, the sidecar. Deleting it first would mean a refused
+    ///   video delete — the common failure, and the one that persists — leaves
+    ///   a `.ts` with no record of its type, which the next scan reads back as
+    ///   a plain **movement**. That is not automatically the shortest
+    ///   retention: `continuous_retention_days` defaults to 1 against
+    ///   movement's 2, and all three are freely configurable in any order, so
+    ///   the reclassification can just as easily extend an expired event's life
+    ///   as shorten it. Local disk has no such exposure — its type is the
+    ///   directory, which a delete never touches. Keeping the sidecar until the
+    ///   video is actually gone means a failed delete is retried against the
+    ///   event's true retention, and a crash between the two leaves an orphan
+    ///   sidecar the next startup collects.
+    ///
+    /// Thumbnail failures are not a reason to keep the footage: holding an
+    /// expired recording because a thumbnail resisted breaks a larger promise
+    /// than the kilobytes it saves, and what is left is collected once the
+    /// video is gone.
+    async fn delete_event_objects(&self, camera_id: &str, entry: &WarmEventEntry) -> Removal {
+        let stem = key_stem(event_key(entry));
         for i in 0..entry.filmstrip_frames {
             let _ = self
                 .http
                 .delete(&format!("{camera_id}/{stem}_thumb_{i}.jpg"))
                 .await;
         }
-        true
+        let removal = match self.http.delete(&format!("{camera_id}/{stem}.ts")).await {
+            DeleteOutcome::Deleted => Removal::Deleted,
+            DeleteOutcome::Missing => Removal::Missing,
+            DeleteOutcome::Failed => {
+                // Per-event detail is debug: a store that is down fails every
+                // delete of every sweep, and both callers report one aggregate
+                // warning per pass.
+                tracing::debug!(camera = %camera_id, stem = %stem,
+                    "failed to delete event video from stathost, will retry on a later tick");
+                return Removal::Failed;
+            }
+        };
+        let _ = self.http.delete(&format!("{camera_id}/{stem}.json")).await;
+        removal
+    }
+
+    /// Delete the filmstrip frames a rewrite of this stem no longer has, and
+    /// leave the index describing what is actually on the host.
+    ///
+    /// Every other object of a rewritten event is overwritten in place by its
+    /// `PUT`; thumbnails past the new frame count are the one thing that has to
+    /// be removed, since the scan counts frames contiguously from 0 and would
+    /// otherwise hand this event the previous write's tail.
+    ///
+    /// Deleting **top down** is what makes a failure survivable. A delete that
+    /// fails stops the trim, and everything above the frame that refused is
+    /// already gone, so what remains is exactly `0..=refused` — still
+    /// contiguous, so the entry can simply claim that many frames and agree
+    /// with both the host and the next scan. Nothing is stranded: those frames
+    /// are inside the range [`Self::delete_event_objects`] deletes, so they go
+    /// with the event. Bottom-up would leave a hole, and everything above it
+    /// invisible to the scan and to the event's own delete — a permanent leak
+    /// out of one transient failure.
+    ///
+    /// The write is not failed over this. It is decoration, the footage is
+    /// already stored, and the index is honest either way.
+    async fn trim_thumbnails(&self, camera_id: &str, key: EventKey, keep: usize, had: usize) {
+        let stem = key_stem(key);
+        for i in (keep..had).rev() {
+            if matches!(
+                self.http
+                    .delete(&format!("{camera_id}/{stem}_thumb_{i}.jpg"))
+                    .await,
+                DeleteOutcome::Failed
+            ) {
+                tracing::warn!(camera = %camera_id, stem = %stem, frame = i,
+                    "could not delete a filmstrip frame this event no longer has; \
+                     it stays part of the event and is deleted with it");
+                self.update_entry(camera_id, key, |entry| entry.filmstrip_frames = i + 1);
+                return;
+            }
+        }
+    }
+
+    /// Delete metadata whose video is not on the host: the sidecar (and any
+    /// thumbnails) of an event whose `.ts` upload never landed.
+    ///
+    /// Nothing else collects them. The index is built from `.ts` objects, so
+    /// such an object is never indexed, never counted against the budget, and
+    /// never deleted alongside an event — on a flaky uplink they accumulate for
+    /// the life of the bucket, and the budget drifts further below true remote
+    /// usage with every one. The listing the scan already fetched is all it
+    /// takes to find them.
+    ///
+    /// The sidecar goes up *before* the video, so "no video" is also what a
+    /// write still in progress looks like. Four things stand between this and
+    /// one, three of them absolute:
+    ///
+    /// * [`WarmStorageBackend::scan`] is awaited once, from `init_storage`,
+    ///   before the backend is handed to any warm writer — so no upload from
+    ///   *this* process has started, and none is pending either: a write that
+    ///   fails is dropped with an error, never queued (the writer retries
+    ///   `NoSpace` alone, an outcome this backend never returns).
+    /// * Only camera prefixes this process owns are touched — the same ones the
+    ///   index is built from — and only names this backend writes, parsing as
+    ///   an event stem.
+    /// * Every candidate is re-checked against the host immediately before it
+    ///   is deleted, and deleted only on a *confirmed* absence. The listing is
+    ///   a snapshot taken before the (possibly long) indexing pass, and it is
+    ///   not the only writer's snapshot: another camon on the same camera id,
+    ///   or a `PUT` that outlived the process which issued it (a client-side
+    ///   timeout says nothing about what the origin commits — the same fact
+    ///   that stops this backend rolling anything back), can land a video after
+    ///   it was taken. A failure to find out is not an absence and never
+    ///   deletes.
+    ///
+    /// **The residual race, stated rather than papered over:** between that
+    /// re-check answering "absent" and the `DELETE` arriving, a `PUT` already
+    /// in flight can commit. stathost has no conditional delete, so the window
+    /// cannot be closed from the client side — only narrowed to one request
+    /// round-trip, which is what the re-check does. Its cost if it is ever lost
+    /// is one video with no type record, which the scan reads as a plain
+    /// movement: the same state this backend already tolerates whenever a
+    /// sidecar cannot be stored, not a lost recording. Reaching it needs a
+    /// second writer on a camera id this process owns, which is unsupported for
+    /// several other reasons already — two such instances prune and evict each
+    /// other's events.
+    ///
+    /// Local disk deliberately has no equivalent sweep: there, metadata is
+    /// written under its final name *before* the `.ts.tmp` is committed, so
+    /// "metadata with no video" is also what an event awaiting startup recovery
+    /// looks like, and collecting it would destroy the sidecar of footage about
+    /// to be salvaged. This backend stages nothing and recovers nothing.
+    async fn sweep_orphaned_metadata(&self, items: &[ListEntry], all_paths: &HashSet<&str>) {
+        let mut deleted = 0usize;
+        let mut failed = 0usize;
+        let mut landed = 0usize;
+        for item in items {
+            let Some((camera_id, stem)) = split_metadata_key(&item.path) else {
+                continue;
+            };
+            if !self.cameras.contains_key(camera_id) || parse_event_filename(stem).is_none() {
+                continue;
+            }
+            let ts_key = format!("{camera_id}/{stem}.ts");
+            if all_paths.contains(ts_key.as_str()) {
+                continue;
+            }
+            match self.http.probe_exists(&ts_key).await {
+                // Confirmed absent: an orphan, as of one request ago.
+                Ok(false) => {}
+                // It landed after the listing was taken — not an orphan at all.
+                Ok(true) => {
+                    landed += 1;
+                    continue;
+                }
+                // Could not find out. Nothing is deleted on a maybe.
+                Err(_) => {
+                    failed += 1;
+                    continue;
+                }
+            }
+            match self.http.delete(&item.path).await {
+                DeleteOutcome::Deleted => deleted += 1,
+                DeleteOutcome::Missing => {}
+                DeleteOutcome::Failed => failed += 1,
+            }
+        }
+        if deleted > 0 {
+            tracing::info!(
+                deleted,
+                "deleted stathost metadata whose event video never landed"
+            );
+        }
+        if landed > 0 {
+            tracing::info!(
+                landed,
+                "stathost metadata whose video appeared after the listing was taken; kept"
+            );
+        }
+        if failed > 0 {
+            tracing::warn!(
+                failed,
+                "could not collect orphaned stathost metadata; the next startup retries"
+            );
+        }
     }
 
     /// Re-read the sidecars of events whose type an earlier scan could not
@@ -313,33 +596,29 @@ impl StathostBackend {
     /// retry can happen at all; it costs one GET per held event, and a store
     /// with nothing held issues none.
     async fn resolve_unknown_types(&self, camera_id: &str, cancel: &std::sync::atomic::AtomicBool) {
-        let held: Vec<u64> = match self.unknown_type.get(camera_id) {
+        let held: Vec<EventKey> = match self.unknown_type.get(camera_id) {
             Some(lock) => lock.read_recover().iter().copied().collect(),
             None => return,
         };
         let mut resolved = 0u64;
-        for start_pts_ns in held {
+        for key in held {
             if cancel.load(Ordering::Relaxed) {
                 break;
             }
-            let Some(entry) = self.find_event(camera_id, start_pts_ns) else {
-                self.clear_unknown_type(camera_id, start_pts_ns);
+            if !self.is_indexed(camera_id, key) {
+                self.clear_unknown_type(camera_id, key);
                 continue;
-            };
-            let stem = format!("{start_pts_ns}_{}", entry.duration_ms);
-            let sidecar = match self.read_sidecar(camera_id, &stem).await {
+            }
+            let sidecar = match self.read_sidecar(camera_id, &key_stem(key)).await {
                 SidecarRead::Parsed(s) => Some(s),
                 SidecarRead::Absent => None,
                 // Still unreadable, or still naming no type: keep the hold.
                 SidecarRead::Unreadable | SidecarRead::Typeless(_) => continue,
             };
-            if let Some(lock) = self.cameras.get(camera_id) {
-                let mut entries = lock.write_recover();
-                if let Ok(i) = entries.binary_search_by_key(&start_pts_ns, |e| e.start_pts_ns) {
-                    apply_sidecar(&mut entries[i], sidecar.as_ref());
-                }
-            }
-            self.clear_unknown_type(camera_id, start_pts_ns);
+            self.update_entry(camera_id, key, |entry| {
+                apply_sidecar(entry, sidecar.as_ref())
+            });
+            self.clear_unknown_type(camera_id, key);
             resolved += 1;
         }
         if resolved > 0 {
@@ -350,19 +629,43 @@ impl StathostBackend {
 
     /// Enforce the client-side storage budget: while tracked usage exceeds
     /// `max_stored_bytes`, delete the oldest events cheapest-tier-first
-    /// (continuous → movements → objects). A transport failure stops the pass
-    /// (retried on the next tick). No-op when the budget is unlimited.
+    /// (continuous → movements → objects). No-op when the budget is unlimited.
     ///
     /// Like the local low-space guard, this is deliberately outside the sweep's
     /// [`cap_sweep_deletions`] cap — the budget is not clock-derived — so a
     /// full budget during a held-back drain can delete the footage the sweep is
     /// holding.
+    ///
+    /// Two things about failures, which have to be read together:
+    ///
+    /// * A failure **stops the pass**, where local disk continues past it. A
+    ///   refusal here is a network answer, not one poisoned file, so the next
+    ///   candidate is overwhelmingly likely to fail the same way — and each
+    ///   attempt can sit for [`REQUEST_TIMEOUT`] inline in a warm writer with a
+    ///   camera's recording waiting behind it.
+    /// * A failure **demotes** the event to the back of its tier
+    ///   ([`WarmEventEntry::delete_failed`]) rather than excluding it. Local
+    ///   disk excludes, and can afford to: it continues past failures, so a
+    ///   flagged file never blocks the rest. Excluding *and* stopping would
+    ///   starve this pass outright — an outage flags a candidate per pass, and
+    ///   the hourly sweep only ever retries events that are already age-expired,
+    ///   so once the store came back nothing under retention would be
+    ///   reclaimable and the budget would sit over its limit permanently, with
+    ///   only newly written events left to evict. Demotion keeps the ordering
+    ///   benefit (a known-bad object is never tried ahead of a good one) and
+    ///   costs at most one failed request per pass, which is the bound.
+    ///
+    /// An object that was already gone unindexes like a deleted one, but is
+    /// reported separately: it reclaimed nothing on the host, it only corrected
+    /// an index entry that was describing nothing.
     async fn enforce_budget(&self, camera_id: &str) {
         if self.max_stored_bytes == 0 || self.used() <= self.max_stored_bytes {
             return;
         }
         let mut deleted = 0u64;
-        for tier in [
+        let mut missing = 0u64;
+        let mut failed = 0u64;
+        'tiers: for tier in [
             EventType::Continuous,
             EventType::Movement,
             EventType::Object,
@@ -378,7 +681,7 @@ impl StathostBackend {
                         // and evicting on that guess would throw away footage
                         // this whole path exists to keep.
                         .filter(|e| {
-                            if self.has_unknown_type(cam, e.start_pts_ns) {
+                            if self.has_unknown_type(cam, event_key(e)) {
                                 tier == EventType::Object
                             } else {
                                 e.event_type == tier
@@ -388,34 +691,43 @@ impl StathostBackend {
                         .map(|e| (cam.clone(), e)),
                 );
             }
-            candidates.sort_by_key(|(_, e)| e.start_pts_ns);
+            // Oldest first, but everything that has already refused to be
+            // deleted after everything that has not: reached only once this
+            // tier's untried candidates are exhausted and the budget is still
+            // unmet — the point at which the pass would otherwise give up.
+            candidates.sort_by_key(|(_, e)| (e.delete_failed, e.start_pts_ns));
 
             for (cam, entry) in candidates {
                 if self.used() <= self.max_stored_bytes {
-                    if deleted > 0 {
-                        tracing::warn!(camera = %camera_id, deleted, "budget prune complete");
+                    break 'tiers;
+                }
+                let key = event_key(&entry);
+                match self.delete_event_objects(&cam, &entry).await {
+                    Removal::Failed => {
+                        failed += 1;
+                        self.mark_delete_failed(&cam, key);
+                        break 'tiers;
                     }
-                    return;
+                    Removal::Missing => {
+                        self.remove_entry(&cam, key);
+                        missing += 1;
+                    }
+                    Removal::Deleted => {
+                        self.remove_entry(&cam, key);
+                        deleted += 1;
+                        tracing::warn!(
+                            camera = %cam,
+                            start_pts_ns = entry.start_pts_ns,
+                            event_type = ?entry.event_type,
+                            "budget prune: deleted event to stay under max_stored_bytes"
+                        );
+                    }
                 }
-                if !self.delete_event_objects(&cam, &entry).await {
-                    // Can't reclaim right now; leave the rest for the next tick.
-                    return;
-                }
-                if let Some(removed) = self.remove_entry(&cam, entry.start_pts_ns) {
-                    self.used_bytes
-                        .fetch_sub(removed.file_size, Ordering::Relaxed);
-                }
-                deleted += 1;
-                tracing::warn!(
-                    camera = %cam,
-                    start_pts_ns = entry.start_pts_ns,
-                    event_type = ?entry.event_type,
-                    "budget prune: deleted event to stay under max_stored_bytes"
-                );
             }
         }
-        if deleted > 0 {
-            tracing::warn!(camera = %camera_id, deleted, "budget prune complete");
+        if deleted > 0 || missing > 0 || failed > 0 {
+            tracing::warn!(camera = %camera_id, deleted, missing, failed,
+                "budget prune complete");
         }
     }
 }
@@ -423,8 +735,24 @@ impl StathostBackend {
 #[async_trait]
 impl WarmStorageBackend for StathostBackend {
     async fn write_event(&self, camera_id: &str, event: &FinishedEvent) -> WriteOutcome {
-        let duration_ms = event.duration_ns() / NANOS_PER_MS;
-        let stem = format!("{}_{}", event.first_pts, duration_ms);
+        // Checked, not cast: the index entry — and so [`event_key`], the
+        // identity every object of this event is keyed by — holds a `u32`,
+        // while the duration is computed as `u64`. A silent truncation would
+        // put the video under a stem no index entry names. It takes an event of
+        // over 49 days for that, which `max_event_duration_secs` makes
+        // unreachable; the conversion is here so the invariant is stated rather
+        // than assumed.
+        let Ok(duration_ms) = u32::try_from(event.duration_ns() / NANOS_PER_MS) else {
+            tracing::error!(
+                camera = %camera_id,
+                first_pts = event.first_pts,
+                duration_ns = event.duration_ns(),
+                "dropping event: duration does not fit the storage key"
+            );
+            return WriteOutcome::Failed;
+        };
+        let key = (event.first_pts, duration_ms);
+        let stem = key_stem(key);
         let data = concatenate_segments(&event.segments, event.total_bytes);
         let file_size = data.len() as u64;
         let event_type = event.event_type();
@@ -503,11 +831,11 @@ impl WarmStorageBackend for StathostBackend {
             None => 0,
         };
 
-        self.insert_entry(
+        let replaced = self.index_entry(
             camera_id,
             WarmEventEntry {
                 start_pts_ns: event.first_pts,
-                duration_ms: duration_ms as u32,
+                duration_ms,
                 event_type,
                 file_size,
                 object_classes: event.object_classes.clone(),
@@ -520,8 +848,12 @@ impl WarmStorageBackend for StathostBackend {
                 delete_failed: false,
             },
         );
-        self.used_bytes.fetch_add(file_size, Ordering::Relaxed);
-        self.clear_unknown_type(camera_id, event.first_pts);
+        self.clear_unknown_type(camera_id, key);
+
+        if let Some(previous) = replaced {
+            self.trim_thumbnails(camera_id, key, filmstrip_frames, previous.filmstrip_frames)
+                .await;
+        }
 
         tracing::info!(
             camera = %camera_id,
@@ -537,7 +869,8 @@ impl WarmStorageBackend for StathostBackend {
         // The upgrade rewrites the sidecar in place — no video is moved. If the
         // event was never indexed (write failed, or already pruned) there is
         // nothing to rewrite; the detections remain in the detection store.
-        if self.find_event(camera_id, upgrade.start_pts_ns).is_none() {
+        let key = (upgrade.start_pts_ns, upgrade.duration_ms);
+        if !self.is_indexed(camera_id, key) {
             tracing::warn!(
                 camera = %camera_id,
                 start_pts_ns = upgrade.start_pts_ns,
@@ -546,7 +879,7 @@ impl WarmStorageBackend for StathostBackend {
             );
             return;
         }
-        let stem = format!("{}_{}", upgrade.start_pts_ns, upgrade.duration_ms);
+        let stem = key_stem(key);
         let sidecar = sidecar_json(
             EventType::Object,
             Some(&upgrade.backend),
@@ -565,26 +898,22 @@ impl WarmStorageBackend for StathostBackend {
             return;
         }
 
-        if let Some(lock) = self.cameras.get(camera_id) {
-            let mut entries = lock.write_recover();
-            if let Ok(i) = entries.binary_search_by_key(&upgrade.start_pts_ns, |e| e.start_pts_ns) {
-                let entry = &mut entries[i];
-                entry.event_type = EventType::Object;
-                entry.object_classes = upgrade.object_classes.clone();
-                entry.detections = upgrade.detections.clone();
-                entry.backend = Some(upgrade.backend.clone());
-                entry.model = Some(upgrade.model.clone());
-                // The sidecar just written carries the upgrade's `continues`;
-                // the index has to say the same thing (LocalDisk rebuilds the
-                // whole entry here, which is where this was being lost).
-                entry.continues = upgrade.continues;
-            }
-        }
+        self.update_entry(camera_id, key, |entry| {
+            entry.event_type = EventType::Object;
+            entry.object_classes = upgrade.object_classes.clone();
+            entry.detections = upgrade.detections.clone();
+            entry.backend = Some(upgrade.backend.clone());
+            entry.model = Some(upgrade.model.clone());
+            // The sidecar just written carries the upgrade's `continues`;
+            // the index has to say the same thing (LocalDisk rebuilds the
+            // whole entry here, which is where this was being lost).
+            entry.continues = upgrade.continues;
+        });
         // The type is now established. An upgrade only ever targets an event
         // written by this process, so it cannot reach one the scan held — but
         // this and `write_event` are the two places a type becomes a fact, and
         // neither may leave a "type unknown" marker behind it.
-        self.clear_unknown_type(camera_id, upgrade.start_pts_ns);
+        self.clear_unknown_type(camera_id, key);
 
         tracing::info!(
             camera = %camera_id,
@@ -631,7 +960,7 @@ impl WarmStorageBackend for StathostBackend {
                 let expired: Vec<WarmEventEntry> = entries
                     .iter()
                     .filter(|e| {
-                        let limit = if self.has_unknown_type(camera_id, e.start_pts_ns) {
+                        let limit = if self.has_unknown_type(camera_id, event_key(e)) {
                             unknown_max_age
                         } else {
                             max_age(e.event_type)
@@ -648,22 +977,38 @@ impl WarmStorageBackend for StathostBackend {
             let expired = cap_sweep_deletions(camera_id, indexed, expired);
 
             let mut deleted = 0u64;
+            let mut failed = 0u64;
             for entry in &expired {
                 if stop() {
                     break;
                 }
-                if self.delete_event_objects(camera_id, entry).await {
-                    if let Some(removed) = self.remove_entry(camera_id, entry.start_pts_ns) {
-                        self.used_bytes
-                            .fetch_sub(removed.file_size, Ordering::Relaxed);
+                let key = event_key(entry);
+                match self.delete_event_objects(camera_id, entry).await {
+                    Removal::Deleted => {
+                        self.remove_entry(camera_id, key);
+                        deleted += 1;
                     }
-                    deleted += 1;
-                } else {
-                    self.mark_delete_failed(camera_id, entry.start_pts_ns);
+                    // Already gone on the host: nothing was reclaimed, but the
+                    // entry describes an object that does not exist.
+                    Removal::Missing => {
+                        self.remove_entry(camera_id, key);
+                    }
+                    Removal::Failed => {
+                        failed += 1;
+                        self.mark_delete_failed(camera_id, key);
+                    }
                 }
             }
             if deleted > 0 {
                 tracing::info!(camera = %camera_id, deleted, "pruned expired warm events");
+            }
+            if failed > 0 {
+                tracing::warn!(
+                    camera = %camera_id,
+                    failed,
+                    "expired warm events are still on stathost after a failed delete, \
+                     kept indexed for the next prune tick (stems at debug level)"
+                );
             }
         }
     }
@@ -758,14 +1103,15 @@ impl WarmStorageBackend for StathostBackend {
                 delete_failed: false,
             };
             apply_sidecar(&mut entry, sidecar.as_ref());
-            self.used_bytes.fetch_add(item.size, Ordering::Relaxed);
-            self.insert_entry(camera_id, entry);
+            self.index_entry(camera_id, entry);
             if !type_known {
-                self.mark_unknown_type(camera_id, start_pts_ns);
+                self.mark_unknown_type(camera_id, (start_pts_ns, duration_ms));
                 unknown_type += 1;
             }
             total += 1;
         }
+
+        self.sweep_orphaned_metadata(&items, &all_paths).await;
 
         if unknown_type > 0 {
             tracing::warn!(
@@ -785,7 +1131,9 @@ impl WarmStorageBackend for StathostBackend {
 
     fn recover_orphans(&self) {
         // Interrupted uploads are a server-side concern; nothing to salvage
-        // client-side.
+        // client-side. What an interrupted upload can leave behind is metadata
+        // without a video, which [`StathostBackend::sweep_orphaned_metadata`]
+        // collects during the scan — it needs the listing the scan already has.
     }
 
     /// Every event overlapping `[from_ns, to_ns]`. An inverted range is empty.
@@ -1041,6 +1389,30 @@ impl Http {
         Ok(Some(resp.error_for_status()?.bytes().await?.to_vec()))
     }
 
+    /// Whether an object is on the host, without fetching it: a one-byte ranged
+    /// GET, so probing a video worth tens of megabytes costs one byte (the body
+    /// is dropped unread in any case). Range support is required of the server
+    /// anyway — playback depends on it — where `HEAD` is not.
+    ///
+    /// `Err` means "could not find out", which a caller that deletes on absence
+    /// must not treat as one. A zero-byte object answers `416` and so reads as
+    /// unknown rather than absent, which errs the safe way for the one caller.
+    async fn probe_exists(&self, path: &str) -> Result<bool, reqwest::Error> {
+        let resp = self
+            .client
+            .get(self.url(path))
+            .bearer_auth(&self.token)
+            .header(reqwest::header::RANGE, "bytes=0-0")
+            .timeout(REQUEST_TIMEOUT)
+            .send()
+            .await?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(false);
+        }
+        resp.error_for_status()?;
+        Ok(true)
+    }
+
     /// Start a streamed GET, optionally forwarding a single `Range`. The raw
     /// response is returned unvalidated so the caller can distinguish `206`
     /// (partial), `200` (full / range-ignored) and `416` (unsatisfiable).
@@ -1103,6 +1475,26 @@ fn concatenate_segments(segments: &[GopSegment], capacity: usize) -> Vec<u8> {
 /// that is not a `.ts` object with a camera prefix.
 fn split_ts_key(path: &str) -> Option<(&str, &str)> {
     let rest = path.strip_suffix(".ts")?;
+    rest.rsplit_once('/')
+}
+
+/// Split a metadata object key — `{camera_id}/{stem}.json` or
+/// `{camera_id}/{stem}_thumb_{i}.jpg` — into `(camera_id, stem)`, where the
+/// stem is the one its `.ts` sibling carries. `None` for anything else,
+/// including a `.jpg` that is not a numbered filmstrip frame: what this matches
+/// is what [`StathostBackend::sweep_orphaned_metadata`] deletes, so it matches
+/// only names this backend writes.
+fn split_metadata_key(path: &str) -> Option<(&str, &str)> {
+    let rest = match path.strip_suffix(".json") {
+        Some(rest) => rest,
+        None => {
+            let (rest, index) = path.strip_suffix(".jpg")?.rsplit_once("_thumb_")?;
+            if index.is_empty() || !index.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            rest
+        }
+    };
     rest.rsplit_once('/')
 }
 
@@ -1219,6 +1611,9 @@ mod tests {
         /// When set, GET ignores an incoming `Range` and answers a full `200` —
         /// a legal HTTP response the client must handle by replaying in full.
         ignore_range: Arc<AtomicBool>,
+        /// Paths that appear the instant after a listing is served: an upload
+        /// committing while a scan walks the snapshot it took.
+        commit_after_list: Arc<Mutex<Vec<String>>>,
     }
 
     /// A PUT failure injected by path suffix. `stored` decides whether the
@@ -1324,7 +1719,7 @@ mod tests {
             let files = stub.files.lock().unwrap();
             let mut paths: Vec<String> = files.keys().cloned().collect();
             paths.sort();
-            return if detail {
+            let response = if detail {
                 let arr: Vec<serde_json::Value> = paths
                     .iter()
                     .map(|p| serde_json::json!({"path": p, "size": files[p].len(), "mtime": 0}))
@@ -1333,6 +1728,12 @@ mod tests {
             } else {
                 Json(paths).into_response()
             };
+            drop(files);
+            // Whatever was landing while the snapshot was taken lands now.
+            for path in stub.commit_after_list.lock().unwrap().drain(..) {
+                stub.files.lock().unwrap().insert(path, vec![0u8; 10]);
+            }
+            return response;
         }
 
         match method {
@@ -1426,6 +1827,7 @@ mod tests {
             fail_get_suffix: Arc::new(Mutex::new(None)),
             fail_delete_paths: Arc::new(Mutex::new(HashSet::new())),
             ignore_range: Arc::new(AtomicBool::new(false)),
+            commit_after_list: Arc::new(Mutex::new(Vec::new())),
         };
         let app = Router::new()
             .route("/{bucket}/{*path}", any(handler))
@@ -1489,6 +1891,25 @@ mod tests {
             confidence: 0.8,
         }];
         e
+    }
+
+    /// A second event at the same start PTS, twice as long: same start,
+    /// different stem, and so a different set of objects on the host. Nothing
+    /// enforces the uniqueness of a start PTS, which is why an event is
+    /// identified by its stem and not by where a binary search on the start
+    /// happens to land.
+    fn longer_movement_event(first_pts: u64, size: usize) -> FinishedEvent {
+        let mut e = movement_event(first_pts, size);
+        e.segments.push(segment(first_pts + SEC, 0xcd, size));
+        e.total_bytes = size * 2;
+        e
+    }
+
+    fn sibling(backend: &StathostBackend, duration_ms: u32) -> Option<WarmEventEntry> {
+        backend
+            .query("cam", 0, u64::MAX)
+            .into_iter()
+            .find(|e| e.duration_ms == duration_ms)
     }
 
     fn continuous_event(first_pts: u64, size: usize) -> FinishedEvent {
@@ -1555,6 +1976,157 @@ mod tests {
         assert_eq!(e.file_size, 40);
         assert_eq!(e.filmstrip_frames, 2);
         assert_eq!(scanned.free_space().unwrap(), u64::MAX); // unlimited budget
+    }
+
+    /// A `PUT` of a key that exists is an update, so writing a stem twice
+    /// rewrites one event. The index used to gain a second entry for it and the
+    /// budget was charged twice — an in-RAM store of two events where the host
+    /// holds one, drifting the client-side budget away from real usage.
+    #[tokio::test]
+    async fn a_rewritten_stem_replaces_its_entry_rather_than_adding_one() {
+        let (url, stub) = spawn_stub("secret").await;
+        let backend = backend_for(&url, "secret", 0);
+
+        backend.write_event("cam", &movement_event(1_000, 40)).await;
+        // Same start and duration — the same stem, and so the same objects.
+        backend.write_event("cam", &movement_event(1_000, 25)).await;
+
+        assert_eq!(backend.query("cam", 0, u64::MAX).len(), 1);
+        assert_eq!(backend.find_event("cam", 1_000).unwrap().file_size, 25);
+        assert_eq!(backend.used_bytes.load(Ordering::Relaxed), 25);
+        // ts + json + 2 thumbs, overwritten in place.
+        assert_eq!(stub.files.lock().unwrap().len(), 4);
+    }
+
+    /// The scan counts filmstrip frames contiguously from 0, so a thumbnail the
+    /// rewrite has no frame for would be served as part of this event and would
+    /// outlive it — the delete only removes the frames the entry knows about.
+    #[tokio::test]
+    async fn a_shorter_rewrite_deletes_the_thumbnails_it_no_longer_has() {
+        let (url, stub) = spawn_stub("secret").await;
+        let backend = backend_for(&url, "secret", 0);
+
+        let mut event = movement_event(2_000, 30);
+        event.filmstrip_frames = Some(Arc::new(vec![vec![0x01], vec![0x02], vec![0x03]]));
+        backend.write_event("cam", &event).await;
+        assert!(stub.has("cam/2000_1000_thumb_2.jpg"));
+
+        let mut shorter = movement_event(2_000, 30);
+        shorter.filmstrip_frames = Some(Arc::new(vec![vec![0x09]]));
+        backend.write_event("cam", &shorter).await;
+
+        assert_eq!(
+            backend.find_event("cam", 2_000).unwrap().filmstrip_frames,
+            1
+        );
+        assert!(stub.has("cam/2000_1000_thumb_0.jpg"));
+        assert!(!stub.has("cam/2000_1000_thumb_1.jpg"));
+        assert!(!stub.has("cam/2000_1000_thumb_2.jpg"));
+
+        // What a restart rebuilds agrees with the index in RAM.
+        let scanned = backend_for(&url, "secret", 0);
+        scanned.scan().await;
+        assert_eq!(
+            scanned.find_event("cam", 2_000).unwrap().filmstrip_frames,
+            1
+        );
+    }
+
+    /// Two events sharing a start PTS are two events. Everything that reaches
+    /// into the index by key — the upgrade's in-place rewrite and the sweep's
+    /// removal — has to find the one it named, not whichever of the pair a
+    /// binary search on the start returns.
+    #[tokio::test]
+    async fn siblings_sharing_a_start_pts_are_upgraded_and_removed_by_stem() {
+        let (url, stub) = spawn_stub("secret").await;
+        let backend = backend_for(&url, "secret", 0);
+        backend
+            .write_event("cam", &movement_event(OLD_PTS, 40))
+            .await;
+        backend
+            .write_event("cam", &longer_movement_event(OLD_PTS, 40))
+            .await;
+        assert_eq!(backend.query("cam", 0, u64::MAX).len(), 2);
+        assert_eq!(backend.used_bytes.load(Ordering::Relaxed), 40 + 80);
+
+        // Upgrade only the longer one.
+        let mut upgrade = upgrade_for(OLD_PTS);
+        upgrade.duration_ms = 2000;
+        backend.upgrade_event("cam", &upgrade).await;
+        assert_eq!(
+            sibling(&backend, 2000).unwrap().event_type,
+            EventType::Object
+        );
+        assert_eq!(
+            sibling(&backend, 1000).unwrap().event_type,
+            EventType::Movement
+        );
+        let sidecar = stub
+            .files
+            .lock()
+            .unwrap()
+            .get(&format!("cam/{OLD_PTS}_1000.json"))
+            .cloned()
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&sidecar).unwrap()["event_type"],
+            serde_json::json!("movement"),
+            "the upgrade rewrote its sibling's sidecar"
+        );
+
+        // The movement sibling expires; the object one does not.
+        backend
+            .prune(1, u64::MAX, u64::MAX, &AtomicBool::new(false))
+            .await;
+        assert!(sibling(&backend, 1000).is_none());
+        assert!(sibling(&backend, 2000).is_some());
+        assert!(!stub.has(&format!("cam/{OLD_PTS}_1000.ts")));
+        assert!(stub.has(&format!("cam/{OLD_PTS}_2000.ts")));
+        assert_eq!(
+            backend.used_bytes.load(Ordering::Relaxed),
+            80,
+            "the wrong sibling's bytes were refunded"
+        );
+    }
+
+    /// The same for the two flags an entry carries: a failed delete and a type
+    /// the scan could not read both belong to one stem, not to a start PTS.
+    #[tokio::test]
+    async fn flags_and_type_holds_follow_the_stem_not_the_start_pts() {
+        let (url, stub) = spawn_stub("secret").await;
+        let writer = backend_for(&url, "secret", 0);
+        writer
+            .write_event("cam", &movement_event(OLD_PTS, 40))
+            .await;
+        writer
+            .write_event("cam", &longer_movement_event(OLD_PTS, 40))
+            .await;
+
+        // Only the longer sibling's sidecar is unreadable on the next start.
+        stub.fail_gets("_2000.json");
+        let backend = backend_for(&url, "secret", 0);
+        backend.scan().await;
+        assert!(backend.has_unknown_type("cam", (OLD_PTS, 2000)));
+        assert!(!backend.has_unknown_type("cam", (OLD_PTS, 1000)));
+
+        // The typed sibling expires as a movement; the held one is measured
+        // against the longest configured retention and stays.
+        stub.fail_delete_paths
+            .lock()
+            .unwrap()
+            .insert(format!("cam/{OLD_PTS}_2000.ts"));
+        backend
+            .prune(1, u64::MAX, u64::MAX, &AtomicBool::new(false))
+            .await;
+        assert!(sibling(&backend, 1000).is_none());
+        assert!(sibling(&backend, 2000).is_some());
+
+        // Now expire everything: the held sibling is tried, refuses, and is the
+        // one flagged.
+        backend.prune(1, 1, 1, &AtomicBool::new(false)).await;
+        let held = sibling(&backend, 2000).unwrap();
+        assert!(held.delete_failed);
+        assert!(backend.has_unknown_type("cam", (OLD_PTS, 2000)));
     }
 
     #[tokio::test]
@@ -1747,6 +2319,184 @@ mod tests {
         assert!(backend.used_bytes.load(Ordering::Relaxed) <= 60);
     }
 
+    /// Budget eviction runs ahead of every write, so an object the store
+    /// refuses must not be re-attempted by every pass: it would spend each one
+    /// on the same doomed delete and never reach the events that would free
+    /// space. Local disk's emergency prune skips its own failures for exactly
+    /// this reason.
+    #[tokio::test]
+    async fn budget_eviction_skips_an_event_it_already_failed_to_delete() {
+        let (url, stub) = spawn_stub("secret").await;
+        let backend = backend_for(&url, "secret", 60);
+        for pts in [1_000u64, 2_000, 3_000] {
+            backend.write_event("cam", &movement_event(pts, 40)).await;
+        }
+        stub.fail_delete_paths
+            .lock()
+            .unwrap()
+            .insert("cam/1000_1000.ts".to_string());
+
+        // First pass: the oldest refuses, and the pass stops there.
+        backend.guard_free_space("cam", 0).await;
+        assert_eq!(backend.query("cam", 0, u64::MAX).len(), 3);
+        assert!(backend.find_event("cam", 1_000).unwrap().delete_failed);
+
+        // Second: it is skipped, and the budget is enforced around it.
+        backend.guard_free_space("cam", 0).await;
+        assert!(backend.find_event("cam", 1_000).is_some());
+        assert!(backend.find_event("cam", 2_000).is_none());
+        assert!(backend.find_event("cam", 3_000).is_none());
+        assert!(stub.has("cam/1000_1000.ts"));
+    }
+
+    /// An object that was already gone reclaimed nothing on the host — it only
+    /// corrected an index entry describing nothing. Its entry still has to go,
+    /// and the pass still has to go on to something that does free bytes.
+    #[tokio::test]
+    async fn budget_eviction_unindexes_an_object_that_is_already_gone() {
+        let (url, stub) = spawn_stub("secret").await;
+        let backend = backend_for(&url, "secret", 60);
+        backend.write_event("cam", &movement_event(1_000, 40)).await;
+        backend.write_event("cam", &movement_event(2_000, 40)).await;
+        backend.write_event("cam", &movement_event(3_000, 40)).await;
+        // Someone else removed the oldest video behind camon's back.
+        stub.files.lock().unwrap().remove("cam/1000_1000.ts");
+
+        backend.guard_free_space("cam", 0).await;
+
+        assert!(backend.find_event("cam", 1_000).is_none());
+        assert!(backend.find_event("cam", 2_000).is_none());
+        assert!(backend.find_event("cam", 3_000).is_some());
+        assert_eq!(backend.used_bytes.load(Ordering::Relaxed), 40);
+    }
+
+    /// An outage flags one candidate per pass (the pass stops at the first
+    /// failure). If flagging *excluded* an event from eviction, the store
+    /// coming back would leave the budget permanently over its limit: nothing
+    /// already written would ever be reconsidered, and the hourly sweep only
+    /// retries events that are age-expired. Flagging demotes instead.
+    #[tokio::test]
+    async fn budget_eviction_recovers_after_an_outage_flagged_every_candidate() {
+        let (url, stub) = spawn_stub("secret").await;
+        let backend = backend_for(&url, "secret", 60);
+        for pts in [1_000u64, 2_000, 3_000, 4_000] {
+            backend.write_event("cam", &movement_event(pts, 40)).await;
+        }
+        {
+            let mut refused = stub.fail_delete_paths.lock().unwrap();
+            for pts in [1_000u64, 2_000, 3_000, 4_000] {
+                refused.insert(format!("cam/{pts}_1000.ts"));
+            }
+        }
+
+        // The store is unreachable: every pass flags one more candidate.
+        for _ in 0..4 {
+            backend.guard_free_space("cam", 0).await;
+        }
+        assert_eq!(backend.query("cam", 0, u64::MAX).len(), 4);
+        assert!(backend
+            .query("cam", 0, u64::MAX)
+            .iter()
+            .all(|e| e.delete_failed));
+
+        // It comes back. Eviction has to reconsider what it flagged, or the
+        // budget stays at 160 of 60 for the life of the process.
+        stub.fail_delete_paths.lock().unwrap().clear();
+        backend.guard_free_space("cam", 0).await;
+        assert!(backend.used_bytes.load(Ordering::Relaxed) <= 60);
+        assert_eq!(backend.query("cam", 0, u64::MAX).len(), 1);
+    }
+
+    /// The video is deleted before the sidecar, so a refused video delete keeps
+    /// the event's type. The old order lost it, and a type-less survivor is not
+    /// simply "expired sooner": `continuous_retention_days` defaults to 1 day
+    /// against movement's 2, and all three retentions are freely configurable,
+    /// so reading a continuous chunk back as a movement can keep it a day
+    /// longer than its own class allows.
+    #[tokio::test]
+    async fn a_video_that_refuses_to_delete_keeps_its_sidecar_and_its_type() {
+        let (url, stub) = spawn_stub("secret").await;
+        let backend = backend_for(&url, "secret", 0);
+        let mut event = continuous_event(OLD_PTS, 30);
+        event.filmstrip_frames = Some(Arc::new(vec![vec![0x01]]));
+        backend.write_event("cam", &event).await;
+        stub.fail_delete_paths
+            .lock()
+            .unwrap()
+            .insert(format!("cam/{OLD_PTS}_1000.ts"));
+
+        // Expire it as a continuous chunk (1 day) while movements keep 2.
+        backend
+            .prune(u64::MAX, u64::MAX, 1, &AtomicBool::new(false))
+            .await;
+
+        let entry = backend.find_event("cam", OLD_PTS).unwrap();
+        assert!(entry.delete_failed);
+        assert!(stub.has(&format!("cam/{OLD_PTS}_1000.ts")));
+        assert!(stub.has(&format!("cam/{OLD_PTS}_1000.json")), "type lost");
+        // Thumbnails are decoration and carry no type; they go first.
+        assert!(!stub.has(&format!("cam/{OLD_PTS}_1000_thumb_0.jpg")));
+
+        // A restart still knows what it is, so the retry measures it against
+        // the retention it actually belongs to.
+        let scanned = backend_for(&url, "secret", 0);
+        scanned.scan().await;
+        assert_eq!(
+            scanned.find_event("cam", OLD_PTS).unwrap().event_type,
+            EventType::Continuous
+        );
+        // ...and once the store lets go, the whole event goes.
+        stub.fail_delete_paths.lock().unwrap().clear();
+        scanned
+            .prune(u64::MAX, u64::MAX, 1, &AtomicBool::new(false))
+            .await;
+        assert!(scanned.find_event("cam", OLD_PTS).is_none());
+        assert!(stub.files.lock().unwrap().is_empty());
+    }
+
+    /// A thumbnail the store refuses to delete stays part of the event rather
+    /// than leaking: frames are trimmed top-down, so what survives is still
+    /// contiguous from 0 and the entry can say so — which is what the next scan
+    /// counts, and what the event's own delete removes.
+    #[tokio::test]
+    async fn a_thumbnail_that_refuses_to_delete_stays_part_of_the_event() {
+        let (url, stub) = spawn_stub("secret").await;
+        let backend = backend_for(&url, "secret", 0);
+        let mut event = movement_event(24_000, 30);
+        event.filmstrip_frames = Some(Arc::new(vec![vec![0x01], vec![0x02], vec![0x03]]));
+        backend.write_event("cam", &event).await;
+        stub.fail_delete_paths
+            .lock()
+            .unwrap()
+            .insert("cam/24000_1000_thumb_1.jpg".to_string());
+
+        let mut shorter = movement_event(24_000, 30);
+        shorter.filmstrip_frames = Some(Arc::new(vec![vec![0x09]]));
+        backend.write_event("cam", &shorter).await;
+
+        // Frame 2 went; frame 1 refused, so the event still has 0 and 1.
+        assert!(!stub.has("cam/24000_1000_thumb_2.jpg"));
+        assert!(stub.has("cam/24000_1000_thumb_1.jpg"));
+        assert_eq!(
+            backend.find_event("cam", 24_000).unwrap().filmstrip_frames,
+            2,
+            "index disagrees with the host about what exists"
+        );
+
+        // The scan counts the same thing, and the event's delete takes it all.
+        let scanned = backend_for(&url, "secret", 0);
+        scanned.scan().await;
+        assert_eq!(
+            scanned.find_event("cam", 24_000).unwrap().filmstrip_frames,
+            2
+        );
+        stub.fail_delete_paths.lock().unwrap().clear();
+        scanned
+            .prune(1, u64::MAX, u64::MAX, &AtomicBool::new(false))
+            .await;
+        assert!(stub.files.lock().unwrap().is_empty(), "leaked a thumbnail");
+    }
+
     #[tokio::test]
     async fn scan_tolerates_ts_without_sidecar() {
         let (url, stub) = spawn_stub("secret").await;
@@ -1866,9 +2616,13 @@ mod tests {
     }
 
     /// The mirror case: the video genuinely did not land. The orphan sidecar
-    /// left behind is invisible to the scan, which walks `.ts` objects only.
+    /// left behind indexes nothing — the scan walks `.ts` objects only — and so
+    /// nothing else would ever delete it either: it is never indexed, never
+    /// counted against the budget, and never a sibling of an event. The scan
+    /// collects it instead of leaving it to accumulate for the life of the
+    /// bucket, one flaky upload at a time.
     #[tokio::test]
-    async fn an_orphan_sidecar_indexes_nothing() {
+    async fn an_orphan_sidecar_indexes_nothing_and_is_collected() {
         let (url, stub) = spawn_stub("secret").await;
         let backend = backend_for(&url, "secret", 0);
         stub.fail_puts(".ts", false);
@@ -1881,6 +2635,118 @@ mod tests {
         let scanned = backend_for(&url, "secret", 0);
         scanned.scan().await;
         assert!(scanned.find_event("cam", 17_000).is_none());
+        assert!(!stub.has("cam/17000_1000.json"), "orphan sidecar kept");
+    }
+
+    /// Thumbnails orphan the same way: an upload that got as far as the
+    /// filmstrip before the video failed leaves them behind too.
+    #[tokio::test]
+    async fn orphaned_thumbnails_are_collected_and_live_ones_are_not() {
+        let (url, stub) = spawn_stub("secret").await;
+        let backend = backend_for(&url, "secret", 0);
+        backend
+            .write_event("cam", &movement_event(19_000, 30))
+            .await;
+        // Orphans of an event whose video is not on the host.
+        stub.files
+            .lock()
+            .unwrap()
+            .insert("cam/20000_1000_thumb_0.jpg".to_string(), vec![0x01]);
+        stub.files
+            .lock()
+            .unwrap()
+            .insert("cam/20000_1000.json".to_string(), b"{}".to_vec());
+
+        let scanned = backend_for(&url, "secret", 0);
+        scanned.scan().await;
+
+        assert!(!stub.has("cam/20000_1000_thumb_0.jpg"));
+        assert!(!stub.has("cam/20000_1000.json"));
+        // The live event keeps every one of its objects.
+        assert_eq!(
+            scanned.find_event("cam", 19_000).unwrap().filmstrip_frames,
+            2
+        );
+        assert!(stub.has("cam/19000_1000.json"));
+        assert!(stub.has("cam/19000_1000_thumb_1.jpg"));
+    }
+
+    /// The listing is a snapshot, and it is not necessarily *this* process's
+    /// snapshot: another camon on the same camera id, or a `PUT` that outlived
+    /// the process which issued it, can commit a video after the bucket was
+    /// listed. The sweep re-checks every candidate against the host immediately
+    /// before deleting it, so a sidecar whose video landed in that window keeps
+    /// the event's only record of its type.
+    #[tokio::test]
+    async fn the_sweep_keeps_a_sidecar_whose_video_landed_after_the_listing() {
+        let (url, stub) = spawn_stub("secret").await;
+        stub.files.lock().unwrap().insert(
+            "cam/22000_1000.json".to_string(),
+            br#"{"event_type":"object"}"#.to_vec(),
+        );
+        // The video commits the moment the scan has its listing — the shape of
+        // an upload in flight under a camera id this process also owns.
+        stub.commit_after_list
+            .lock()
+            .unwrap()
+            .push("cam/22000_1000.ts".to_string());
+
+        let backend = backend_for(&url, "secret", 0);
+        backend.scan().await;
+
+        assert!(stub.has("cam/22000_1000.json"), "live sidecar collected");
+        assert!(stub.has("cam/22000_1000.ts"));
+        // Not indexed — it was not in the listing — but the next start reads it
+        // back as the object event its surviving sidecar says it is.
+        let scanned = backend_for(&url, "secret", 0);
+        scanned.scan().await;
+        assert_eq!(
+            scanned.find_event("cam", 22_000).unwrap().event_type,
+            EventType::Object
+        );
+    }
+
+    /// A failure to find out whether the video is there is not an absence.
+    #[tokio::test]
+    async fn the_sweep_keeps_metadata_it_could_not_check() {
+        let (url, stub) = spawn_stub("secret").await;
+        stub.files
+            .lock()
+            .unwrap()
+            .insert("cam/23000_1000.json".to_string(), b"{}".to_vec());
+        // The re-check itself fails: a 500 on the video probe, not a 404.
+        stub.fail_gets(".ts");
+
+        let backend = backend_for(&url, "secret", 0);
+        backend.scan().await;
+
+        assert!(stub.has("cam/23000_1000.json"));
+    }
+
+    /// The sweep deletes, so it may only touch what this process is the
+    /// authority for: the cameras it owns, under names this backend writes. A
+    /// second camon sharing the bucket has uploads in flight that look exactly
+    /// like orphans — sidecar first, video second.
+    #[tokio::test]
+    async fn the_scan_only_collects_orphans_of_cameras_it_owns() {
+        let (url, stub) = spawn_stub("secret").await;
+        {
+            let mut files = stub.files.lock().unwrap();
+            // Another camon's in-flight write: sidecar up, video still going.
+            files.insert("other/21000_1000.json".to_string(), b"{}".to_vec());
+            // Ours, but not something this backend writes.
+            files.insert("cam/notes.txt".to_string(), b"hi".to_vec());
+            files.insert("cam/settings.json".to_string(), b"{}".to_vec());
+            files.insert("cam/logo.jpg".to_string(), vec![0x01]);
+        }
+
+        let backend = backend_for(&url, "secret", 0);
+        backend.scan().await;
+
+        assert!(stub.has("other/21000_1000.json"));
+        assert!(stub.has("cam/notes.txt"));
+        assert!(stub.has("cam/settings.json"));
+        assert!(stub.has("cam/logo.jpg"));
     }
 
     /// Thumbnails are decoration — the UI hides frames that fail to load — so
@@ -1953,7 +2819,7 @@ mod tests {
         stub.fail_gets(".json");
         let backend = backend_for(&url, "secret", 0);
         backend.scan().await;
-        assert!(backend.has_unknown_type("cam", OLD_PTS));
+        assert!(backend.has_unknown_type("cam", (OLD_PTS, 1000)));
 
         // The store recovers; the next sweep reads the sidecar it could not.
         stub.clear_faults();
@@ -1964,7 +2830,7 @@ mod tests {
         let entry = backend.find_event("cam", OLD_PTS).unwrap();
         assert_eq!(entry.event_type, EventType::Object);
         assert_eq!(entry.object_classes, vec!["car".to_string()]);
-        assert!(!backend.has_unknown_type("cam", OLD_PTS));
+        assert!(!backend.has_unknown_type("cam", (OLD_PTS, 1000)));
 
         // Typed again, it prunes on its own retention: kept as an object...
         backend.prune(1, u64::MAX, 1, &AtomicBool::new(false)).await;
@@ -1991,14 +2857,14 @@ mod tests {
 
         let backend = backend_for(&url, "secret", 0);
         backend.scan().await;
-        assert!(backend.has_unknown_type("cam", OLD_PTS));
+        assert!(backend.has_unknown_type("cam", (OLD_PTS, 1000)));
 
         backend
             .prune(1, u64::MAX, u64::MAX, &AtomicBool::new(false))
             .await;
         // A re-read says the same thing, so the hold survives the sweep.
         assert!(backend.find_event("cam", OLD_PTS).is_some());
-        assert!(backend.has_unknown_type("cam", OLD_PTS));
+        assert!(backend.has_unknown_type("cam", (OLD_PTS, 1000)));
     }
 
     /// Bytes that are not JSON are a failed read, not an absent sidecar: the
@@ -2018,7 +2884,7 @@ mod tests {
 
         let backend = backend_for(&url, "secret", 0);
         backend.scan().await;
-        assert!(backend.has_unknown_type("cam", OLD_PTS));
+        assert!(backend.has_unknown_type("cam", (OLD_PTS, 1000)));
 
         backend
             .prune(1, u64::MAX, u64::MAX, &AtomicBool::new(false))
@@ -2040,7 +2906,7 @@ mod tests {
         stub.fail_gets("1000_1000.json");
         let backend = backend_for(&url, "secret", 60);
         backend.scan().await;
-        assert!(backend.has_unknown_type("cam", 1_000));
+        assert!(backend.has_unknown_type("cam", (1_000, 1000)));
 
         // ...so the budget must still evict the genuine movement event first,
         // even though the held one is older and labelled movement too.
