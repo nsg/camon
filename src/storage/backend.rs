@@ -44,7 +44,10 @@ pub enum WriteOutcome {
     Written,
     /// The write failed with ENOSPC — worth an emergency prune and one retry.
     NoSpace,
-    /// The write failed for any other reason (already logged).
+    /// The write failed for any other reason (already logged) — including a
+    /// commit that landed but could not be made durable, where the event is on
+    /// disk and indexed yet not guaranteed to survive a power cut. Never
+    /// retried by the writer.
     Failed,
 }
 
@@ -309,7 +312,12 @@ impl WarmStorageBackend for LocalDiskBackend {
             return;
         }
         // data_dir may not exist before the first write; statvfs needs it.
-        let _ = tokio::fs::create_dir_all(&self.data_dir).await;
+        // Synced, because this runs before every write and would otherwise be
+        // what creates the storage root: the event write's own synced
+        // `create_dir_all` walks up only as far as the first directory that
+        // already exists, so a root left durable-less here is a root the first
+        // power cut can take away with everything under it.
+        let _ = crate::durable::create_dir_all_synced_async(&self.data_dir).await;
         match self.free_space() {
             Ok(free) if should_emergency_prune(free, min_free_bytes) => {
                 tracing::warn!(
@@ -555,40 +563,26 @@ pub(crate) fn deduplicate_detections(details: &[DetectionDetail]) -> Vec<(String
     best.into_iter().collect()
 }
 
-/// Path of the staging file for an atomic write: `{file_name}.tmp` next to
-/// the final path. Startup orphan recovery keys off this exact convention.
-fn tmp_path(final_path: &Path) -> PathBuf {
-    let mut name = final_path.file_name().unwrap_or_default().to_os_string();
-    name.push(".tmp");
-    final_path.with_file_name(name)
-}
-
 fn is_no_space(e: &std::io::Error) -> bool {
     e.raw_os_error() == Some(libc::ENOSPC)
 }
 
-/// Write `data` to `path`, fsyncing before returning so the bytes are durable
-/// (not just in the page cache) even across a power cut.
-async fn write_file_synced(path: &Path, data: &[u8]) -> std::io::Result<()> {
-    use tokio::io::AsyncWriteExt;
-    let mut file = tokio::fs::File::create(path).await?;
-    file.write_all(data).await?;
-    file.sync_all().await?;
-    Ok(())
-}
-
 /// Atomically write a small metadata file (sidecar/thumbnail): stage as
-/// `.tmp`, then rename. No fsync — the one fsync per event is spent on the
-/// video; a metadata file lost to a power cut is acceptable, a torn one is
-/// not (and recovery deletes any leftover `.tmp`).
+/// `.tmp`, then rename.
+///
+/// The *contents* are deliberately not fsynced. The one contents fsync per
+/// event is spent on the video, which is the thing that cannot be
+/// reconstructed; a sidecar that a power cut leaves empty or torn costs the
+/// event's detections and its `continues` flag, and the index scan already
+/// falls back to a plain movement when a sidecar will not parse. Staging still
+/// earns its keep: it keeps a *reader* from ever seeing a half-written file,
+/// and any leftover `.tmp` is swept at startup.
+///
+/// The *rename* is made durable, but not here — these files live in the same
+/// directory as the `.ts` they belong to, so the single directory fsync after
+/// the commit rename covers their entries too.
 async fn write_metadata_atomic(final_path: &Path, data: &[u8]) -> std::io::Result<()> {
-    let tmp = tmp_path(final_path);
-    tokio::fs::write(&tmp, data).await?;
-    if let Err(e) = tokio::fs::rename(&tmp, final_path).await {
-        let _ = tokio::fs::remove_file(&tmp).await;
-        return Err(e);
-    }
-    Ok(())
+    crate::durable::replace_atomic_async(final_path, data).await
 }
 
 /// Write the filmstrip thumbnails and return how many landed on disk. Frames
@@ -640,7 +634,12 @@ fn build_index_entry(
 /// 3. rename `{stem}.ts.tmp` → `{stem}.ts` — the commit point. The index scan
 ///    only ever looks at `.ts` files, so a crash at any earlier step leaves a
 ///    recoverable `.tmp` (plus adoptable metadata), never a half-indexed
-///    event; a crash after the rename leaves a complete event.
+///    event; a crash after the rename leaves a complete event;
+/// 4. fsync the event directory, which is what makes step 3 survive a power
+///    cut — the rename is atomic, but the directory entry naming the file is
+///    not durable until the directory is synced. A failure here still leaves
+///    the event on disk and indexed, but it is reported as `Failed`, not
+///    `Written` (see [`commit_outcome`]).
 async fn write_event(
     data_dir: &Path,
     camera_id: &str,
@@ -651,7 +650,10 @@ async fn write_event(
     let segment_count = event.segments.len();
 
     let camera_dir = data_dir.join(camera_id).join(event.event_type().dir_name());
-    if let Err(e) = tokio::fs::create_dir_all(&camera_dir).await {
+    // Synced, so that on a first ever write the directory the event is about to
+    // be committed into cannot itself be lost to a power cut. A no-op once the
+    // tree exists, which is every write but the first.
+    if let Err(e) = crate::durable::create_dir_all_synced_async(&camera_dir).await {
         tracing::error!(camera = %camera_id, error = %e, "failed to create warm storage directory");
         return if is_no_space(&e) {
             WriteOutcome::NoSpace
@@ -662,12 +664,12 @@ async fn write_event(
 
     let stem = format!("{}_{}", event.first_pts, duration_ms);
     let file_path = camera_dir.join(format!("{}.ts", stem));
-    let staging_path = tmp_path(&file_path);
+    let staging_path = crate::durable::tmp_path(&file_path);
     let data = concatenate_segments(&event.segments, event.total_bytes);
     let file_size = data.len() as u64;
 
     // Step 1: footage first. Once this returns, the video survives a crash.
-    if let Err(e) = write_file_synced(&staging_path, &data).await {
+    if let Err(e) = crate::durable::write_synced_async(&staging_path, &data).await {
         // A partial staging file from a failed write is deleted rather than
         // left for recovery: the disk is under pressure and the writer is
         // about to either retry from scratch or drop the event knowingly.
@@ -710,6 +712,15 @@ async fn write_event(
         };
     }
 
+    // Step 4: make the commit durable. One fsync of the directory covers the
+    // `.ts` entry and the sidecar/thumbnail entries renamed alongside it.
+    let synced = crate::durable::sync_dir_async(&camera_dir).await;
+    if let Err(e) = &synced {
+        tracing::error!(camera = %camera_id, path = %camera_dir.display(), error = %e,
+            "failed to fsync warm storage directory: the event is on disk and served, but a \
+             power cut could still lose it");
+    }
+
     tracing::info!(
         camera = %camera_id,
         path = %file_path.display(),
@@ -719,13 +730,33 @@ async fn write_event(
         "wrote warm event file"
     );
 
+    // Indexed either way: the bytes are on disk under their final name, so the
+    // event is served, pruned and counted like any other, and a restart's scan
+    // would find it regardless. Only the *guarantee* is missing.
     if let Some(index) = warm_index {
         index.insert(
             camera_id,
             build_index_entry(event, duration_ms, file_size, filmstrip_frames),
         );
     }
-    WriteOutcome::Written
+    commit_outcome(synced)
+}
+
+/// What a commit whose directory fsync failed is worth reporting as.
+///
+/// Not `Written`: this trait promises to *durably* persist, `Written` is what
+/// resets the camera's recording-silence watchdog, and a storage stack failing
+/// every fsync would otherwise look perfectly healthy while nothing it wrote
+/// was guaranteed to survive. Not `NoSpace` either, whatever errno says — that
+/// outcome asks the writer for an emergency prune and a retry, and there is
+/// nothing to retry when the event is already committed. `Failed` is not
+/// retried by the writer, so reporting it honestly costs no rewrite and drops
+/// no footage; it only stops a durability failure from being called a success.
+fn commit_outcome(synced: std::io::Result<()>) -> WriteOutcome {
+    match synced {
+        Ok(()) => WriteOutcome::Written,
+        Err(_) => WriteOutcome::Failed,
+    }
 }
 
 /// Apply a post-hoc movement→object upgrade. Runs only on the writer task,
@@ -738,7 +769,11 @@ async fn write_event(
 /// 1. write the new sidecar (with detections) atomically into `objects/`;
 /// 2. rename the `.ts` from `movements/` to `objects/` — the commit;
 /// 3. move the filmstrip thumbnails;
-/// 4. delete the old `movements/` sidecar, if any.
+/// 4. delete the old `movements/` sidecar, if any;
+/// 5. fsync `objects/` and then `movements/`, so the entries the rename moved
+///    between them are durable and a power cut cannot resurrect the event as a
+///    movement — in that order and no further than the first failure, for the
+///    reason [`sync_move`] gives.
 ///
 /// A crash before step 2 leaves a stray sidecar in `objects/` that the scan
 /// ignores; after step 2 the event is object-classified with its detections.
@@ -767,7 +802,7 @@ async fn upgrade_event(
         );
         return;
     }
-    if let Err(e) = tokio::fs::create_dir_all(&objects).await {
+    if let Err(e) = crate::durable::create_dir_all_synced_async(&objects).await {
         tracing::error!(camera = %camera_id, error = %e,
             "failed to create objects directory for upgrade");
         return;
@@ -802,6 +837,14 @@ async fn upgrade_event(
     }
     let _ = tokio::fs::remove_file(movements.join(format!("{stem}.json"))).await;
 
+    // Step 5: both sides of the move, destination first and *only* then the
+    // source (see `sync_move`).
+    if let Err(e) = sync_move(&objects, &movements).await {
+        tracing::error!(camera = %camera_id, error = %e,
+            "failed to fsync a directory after upgrade: the upgrade is applied, but a power \
+             cut could still undo it");
+    }
+
     if let Some(index) = warm_index {
         let updated = index.update_event(camera_id, upgrade.start_pts_ns, |entry| {
             entry.event_type = EventType::Object;
@@ -831,6 +874,26 @@ async fn upgrade_event(
         classes = ?upgrade.object_classes,
         "upgraded movement event to object event"
     );
+}
+
+/// Make a rename *between* two directories durable: fsync the destination,
+/// then the source. The order is not a preference and the `?` is not a
+/// shortcut — each step is only safe once the one before it succeeded:
+///
+/// * destination first, because it holds the only remaining name for the file.
+///   Making the source's deletion durable while the destination entry is still
+///   only in the page cache is the one combination that loses the event
+///   outright: a power cut then takes away both names at once. So a failed
+///   destination sync must not be followed by the source sync — hence `?`.
+/// * source second, and its failure is survivable rather than fixable: the old
+///   name can come back, leaving the same footage listed twice (the scan does
+///   not deduplicate) — once as the upgraded object event and once as the
+///   movement it was, which then expires on the shorter movement retention.
+///   That is a visible duplicate and some wasted disk, which is the cheaper
+///   half of the trade against losing the recording.
+async fn sync_move(dest: &Path, src: &Path) -> std::io::Result<()> {
+    crate::durable::sync_dir_async(dest).await?;
+    crate::durable::sync_dir_async(src).await
 }
 
 /// Rebuild an index entry for an event that was upgraded while nothing in the
@@ -1000,6 +1063,97 @@ mod tests {
             index.resolve_file_path("cam", &entry),
             movements.join(format!("{}.ts", stem))
         );
+    }
+
+    /// Whether an fsync reached the platter is not observable from a test, and
+    /// neither is a lost directory entry without cutting real power. What is
+    /// observable is that the durable variants used on the commit path behave
+    /// like the plain ones did: a first-ever write, where the whole tree has to
+    /// be created and synced from `data_dir` down, still commits.
+    ///
+    /// Driven through the backend in the order the writer really uses — the
+    /// low-space guard first, which is what creates `data_dir` on a first run,
+    /// then the write. Calling `write_event` alone would skip the guard and so
+    /// skip the directory that matters most.
+    #[tokio::test]
+    async fn first_write_commits_into_a_tree_that_did_not_exist() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("does").join("not").join("exist");
+        let buffer = populated_buffer(10);
+        let event = {
+            let buf = buffer.read_recover();
+            assemble_event(&buf, None, "cam", 5, 7, 0, SEC, false, None).unwrap()
+        };
+
+        let backend = LocalDiskBackend::new(data_dir.clone(), &["cam".to_string()]);
+        backend.guard_free_space("cam", 1).await;
+        assert!(data_dir.is_dir(), "the guard creates the storage root");
+        let outcome = backend.write_event("cam", &event).await;
+
+        assert_eq!(outcome, WriteOutcome::Written);
+        assert!(data_dir
+            .join("cam")
+            .join("movements")
+            .join(format!("{}_4000.ts", event.first_pts))
+            .exists());
+    }
+
+    /// The policy a real fsync failure would exercise, which no test can
+    /// provoke: the directory is openable whenever the rename into it just
+    /// succeeded, and a permission trick would be a no-op for a root test
+    /// runner. What is pinned is the decision itself — a commit that could not
+    /// be made durable is not a successful write, because `Written` is what
+    /// resets the recording-silence watchdog (`buffer::warm`), and `Failed`
+    /// rather than `NoSpace` because only `NoSpace` is retried.
+    #[test]
+    fn a_commit_that_cannot_be_synced_is_not_reported_as_written() {
+        assert_eq!(commit_outcome(Ok(())), WriteOutcome::Written);
+        assert_eq!(
+            commit_outcome(Err(std::io::Error::other("fsync failed"))),
+            WriteOutcome::Failed
+        );
+    }
+
+    /// The `?` in `sync_move` is load-bearing: syncing the source directory
+    /// after the destination sync failed makes the *removal* of the old name
+    /// durable while the new name is not, which loses the event entirely. That
+    /// the source is skipped is enforced by the type, not observable here; what
+    /// a test can pin is that a destination that cannot be synced ends the
+    /// sequence with an error instead of being logged past.
+    #[tokio::test]
+    async fn sync_move_stops_at_a_destination_it_cannot_sync() {
+        let dir = tempfile::tempdir().unwrap();
+        let objects = dir.path().join("objects");
+        let movements = dir.path().join("movements");
+        std::fs::create_dir_all(&objects).unwrap();
+        std::fs::create_dir_all(&movements).unwrap();
+        sync_move(&objects, &movements).await.unwrap();
+
+        assert!(sync_move(&dir.path().join("gone"), &movements)
+            .await
+            .is_err());
+        // A source that cannot be synced is reported too, but only after the
+        // destination is durable — a duplicate movement entry, not a lost event.
+        assert!(sync_move(&objects, &dir.path().join("gone")).await.is_err());
+    }
+
+    /// A regular file where the camera directory belongs: the directory can
+    /// never be created, whatever user the test runs as. The error has to reach
+    /// the caller as a failed write rather than being swallowed by the sync.
+    #[tokio::test]
+    async fn write_fails_when_the_event_directory_cannot_be_created() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("cam"), b"not a directory").unwrap();
+        let buffer = populated_buffer(10);
+        let event = {
+            let buf = buffer.read_recover();
+            assemble_event(&buf, None, "cam", 5, 7, 0, SEC, false, None).unwrap()
+        };
+
+        let index = WarmEventIndex::new(&["cam".to_string()], dir.path().to_path_buf());
+        let outcome = write_event(dir.path(), "cam", &event, Some(&index)).await;
+        assert_eq!(outcome, WriteOutcome::Failed);
+        assert!(index.find_event("cam", event.first_pts).is_none());
     }
 
     #[tokio::test]

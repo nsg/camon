@@ -754,21 +754,20 @@ fn write_guard(path: &Path, guard: &InstallGuard) -> std::io::Result<()> {
     let text = serde_json::to_string(guard).map_err(std::io::Error::other)?;
     // Staged, flushed, renamed, and the directory flushed too, like every other
     // file camon has to find again after an unclean stop.
+    // Not the shared `{name}.tmp` staging name: two camon processes can race
+    // for the same guard, and each needs its own staging file.
     let temp = sibling(path, &format!(".{}.tmp", std::process::id()));
-    {
-        use std::io::Write as _;
-        let mut file = std::fs::File::create(&temp)?;
-        file.write_all(text.as_bytes())?;
-        file.sync_all()?;
-    }
+    crate::durable::write_synced(&temp, text.as_bytes())?;
     std::fs::rename(&temp, path)?;
     sync_parent(path)
 }
 
 fn sync_parent(path: &Path) -> std::io::Result<()> {
-    match path.parent() {
-        Some(dir) if !dir.as_os_str().is_empty() => std::fs::File::open(dir)?.sync_all(),
-        _ => Ok(()),
+    match crate::durable::parent_dir(path) {
+        // A bare relative name resolves to `.`, which is a real directory to
+        // sync rather than a reason to skip the sync.
+        Some(dir) => crate::durable::sync_dir(dir),
+        None => Ok(()),
     }
 }
 

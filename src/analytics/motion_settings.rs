@@ -14,6 +14,7 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use serde::{Deserialize, Serialize};
 
+use crate::durable::{create_dir_all_synced, sync_dir, tmp_path, write_synced};
 use crate::locks::{LockExt, MutexExt};
 
 /// Ignore-mask grid geometry. 16x12 over a 320x240 analysis frame gives 20x20px
@@ -254,18 +255,15 @@ fn load(path: &Path) -> Option<MotionSettings> {
 }
 
 /// Persist settings the way the storage layer commits an event: stage into
-/// `motion_settings.json.tmp`, fsync it, then rename. `load` falls back to
-/// unmasked defaults on any parse error, so a torn write would silently drop a
-/// privacy mask; the rename makes that unreachable — a crash can only leave a
-/// stale `.tmp` beside an intact previous file.
+/// `motion_settings.json.tmp`, fsync it, rename, then fsync the directory.
+/// `load` falls back to unmasked defaults on any parse error, so a torn write
+/// would silently drop a privacy mask; the rename makes that unreachable — a
+/// crash can only leave a stale `.tmp` beside an intact previous file — and the
+/// directory fsync is what keeps the rename itself from being lost.
 ///
-/// The containing directory is fsynced after the rename as well. `sync_all` on
-/// the staging file only makes its *contents* durable; the directory entry the
-/// rename swaps is not, so without this a crash just after a success response
-/// could still bring back the previous mask, or lose a first-ever settings file
-/// outright. Nothing sweeps a stray `motion_settings.json.tmp` at startup — the
-/// warm storage recovery pass only walks the per-event-type subdirectories — so
-/// there is no second chance here of the kind the event path has.
+/// Unlike the event path, nothing sweeps a stray `motion_settings.json.tmp` at
+/// startup (the warm storage recovery pass only walks the per-event-type
+/// subdirectories), so there is no second chance here.
 fn save(path: &Path, settings: &MotionSettings) -> std::io::Result<()> {
     let dir = path.parent().unwrap_or(Path::new("."));
     create_dir_all_synced(dir)?;
@@ -277,47 +275,6 @@ fn save(path: &Path, settings: &MotionSettings) -> std::io::Result<()> {
         return Err(e);
     }
     sync_dir(dir)
-}
-
-/// `create_dir_all`, then make every directory it had to create durable. A
-/// directory only exists for certain once the parent holding its entry is
-/// synced, and that runs the whole way up: on a first ever start `{data_dir}`
-/// itself can be new, and syncing only the camera directory's parent would
-/// leave the tree able to vanish from above with the settings file inside it.
-fn create_dir_all_synced(dir: &Path) -> std::io::Result<()> {
-    let mut created = Vec::new();
-    let mut missing = Some(dir);
-    while let Some(d) = missing.filter(|d| !d.exists()) {
-        created.push(d);
-        missing = d.parent();
-    }
-    std::fs::create_dir_all(dir)?;
-    // Top down, so an entry is only made durable once the directory holding it
-    // is: `created` runs deepest first.
-    for d in created.iter().rev() {
-        if let Some(parent) = d.parent() {
-            sync_dir(parent)?;
-        }
-    }
-    Ok(())
-}
-
-fn tmp_path(path: &Path) -> PathBuf {
-    let mut name = path.file_name().unwrap_or_default().to_os_string();
-    name.push(".tmp");
-    path.with_file_name(name)
-}
-
-fn write_synced(path: &Path, data: &[u8]) -> std::io::Result<()> {
-    use std::io::Write;
-    let mut f = std::fs::File::create(path)?;
-    f.write_all(data)?;
-    f.sync_all()
-}
-
-/// fsync a directory so a rename or creation inside it survives a crash.
-fn sync_dir(dir: &Path) -> std::io::Result<()> {
-    std::fs::File::open(dir)?.sync_all()
 }
 
 /// Delete the persisted state of the removed auto-tuner and detection grid.

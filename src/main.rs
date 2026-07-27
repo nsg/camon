@@ -9,6 +9,7 @@ mod api;
 mod buffer;
 mod camera;
 mod config;
+mod durable;
 mod install;
 mod locks;
 mod mpegts;

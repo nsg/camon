@@ -12,7 +12,8 @@
 //! 2. recompute the real duration from the first→last PES PTS delta,
 //! 3. rename to a proper `{first_pts_ns}_{duration_ms}.ts`, adopting any
 //!    sidecar/thumbnails the writer finished before the crash, and mark the
-//!    sidecar `"recovered": true`,
+//!    sidecar `"recovered": true`, then fsync the directory so the salvage
+//!    itself is not lost to the next power cut,
 //! 4. only a file with no PES payload at all (nothing decodable) is deleted.
 //!
 //! Orphaned `.json.tmp` / `.jpg.tmp` staging files are simply deleted — the
@@ -152,6 +153,16 @@ fn recover_video_tmp(path: &Path, camera_id: &str) {
     if orig_stem != new_stem {
         adopt_thumbnails(dir, orig_stem, &new_stem);
     }
+    // One fsync per salvaged file, covering every entry this recovery just
+    // renamed in the directory. Without it a second power cut during the same
+    // boot would undo the salvage — the trimmed bytes are durable, but the name
+    // that makes them an event is not. Re-running recovery on the `.ts.tmp`
+    // that comes back is harmless (it recomputes the same stem), so a failure
+    // here is a warning, not a reason to abandon the file.
+    if let Err(e) = crate::durable::sync_dir(dir) {
+        tracing::warn!(camera = %camera_id, path = %dir.display(), error = %e,
+            "failed to fsync directory after recovering an event file");
+    }
 
     tracing::warn!(
         camera = %camera_id,
@@ -187,11 +198,9 @@ fn write_recovered_sidecar(dir: &Path, orig_stem: &str, new_stem: &str, camera_i
 
     // Atomic like every other sidecar write; an interruption here just leaves
     // a .json.tmp for the next startup to clean up.
-    let tmp = dir.join(format!("{new_stem}.json.tmp"));
     let final_sidecar = dir.join(format!("{new_stem}.json"));
     let json = serde_json::to_string(&meta).unwrap();
-    let result = std::fs::write(&tmp, json).and_then(|()| std::fs::rename(&tmp, &final_sidecar));
-    if let Err(e) = result {
+    if let Err(e) = crate::durable::replace_atomic(&final_sidecar, json.as_bytes()) {
         tracing::warn!(camera = %camera_id, path = %final_sidecar.display(), error = %e,
             "failed to write recovered-event sidecar");
         return;

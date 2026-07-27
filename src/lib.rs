@@ -3,6 +3,7 @@ pub mod api;
 pub mod buffer;
 pub mod camera;
 pub mod config;
+pub(crate) mod durable;
 pub mod locks;
 pub mod mpegts;
 pub mod mqtt;

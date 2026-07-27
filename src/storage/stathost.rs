@@ -42,6 +42,10 @@
 //!   only, and a phantom `.ts` still has the sidecar that types it correctly.
 //!   stathost's uploads are atomic server-side, so a truncated object can't be
 //!   served; a zero-byte `.ts` in the listing still gets a warning at scan time.
+//!   There is nothing here matching local mode's fsync of the video and of the
+//!   directory it is committed into: this backend owns no filesystem, and a
+//!   `PUT` that has been acknowledged is durable or not by the *server's*
+//!   rules. Nothing camon can do from the client side changes that.
 //! * **An unreadable sidecar is not a movement event.** The scan applies the
 //!   movement default only to a *confirmed* 404; anything else — a transport
 //!   failure, unparsable bytes, valid JSON naming no type — leaves the type
