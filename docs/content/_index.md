@@ -46,6 +46,8 @@ An event query takes wall-clock nanosecond bounds, either of which may be omitte
 
 Vanilla HTML/CSS/JS served from the Rust binary with video playback via Vidstack (CDN). No build tools required — cargo builds everything. Provides live view with scrollback, timeline scrubbing across tiers (transparent to user), and event search.
 
+The event browser names each event by the type the API gives it — object, movement, or continuous-recording chunk — and gives each of those types its own filter, so none of them is reachable only under "All"; a type from a newer server than the UI is labelled by its wire name and left to "All" rather than filed under a filter it does not belong to. Chunks of one long recording — a motion run split at the duration cap, or the chunks continuous recording rolls — are railed together down the list. Membership is not taken from the `continues` flag alone, which outlives the chunk it points at: a chunk joins the one before it only if it also starts where that one ended. A chunk whose predecessor is still stored is numbered ("part 3"); one whose predecessor has been pruned is only marked "continued", since counting from the oldest surviving chunk would name a position the chunk does not have and would change with every retention sweep.
+
 A settings change that did not stick is shown rather than swallowed: the motion-settings panel carries a dismissible error banner above it that repeats the server's own wording, and it distinguishes camon answering that a change was applied but not saved from camon not being reachable at all — one outcome is certain, the other unknown. The painted mask and slider positions stay as edited either way, because the running detector is using them.
 
 ## Home Assistant

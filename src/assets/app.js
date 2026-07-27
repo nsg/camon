@@ -67,7 +67,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     const debugList = document.getElementById('debug-list');
     const debugEmpty = document.getElementById('debug-empty');
     const debugLinkBtn = document.getElementById('debug-link-btn');
-    let debugPollInterval = null;
+    let debugPoller = null;
 
     // View 3: Event Playback
     const playbackView = document.getElementById('playback-view');
@@ -110,11 +110,12 @@ document.addEventListener('DOMContentLoaded', async () => {
     let lastTickKey = null;
     const hoverCapable = window.matchMedia('(hover: hover)').matches;
     let bufferDuration = 0;
-    let motionPollInterval = null;
-    let detectionPollInterval = null;
-    let warmEventPollInterval = null;
-    let stabilityPollInterval = null;
+    let motionPoller = null;
+    let detectionPoller = null;
+    let warmEventPoller = null;
+    let stabilityPoller = null;
     let stabilityOverlayEnabled = false;
+    let stabilityDrawPending = false;
     let stabilityImage = null;
     let rawMog2Image = null;
     let noShadowImage = null;
@@ -138,8 +139,11 @@ document.addEventListener('DOMContentLoaded', async () => {
     let isLiveScrubbing = false;
     let isAtLiveEdge = true;
 
-    // Warm events (shared between views 2 & 3)
+    // Warm events (shared between views 2 & 3). `eventChains` maps an event's
+    // start_pts_ns to its place in a chain of `continues` chunks; see
+    // buildEventChains.
     let warmEvents = [];
+    let eventChains = new Map();
     let eventFilter = 'all';
     let eventsScrollDay = null;
 
@@ -188,6 +192,49 @@ document.addEventListener('DOMContentLoaded', async () => {
         }));
         if (response.status === 401) showTokenPrompt();
         return response;
+    }
+
+    // === Polling ===
+
+    // `setInterval` with an async callback lets a slow request still be in
+    // flight when the next tick fires, and lets an older answer land after a
+    // newer one and overwrite it. A poller instead runs one pass at a time and
+    // arms the next timer only once the current pass has settled; `stop()`
+    // aborts whatever that pass still has in flight and drops the timer, so a
+    // poller that has been stopped issues nothing further. Requests started by
+    // a *different* poller are not touched — each view stops its own.
+    //
+    // There is deliberately no watchdog: a pass that never settles holds its
+    // poller until the view is torn down. Every fetch here is abortable and
+    // subject to the browser's own network timeouts; the one wait with no
+    // timeout of its own is an <img>, which is why loadOverlayImage caps it.
+    function startPoller(name, intervalMs, pass) {
+        const controller = new AbortController();
+        let timer = null;
+        let stopped = false;
+
+        async function tick() {
+            timer = null;
+            try {
+                await pass(controller.signal);
+            } catch (err) {
+                // Aborts are how stopping works, not a failure to report.
+                if (err && err.name === 'AbortError') return;
+                console.error(`Failed to fetch ${name}:`, err);
+            }
+            if (!stopped) timer = setTimeout(tick, intervalMs);
+        }
+
+        return {
+            // Settles when the first pass is done, for callers that cannot
+            // render until the data is there.
+            first: tick(),
+            stop() {
+                stopped = true;
+                if (timer !== null) { clearTimeout(timer); timer = null; }
+                controller.abort();
+            },
+        };
     }
 
     function hlsAuthConfig() {
@@ -568,12 +615,16 @@ document.addEventListener('DOMContentLoaded', async () => {
         }
     });
 
-    // Resize handler for overlays
-    window.addEventListener('resize', () => {
+    // The overlay canvases are sized from the video box and hold images that
+    // only change when a poll delivers a new one, so they are repainted when
+    // one arrives and when that box changes — which is window resizes,
+    // rotation, and the element taking its real size once the stream's
+    // dimensions are known. Watching the element covers all three at once.
+    new ResizeObserver(() => {
         drawBackground();
-        drawStability();
+        scheduleStabilityDraw();
         drawMask();
-    });
+    }).observe(detailVideo);
 
     // === View Functions ===
 
@@ -588,12 +639,15 @@ document.addEventListener('DOMContentLoaded', async () => {
     function showGridView() {
         cleanupLiveView();
         cleanupPlaybackView();
+        cleanupDebugView();
         hideAllViews();
         gridView.hidden = false;
 
         cameras.forEach(cameraId => {
             if (!gridHlsInstances.has(cameraId)) {
-                const cell = grid.querySelector(`[data-camera-id="${cameraId}"]`);
+                // Matched on the property rather than through a selector, so a
+                // camera id never has to survive being spliced into one.
+                const cell = Array.from(grid.children).find(c => c.dataset.cameraId === cameraId);
                 if (cell) {
                     loadGridCamera(cameraId, cell.querySelector('video'));
                 }
@@ -603,6 +657,7 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     function showLiveView(cameraId) {
         cleanupPlaybackView();
+        cleanupDebugView();
 
         // Only reload if switching cameras
         if (currentDetailCameraId !== cameraId) {
@@ -638,6 +693,7 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     function showEventsView(cameraId) {
         cleanupPlaybackView();
+        cleanupDebugView();
 
         // Ensure we have warm events loaded
         if (currentDetailCameraId !== cameraId) {
@@ -657,6 +713,8 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
 
     function showPlaybackView(cameraId, pts) {
+        cleanupDebugView();
+
         // Ensure warm events are available
         if (currentDetailCameraId !== cameraId) {
             currentDetailCameraId = cameraId;
@@ -674,9 +732,8 @@ document.addEventListener('DOMContentLoaded', async () => {
         const ev = warmEvents.find(e => e.start_pts_ns === pts);
         if (ev) {
             const evDate = new Date(ev.start_ms);
-            const typeLabel = ev.event_type === 'object' ? 'Object' : 'Motion';
             const timeStr = evDate.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
-            playbackEventInfo.textContent = `${typeLabel} \u00b7 ${timeStr}`;
+            playbackEventInfo.textContent = `${eventTypeLabel(ev)}${chainPartLabel(ev)} \u00b7 ${timeStr}`;
         } else {
             playbackEventInfo.textContent = 'Event';
         }
@@ -692,10 +749,10 @@ document.addEventListener('DOMContentLoaded', async () => {
             cancelAnimationFrame(overlayAnimationId);
             overlayAnimationId = null;
         }
-        if (motionPollInterval) { clearInterval(motionPollInterval); motionPollInterval = null; }
-        if (detectionPollInterval) { clearInterval(detectionPollInterval); detectionPollInterval = null; }
-        if (warmEventPollInterval) { clearInterval(warmEventPollInterval); warmEventPollInterval = null; }
-        if (stabilityPollInterval) { clearInterval(stabilityPollInterval); stabilityPollInterval = null; }
+        if (motionPoller) { motionPoller.stop(); motionPoller = null; }
+        if (detectionPoller) { detectionPoller.stop(); detectionPoller = null; }
+        if (warmEventPoller) { warmEventPoller.stop(); warmEventPoller = null; }
+        if (stabilityPoller) { stabilityPoller.stop(); stabilityPoller = null; }
         if (detailHls) { detailHls.destroy(); detailHls = null; }
         detailVideo.src = '';
         currentDetections = [];
@@ -704,6 +761,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         currentDetailCameraId = null;
         bufferDuration = 0;
         warmEvents = [];
+        eventChains = new Map();
 
         stabilityImage = null;
         rawMog2Image = null;
@@ -765,7 +823,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         cell.className = 'camera-cell';
         cell.dataset.cameraId = cameraId;
         cell.innerHTML = `
-            <span class="camera-label">${cameraId}</span>
+            <span class="camera-label">${esc(cameraId)}</span>
             <video playsinline muted></video>
             <div class="loading"><p>Loading...</p></div>
         `;
@@ -778,7 +836,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     // === HLS Loading ===
 
     function loadGridCamera(cameraId, video) {
-        const src = `api/stream/${cameraId}/playlist.m3u8?live=true`;
+        const src = `api/stream/${encodeURIComponent(cameraId)}/playlist.m3u8?live=true`;
         const loading = video.parentElement.querySelector('.loading');
 
         if (typeof Hls !== 'undefined' && Hls.isSupported()) {
@@ -816,7 +874,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
 
     function loadDetailCamera(cameraId) {
-        const src = `api/stream/${cameraId}/playlist.m3u8`;
+        const src = `api/stream/${encodeURIComponent(cameraId)}/playlist.m3u8`;
 
         if (typeof Hls !== 'undefined' && Hls.isSupported()) {
             detailHls = new Hls({
@@ -899,11 +957,14 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     // === Live Monitor: Overlay Updates ===
 
+    // Only the playhead and the timeline follow playback closely enough to need
+    // an animation frame. The overlays are painted from images that arrive on a
+    // 5-second poll, and repainting them per frame meant recolouring up to four
+    // video-sized layers pixel by pixel ~60 times a second to draw the same
+    // thing; they redraw on arrival and on resize instead.
     function startOverlayUpdates() {
+        if (overlayAnimationId) cancelAnimationFrame(overlayAnimationId);
         function update() {
-            drawBackground();
-            drawStability();
-            drawMask();
             updateTimeline();
             overlayAnimationId = requestAnimationFrame(update);
         }
@@ -1026,30 +1087,62 @@ document.addEventListener('DOMContentLoaded', async () => {
         setLiveEdge(false);
     }
 
-    function fetchStabilityMap() {
+    // <img> cannot set an Authorization header, so these carry the token in the
+    // query string. A layer that fails to load simply doesn't paint.
+    //
+    // A stalled image fires neither load nor error until the browser gives up
+    // on it, which can be minutes; since the overlay poller waits for these,
+    // that would stall the overlays entirely rather than just skipping a round.
+    // Giving up after three poll intervals returns them to a fresh attempt.
+    const OVERLAY_IMAGE_TIMEOUT_MS = 15000;
+
+    function loadOverlayImage(url) {
+        return new Promise(resolve => {
+            const img = new Image();
+            const done = (value) => { clearTimeout(timer); resolve(value); };
+            const timer = setTimeout(() => done(null), OVERLAY_IMAGE_TIMEOUT_MS);
+            img.onload = () => done(img);
+            img.onerror = () => done(null);
+            img.src = authUrl(url);
+        });
+    }
+
+    // All four layers are swapped together once they have all arrived: they are
+    // stages of one frame, so showing them mixed across two polls would draw a
+    // mask that never existed — and it costs one redraw per poll instead of
+    // four.
+    async function fetchStabilityMap() {
         if (!stabilityOverlayEnabled || !currentDetailCameraId) return;
-        const cam = encodeURIComponent(currentDetailCameraId);
+        const cameraId = currentDetailCameraId;
+        const cam = encodeURIComponent(cameraId);
         const t = Date.now();
 
-        const img = new Image();
-        img.onload = () => { stabilityImage = img; drawStability(); };
-        img.onerror = () => {};
-        img.src = authUrl(`api/cameras/${cam}/motion/stability?t=${t}`);
+        const [raw, noShadow, morph, filtered] = await Promise.all([
+            loadOverlayImage(`api/cameras/${cam}/motion/stability/raw?t=${t}`),
+            loadOverlayImage(`api/cameras/${cam}/motion/stability/no-shadow?t=${t}`),
+            loadOverlayImage(`api/cameras/${cam}/motion/stability/morph?t=${t}`),
+            loadOverlayImage(`api/cameras/${cam}/motion/stability?t=${t}`),
+        ]);
+        // The overlay may have been switched off, or the view moved to another
+        // camera, while these were loading.
+        if (!stabilityOverlayEnabled || currentDetailCameraId !== cameraId) return;
 
-        const raw = new Image();
-        raw.onload = () => { rawMog2Image = raw; drawStability(); };
-        raw.onerror = () => {};
-        raw.src = authUrl(`api/cameras/${cam}/motion/stability/raw?t=${t}`);
+        rawMog2Image = raw;
+        noShadowImage = noShadow;
+        morphImage = morph;
+        stabilityImage = filtered;
+        scheduleStabilityDraw();
+    }
 
-        const noShadow = new Image();
-        noShadow.onload = () => { noShadowImage = noShadow; drawStability(); };
-        noShadow.onerror = () => {};
-        noShadow.src = authUrl(`api/cameras/${cam}/motion/stability/no-shadow?t=${t}`);
-
-        const morph = new Image();
-        morph.onload = () => { morphImage = morph; drawStability(); };
-        morph.onerror = () => {};
-        morph.src = authUrl(`api/cameras/${cam}/motion/stability/morph?t=${t}`);
+    // Recolouring four video-sized layers is the most expensive thing this
+    // page does, so several triggers landing in one frame get one redraw.
+    function scheduleStabilityDraw() {
+        if (stabilityDrawPending) return;
+        stabilityDrawPending = true;
+        requestAnimationFrame(() => {
+            stabilityDrawPending = false;
+            drawStability();
+        });
     }
 
     function drawStability() {
@@ -1106,16 +1199,21 @@ document.addEventListener('DOMContentLoaded', async () => {
         stabilityCtx.drawImage(tmp, 0, 0);
     }
 
-    function fetchBackgroundMap() {
+    // Same rule as the stability layers: what fails to load is shown as absent,
+    // not as the last thing that worked. These overlays exist to say what the
+    // detector is seeing right now, and a frame that has quietly stopped
+    // updating reads exactly like a scene that has stopped changing.
+    async function fetchBackgroundMap() {
         if (!bgOverlayEnabled || !currentDetailCameraId) return;
-        const img = new Image();
-        img.onload = () => { bgImage = img; drawBackground(); };
-        img.onerror = () => {};
-        img.src = authUrl(`api/cameras/${encodeURIComponent(currentDetailCameraId)}/motion/background?t=${Date.now()}`);
+        const cameraId = currentDetailCameraId;
+        const img = await loadOverlayImage(
+            `api/cameras/${encodeURIComponent(cameraId)}/motion/background?t=${Date.now()}`);
+        if (!bgOverlayEnabled || currentDetailCameraId !== cameraId) return;
+        bgImage = img;
+        drawBackground();
     }
 
     function drawBackground() {
-        if (!bgImage) return;
         const w = detailVideo.clientWidth;
         const h = detailVideo.clientHeight;
         if (w === 0 || h === 0) return;
@@ -1124,7 +1222,7 @@ document.addEventListener('DOMContentLoaded', async () => {
             bgOverlay.height = h;
         }
         bgCtx.clearRect(0, 0, w, h);
-        bgCtx.drawImage(bgImage, 0, 0, w, h);
+        if (bgImage) bgCtx.drawImage(bgImage, 0, 0, w, h);
     }
 
     // === Live Monitor: Motion Settings + Ignore Mask ===
@@ -1283,104 +1381,75 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     // === Live Monitor: Data Fetching ===
 
-    async function fetchMotionSegments(cameraId) {
-        if (motionPollInterval) clearInterval(motionPollInterval);
-
-        async function poll() {
-            try {
-                const response = await apiFetch(`api/cameras/${encodeURIComponent(cameraId)}/motion`);
-                if (currentDetailCameraId !== cameraId) return;
-                if (response.ok) {
-                    const data = await response.json();
-                    if (data.total_duration > 0) {
-                        bufferDuration = data.total_duration;
-                    }
-                    // Segment offsets are relative to the (sliding) buffer
-                    // start; anchor them to the wall clock via the live edge.
-                    const nowS = Date.now() / 1000;
-                    motionSegs = (data.segments || []).map(s => ({
-                        tStart: nowS - (data.total_duration - s.start),
-                        tEnd: nowS - (data.total_duration - s.end),
-                        intensity: s.intensity,
-                    }));
-                    lastTimelineDraw = 0;
-                }
-            } catch (err) {
-                console.error('Failed to fetch motion data:', err);
+    function fetchMotionSegments(cameraId) {
+        if (motionPoller) motionPoller.stop();
+        motionPoller = startPoller('motion data', 5000, async (signal) => {
+            const response = await apiFetch(`api/cameras/${encodeURIComponent(cameraId)}/motion`, { signal });
+            if (currentDetailCameraId !== cameraId || !response.ok) return;
+            const data = await response.json();
+            if (data.total_duration > 0) {
+                bufferDuration = data.total_duration;
             }
-        }
+            // Segment offsets are relative to the (sliding) buffer
+            // start; anchor them to the wall clock via the live edge.
+            const nowS = Date.now() / 1000;
+            motionSegs = (data.segments || []).map(s => ({
+                tStart: nowS - (data.total_duration - s.start),
+                tEnd: nowS - (data.total_duration - s.end),
+                intensity: s.intensity,
+            }));
+            lastTimelineDraw = 0;
+        });
 
-        await poll();
-        motionPollInterval = setInterval(poll, 5000);
-
-        if (stabilityPollInterval) clearInterval(stabilityPollInterval);
-        stabilityPollInterval = setInterval(() => {
-            fetchStabilityMap();
-            fetchBackgroundMap();
-        }, 5000);
+        if (stabilityPoller) stabilityPoller.stop();
+        stabilityPoller = startPoller('motion overlays', 5000, () =>
+            Promise.all([fetchStabilityMap(), fetchBackgroundMap()]));
     }
 
-    async function fetchDetections(cameraId) {
-        if (detectionPollInterval) clearInterval(detectionPollInterval);
-
-        async function poll() {
-            try {
-                const response = await apiFetch(`api/cameras/${encodeURIComponent(cameraId)}/detections`);
-                if (currentDetailCameraId !== cameraId) return;
-                if (response.ok) {
-                    const data = await response.json();
-                    if (data.total_duration > 0) {
-                        bufferDuration = data.total_duration;
-                    }
-                    const nowS = Date.now() / 1000;
-                    currentDetections = (data.detections || []).map(d => ({
-                        id: d.id,
-                        t: nowS - (data.total_duration - d.timestamp),
-                        object_class: d.object_class,
-                        confidence: d.confidence,
-                    }));
-                    const ids = currentDetections.map(d => d.id).join(',');
-                    // Rebuilding closes any open card, so skip when nothing
-                    // changed or while the user is reading one.
-                    if (ids !== lastDetIds && !openMarker) {
-                        rebuildMarkers();
-                    }
-                }
-            } catch (err) {
-                console.error('Failed to fetch detection data:', err);
+    function fetchDetections(cameraId) {
+        if (detectionPoller) detectionPoller.stop();
+        detectionPoller = startPoller('detection data', 5000, async (signal) => {
+            const response = await apiFetch(`api/cameras/${encodeURIComponent(cameraId)}/detections`, { signal });
+            if (currentDetailCameraId !== cameraId || !response.ok) return;
+            const data = await response.json();
+            if (data.total_duration > 0) {
+                bufferDuration = data.total_duration;
             }
-        }
-
-        await poll();
-        detectionPollInterval = setInterval(poll, 5000);
+            const nowS = Date.now() / 1000;
+            currentDetections = (data.detections || []).map(d => ({
+                id: d.id,
+                t: nowS - (data.total_duration - d.timestamp),
+                object_class: d.object_class,
+                confidence: d.confidence,
+            }));
+            const ids = currentDetections.map(d => d.id).join(',');
+            // Rebuilding closes any open card, so skip when nothing
+            // changed or while the user is reading one.
+            if (ids !== lastDetIds && !openMarker) {
+                rebuildMarkers();
+            }
+        });
     }
 
-    async function fetchWarmEvents(cameraId) {
-        if (warmEventPollInterval) clearInterval(warmEventPollInterval);
-
-        async function poll() {
-            try {
-                const response = await apiFetch(`api/cameras/${encodeURIComponent(cameraId)}/events`);
-                if (currentDetailCameraId !== cameraId) return;
-                if (response.ok) {
-                    const raw = await response.json();
-                    warmEvents = raw.map(ev => ({
-                        ...ev,
-                        start_ms: Number(BigInt(ev.start_pts_ns) / 1_000_000n),
-                    }));
-                    renderHistoryPanel();
-                    // Re-render event list if visible
-                    if (!eventsView.hidden) renderEventList();
-                    // Update nav if in playback
-                    if (!playbackView.hidden) updatePlaybackNav();
-                }
-            } catch (err) {
-                console.error('Failed to fetch warm events:', err);
-            }
-        }
-
-        await poll();
-        warmEventPollInterval = setInterval(poll, 15000);
+    function fetchWarmEvents(cameraId) {
+        if (warmEventPoller) warmEventPoller.stop();
+        warmEventPoller = startPoller('warm events', 15000, async (signal) => {
+            const response = await apiFetch(`api/cameras/${encodeURIComponent(cameraId)}/events`, { signal });
+            if (currentDetailCameraId !== cameraId || !response.ok) return;
+            const raw = await response.json();
+            warmEvents = raw.map(ev => ({
+                ...ev,
+                start_ms: Number(BigInt(ev.start_pts_ns) / 1_000_000n),
+            }));
+            eventChains = buildEventChains(warmEvents);
+            renderHistoryPanel();
+            // Re-render event list if visible
+            if (!eventsView.hidden) renderEventList();
+            // Update nav if in playback
+            if (!playbackView.hidden) updatePlaybackNav();
+        });
+        // Callers that cannot render until the events are here await this.
+        return warmEventPoller.first;
     }
 
     // === Live Monitor: Detection Markers ===
@@ -1420,9 +1489,9 @@ document.addEventListener('DOMContentLoaded', async () => {
                 const conf = Math.round(det.confidence * 100);
                 const src = authUrl(`api/cameras/${encodeURIComponent(currentDetailCameraId)}/detections/${det.id}/frame`);
                 return `<div class="tl-card-row" data-t="${det.t}">
-                    <img src="${src}" loading="lazy" alt="${det.object_class}">
+                    <img src="${esc(src)}" loading="lazy" alt="${esc(det.object_class)}">
                     <div class="tl-card-text">
-                        <span class="tl-card-class">${det.object_class}</span>
+                        <span class="tl-card-class">${esc(det.object_class)}</span>
                         <span class="tl-card-conf">${conf}%</span>
                         <span class="tl-card-ago"></span>
                     </div>
@@ -1525,13 +1594,18 @@ document.addEventListener('DOMContentLoaded', async () => {
         historyDays.innerHTML = '';
         groups.forEach(group => {
             const objects = group.events.filter(e => e.event_type === 'object').length;
+            const continuous = group.events.filter(e => e.event_type === 'continuous').length;
             const row = document.createElement('div');
             row.className = 'history-day';
 
             const ticks = group.events.map(ev => {
                 const d = new Date(ev.start_ms);
                 const frac = (d.getHours() * 3600 + d.getMinutes() * 60 + d.getSeconds()) / 86400;
-                const cls = ev.event_type === 'object' ? ' obj' : '';
+                // Continuous chunks are a recording, not an incident: they get
+                // a dim full-height tick so a day of them reads as coverage
+                // rather than as hundreds of things that happened.
+                const cls = ev.event_type === 'object' ? ' obj'
+                    : ev.event_type === 'continuous' ? ' cont' : '';
                 return `<span class="history-tick${cls}" style="left:${(frac * 100).toFixed(2)}%"></span>`;
             }).join('');
             const future = group.label === 'Today'
@@ -1542,10 +1616,13 @@ document.addEventListener('DOMContentLoaded', async () => {
             if (objects > 0) {
                 counts += ` \u00b7 ${objects} object${objects !== 1 ? 's' : ''}`;
             }
+            if (continuous > 0) {
+                counts += ` \u00b7 ${continuous} continuous chunk${continuous !== 1 ? 's' : ''}`;
+            }
 
             row.innerHTML = `
                 <div class="history-day-head">
-                    <span class="history-day-label">${group.label}</span>
+                    <span class="history-day-label">${esc(group.label)}</span>
                     <span class="history-day-count">${counts}
                         <svg viewBox="0 0 24 24" fill="currentColor"><path d="M8.59 16.59L13.17 12 8.59 7.41 10 6l6 6-6 6z"/></svg>
                     </span>
@@ -1562,6 +1639,92 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     // === View 2: Event List Rendering ===
 
+    // The event types the API can send, exhaustively (see WarmEventResponse in
+    // src/api/server.rs). Calling everything that isn't an object "Movement"
+    // mislabelled continuous-recording chunks as something that was detected.
+    // An unknown type means a newer server talking to an older UI: show the
+    // wire name rather than quietly filing it under the wrong one.
+    const EVENT_TYPE_LABELS = {
+        object: 'Object detected',
+        movement: 'Movement',
+        continuous: 'Continuous recording',
+    };
+
+    function eventTypeLabel(ev) {
+        return EVENT_TYPE_LABELS[ev.event_type] || ev.event_type || 'Event';
+    }
+
+    function eventTypeClass(ev) {
+        return EVENT_TYPE_LABELS[ev.event_type] ? ev.event_type : 'unknown';
+    }
+
+    // `continues` marks a chunk that carries on the one before it: a motion run
+    // split at max_event_duration_secs, or the fixed-length chunks continuous
+    // recording rolls. Walking the events oldest-first turns those flags into
+    // runs, so each chunk can say where it sits in one recording instead of
+    // standing there as an unrelated event.
+    //
+    // The flag alone does not identify the predecessor, and outliving it is the
+    // normal case rather than a corner: a movement chunk expires after
+    // movement_retention_days while the object chunk that continues it keeps
+    // the flag and the far longer object retention, and continuous chunks
+    // expire daily while the flag says "not the first chunk since startup"
+    // forever. So a chunk joins the run only if it also starts where the
+    // previous one ended — both producers emit strictly contiguous chunks (the
+    // follow-on begins at the segment after the last one written, with no
+    // pre-padding), which makes adjacency an exact test rather than a
+    // heuristic. A second of slack absorbs millisecond rounding.
+    const CHUNK_GAP_TOLERANCE_MS = 2000;
+
+    function buildEventChains(events) {
+        // start_pts_ns -> { part, headKnown }
+        const chains = new Map();
+        const ascending = [...events].sort((a, b) => a.start_ms - b.start_ms);
+        let run = [];
+        const flush = () => {
+            // A run whose first chunk is itself flagged `continues` reaches back
+            // past what the archive still holds: its head has been pruned, so
+            // nothing here can say which part of the recording these are — only
+            // that they carry one on. A run with its head intact can be counted
+            // forward, but never totalled: the recording may still be growing.
+            const headKnown = run.length > 0 && !run[0].continues;
+            run.forEach((ev, i) => chains.set(ev.start_pts_ns, {
+                part: i + 1,
+                length: run.length,
+                headKnown,
+            }));
+            run = [];
+        };
+        ascending.forEach(ev => {
+            const prev = run[run.length - 1];
+            const followsPrev = prev &&
+                Math.abs(ev.start_ms - (prev.start_ms + prev.duration_ms)) < CHUNK_GAP_TOLERANCE_MS;
+            if (!ev.continues || !followsPrev) flush();
+            run.push(ev);
+        });
+        flush();
+        return chains;
+    }
+
+    // "part 3" counts from a head we can actually see. "continued" is all that
+    // can honestly be said when we cannot: a number counted from the oldest
+    // surviving chunk would claim a position in the recording that it does not
+    // have, and would change on every retention sweep.
+    function chainPartLabel(ev) {
+        const chain = eventChains.get(ev.start_pts_ns);
+        if (!chain) return '';
+        if (!chain.headKnown) return ' · continued';
+        return chain.length > 1 ? ` · part ${chain.part}` : '';
+    }
+
+    // Whether this event is a chunk of a longer recording — either because more
+    // of that recording is on screen, or because it continues one that has been
+    // pruned away.
+    function isChunkOfRun(ev) {
+        const chain = eventChains.get(ev.start_pts_ns);
+        return !!chain && (chain.length > 1 || !chain.headKnown);
+    }
+
     function formatDateLabel(date) {
         const now = new Date();
         const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
@@ -1576,12 +1739,11 @@ document.addEventListener('DOMContentLoaded', async () => {
     function renderEventList() {
         eventList.innerHTML = '';
 
-        let filtered = warmEvents;
-        if (eventFilter === 'object') {
-            filtered = warmEvents.filter(e => e.event_type === 'object');
-        } else if (eventFilter === 'movement') {
-            filtered = warmEvents.filter(e => e.event_type === 'movement');
-        }
+        // One filter per event type, matched on the wire name, so no type can
+        // fall through every filter the way continuous chunks used to.
+        const filtered = eventFilter === 'all'
+            ? warmEvents
+            : warmEvents.filter(e => e.event_type === eventFilter);
 
         if (filtered.length === 0) {
             eventList.innerHTML = '<div class="event-list-empty">No events found</div>';
@@ -1612,13 +1774,17 @@ document.addEventListener('DOMContentLoaded', async () => {
             events.forEach(ev => {
                 const item = document.createElement('div');
                 item.className = 'event-list-item';
+                // Chunks of one long recording get a rail down their left edge
+                // tying them together; the list runs newest-first, so a chunk
+                // continues the one below it.
+                if (isChunkOfRun(ev)) item.classList.add('chain-part');
 
                 const thumbSrc = authUrl(`api/cameras/${encodeURIComponent(currentDetailCameraId)}/events/${ev.start_pts_ns}/thumbnail`);
                 const evDate = new Date(ev.start_ms);
                 const timeStr = evDate.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
                 const durSec = (ev.duration_ms / 1000).toFixed(1);
-                const typeLabel = ev.event_type === 'object' ? 'Object detected' : 'Movement';
-                const typeClass = ev.event_type === 'object' ? 'object' : 'movement';
+                const typeLabel = eventTypeLabel(ev) + chainPartLabel(ev);
+                const typeClass = eventTypeClass(ev);
 
                 // Salvaged from an interrupted write at startup: flag it so the
                 // viewer knows the tail may be cut short.
@@ -1635,19 +1801,22 @@ document.addEventListener('DOMContentLoaded', async () => {
                 if (ev.filmstrip_frames > 0) {
                     const cid = encodeURIComponent(currentDetailCameraId);
                     thumbHtml = `<div class="event-filmstrip">` +
-                        Array.from({ length: ev.filmstrip_frames }, (_, i) => `<img class="filmstrip-frame" src="${authUrl(`api/cameras/${cid}/events/${ev.start_pts_ns}/filmstrip/${i}`)}" loading="lazy" alt="" onerror="this.style.display='none'">`).join('') +
+                        Array.from({ length: ev.filmstrip_frames }, (_, i) => `<img class="filmstrip-frame" src="${esc(authUrl(`api/cameras/${cid}/events/${ev.start_pts_ns}/filmstrip/${i}`))}" loading="lazy" alt="" onerror="this.style.display='none'">`).join('') +
                         `</div>`;
                 } else {
-                    thumbHtml = `<img class="event-list-thumb" src="${thumbSrc}" loading="lazy" alt="">`;
+                    thumbHtml = `<img class="event-list-thumb" src="${esc(thumbSrc)}" loading="lazy" alt="">`;
                 }
 
+                // Nothing about the chain goes here: the type line already says
+                // "part 3" or "continued", and in continuous recording every
+                // row is a continuation, so repeating it distinguishes nothing.
                 const detailText = ev.event_type === 'object' && ev.object_classes ? ev.object_classes.join(', ') : '';
 
                 item.innerHTML = `
                     ${thumbHtml}
                     <div class="event-list-info">
-                        <div class="event-list-type ${typeClass}">${typeLabel}${recoveredBadge}</div>
-                        <div class="event-list-detail">${detailText}</div>
+                        <div class="event-list-type ${esc(typeClass)}">${esc(typeLabel)}${recoveredBadge}</div>
+                        <div class="event-list-detail">${esc(detailText)}</div>
                     </div>
                     <div class="event-list-meta">
                         <div class="event-list-time">${timeStr}</div>
@@ -1747,25 +1916,19 @@ document.addEventListener('DOMContentLoaded', async () => {
         debugView.hidden = false;
         debugCameraName.textContent = `${cameraId} — Detection Debug`;
         currentDetailCameraId = cameraId;
-        fetchDebugEntries(cameraId);
-        debugPollInterval = setInterval(() => fetchDebugEntries(cameraId), 5000);
+        debugPoller = startPoller('debug entries', 5000, async (signal) => {
+            const res = await apiFetch(`api/cameras/${encodeURIComponent(cameraId)}/detection-debug`, { signal });
+            if (!res.ok || currentDetailCameraId !== cameraId) return;
+            renderDebugList(cameraId, await res.json());
+        });
     }
 
+    // Called by every other view as well: leaving the debug view is otherwise
+    // the one way to walk away from a poller that keeps running.
     function cleanupDebugView() {
-        if (debugPollInterval) {
-            clearInterval(debugPollInterval);
-            debugPollInterval = null;
-        }
-    }
-
-    async function fetchDebugEntries(cameraId) {
-        try {
-            const res = await apiFetch(`api/cameras/${encodeURIComponent(cameraId)}/detection-debug`);
-            if (!res.ok) return;
-            const entries = await res.json();
-            renderDebugList(cameraId, entries);
-        } catch (e) {
-            console.error('Failed to fetch debug entries:', e);
+        if (debugPoller) {
+            debugPoller.stop();
+            debugPoller = null;
         }
     }
 
@@ -1791,8 +1954,8 @@ document.addEventListener('DOMContentLoaded', async () => {
             const fullFrameHtml = entry.has_full_frame
                 ? `<div class="debug-full-frame-container">
                     <div class="debug-full-frame-wrap">
-                        <img class="debug-full-frame-image" data-entry-id="${entry.id}" src="${authUrl(`api/cameras/${encodedId}/detection-debug/${entry.id}/full-frame`)}" alt="Full frame" loading="lazy">
-                        <canvas class="debug-overlay-canvas" data-entry-id="${entry.id}"></canvas>
+                        <img class="debug-full-frame-image" data-entry-id="${esc(entry.id)}" src="${esc(authUrl(`api/cameras/${encodedId}/detection-debug/${entry.id}/full-frame`))}" alt="Full frame" loading="lazy">
+                        <canvas class="debug-overlay-canvas" data-entry-id="${esc(entry.id)}"></canvas>
                     </div>
                     <div class="debug-overlay-legend">
                         <span class="debug-legend-item"><span class="debug-legend-color" style="border-color:#0f0"></span>Motion</span>
@@ -1803,12 +1966,9 @@ document.addEventListener('DOMContentLoaded', async () => {
                 : '';
 
             const framesHtml = Array.from({length: entry.frame_count}, (_, i) => {
-                const response = (entry.raw_responses[i] || '(no response)')
-                    .replace(/&/g, '&amp;')
-                    .replace(/</g, '&lt;')
-                    .replace(/>/g, '&gt;');
+                const response = esc(entry.raw_responses[i] || '(no response)');
                 return `<div class="debug-frame-pair">
-                    <img class="debug-frame-image" src="${authUrl(`api/cameras/${encodedId}/detection-debug/${entry.id}/frame/${i}`)}" alt="Frame ${i + 1}" loading="lazy">
+                    <img class="debug-frame-image" src="${esc(authUrl(`api/cameras/${encodedId}/detection-debug/${entry.id}/frame/${i}`))}" alt="Frame ${i + 1}" loading="lazy">
                     <pre class="debug-raw-response">${response}</pre>
                 </div>`;
             }).join('');
@@ -1816,7 +1976,7 @@ document.addEventListener('DOMContentLoaded', async () => {
             return `<div class="debug-entry">
                 <div class="debug-entry-header">
                     <span class="debug-time">${timeStr}</span>
-                    <span class="debug-model">${entry.model}</span>
+                    <span class="debug-model">${esc(entry.model)}</span>
                     ${detectionBadge}
                 </div>
                 ${fullFrameHtml}
@@ -1884,6 +2044,20 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
 
     // === Utility ===
+
+    // Every value interpolated into an innerHTML template goes through here.
+    // Camera ids, object classes and model names come from operator config and
+    // from metadata camon has already filtered, not straight off the network —
+    // but "trusted enough" is not something the markup can check, and one
+    // escaped hole beside four raw ones is the bug regardless of who fills it.
+    function esc(value) {
+        return String(value)
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;')
+            .replace(/'/g, '&#39;');
+    }
 
     function formatTime(seconds) {
         if (!isFinite(seconds)) return '00:00:00';

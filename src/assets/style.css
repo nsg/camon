@@ -701,6 +701,16 @@ main {
     opacity: 1;
 }
 
+/* Continuous chunks are coverage, not incidents: full height and dim, so a day
+   of back-to-back chunks reads as a band rather than as a wall of events. */
+.history-tick.cont {
+    top: 0;
+    bottom: 0;
+    width: 3px;
+    background: var(--color-tan);
+    opacity: 0.28;
+}
+
 /* Hours of today that haven't happened yet. */
 .history-future {
     position: absolute;
@@ -838,6 +848,16 @@ main {
 
 .event-list-type.object { color: rgba(220, 50, 50, 0.9); }
 .event-list-type.movement { color: rgba(255, 200, 50, 0.9); }
+.event-list-type.continuous { color: rgba(216, 189, 138, 0.9); }
+/* An event type this build has never heard of — labelled with its wire name. */
+.event-list-type.unknown { color: #999; }
+
+/* Chunks of one recording, split at the duration cap: a rail down the left
+   edge ties them together. The list runs newest-first, so a chunk continues
+   the one below it. */
+.event-list-item.chain-part {
+    box-shadow: inset 3px 0 0 rgba(216, 189, 138, 0.4);
+}
 
 .event-recovered-badge {
     color: rgba(255, 170, 50, 0.9);

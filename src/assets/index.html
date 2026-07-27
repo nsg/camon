@@ -154,6 +154,10 @@
                 <button class="filter-btn active" data-filter="all">All</button>
                 <button class="filter-btn" data-filter="object">Object</button>
                 <button class="filter-btn" data-filter="movement">Movement</button>
+                <!-- Continuous-recording chunks are their own event type on the
+                     wire, so they need their own filter — without it they show
+                     up only under "All". -->
+                <button class="filter-btn" data-filter="continuous">Continuous</button>
             </div>
             <div id="event-list"></div>
         </div>
