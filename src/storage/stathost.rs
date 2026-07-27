@@ -324,6 +324,7 @@ impl WarmStorageBackend for StathostBackend {
                 filmstrip_frames,
                 continues: event.continues,
                 recovered: false,
+                delete_failed: false,
             },
         );
         self.used_bytes.fetch_add(file_size, Ordering::Relaxed);
@@ -395,6 +396,7 @@ impl WarmStorageBackend for StathostBackend {
         movement_max_age_ns: u64,
         object_max_age_ns: u64,
         continuous_max_age_ns: u64,
+        cancel: &std::sync::atomic::AtomicBool,
     ) {
         let now_ns = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -406,7 +408,14 @@ impl WarmStorageBackend for StathostBackend {
             EventType::Continuous => continuous_max_age_ns,
         };
 
+        // Deleting one event here is several sequential HTTP requests, each
+        // able to sit on a request timeout, so shutdown gets checked between
+        // events and between cameras — never part-way through an event.
+        let stop = || cancel.load(Ordering::Relaxed);
         for (camera_id, lock) in self.cameras.iter() {
+            if stop() {
+                break;
+            }
             let expired: Vec<WarmEventEntry> = {
                 let entries = lock.read_recover();
                 entries
@@ -421,6 +430,9 @@ impl WarmStorageBackend for StathostBackend {
 
             let mut deleted = 0u64;
             for entry in &expired {
+                if stop() {
+                    break;
+                }
                 if self.delete_event_objects(camera_id, entry).await {
                     if let Some(removed) = self.remove_entry(camera_id, entry.start_pts_ns) {
                         self.used_bytes
@@ -522,6 +534,7 @@ impl WarmStorageBackend for StathostBackend {
                 filmstrip_frames,
                 continues: sidecar.as_ref().map(|s| s.continues).unwrap_or(false),
                 recovered: sidecar.as_ref().map(|s| s.recovered).unwrap_or(false),
+                delete_failed: false,
             };
             self.used_bytes.fetch_add(item.size, Ordering::Relaxed);
             self.insert_entry(camera_id, entry);
@@ -1236,11 +1249,33 @@ mod tests {
         assert_eq!(stub.files.lock().unwrap().len(), 4); // ts + json + 2 thumbs
 
         // Prune with a tiny movement retention → the old event goes.
-        backend.prune(1, u64::MAX, u64::MAX).await;
+        backend
+            .prune(1, u64::MAX, u64::MAX, &AtomicBool::new(false))
+            .await;
 
         assert!(backend.find_event("cam", old_pts).is_none());
         assert!(stub.files.lock().unwrap().is_empty());
         assert_eq!(backend.used_bytes.load(Ordering::Relaxed), 0);
+    }
+
+    /// Shutdown reaches this backend as a raised flag, and one event here is
+    /// several sequential HTTP deletes: a cancelled sweep must issue none.
+    #[tokio::test]
+    async fn a_cancelled_prune_deletes_nothing() {
+        let (url, stub) = spawn_stub("secret").await;
+        let backend = backend_for(&url, "secret", 0);
+        let old_pts = 1_000_000_000;
+        backend
+            .write_event("cam", &movement_event(old_pts, 30))
+            .await;
+        let before = stub.files.lock().unwrap().len();
+
+        backend
+            .prune(1, u64::MAX, u64::MAX, &AtomicBool::new(true))
+            .await;
+
+        assert!(backend.find_event("cam", old_pts).is_some());
+        assert_eq!(stub.files.lock().unwrap().len(), before);
     }
 
     #[tokio::test]
@@ -1422,6 +1457,7 @@ mod tests {
                     filmstrip_frames: 0,
                     continues: false,
                     recovered: false,
+                    delete_failed: false,
                 },
             );
         }

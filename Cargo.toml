@@ -49,3 +49,9 @@ rumqttc = { version = "0.25.1", default-features = false }
 
 [dev-dependencies]
 tempfile = "3.27.0"
+# Paused-clock tests (`#[tokio::test(start_paused = true)]`) for the retention
+# schedule: an hourly cadence is otherwise only testable with real sleeps and a
+# loaded machine turns those into flakes. A feature on a crate already in the
+# graph — no new crate enters the build, and dev-dependency features do not
+# reach the release binary.
+tokio = { version = "1", features = ["test-util"] }

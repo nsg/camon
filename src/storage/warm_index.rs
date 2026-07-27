@@ -1,10 +1,10 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
 use crate::locks::LockExt;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum EventType {
     Movement,
     Object,
@@ -71,6 +71,62 @@ pub struct WarmEventEntry {
     /// after a crash or power cut (from the sidecar `"recovered"` flag). The
     /// tail may be truncated at the last intact packet.
     pub recovered: bool,
+    /// Set once a deletion of this event has failed. Purely in-RAM (a restart
+    /// clears it, and the scan retries everything): it takes the event out of
+    /// *emergency* candidate selection, so a low-space pass ahead of every
+    /// write does not re-attempt a file the filesystem has already refused.
+    /// The hourly sweep ignores this and keeps retrying — that is where a
+    /// transient failure gets its second chance.
+    pub delete_failed: bool,
+}
+
+/// What identifies one indexed event, and with it exactly one file on disk:
+/// `{data_dir}/{camera}/{event_type}/{start_pts_ns}_{duration_ms}.ts`.
+///
+/// The start PTS alone does not. Nothing enforces its uniqueness — `scan`
+/// happily indexes the same start under two event types with two durations,
+/// and `insert` never checks — and a movement→object upgrade changes an
+/// entry's type while a prune is mid-flight. Unindexing on the start alone
+/// would then drop a surviving entry on the strength of some other entry's
+/// delete, which is the leak this whole path exists to prevent.
+type EventKey = (u64, EventType, u32);
+
+fn event_key(entry: &WarmEventEntry) -> EventKey {
+    (entry.start_pts_ns, entry.event_type, entry.duration_ms)
+}
+
+/// Outcome of deleting one indexed event's files.
+enum Removal {
+    /// The video file was deleted; its bytes are back.
+    Deleted,
+    /// The video file was already gone. Nothing was reclaimed, but the index
+    /// entry has to go too — it describes a file that does not exist.
+    Missing,
+    /// The video file is still on disk (EACCES, EIO, ...). The entry stays
+    /// indexed so the next prune retries it instead of leaking the file.
+    ///
+    /// The cost is deliberate: such an event stays listed, and stays offered
+    /// for playback, indefinitely past its configured retention — for as long
+    /// as the deletion keeps failing. A visible retention violation an
+    /// operator can see and act on beats a file that is gone from the index,
+    /// still eating disk, and never retried by anything.
+    Failed,
+}
+
+/// What one pass of [`WarmEventIndex::emergency_prune`] actually achieved.
+/// The three counts are distinct outcomes with distinct operator meanings —
+/// "nothing to delete", "deletions are failing", and "someone else already
+/// reclaimed it" all produce zero deleted events and call for different
+/// reactions.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct EmergencyOutcome {
+    /// Events deleted; the only count that reflects reclaimed bytes.
+    pub deleted: u64,
+    /// Events whose deletion failed. They are still on disk and still indexed.
+    pub failed: u64,
+    /// Events whose file had already vanished. Nothing was reclaimed here, but
+    /// the stale index entries were dropped.
+    pub missing: u64,
 }
 
 #[derive(Clone)]
@@ -262,6 +318,7 @@ impl WarmEventIndex {
             filmstrip_frames,
             continues: sidecar.continues,
             recovered: sidecar.recovered,
+            delete_failed: false,
         })
     }
 
@@ -342,12 +399,21 @@ impl WarmEventIndex {
         dir.join(format!("{}_{}.ts", entry.start_pts_ns, entry.duration_ms))
     }
 
-    pub async fn prune(
+    /// Delete every event past its per-class retention and drop it from the
+    /// index. Returns the number of events actually deleted.
+    ///
+    /// `cancel` is polled between events and between cameras so a shutdown
+    /// does not wait out a whole sweep. Never mid-event: an event that lost
+    /// its `.ts` but kept its sidecar and thumbnails is invisible to the
+    /// startup scan, which only looks at `.ts` files, so those files would
+    /// leak exactly as the ones this method refuses to unindex would.
+    pub async fn prune<F: FnMut() -> bool>(
         &self,
         movement_max_age_ns: u64,
         object_max_age_ns: u64,
         continuous_max_age_ns: u64,
-    ) {
+        mut cancel: F,
+    ) -> u64 {
         let now_ns = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -359,7 +425,11 @@ impl WarmEventIndex {
             EventType::Continuous => continuous_max_age_ns,
         };
 
+        let mut total_deleted = 0u64;
         for (camera_id, lock) in self.cameras.iter() {
+            if cancel() {
+                break;
+            }
             let expired: Vec<WarmEventEntry> = {
                 let entries = lock.read_recover();
                 entries
@@ -374,17 +444,33 @@ impl WarmEventIndex {
             }
 
             let mut deleted = 0u64;
+            let mut failed = 0u64;
+            let mut unindex: HashSet<EventKey> = HashSet::new();
             for entry in &expired {
-                if self.remove_event_files(camera_id, entry).await {
-                    deleted += 1;
+                if cancel() {
+                    break;
+                }
+                match self.remove_event_files(camera_id, entry).await {
+                    Removal::Deleted => {
+                        deleted += 1;
+                        unindex.insert(event_key(entry));
+                    }
+                    Removal::Missing => {
+                        unindex.insert(event_key(entry));
+                    }
+                    Removal::Failed => {
+                        failed += 1;
+                        self.mark_delete_failed(camera_id, event_key(entry));
+                    }
                 }
             }
 
             {
                 let mut entries = lock.write_recover();
-                entries.retain(|e| e.start_pts_ns >= now_ns.saturating_sub(max_age(e.event_type)));
+                entries.retain(|e| !unindex.contains(&event_key(e)));
             }
 
+            total_deleted += deleted;
             if deleted > 0 {
                 tracing::info!(
                     camera = %camera_id,
@@ -392,28 +478,46 @@ impl WarmEventIndex {
                     "pruned expired warm events"
                 );
             }
+            if failed > 0 {
+                tracing::warn!(
+                    camera = %camera_id,
+                    failed,
+                    "expired warm events are still on disk after a failed delete, \
+                     kept indexed for the next prune (paths at debug level)"
+                );
+            }
         }
+        total_deleted
     }
 
     /// Delete every file belonging to one event (.ts, sidecar, thumbnails).
-    /// Returns true if the video file itself was actually deleted.
-    async fn remove_event_files(&self, camera_id: &str, entry: &WarmEventEntry) -> bool {
+    async fn remove_event_files(&self, camera_id: &str, entry: &WarmEventEntry) -> Removal {
         let path = self.resolve_file_path(camera_id, entry);
         let thumb = path.with_extension("jpg");
         let removed = match tokio::fs::remove_file(&path).await {
-            Ok(()) => true,
+            Ok(()) => Removal::Deleted,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Removal::Missing,
             Err(e) => {
-                if e.kind() != std::io::ErrorKind::NotFound {
-                    tracing::warn!(
-                        camera = %camera_id,
-                        path = %path.display(),
-                        error = %e,
-                        "failed to delete warm event file"
-                    );
-                }
-                false
+                // Per-file detail is debug: a persistently broken disk hits
+                // this on every sweep and every low-space pass, and the
+                // callers already report one aggregate warning per pass.
+                tracing::debug!(
+                    camera = %camera_id,
+                    path = %path.display(),
+                    error = %e,
+                    "failed to delete warm event file"
+                );
+                Removal::Failed
             }
         };
+        // The video is still on disk, so the entry stays indexed for the next
+        // attempt and its metadata is left intact — stripping the sidecar and
+        // thumbnails off a file that is still there helps nobody. Being
+        // indexed is not a promise that it still reads: whatever blocked the
+        // delete may well block playback too.
+        if matches!(removed, Removal::Failed) {
+            return removed;
+        }
         let _ = tokio::fs::remove_file(&thumb).await;
         let _ = tokio::fs::remove_file(&path.with_extension("json")).await;
         // Clean up filmstrip thumbnails
@@ -425,15 +529,47 @@ impl WarmEventIndex {
         removed
     }
 
+    /// Remember that this event resisted deletion, so the low-space guard
+    /// stops offering it as reclaimable space. Keyed on the full
+    /// [`EventKey`]: an entry that has been upgraded since is a different
+    /// event and must not inherit the flag.
+    fn mark_delete_failed(&self, camera_id: &str, key: EventKey) {
+        let Some(lock) = self.cameras.get(camera_id) else {
+            return;
+        };
+        let mut entries = lock.write_recover();
+        // Entries are sorted by start PTS, which repeats across event types, so
+        // walk the run of equal starts rather than trusting one hit.
+        let from = entries.partition_point(|e| e.start_pts_ns < key.0);
+        for entry in entries[from..]
+            .iter_mut()
+            .take_while(|e| e.start_pts_ns == key.0)
+        {
+            if event_key(entry) == key {
+                entry.delete_failed = true;
+                return;
+            }
+        }
+    }
+
     /// Emergency prune for low-disk-space conditions: delete the oldest events
     /// first, cheapest-to-lose tier first (continuous → movements → objects),
     /// until `satisfied()` reports the pressure is gone (in production: free
     /// space back above `min_free_bytes`) or nothing is left to delete.
     ///
-    /// Returns the number of events deleted.
-    pub async fn emergency_prune<F: FnMut() -> bool>(&self, mut satisfied: F) -> u64 {
-        let mut deleted = 0u64;
-        for tier in [
+    /// Reports what it achieved: see [`EmergencyOutcome`]. A pass ends when the
+    /// pressure is gone or its candidates are exhausted — never on a failure
+    /// count, which would let the oldest few undeletable events starve every
+    /// newer deletable one and stop recording outright.
+    ///
+    /// Candidates exclude events whose deletion has already failed once
+    /// ([`WarmEventEntry::delete_failed`]). That is what bounds the work: this
+    /// runs ahead of every single write, and re-attempting a file the
+    /// filesystem has refused costs a syscall to learn nothing. The hourly
+    /// sweep does the retrying.
+    pub async fn emergency_prune<F: FnMut() -> bool>(&self, mut satisfied: F) -> EmergencyOutcome {
+        let mut outcome = EmergencyOutcome::default();
+        'tiers: for tier in [
             EventType::Continuous,
             EventType::Movement,
             EventType::Object,
@@ -445,7 +581,7 @@ impl WarmEventIndex {
                 candidates.extend(
                     entries
                         .iter()
-                        .filter(|e| e.event_type == tier)
+                        .filter(|e| e.event_type == tier && !e.delete_failed)
                         .cloned()
                         .map(|e| (camera_id.clone(), e)),
                 );
@@ -454,24 +590,37 @@ impl WarmEventIndex {
 
             for (camera_id, entry) in candidates {
                 if satisfied() {
-                    return deleted;
+                    break 'tiers;
                 }
-                self.remove_event_files(&camera_id, &entry).await;
+                // A failed delete keeps its entry: the file is still on disk and
+                // occupying the space this prune is trying to reclaim, so the
+                // hourly sweep must see it again. One poisoned file must not
+                // block the rest, hence `continue` and not `break` — the
+                // events behind it are the space this pass exists to reclaim.
+                let removal = self.remove_event_files(&camera_id, &entry).await;
+                if matches!(removal, Removal::Failed) {
+                    outcome.failed += 1;
+                    self.mark_delete_failed(&camera_id, event_key(&entry));
+                    continue;
+                }
+                let key = event_key(&entry);
                 if let Some(lock) = self.cameras.get(&camera_id) {
-                    lock.write_recover().retain(|e| {
-                        !(e.start_pts_ns == entry.start_pts_ns && e.event_type == entry.event_type)
-                    });
+                    lock.write_recover().retain(|e| event_key(e) != key);
                 }
-                deleted += 1;
-                tracing::warn!(
-                    camera = %camera_id,
-                    start_pts_ns = entry.start_pts_ns,
-                    event_type = ?entry.event_type,
-                    "emergency prune: deleted event to reclaim disk space"
-                );
+                if matches!(removal, Removal::Deleted) {
+                    outcome.deleted += 1;
+                    tracing::warn!(
+                        camera = %camera_id,
+                        start_pts_ns = entry.start_pts_ns,
+                        event_type = ?entry.event_type,
+                        "emergency prune: deleted event to reclaim disk space"
+                    );
+                } else {
+                    outcome.missing += 1;
+                }
             }
         }
-        deleted
+        outcome
     }
 }
 
@@ -513,6 +662,12 @@ mod tests {
         index.query("cam", 0, u64::MAX)
     }
 
+    /// A cancel predicate that never fires, for the sweeps that are not about
+    /// shutdown.
+    fn running() -> impl FnMut() -> bool {
+        || false
+    }
+
     const SEC: u64 = 1_000_000_000;
 
     fn indexed(spans: &[(u64, u32)]) -> WarmEventIndex {
@@ -532,6 +687,7 @@ mod tests {
                     filmstrip_frames: 0,
                     continues: false,
                     recovered: false,
+                    delete_failed: false,
                 },
             );
         }
@@ -696,7 +852,9 @@ mod tests {
 
         // Movement retention 7d (keep the 3d-old movement), continuous 1d (drop
         // the 2d-old chunk). Object retention irrelevant here.
-        index.prune(7 * day_ns, 14 * day_ns, day_ns).await;
+        index
+            .prune(7 * day_ns, 14 * day_ns, day_ns, running())
+            .await;
 
         let remaining = entries(&index);
         assert_eq!(remaining.len(), 1);
@@ -708,6 +866,240 @@ mod tests {
             .join("cam")
             .join("continuous")
             .join(format!("{continuous_pts}_5000.ts"))
+            .exists());
+    }
+
+    /// Put something undeletable where an event file belongs: on Linux
+    /// `unlink` on a directory fails with EISDIR for every user, root
+    /// included, which a permission bit could not guarantee.
+    fn write_undeletable_event(dir: &std::path::Path, subdir: &str, stem: &str) {
+        let path = dir.join("cam").join(subdir).join(format!("{stem}.ts"));
+        std::fs::create_dir_all(&path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn prune_keeps_events_it_could_not_delete_and_retries_them() {
+        let dir = tempfile::tempdir().unwrap();
+        write_event_files(dir.path(), "continuous", "1000_1000", None);
+        write_undeletable_event(dir.path(), "continuous", "2000_1000");
+
+        let index = WarmEventIndex::new(&["cam".to_string()], dir.path().to_path_buf());
+        index.scan();
+        assert_eq!(entries(&index).len(), 2);
+
+        // Both are expired, only one can actually go.
+        assert_eq!(index.prune(1, 1, 1, running()).await, 1);
+        let remaining = entries(&index);
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(
+            remaining[0].start_pts_ns, 2000,
+            "a failed deletion was unindexed, leaking the file"
+        );
+
+        // Whatever blocked the delete clears — the path is a normal file again
+        // — and the next prune actually deletes it, and says so.
+        let path = dir
+            .path()
+            .join("cam")
+            .join("continuous")
+            .join("2000_1000.ts");
+        std::fs::remove_dir(&path).unwrap();
+        std::fs::write(&path, b"tsdata").unwrap();
+
+        assert_eq!(
+            index.prune(1, 1, 1, running()).await,
+            1,
+            "the retry deleted nothing"
+        );
+        assert!(entries(&index).is_empty());
+        assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn prune_unindexes_events_whose_files_already_vanished() {
+        let dir = tempfile::tempdir().unwrap();
+        write_event_files(dir.path(), "continuous", "1000_1000", None);
+        let index = WarmEventIndex::new(&["cam".to_string()], dir.path().to_path_buf());
+        index.scan();
+
+        // Deleted behind camon's back: nothing to reclaim, but an entry
+        // pointing at a file that does not exist must not linger forever.
+        std::fs::remove_file(
+            dir.path()
+                .join("cam")
+                .join("continuous")
+                .join("1000_1000.ts"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            index.prune(1, 1, 1, running()).await,
+            0,
+            "an already-gone file was counted as reclaimed"
+        );
+        assert!(entries(&index).is_empty());
+    }
+
+    /// Shutdown asks the sweep to stop rather than cancelling it mid-event, so
+    /// the flag has to be honoured inside `prune` — and between *events*, not
+    /// just once per camera: a camera with a day of footage is one iteration
+    /// of the outer loop and thousands of the inner one.
+    #[tokio::test]
+    async fn prune_stops_between_events_once_cancelled() {
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..4 {
+            write_event_files(
+                dir.path(),
+                "continuous",
+                &format!("{}_1000", 1000 + i),
+                None,
+            );
+        }
+        let index = WarmEventIndex::new(&["cam".to_string()], dir.path().to_path_buf());
+        index.scan();
+
+        // Cancelled part-way in: the per-camera check passes, the first event
+        // is deleted, and the rest of that camera's sweep is abandoned.
+        let mut checks = 0;
+        let deleted = index
+            .prune(1, 1, 1, || {
+                checks += 1;
+                checks > 2
+            })
+            .await;
+        assert_eq!(deleted, 1, "the sweep ignored the flag between events");
+        assert_eq!(entries(&index).len(), 3);
+
+        // Cancelled before it starts: nothing at all.
+        assert_eq!(index.prune(1, 1, 1, || true).await, 0);
+        assert_eq!(entries(&index).len(), 3);
+
+        // Uncancelled, the same sweep takes the rest.
+        assert_eq!(index.prune(1, 1, 1, running()).await, 3);
+        assert!(entries(&index).is_empty());
+    }
+
+    /// The retain key has to identify a file, not just a start time: `scan`
+    /// indexes the same start under two event types, and an upgrade moves an
+    /// entry between them while a prune is in flight.
+    #[tokio::test]
+    async fn prune_does_not_unindex_a_different_event_sharing_a_start() {
+        let dir = tempfile::tempdir().unwrap();
+        // Same start PTS, two event types, two durations — one deletable, one
+        // not. Only the deletable one may leave the index.
+        write_undeletable_event(dir.path(), "movements", "1000_1000");
+        write_event_files(dir.path(), "objects", "1000_2000", None);
+
+        let index = WarmEventIndex::new(&["cam".to_string()], dir.path().to_path_buf());
+        index.scan();
+        assert_eq!(entries(&index).len(), 2);
+
+        assert_eq!(index.prune(1, 1, 1, running()).await, 1);
+        let remaining = entries(&index);
+        assert_eq!(remaining.len(), 1, "an unrelated entry was unindexed");
+        assert_eq!(remaining[0].event_type, EventType::Movement);
+        assert_eq!(remaining[0].duration_ms, 1000);
+    }
+
+    /// Same start, same event type, different duration: two distinct files,
+    /// so the duration has to carry its own weight in the key.
+    #[tokio::test]
+    async fn prune_distinguishes_events_that_differ_only_in_duration() {
+        let dir = tempfile::tempdir().unwrap();
+        write_undeletable_event(dir.path(), "continuous", "1000_1000");
+        write_event_files(dir.path(), "continuous", "1000_2000", None);
+
+        let index = WarmEventIndex::new(&["cam".to_string()], dir.path().to_path_buf());
+        index.scan();
+        assert_eq!(entries(&index).len(), 2);
+
+        assert_eq!(index.prune(1, 1, 1, running()).await, 1);
+        let remaining = entries(&index);
+        assert_eq!(remaining.len(), 1, "an unrelated entry was unindexed");
+        assert_eq!(remaining[0].duration_ms, 1000);
+    }
+
+    /// The same collision through the emergency path, which keys its retain
+    /// separately.
+    #[tokio::test]
+    async fn emergency_prune_distinguishes_events_that_differ_only_in_duration() {
+        let dir = tempfile::tempdir().unwrap();
+        write_undeletable_event(dir.path(), "continuous", "1000_1000");
+        write_event_files(dir.path(), "continuous", "1000_2000", None);
+
+        let index = WarmEventIndex::new(&["cam".to_string()], dir.path().to_path_buf());
+        index.scan();
+
+        assert_eq!(index.emergency_prune(|| false).await.deleted, 1);
+        let remaining = entries(&index);
+        assert_eq!(remaining.len(), 1, "an unrelated entry was unindexed");
+        assert_eq!(remaining[0].duration_ms, 1000);
+    }
+
+    /// The race the key guards against: a sweep snapshots a movement, the
+    /// writer upgrades that same event to an object mid-sweep, and the sweep
+    /// then finds `movements/{stem}.ts` gone. The surviving object entry must
+    /// not answer to the key of the movement that was pruned.
+    #[test]
+    fn an_upgraded_event_no_longer_answers_to_its_pre_upgrade_key() {
+        let index = WarmEventIndex::new(&["cam".to_string()], PathBuf::from("/nonexistent"));
+        index.insert(
+            "cam",
+            WarmEventEntry {
+                start_pts_ns: 1000,
+                duration_ms: 5000,
+                event_type: EventType::Movement,
+                file_size: 0,
+                object_classes: Vec::new(),
+                backend: None,
+                model: None,
+                detections: Vec::new(),
+                filmstrip_frames: 0,
+                continues: false,
+                recovered: false,
+                delete_failed: false,
+            },
+        );
+        let snapshot_key = event_key(&index.find_event("cam", 1000).unwrap());
+
+        index.update_event("cam", 1000, |e| e.event_type = EventType::Object);
+
+        let after = event_key(&index.find_event("cam", 1000).unwrap());
+        assert_ne!(
+            snapshot_key, after,
+            "an upgraded event would be unindexed by the sweep it raced"
+        );
+    }
+
+    #[tokio::test]
+    async fn emergency_prune_keeps_events_it_could_not_delete() {
+        let dir = tempfile::tempdir().unwrap();
+        write_undeletable_event(dir.path(), "continuous", "1000_1000");
+        write_event_files(dir.path(), "continuous", "2000_1000", None);
+
+        let index = WarmEventIndex::new(&["cam".to_string()], dir.path().to_path_buf());
+        index.scan();
+
+        // Never satisfied: it tries both, oldest first. Only the second frees
+        // anything, so only that one may be counted and unindexed.
+        let outcome = index.emergency_prune(|| false).await;
+        assert_eq!(
+            outcome,
+            EmergencyOutcome {
+                deleted: 1,
+                failed: 1,
+                missing: 0
+            },
+            "an undeletable event was reported as reclaimed"
+        );
+        let remaining = entries(&index);
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].start_pts_ns, 1000);
+        assert!(dir
+            .path()
+            .join("cam")
+            .join("continuous")
+            .join("1000_1000.ts")
             .exists());
     }
 
@@ -745,13 +1137,13 @@ mod tests {
         // (oldest first) and the movement go; the object survives even though
         // it is the oldest file on disk.
         let mut checks = 0;
-        let deleted = index
+        let outcome = index
             .emergency_prune(|| {
                 checks += 1;
                 checks > 3
             })
             .await;
-        assert_eq!(deleted, 3);
+        assert_eq!(outcome.deleted, 3);
 
         let remaining = entries(&index);
         assert_eq!(remaining.len(), 1);
@@ -785,8 +1177,8 @@ mod tests {
         let index = WarmEventIndex::new(&["cam".to_string()], dir.path().to_path_buf());
         index.scan();
         // Never satisfied: deletes everything it has, then gives up.
-        let deleted = index.emergency_prune(|| false).await;
-        assert_eq!(deleted, 1);
+        let outcome = index.emergency_prune(|| false).await;
+        assert_eq!(outcome.deleted, 1);
         assert!(entries(&index).is_empty());
     }
 
@@ -796,8 +1188,100 @@ mod tests {
         write_event_files(dir.path(), "continuous", "1000_1000", None);
         let index = WarmEventIndex::new(&["cam".to_string()], dir.path().to_path_buf());
         index.scan();
-        assert_eq!(index.emergency_prune(|| true).await, 0);
+        assert_eq!(
+            index.emergency_prune(|| true).await,
+            EmergencyOutcome::default()
+        );
         assert_eq!(entries(&index).len(), 1);
+    }
+
+    /// Reclaiming nothing has three meanings and the caller logs three
+    /// different things: this is the one where a concurrent guard already
+    /// deleted the files. Stale entries go; the "deleted" count must not move.
+    #[tokio::test]
+    async fn emergency_prune_unindexes_vanished_events_without_counting_them() {
+        let dir = tempfile::tempdir().unwrap();
+        write_event_files(dir.path(), "continuous", "1000_1000", None);
+        write_event_files(dir.path(), "continuous", "2000_1000", None);
+        let index = WarmEventIndex::new(&["cam".to_string()], dir.path().to_path_buf());
+        index.scan();
+
+        let continuous = dir.path().join("cam").join("continuous");
+        std::fs::remove_file(continuous.join("1000_1000.ts")).unwrap();
+        std::fs::remove_file(continuous.join("2000_1000.ts")).unwrap();
+
+        assert_eq!(
+            index.emergency_prune(|| false).await,
+            EmergencyOutcome {
+                deleted: 0,
+                failed: 0,
+                missing: 2
+            },
+            "already-gone events were counted as reclaimed space"
+        );
+        assert!(entries(&index).is_empty());
+    }
+
+    /// The starvation case: the oldest events cannot be deleted and plenty of
+    /// newer ones can. Head-of-line blocking here is fatal — the guard runs
+    /// ahead of every write, so a pass that reclaims nothing means every event
+    /// is dropped from then on and recording stops for good.
+    #[tokio::test]
+    async fn emergency_prune_reclaims_past_undeletable_oldest_events() {
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..8 {
+            write_undeletable_event(dir.path(), "continuous", &format!("{}_1000", 1000 + i));
+        }
+        for i in 0..20 {
+            write_event_files(
+                dir.path(),
+                "continuous",
+                &format!("{}_1000", 2000 + i),
+                None,
+            );
+        }
+        let index = WarmEventIndex::new(&["cam".to_string()], dir.path().to_path_buf());
+        index.scan();
+
+        let outcome = index.emergency_prune(|| false).await;
+        assert_eq!(
+            outcome.deleted, 20,
+            "undeletable oldest events blocked every newer deletable one"
+        );
+        assert_eq!(outcome.failed, 8);
+        assert_eq!(entries(&index).len(), 8);
+    }
+
+    /// What bounds the work instead of a failure counter: an event that has
+    /// refused deletion once stops being offered to the *guard*, which runs
+    /// ahead of every write — while the hourly sweep keeps retrying it.
+    #[tokio::test]
+    async fn emergency_prune_stops_retrying_known_failures_but_the_sweep_does_not() {
+        let dir = tempfile::tempdir().unwrap();
+        write_undeletable_event(dir.path(), "continuous", "1000_1000");
+        let index = WarmEventIndex::new(&["cam".to_string()], dir.path().to_path_buf());
+        index.scan();
+
+        assert_eq!(index.emergency_prune(|| false).await.failed, 1);
+        assert_eq!(
+            index.emergency_prune(|| false).await,
+            EmergencyOutcome::default(),
+            "the guard re-attempted a file the filesystem had already refused"
+        );
+        assert_eq!(entries(&index).len(), 1);
+
+        // The hourly sweep excludes nothing: it retries, and once the
+        // obstruction clears it finishes the job.
+        assert_eq!(index.prune(1, 1, 1, running()).await, 0);
+        let path = dir
+            .path()
+            .join("cam")
+            .join("continuous")
+            .join("1000_1000.ts");
+        std::fs::remove_dir(&path).unwrap();
+        std::fs::write(&path, b"tsdata").unwrap();
+        assert_eq!(index.prune(1, 1, 1, running()).await, 1);
+        assert!(entries(&index).is_empty());
     }
 
     #[test]

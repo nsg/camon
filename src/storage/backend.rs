@@ -31,7 +31,9 @@ use tokio_util::io::ReaderStream;
 
 use crate::buffer::warm::{EventUpgrade, FinishedEvent};
 use crate::buffer::GopSegment;
-use crate::storage::warm_index::{free_space_bytes, should_emergency_prune, DetectionDetail};
+use crate::storage::warm_index::{
+    free_space_bytes, should_emergency_prune, DetectionDetail, EmergencyOutcome,
+};
 use crate::storage::{EventType, WarmEventEntry, WarmEventIndex};
 
 const NANOS_PER_MS: u64 = 1_000_000;
@@ -171,11 +173,18 @@ pub trait WarmStorageBackend: Send + Sync {
     async fn upgrade_event(&self, camera_id: &str, upgrade: &EventUpgrade);
 
     /// Delete every event older than its per-class retention.
+    ///
+    /// `cancel` is the shutdown flag. A sweep is long (a remote backend deletes
+    /// one event at a time, each able to sit on a request timeout) and the
+    /// drain waits for it, so implementations must poll this between events and
+    /// stop early — but never part-way through one event, which would strip a
+    /// `.ts` and orphan its sidecar and thumbnails where no scan can find them.
     async fn prune(
         &self,
         movement_max_age_ns: u64,
         object_max_age_ns: u64,
         continuous_max_age_ns: u64,
+        cancel: &std::sync::atomic::AtomicBool,
     );
 
     /// Low-space guard run before a write: if free space is below
@@ -275,12 +284,14 @@ impl WarmStorageBackend for LocalDiskBackend {
         movement_max_age_ns: u64,
         object_max_age_ns: u64,
         continuous_max_age_ns: u64,
+        cancel: &std::sync::atomic::AtomicBool,
     ) {
         self.index
             .prune(
                 movement_max_age_ns,
                 object_max_age_ns,
                 continuous_max_age_ns,
+                || cancel.load(std::sync::atomic::Ordering::Relaxed),
             )
             .await;
     }
@@ -310,7 +321,7 @@ impl WarmStorageBackend for LocalDiskBackend {
 
     async fn emergency_prune(&self, camera_id: &str, min_free_bytes: u64) {
         let data_dir = self.data_dir.clone();
-        let deleted = self
+        let outcome = self
             .index
             .emergency_prune(move || {
                 // Stop as soon as space recovers; a failing statvfs also stops
@@ -320,13 +331,54 @@ impl WarmStorageBackend for LocalDiskBackend {
                     .unwrap_or(true)
             })
             .await;
-        if deleted == 0 {
-            tracing::warn!(
-                camera = %camera_id,
-                "emergency prune freed nothing (no events left to delete)"
-            );
-        } else {
-            tracing::warn!(camera = %camera_id, deleted, "emergency prune complete");
+
+        // Three ways to reclaim nothing, three different things to go and do
+        // about it — and this is read during a disk emergency.
+        match outcome {
+            EmergencyOutcome {
+                deleted: 0,
+                failed,
+                missing: _,
+            } if failed > 0 => {
+                tracing::error!(
+                    camera = %camera_id,
+                    failed,
+                    "emergency prune could not delete ANY event: there are events to delete \
+                     and the filesystem is refusing to — check for a read-only mount or \
+                     failing disk (per-file errors at debug level)"
+                );
+            }
+            EmergencyOutcome {
+                deleted: 0,
+                missing,
+                ..
+            } if missing > 0 => {
+                tracing::warn!(
+                    camera = %camera_id,
+                    missing,
+                    "emergency prune found its candidates already gone from disk; \
+                     dropped the stale index entries"
+                );
+            }
+            EmergencyOutcome { deleted: 0, .. } => {
+                tracing::warn!(
+                    camera = %camera_id,
+                    "emergency prune had nothing left to delete"
+                );
+            }
+            EmergencyOutcome {
+                deleted,
+                failed,
+                missing,
+            } => {
+                tracing::warn!(
+                    camera = %camera_id,
+                    deleted,
+                    failed,
+                    missing,
+                    "emergency prune complete"
+                );
+            }
         }
     }
 
@@ -563,6 +615,7 @@ fn build_index_entry(
         // Live writes are never recovered files; the flag only enters the
         // index via startup orphan recovery + sidecar scan.
         recovered: false,
+        delete_failed: false,
     }
 }
 
@@ -746,8 +799,17 @@ async fn upgrade_event(
             entry.model = Some(upgrade.model.clone());
         });
         if !updated {
+            // A retention sweep that snapshotted this event as a movement,
+            // then found `movements/{stem}.ts` already renamed away, drops the
+            // entry as vanished. The footage is fine and now lives under
+            // objects/, so re-index it here rather than leaving it invisible
+            // until the next startup scan re-reads the directory.
             tracing::warn!(camera = %camera_id, start_pts_ns = upgrade.start_pts_ns,
-                "upgraded event not found in warm index");
+                "upgraded event was not in the warm index (pruned mid-upgrade?), re-indexing it");
+            index.insert(
+                camera_id,
+                reindexed_upgrade(&dst_ts, &objects, &stem, upgrade).await,
+            );
         }
     }
 
@@ -757,6 +819,45 @@ async fn upgrade_event(
         classes = ?upgrade.object_classes,
         "upgraded movement event to object event"
     );
+}
+
+/// Rebuild an index entry for an event that was upgraded while nothing in the
+/// index described it any more. Everything comes from the upgrade itself
+/// except the file size and the filmstrip count, which are read back off disk
+/// exactly as the startup scan would read them.
+async fn reindexed_upgrade(
+    dst_ts: &Path,
+    objects: &Path,
+    stem: &str,
+    upgrade: &EventUpgrade,
+) -> WarmEventEntry {
+    let file_size = tokio::fs::metadata(dst_ts)
+        .await
+        .map(|m| m.len())
+        .unwrap_or(0);
+    let mut filmstrip_frames = 0;
+    while objects
+        .join(format!("{stem}_thumb_{filmstrip_frames}.jpg"))
+        .exists()
+    {
+        filmstrip_frames += 1;
+    }
+    WarmEventEntry {
+        start_pts_ns: upgrade.start_pts_ns,
+        duration_ms: upgrade.duration_ms,
+        event_type: EventType::Object,
+        file_size,
+        object_classes: upgrade.object_classes.clone(),
+        backend: Some(upgrade.backend.clone()),
+        model: Some(upgrade.model.clone()),
+        detections: upgrade.detections.clone(),
+        filmstrip_frames,
+        continues: upgrade.continues,
+        // The sidecar this upgrade just wrote carries no `recovered` flag, so a
+        // rescan would report false here too.
+        recovered: false,
+        delete_failed: false,
+    }
 }
 
 /// Render a single poster frame from `ts_path` into `thumb_path` with ffmpeg.
@@ -1006,6 +1107,67 @@ mod tests {
             .flatten()
             .collect();
         assert!(leftovers.is_empty(), "movement residue: {leftovers:?}");
+    }
+
+    /// The interleaving the index-level key test cannot reach: a sweep
+    /// snapshots the movement, this upgrade renames the file into objects/,
+    /// and only then does the sweep look — finds `movements/{stem}.ts` gone,
+    /// and unindexes the entry. The footage is fine, so the upgrade puts it
+    /// back rather than leaving it invisible until the next restart.
+    #[tokio::test]
+    async fn upgrade_reindexes_an_event_a_racing_prune_unindexed() {
+        let dir = tempfile::tempdir().unwrap();
+        let buffer = populated_buffer(10);
+        let mut event = {
+            let buf = buffer.read_recover();
+            assemble_event(&buf, None, "cam", 5, 7, 0, SEC, false, None).unwrap()
+        };
+        event.filmstrip_frames = Some(std::sync::Arc::new(vec![vec![0xff], vec![0xfe]]));
+        let first_pts = event.first_pts;
+
+        // Files on disk, deliberately absent from the index: exactly the state
+        // a racing sweep leaves behind when it unindexes as vanished.
+        let index = WarmEventIndex::new(&["cam".to_string()], dir.path().to_path_buf());
+        write_event(dir.path(), "cam", &event, None).await;
+        assert!(index.find_event("cam", first_pts).is_none());
+
+        upgrade_event(dir.path(), "cam", &upgrade_for(&event), Some(&index)).await;
+
+        let entry = index
+            .find_event("cam", first_pts)
+            .expect("upgraded event stayed invisible until the next restart");
+        assert_eq!(entry.event_type, EventType::Object);
+        assert_eq!(entry.object_classes, vec!["person".to_string()]);
+        assert_eq!(entry.detections.len(), 2);
+        // Read back off disk, as the startup scan would have.
+        assert_eq!(entry.file_size, 16);
+        assert_eq!(entry.filmstrip_frames, 2);
+        assert_eq!(
+            index.resolve_file_path("cam", &entry),
+            dir.path()
+                .join("cam")
+                .join("objects")
+                .join(format!("{first_pts}_4000.ts"))
+        );
+    }
+
+    /// The trait seam itself: the flag the retention task holds has to reach
+    /// the sweep, not just exist.
+    #[tokio::test]
+    async fn local_disk_prune_honors_the_cancel_flag() {
+        let (backend, entry, dir) = backend_with_event().await;
+        let start_pts = entry.start_pts_ns;
+
+        backend
+            .prune(1, 1, 1, &std::sync::atomic::AtomicBool::new(true))
+            .await;
+        assert!(backend.find_event("cam", start_pts).is_some());
+
+        backend
+            .prune(1, 1, 1, &std::sync::atomic::AtomicBool::new(false))
+            .await;
+        assert!(backend.find_event("cam", start_pts).is_none());
+        drop(dir);
     }
 
     #[tokio::test]

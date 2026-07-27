@@ -308,27 +308,28 @@ pub async fn run_continuous_recorder(
     tracing::info!(camera = %camera_id, "continuous recorder stopped");
 }
 
-/// Persists finished events to warm storage and prunes expired ones.
+/// Persists finished events to warm storage.
 ///
 /// Receives complete events (and post-hoc upgrade requests from the
 /// detection worker) over a bounded channel and handles each one inline — no
 /// detached spawns — so awaiting the writer task at shutdown guarantees every
 /// accepted event reached disk. The writer owns ALL file mutations under its
 /// camera's warm-storage directory.
+///
+/// Retention is NOT its business: pruning sweeps the whole store, not one
+/// camera, so it belongs to the single [`RetentionTask`]. What stays here is
+/// the write-triggered part of space management — a write that finds the disk
+/// full has to be able to make room for itself.
 pub struct WarmWriter {
     receiver: mpsc::Receiver<WriterMessage>,
     camera_id: String,
     backend: Arc<dyn WarmStorageBackend>,
-    movement_retention_ns: u64,
-    object_retention_ns: u64,
-    continuous_retention_ns: u64,
     /// Low-space guard threshold: before each event write, if the storage
     /// filesystem has less free space than this, the oldest events are
     /// emergency-pruned first. 0 disables the guard.
     min_free_bytes: u64,
 }
 
-const PRUNE_INTERVAL_SECS: u64 = 3600;
 const NANOS_PER_SEC: u64 = 1_000_000_000;
 
 impl WarmWriter {
@@ -342,32 +343,17 @@ impl WarmWriter {
             receiver,
             camera_id,
             backend,
-            movement_retention_ns: warm_config.movement_retention_days * 86400 * NANOS_PER_SEC,
-            object_retention_ns: warm_config.object_retention_days * 86400 * NANOS_PER_SEC,
-            continuous_retention_ns: warm_config.continuous_retention_days * 86400 * NANOS_PER_SEC,
             min_free_bytes: warm_config.min_free_bytes,
         }
     }
 
     pub async fn run(mut self) {
-        let mut prune_interval =
-            tokio::time::interval(std::time::Duration::from_secs(PRUNE_INTERVAL_SECS));
-        prune_interval.tick().await;
-
         // recv() drains buffered events after all senders drop, so the queue
         // is fully written out before the task exits at shutdown.
-        loop {
-            tokio::select! {
-                message = self.receiver.recv() => {
-                    match message {
-                        Some(WriterMessage::Event(event)) => self.handle_event(event).await,
-                        Some(WriterMessage::Upgrade(upgrade)) => self.handle_upgrade(upgrade).await,
-                        None => break,
-                    }
-                }
-                _ = prune_interval.tick() => {
-                    self.run_prune().await;
-                }
+        while let Some(message) = self.receiver.recv().await {
+            match message {
+                WriterMessage::Event(event) => self.handle_event(event).await,
+                WriterMessage::Upgrade(upgrade) => self.handle_upgrade(upgrade).await,
             }
         }
 
@@ -408,15 +394,88 @@ impl WarmWriter {
     async fn handle_upgrade(&self, upgrade: EventUpgrade) {
         self.backend.upgrade_event(&self.camera_id, &upgrade).await;
     }
+}
 
-    async fn run_prune(&self) {
-        self.backend
-            .prune(
-                self.movement_retention_ns,
-                self.object_retention_ns,
-                self.continuous_retention_ns,
-            )
-            .await;
+/// How much footage ages out between two scheduled sweeps.
+const PRUNE_INTERVAL: Duration = Duration::from_secs(3600);
+
+/// How often the retention task wakes to compare the clock against its next
+/// deadline. Cheap enough not to matter, fine enough that a shutdown between
+/// sweeps is not noticeable.
+const RETENTION_POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+/// The single owner of scheduled retention for the whole warm store.
+///
+/// A prune sweeps every camera, so exactly one of these runs per process. One
+/// per writer — which is what used to happen — meant N concurrent whole-store
+/// sweeps racing on the same snapshot/delete/unindex sequence.
+///
+/// The shutdown flag is handed to the backend rather than only checked around
+/// the sweep: a sweep is long (sequential deletes, each able to sit on a remote
+/// request timeout) and shutdown joins this task, so the sweep itself stops
+/// early, between events. Cancelling it from out here instead — dropping the
+/// future mid-delete — could strip an event's `.ts` and leave its sidecar and
+/// thumbnails behind, invisible to a scan that only looks at `.ts` files.
+pub struct RetentionTask {
+    backend: Arc<dyn WarmStorageBackend>,
+    movement_retention_ns: u64,
+    object_retention_ns: u64,
+    continuous_retention_ns: u64,
+    shutdown: Arc<AtomicBool>,
+}
+
+impl RetentionTask {
+    pub fn new(
+        backend: Arc<dyn WarmStorageBackend>,
+        warm_config: &WarmConfig,
+        shutdown: Arc<AtomicBool>,
+    ) -> Self {
+        Self {
+            backend,
+            movement_retention_ns: warm_config.movement_retention_days * 86400 * NANOS_PER_SEC,
+            object_retention_ns: warm_config.object_retention_days * 86400 * NANOS_PER_SEC,
+            continuous_retention_ns: warm_config.continuous_retention_days * 86400 * NANOS_PER_SEC,
+            shutdown,
+        }
+    }
+
+    /// The first sweep is one full interval in, as it was when the writers
+    /// owned the tick: startup already scanned the store, and an operator
+    /// restarting camon is rarely asking for deletions.
+    ///
+    /// Deadlines advance by whole intervals from the previous deadline, so the
+    /// cadence is fixed-rate: a sweep that takes 20 minutes does not push the
+    /// next one out to 80 minutes, and a backend timing out repeatedly cannot
+    /// drift retention arbitrarily late. Intervals that elapsed during a long
+    /// sweep are skipped rather than fired back to back — the deletions they
+    /// would have made are still due, and the next sweep makes them.
+    pub async fn run(self) {
+        let mut interval = tokio::time::interval(RETENTION_POLL_INTERVAL);
+        // The poll exists to notice a deadline, not to catch up on missed
+        // wakeups: replaying them after a long sweep would achieve nothing.
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut next_prune = tokio::time::Instant::now() + PRUNE_INTERVAL;
+        tracing::debug!("retention task started");
+
+        while !self.shutdown.load(Ordering::Relaxed) {
+            interval.tick().await;
+            if tokio::time::Instant::now() >= next_prune {
+                self.backend
+                    .prune(
+                        self.movement_retention_ns,
+                        self.object_retention_ns,
+                        self.continuous_retention_ns,
+                        &self.shutdown,
+                    )
+                    .await;
+                let now = tokio::time::Instant::now();
+                while next_prune <= now {
+                    next_prune += PRUNE_INTERVAL;
+                }
+            }
+        }
+
+        tracing::debug!("retention task stopped");
     }
 }
 
@@ -424,7 +483,7 @@ impl WarmWriter {
 mod tests {
     use super::*;
     use crate::storage::backend::deduplicate_detections;
-    use crate::storage::DetectionEntry;
+    use crate::storage::{DetectionEntry, WarmEventEntry};
 
     const SEC: u64 = 1_000_000_000;
 
@@ -611,6 +670,281 @@ mod tests {
     fn plan_roll_zero_cap_only_rolls_on_force() {
         assert_eq!(plan_continuous_roll(0, 4, 4 * SEC, 0, false), None);
         assert_eq!(plan_continuous_roll(0, 4, 4 * SEC, 0, true), Some((0, 3)));
+    }
+
+    // ---- Who prunes: the retention task, never a writer ----
+
+    use std::sync::atomic::AtomicUsize;
+
+    /// Records what the writer and the retention task ask of storage. Only the
+    /// writer path is implemented; the read path is never reached from here.
+    #[derive(Default)]
+    struct RecordingBackend {
+        writes: AtomicUsize,
+        /// Sweeps started, counted on entry to `prune`.
+        prunes: AtomicUsize,
+        /// Sweeps that ran to completion.
+        prunes_finished: AtomicUsize,
+        /// Sweeps that saw the shutdown flag and returned early.
+        prunes_cancelled: AtomicUsize,
+        guards: AtomicUsize,
+        emergency_prunes: AtomicUsize,
+        /// When set, the next write reports a full disk and clears the flag.
+        no_space_next_write: AtomicBool,
+        /// How long a sweep takes, for cadence tests.
+        prune_duration: Duration,
+        /// When set, a sweep parks here until notified — a sweep that is in
+        /// flight and cannot be hurried, which is what a remote backend
+        /// sitting on request timeouts looks like from out here.
+        prune_gate: Option<Arc<tokio::sync::Notify>>,
+    }
+
+    #[async_trait::async_trait]
+    impl WarmStorageBackend for RecordingBackend {
+        async fn write_event(&self, _camera_id: &str, _event: &FinishedEvent) -> WriteOutcome {
+            self.writes.fetch_add(1, Ordering::Relaxed);
+            if self.no_space_next_write.swap(false, Ordering::Relaxed) {
+                WriteOutcome::NoSpace
+            } else {
+                WriteOutcome::Written
+            }
+        }
+
+        async fn upgrade_event(&self, _camera_id: &str, _upgrade: &EventUpgrade) {}
+
+        async fn prune(
+            &self,
+            _movement_ns: u64,
+            _object_ns: u64,
+            _continuous_ns: u64,
+            cancel: &AtomicBool,
+        ) {
+            self.prunes.fetch_add(1, Ordering::Relaxed);
+            if let Some(gate) = &self.prune_gate {
+                gate.notified().await;
+            }
+            // A real sweep is a loop of per-event deletes that checks `cancel`
+            // between them; one delete is the granularity, so model it as one
+            // sleep and one check.
+            tokio::time::sleep(self.prune_duration).await;
+            if cancel.load(Ordering::Relaxed) {
+                self.prunes_cancelled.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+            self.prunes_finished.fetch_add(1, Ordering::Relaxed);
+        }
+
+        async fn guard_free_space(&self, _camera_id: &str, _min_free_bytes: u64) {
+            self.guards.fetch_add(1, Ordering::Relaxed);
+        }
+
+        async fn emergency_prune(&self, _camera_id: &str, _min_free_bytes: u64) {
+            self.emergency_prunes.fetch_add(1, Ordering::Relaxed);
+        }
+
+        fn free_space(&self) -> std::io::Result<u64> {
+            Ok(u64::MAX)
+        }
+
+        async fn scan(&self) {}
+
+        fn recover_orphans(&self) {}
+
+        fn query(&self, _camera_id: &str, _from_ns: u64, _to_ns: u64) -> Vec<WarmEventEntry> {
+            unimplemented!("read path unused in writer tests")
+        }
+
+        fn find_event(&self, _camera_id: &str, _start_pts_ns: u64) -> Option<WarmEventEntry> {
+            unimplemented!("read path unused in writer tests")
+        }
+
+        async fn read_video(
+            &self,
+            _camera_id: &str,
+            _entry: &WarmEventEntry,
+            _range: Option<crate::storage::backend::RangeRequest>,
+        ) -> std::io::Result<crate::storage::backend::VideoStream> {
+            unimplemented!("read path unused in writer tests")
+        }
+
+        async fn read_thumbnail(
+            &self,
+            _camera_id: &str,
+            _entry: &WarmEventEntry,
+        ) -> Result<Vec<u8>, crate::storage::backend::ThumbnailError> {
+            unimplemented!("read path unused in writer tests")
+        }
+
+        async fn read_filmstrip(
+            &self,
+            _camera_id: &str,
+            _entry: &WarmEventEntry,
+            _index: u8,
+        ) -> std::io::Result<Vec<u8>> {
+            unimplemented!("read path unused in writer tests")
+        }
+    }
+
+    fn test_event() -> FinishedEvent {
+        FinishedEvent {
+            segments: vec![segment(0, SEC, 1)],
+            first_pts: 0,
+            total_bytes: 4,
+            has_objects: false,
+            object_classes: Vec::new(),
+            filmstrip_frames: None,
+            backend: None,
+            model: None,
+            detection_details: Vec::new(),
+            continues: false,
+            is_continuous: false,
+        }
+    }
+
+    /// That the writer no longer runs the scheduled prune is pinned by the
+    /// type system, not by a test: it holds no retention config at all any
+    /// more, so there is nothing to prune *with*. A timing test could only
+    /// wait out the one-hour tick, and one that closes the channel first
+    /// passes against the old code too. What is worth pinning is the half of
+    /// space management that stayed: the pre-write guard.
+    #[tokio::test]
+    async fn writer_guards_free_space_before_writing() {
+        let backend = Arc::new(RecordingBackend::default());
+        let (tx, rx) = mpsc::channel(4);
+        let writer = WarmWriter::new(
+            rx,
+            "cam".to_string(),
+            &WarmConfig::default(),
+            backend.clone(),
+        );
+        let handle = tokio::spawn(writer.run());
+
+        tx.send(WriterMessage::Event(test_event())).await.unwrap();
+        drop(tx);
+        handle.await.unwrap();
+
+        assert_eq!(backend.writes.load(Ordering::Relaxed), 1);
+        assert_eq!(backend.guards.load(Ordering::Relaxed), 1);
+    }
+
+    /// The other half of space management stays with the writer: a write that
+    /// finds the disk full makes room itself instead of waiting for the sweep.
+    #[tokio::test]
+    async fn write_that_hits_a_full_disk_emergency_prunes_and_retries() {
+        let backend = Arc::new(RecordingBackend::default());
+        backend.no_space_next_write.store(true, Ordering::Relaxed);
+        let (tx, rx) = mpsc::channel(4);
+        let writer = WarmWriter::new(
+            rx,
+            "cam".to_string(),
+            &WarmConfig::default(),
+            backend.clone(),
+        );
+        let handle = tokio::spawn(writer.run());
+
+        tx.send(WriterMessage::Event(test_event())).await.unwrap();
+        drop(tx);
+        handle.await.unwrap();
+
+        assert_eq!(backend.emergency_prunes.load(Ordering::Relaxed), 1);
+        assert_eq!(backend.writes.load(Ordering::Relaxed), 2, "no retry");
+        assert_eq!(backend.prunes.load(Ordering::Relaxed), 0);
+    }
+
+    fn spawn_retention(
+        backend: Arc<RecordingBackend>,
+        shutdown: &Arc<AtomicBool>,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(
+            RetentionTask::new(backend, &WarmConfig::default(), Arc::clone(shutdown)).run(),
+        )
+    }
+
+    /// The clock is paused, so these run on the real hourly constant in
+    /// virtual time: exact, instant, and no sleeps to be flaky about.
+    #[tokio::test(start_paused = true)]
+    async fn retention_sweeps_at_a_fixed_rate_whatever_a_sweep_costs() {
+        // A sweep taking half the interval must not push the next one out.
+        let backend = Arc::new(RecordingBackend {
+            prune_duration: PRUNE_INTERVAL / 2,
+            ..Default::default()
+        });
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let handle = spawn_retention(backend.clone(), &shutdown);
+
+        tokio::time::sleep(PRUNE_INTERVAL / 2).await;
+        assert_eq!(
+            backend.prunes.load(Ordering::Relaxed),
+            0,
+            "swept before the first interval elapsed"
+        );
+
+        // Now at 3.25 intervals. Fixed-rate starts sweeps at 1x, 2x and 3x
+        // (the third still running). Fixed-delay — deadline measured from the
+        // end of the previous sweep — would have managed two, at 1x and 2.5x.
+        tokio::time::sleep(PRUNE_INTERVAL * 11 / 4).await;
+        assert_eq!(
+            backend.prunes.load(Ordering::Relaxed),
+            3,
+            "cadence drifted with the sweep duration"
+        );
+        assert_eq!(backend.prunes_finished.load(Ordering::Relaxed), 2);
+
+        shutdown.store(true, Ordering::Relaxed);
+        tokio::time::timeout(PRUNE_INTERVAL, handle)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retention_task_stops_between_sweeps_without_waiting_out_the_interval() {
+        let backend = Arc::new(RecordingBackend::default());
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let handle = spawn_retention(backend.clone(), &shutdown);
+
+        tokio::time::sleep(PRUNE_INTERVAL / 4).await;
+        shutdown.store(true, Ordering::Relaxed);
+        tokio::time::timeout(RETENTION_POLL_INTERVAL * 3, handle)
+            .await
+            .expect("retention task sat on the hourly deadline instead of leaving")
+            .unwrap();
+        assert_eq!(backend.prunes.load(Ordering::Relaxed), 0);
+    }
+
+    /// Shutdown during a sweep is the case that decides join-vs-abort. The
+    /// sweep gets the flag and stops itself between events; the task then ends
+    /// normally, which is what lets `graceful_shutdown` join it. Cancelling it
+    /// from outside would land mid-delete and orphan sidecars and thumbnails
+    /// where the `.ts`-only startup scan can never see them again.
+    #[tokio::test(start_paused = true)]
+    async fn retention_task_stops_during_a_sweep_without_being_cancelled() {
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let backend = Arc::new(RecordingBackend {
+            prune_gate: Some(Arc::clone(&gate)),
+            ..Default::default()
+        });
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let handle = spawn_retention(backend.clone(), &shutdown);
+
+        // Park the task inside a sweep, the way a slow backend would.
+        tokio::time::sleep(PRUNE_INTERVAL + RETENTION_POLL_INTERVAL).await;
+        assert_eq!(backend.prunes.load(Ordering::Relaxed), 1);
+        assert_eq!(backend.prunes_finished.load(Ordering::Relaxed), 0);
+
+        shutdown.store(true, Ordering::Relaxed);
+        gate.notify_one(); // the delete in flight completes
+
+        tokio::time::timeout(RETENTION_POLL_INTERVAL * 3, handle)
+            .await
+            .expect("a sweep in flight held shutdown up")
+            .expect("the task was cancelled instead of stopping itself");
+        assert_eq!(
+            backend.prunes_cancelled.load(Ordering::Relaxed),
+            1,
+            "the sweep ignored the shutdown flag and ran to completion"
+        );
+        assert_eq!(backend.prunes_finished.load(Ordering::Relaxed), 0);
     }
 
     #[test]

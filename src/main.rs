@@ -18,7 +18,7 @@ mod update;
 
 use analytics::{detect_queue, AnalyzerContext, DetectQueueSender, DetectionWorker, OllamaClient};
 use api::AppState;
-use buffer::warm::{run_continuous_recorder, WarmWriter, WriterMessage};
+use buffer::warm::{run_continuous_recorder, RetentionTask, WarmWriter, WriterMessage};
 use buffer::HotBuffer;
 use camera::FfmpegPipeline;
 use config::Config;
@@ -322,8 +322,8 @@ struct CameraHandles {
     /// Empty in event mode. Flushed at shutdown before the writers' senders drop.
     continuous_handles: Vec<tokio::task::JoinHandle<()>>,
     warm_handles: Vec<tokio::task::JoinHandle<()>>,
-    /// Kept alive so warm writers keep running (prune tick) even without
-    /// analyzers; dropped during shutdown to let the writers drain and exit.
+    /// Kept alive so the writer channels stay open for as long as the process
+    /// runs; dropped during shutdown to let the writers drain and exit.
     event_senders: Vec<tokio::sync::mpsc::Sender<WriterMessage>>,
     /// The same senders keyed by camera, for the detection worker's post-hoc
     /// event upgrades.
@@ -518,9 +518,22 @@ const MQTT_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 
 async fn graceful_shutdown(
     handles: CameraHandles,
+    retention_handle: Option<tokio::task::JoinHandle<()>>,
     detect_worker_handle: Option<tokio::task::JoinHandle<()>>,
     mqtt_handle: Option<tokio::task::JoinHandle<()>>,
 ) {
+    // Joined, not aborted: an abort mid-delete could strip an event's .ts and
+    // leave its sidecar and thumbnails behind, where the startup scan — which
+    // only looks at .ts files — would never see them again. That is the exact
+    // silent leak this drain is not allowed to create, so the sweep is asked
+    // to stop instead: it polls the shutdown flag between events, and the wait
+    // is bounded by one event's deletes. Waiting here first costs nothing —
+    // the flag was raised before the drain began, so every writer, analyzer
+    // and recorder is already winding down concurrently with this await.
+    if let Some(handle) = retention_handle {
+        let _ = handle.await;
+    }
+
     // Analyzers poll the shutdown flag every ~200ms and flush any open motion
     // run as a complete event before exiting — join them, never abort.
     for handle in handles.analyzer_handles {
@@ -695,6 +708,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let camera_handles = spawn_cameras(&spawn_ctx, config.cameras.clone());
 
+    // Retention is a property of the store, not of a camera: one task sweeps
+    // every camera on a schedule, however many writers there are.
+    let retention_handle = storage.as_ref().map(|backend| {
+        tokio::spawn(
+            RetentionTask::new(
+                Arc::clone(backend),
+                &config.storage,
+                Arc::clone(&shutdown.flag),
+            )
+            .run(),
+        )
+    });
+
     let detect_worker_handle = match (ollama_client, detect_rx) {
         (Some(client), Some(rx)) => {
             let worker = DetectionWorker::new(
@@ -761,7 +787,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     server_handle.abort();
 
     spawn_restart_watchdog(Arc::clone(&shutdown.update_installed));
-    graceful_shutdown(camera_handles, detect_worker_handle, mqtt_handle).await;
+    graceful_shutdown(
+        camera_handles,
+        retention_handle,
+        detect_worker_handle,
+        mqtt_handle,
+    )
+    .await;
 
     match reason {
         ShutdownReason::Signal => tracing::info!("shutdown complete"),
@@ -1029,7 +1061,7 @@ mod tests {
         // an unexplained CI timeout is a bad way to find that out.
         tokio::time::timeout(
             Duration::from_secs(30),
-            graceful_shutdown(handles, None, None),
+            graceful_shutdown(handles, None, None, None),
         )
         .await
         .expect("graceful_shutdown deadlocked instead of draining");
