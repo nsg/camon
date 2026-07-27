@@ -47,18 +47,25 @@
                 <canvas id="mask-overlay" hidden></canvas>
                 <div id="detail-loading" class="loading"><p>Loading...</p></div>
             </div>
-            <div class="live-scrubber-bar">
-                <span id="live-current-time" class="time-display">0:00</span>
-                <div class="playback-progress-wrapper">
-                    <div class="playback-progress-track">
-                        <div id="live-progress-fill" class="playback-progress-fill"></div>
-                    </div>
-                    <input type="range" id="live-scrubber" class="live-scrubber" min="0" max="1000" value="1000" step="1">
+            <!-- Hot timeline: the scrubber, motion histogram, and object
+                 detection markers merged into one strip. Its span is exactly
+                 the video's seekable range (= the hot buffer, whatever the
+                 server is configured to keep), so every point on it is
+                 genuinely seekable. -->
+            <div class="hot-timeline">
+                <div class="tl-head">
+                    <span id="tl-window-label" class="tl-window-label"></span>
+                    <span id="tl-offset" class="tl-offset"></span>
+                    <button id="live-btn" class="live-badge-btn active" title="Jump to live">
+                        <span class="live-dot"></span> LIVE
+                    </button>
                 </div>
-                <span id="live-duration" class="time-display">0:00</span>
-                <button id="live-btn" class="live-badge-btn active" title="Jump to live">
-                    <span class="live-dot"></span> LIVE
-                </button>
+                <div id="tl-track" class="tl-track">
+                    <canvas id="tl-canvas"></canvas>
+                    <div id="tl-markers"></div>
+                    <div id="tl-playhead" class="tl-playhead"></div>
+                </div>
+                <div id="tl-ticks" class="tl-ticks"></div>
             </div>
             <div class="live-controls">
                 <div class="live-controls-left">
@@ -116,17 +123,12 @@
                     <span class="setting-hint" id="mask-layer-hint">Movement mask: nothing ever moves here (ignored by motion detection).</span>
                 </div>
             </div>
-            <div id="detection-gallery"></div>
-            <div id="hot-events-strip"></div>
-            <button id="events-summary-btn" class="events-summary-btn" hidden>
-                <span id="events-summary-text">No events</span>
-                <svg viewBox="0 0 24 24" fill="currentColor" width="18" height="18">
-                    <path d="M8.59 16.59L13.17 12 8.59 7.41 10 6l6 6-6 6z"/>
-                </svg>
-            </button>
-            <div id="detection-tooltip" hidden>
-                <img id="tooltip-image" alt="Detection frame">
-                <span id="tooltip-label"></span>
+            <!-- Warm history: one 24h map per day that has stored events.
+                 Only navigates (opens the event browser) — the gaps between
+                 events hold no video, so this is deliberately not a scrubber. -->
+            <div id="history-panel" hidden>
+                <div class="history-title">Earlier</div>
+                <div id="history-days"></div>
             </div>
         </div>
 

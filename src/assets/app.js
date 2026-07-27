@@ -15,13 +15,16 @@ document.addEventListener('DOMContentLoaded', async () => {
     const muteToggleBtn = document.getElementById('mute-toggle-btn');
     const maskToggleBtn = document.getElementById('mask-toggle-btn');
     const bgToggleBtn = document.getElementById('bg-toggle-btn');
-    const detectionGallery = document.getElementById('detection-gallery');
-    const hotEventsStrip = document.getElementById('hot-events-strip');
-    const eventsSummaryBtn = document.getElementById('events-summary-btn');
-    const eventsSummaryText = document.getElementById('events-summary-text');
-    const detectionTooltip = document.getElementById('detection-tooltip');
-    const tooltipImage = document.getElementById('tooltip-image');
-    const tooltipLabel = document.getElementById('tooltip-label');
+    const tlTrack = document.getElementById('tl-track');
+    const tlCanvas = document.getElementById('tl-canvas');
+    const tlCtx = tlCanvas.getContext('2d');
+    const tlMarkers = document.getElementById('tl-markers');
+    const tlPlayhead = document.getElementById('tl-playhead');
+    const tlWindowLabel = document.getElementById('tl-window-label');
+    const tlOffset = document.getElementById('tl-offset');
+    const tlTicks = document.getElementById('tl-ticks');
+    const historyPanel = document.getElementById('history-panel');
+    const historyDays = document.getElementById('history-days');
     const stabilityOverlay = document.getElementById('stability-overlay');
     const stabilityCtx = stabilityOverlay.getContext('2d');
     const bgOverlay = document.getElementById('bg-overlay');
@@ -40,10 +43,6 @@ document.addEventListener('DOMContentLoaded', async () => {
     const maskLayerHint = document.getElementById('mask-layer-hint');
     const layerMovementBtn = document.getElementById('layer-movement-btn');
     const layerDetectionBtn = document.getElementById('layer-detection-btn');
-    const liveScrubber = document.getElementById('live-scrubber');
-    const liveProgressFill = document.getElementById('live-progress-fill');
-    const liveCurrentTime = document.getElementById('live-current-time');
-    const liveDuration = document.getElementById('live-duration');
     const liveBtn = document.getElementById('live-btn');
 
     // View 2: Event Browser
@@ -89,14 +88,23 @@ document.addEventListener('DOMContentLoaded', async () => {
     let isFirstLoad = true;
     let currentDetailCameraId = null;
 
-    // Live monitor state
-    let currentDetections = [];
+    // Live monitor state. Timeline items carry absolute unix-seconds
+    // timestamps (`t`, `tStart`, `tEnd`), derived from each fetch's
+    // total_duration: the API's buffer offsets slide as segments evict, but
+    // "seconds before the live edge at fetch time" anchored to the wall clock
+    // does not.
+    let currentDetections = []; // {id, t, object_class, confidence}
+    let motionSegs = [];        // {tStart, tEnd, intensity}
+    let lastDetIds = null;
+    let openMarker = null;
+    let tlPointerId = null;
+    let lastTimelineDraw = 0;
+    let lastTickKey = null;
+    const hoverCapable = window.matchMedia('(hover: hover)').matches;
     let bufferDuration = 0;
     let motionPollInterval = null;
     let detectionPollInterval = null;
     let warmEventPollInterval = null;
-    let hotEventPollInterval = null;
-    let hotEventsFetchedAt = 0;
     let stabilityPollInterval = null;
     let stabilityOverlayEnabled = false;
     let stabilityImage = null;
@@ -125,6 +133,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     // Warm events (shared between views 2 & 3)
     let warmEvents = [];
     let eventFilter = 'all';
+    let eventsScrollDay = null;
 
     // Playback state
     let currentPlaybackPts = null;
@@ -361,33 +370,58 @@ document.addEventListener('DOMContentLoaded', async () => {
     maskOverlay.addEventListener('pointerup', endMaskPaint);
     maskOverlay.addEventListener('pointercancel', endMaskPaint);
 
-    liveScrubber.addEventListener('input', () => {
+    // Timeline scrubbing: drag anywhere on the track. Marker taps never reach
+    // here (the early return), so seeking and marker cards don't fight.
+    tlTrack.addEventListener('pointerdown', (e) => {
+        if (e.target.closest('.tl-marker')) return;
+        closeMarkerCard();
+        tlPointerId = e.pointerId;
         isLiveScrubbing = true;
-        const seekable = detailVideo.seekable;
-        if (seekable.length > 0) {
-            const start = seekable.start(0);
-            const end = seekable.end(seekable.length - 1);
-            const range = end - start;
-            const progress = liveScrubber.value / 1000;
-            liveProgressFill.style.width = (progress * 100) + '%';
-            const time = start + progress * range;
-            liveCurrentTime.textContent = '-' + formatTimeShort(end - time);
+        tlTrack.setPointerCapture(e.pointerId);
+        scrubPreview(e);
+        e.preventDefault();
+    });
+    tlTrack.addEventListener('pointermove', (e) => {
+        if (tlPointerId !== e.pointerId || !isLiveScrubbing) return;
+        scrubPreview(e);
+    });
+    tlTrack.addEventListener('pointerup', (e) => {
+        if (tlPointerId !== e.pointerId || !isLiveScrubbing) return;
+        tlPointerId = null;
+        isLiveScrubbing = false;
+        const frac = trackFraction(e);
+        const r = timelineRange();
+        if (r) {
+            detailVideo.currentTime = r.start + frac * r.range;
+            setLiveEdge(frac > 0.98);
+        }
+    });
+    tlTrack.addEventListener('pointercancel', (e) => {
+        if (tlPointerId === e.pointerId) {
+            tlPointerId = null;
+            isLiveScrubbing = false;
         }
     });
 
-    liveScrubber.addEventListener('change', () => {
-        const seekable = detailVideo.seekable;
-        if (seekable.length > 0) {
-            const start = seekable.start(0);
-            const end = seekable.end(seekable.length - 1);
-            const range = end - start;
-            const progress = liveScrubber.value / 1000;
-            detailVideo.currentTime = start + progress * range;
+    function trackFraction(e) {
+        const rect = tlTrack.getBoundingClientRect();
+        if (rect.width === 0) return 1;
+        return Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+    }
 
-            const atEdge = progress > 0.98;
-            setLiveEdge(atEdge);
+    function scrubPreview(e) {
+        const frac = trackFraction(e);
+        tlPlayhead.style.left = (frac * 100) + '%';
+        const r = timelineRange();
+        if (r) {
+            const behind = (1 - frac) * r.range;
+            tlOffset.textContent = behind < 3 ? '' : '-' + formatTimeShort(behind);
         }
-        isLiveScrubbing = false;
+    }
+
+    // Tapping outside an open marker card dismisses it (mobile two-step tap).
+    document.addEventListener('click', (e) => {
+        if (openMarker && !e.target.closest('.tl-marker')) closeMarkerCard();
     });
 
     liveBtn.addEventListener('click', () => {
@@ -404,12 +438,6 @@ document.addEventListener('DOMContentLoaded', async () => {
         isAtLiveEdge = atEdge;
         liveBtn.classList.toggle('active', atEdge);
     }
-
-    eventsSummaryBtn.addEventListener('click', () => {
-        if (currentDetailCameraId) {
-            window.location.hash = `/camera/${encodeURIComponent(currentDetailCameraId)}/events`;
-        }
-    });
 
     // View 2: Event Browser
     eventsBackBtn.addEventListener('click', () => {
@@ -533,10 +561,9 @@ document.addEventListener('DOMContentLoaded', async () => {
 
             loadDetailCamera(cameraId);
             fetchWarmEvents(cameraId);
-            fetchHotEvents(cameraId);
         } else {
             // Returning from events/playback — just show the view
-            updateEventsSummary();
+            renderHistoryPanel();
         }
     }
 
@@ -599,13 +626,12 @@ document.addEventListener('DOMContentLoaded', async () => {
         if (motionPollInterval) { clearInterval(motionPollInterval); motionPollInterval = null; }
         if (detectionPollInterval) { clearInterval(detectionPollInterval); detectionPollInterval = null; }
         if (warmEventPollInterval) { clearInterval(warmEventPollInterval); warmEventPollInterval = null; }
-        if (hotEventPollInterval) { clearInterval(hotEventPollInterval); hotEventPollInterval = null; }
         if (stabilityPollInterval) { clearInterval(stabilityPollInterval); stabilityPollInterval = null; }
         if (detailHls) { detailHls.destroy(); detailHls = null; }
         detailVideo.src = '';
         currentDetections = [];
-        hotEventsStrip.innerHTML = '';
-        hotEventsFetchedAt = 0;
+        motionSegs = [];
+        lastDetIds = null;
         currentDetailCameraId = null;
         bufferDuration = 0;
         warmEvents = [];
@@ -635,15 +661,18 @@ document.addEventListener('DOMContentLoaded', async () => {
         settingsBtn.classList.remove('active');
 
         isLiveScrubbing = false;
+        tlPointerId = null;
         setLiveEdge(true);
-        liveScrubber.value = 1000;
-        liveProgressFill.style.width = '100%';
-        liveCurrentTime.textContent = 'LIVE';
-        liveDuration.textContent = '0:00';
-
-        hideTooltip();
-        detectionGallery.innerHTML = '';
-        eventsSummaryBtn.hidden = true;
+        closeMarkerCard();
+        tlMarkers.innerHTML = '';
+        tlCtx.clearRect(0, 0, tlCanvas.width, tlCanvas.height);
+        tlPlayhead.style.left = '100%';
+        tlOffset.textContent = '';
+        tlWindowLabel.textContent = '';
+        tlTicks.innerHTML = '';
+        lastTickKey = null;
+        historyPanel.hidden = true;
+        historyDays.innerHTML = '';
     }
 
     function cleanupPlaybackView() {
@@ -804,37 +833,126 @@ document.addEventListener('DOMContentLoaded', async () => {
             drawBackground();
             drawStability();
             drawMask();
-            updateLiveScrubber();
+            updateTimeline();
             overlayAnimationId = requestAnimationFrame(update);
         }
         update();
     }
 
-    function updateLiveScrubber() {
-        if (isLiveScrubbing) return;
-        const seekable = detailVideo.seekable;
-        if (seekable.length === 0) return;
+    // === Live Monitor: Hot Timeline ===
 
+    function timelineRange() {
+        const seekable = detailVideo.seekable;
+        if (seekable.length === 0) return null;
         const start = seekable.start(0);
         const end = seekable.end(seekable.length - 1);
-        const range = end - start;
-        if (range <= 0) return;
+        if (end - start <= 0) return null;
+        // hls.js retains client-side back-buffer beyond the server's playlist
+        // window, so `seekable` can outgrow the hot buffer. The timeline
+        // covers only the server window (right-aligned at live); anything
+        // older has no motion/detection data to show.
+        let range = end - start;
+        if (bufferDuration > 0 && bufferDuration < range) range = bufferDuration;
+        return { start: end - range, end, range };
+    }
 
-        const current = detailVideo.currentTime;
-        const progress = Math.max(0, Math.min(1, (current - start) / range));
-        const timeToLive = end - current;
+    // Track fraction for an absolute unix-seconds timestamp: 1 = live edge,
+    // 0 = the oldest scrubbable moment. Drifts left as time passes.
+    function timeToFrac(t, r, nowS) {
+        return 1 - (nowS - t) / r.range;
+    }
 
-        liveScrubber.value = Math.round(progress * 1000);
-        liveProgressFill.style.width = (progress * 100) + '%';
-        liveDuration.textContent = formatTimeShort(range);
+    function updateTimeline() {
+        const r = timelineRange();
+        if (!r) return;
 
-        if (timeToLive < 3) {
-            liveCurrentTime.textContent = 'LIVE';
-            if (!isAtLiveEdge) setLiveEdge(true);
-        } else {
-            liveCurrentTime.textContent = '-' + formatTimeShort(timeToLive);
-            if (isAtLiveEdge) setLiveEdge(false);
+        tlWindowLabel.textContent = 'Buffer · ' + formatTimeShort(r.range);
+
+        if (!isLiveScrubbing) {
+            const current = detailVideo.currentTime;
+            const frac = Math.max(0, Math.min(1, (current - r.start) / r.range));
+            tlPlayhead.style.left = (frac * 100) + '%';
+            const timeToLive = r.end - current;
+            if (isAtLiveEdge) {
+                tlOffset.textContent = '';
+                if (timeToLive > 10) {
+                    // Only explicit seeks leave live mode; this gap is drift
+                    // from a buffer stall (or a background stay) — snap back.
+                    detailVideo.currentTime = r.end - 0.5;
+                }
+            } else if (timeToLive < 3) {
+                tlOffset.textContent = '';
+                setLiveEdge(true);
+            } else {
+                tlOffset.textContent = '-' + formatTimeShort(timeToLive);
+            }
         }
+
+        // The histogram and marker positions only shift perceptibly by the
+        // second; no need to repaint every frame.
+        const nowS = Date.now() / 1000;
+        if (nowS - lastTimelineDraw >= 1) {
+            lastTimelineDraw = nowS;
+            drawTimelineBars(r, nowS);
+            positionMarkers(r, nowS);
+            renderTicks(r);
+        }
+    }
+
+    function drawTimelineBars(r, nowS) {
+        const w = tlTrack.clientWidth;
+        const h = tlTrack.clientHeight;
+        if (w === 0 || h === 0) return;
+        const dpr = window.devicePixelRatio || 1;
+        if (tlCanvas.width !== Math.round(w * dpr) || tlCanvas.height !== Math.round(h * dpr)) {
+            tlCanvas.width = Math.round(w * dpr);
+            tlCanvas.height = Math.round(h * dpr);
+        }
+        tlCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        tlCtx.clearRect(0, 0, w, h);
+        if (motionSegs.length === 0) return;
+
+        // motion_score has no fixed scale; normalize against the strongest
+        // segment currently in view so the histogram always uses full height.
+        let maxScore = 0;
+        motionSegs.forEach(s => { maxScore = Math.max(maxScore, s.intensity); });
+        if (maxScore <= 0) maxScore = 1;
+
+        tlCtx.fillStyle = '#d8d78f';
+        motionSegs.forEach(s => {
+            const f0 = timeToFrac(s.tStart, r, nowS);
+            const f1 = timeToFrac(s.tEnd, r, nowS);
+            if (f1 <= 0 || f0 >= 1) return;
+            const x0 = Math.max(0, f0) * w;
+            const x1 = Math.min(1, f1) * w;
+            const norm = Math.min(1, s.intensity / maxScore);
+            const barH = Math.max(3, (0.15 + 0.85 * norm) * (h - 4));
+            tlCtx.globalAlpha = 0.45 + 0.55 * norm;
+            tlCtx.fillRect(x0, h - barH, Math.max(2, x1 - x0 - 1), barH);
+        });
+        tlCtx.globalAlpha = 1;
+    }
+
+    function renderTicks(r) {
+        // Re-render only when the window length changes noticeably.
+        const key = Math.round(r.range / 10);
+        if (key === lastTickKey) return;
+        lastTickKey = key;
+        const parts = [];
+        for (let i = 0; i <= 4; i++) {
+            const behind = r.range * (1 - i / 4);
+            parts.push(`<span>${behind < 3 ? 'now' : '-' + formatTimeShort(behind)}</span>`);
+        }
+        tlTicks.innerHTML = parts.join('');
+    }
+
+    function seekToTime(t) {
+        const seekable = detailVideo.seekable;
+        if (seekable.length === 0) return;
+        const end = seekable.end(seekable.length - 1);
+        const behind = Date.now() / 1000 - t;
+        detailVideo.currentTime = Math.max(seekable.start(0), end - behind);
+        setLiveEdge(false);
     }
 
     function fetchStabilityMap() {
@@ -1076,11 +1194,21 @@ document.addEventListener('DOMContentLoaded', async () => {
         async function poll() {
             try {
                 const response = await fetch(`api/cameras/${encodeURIComponent(cameraId)}/motion`);
+                if (currentDetailCameraId !== cameraId) return;
                 if (response.ok) {
                     const data = await response.json();
                     if (data.total_duration > 0) {
                         bufferDuration = data.total_duration;
                     }
+                    // Segment offsets are relative to the (sliding) buffer
+                    // start; anchor them to the wall clock via the live edge.
+                    const nowS = Date.now() / 1000;
+                    motionSegs = (data.segments || []).map(s => ({
+                        tStart: nowS - (data.total_duration - s.start),
+                        tEnd: nowS - (data.total_duration - s.end),
+                        intensity: s.intensity,
+                    }));
+                    lastTimelineDraw = 0;
                 }
             } catch (err) {
                 console.error('Failed to fetch motion data:', err);
@@ -1103,13 +1231,25 @@ document.addEventListener('DOMContentLoaded', async () => {
         async function poll() {
             try {
                 const response = await fetch(`api/cameras/${encodeURIComponent(cameraId)}/detections`);
+                if (currentDetailCameraId !== cameraId) return;
                 if (response.ok) {
                     const data = await response.json();
-                    currentDetections = data.detections || [];
                     if (data.total_duration > 0) {
                         bufferDuration = data.total_duration;
                     }
-                    renderDetectionGallery();
+                    const nowS = Date.now() / 1000;
+                    currentDetections = (data.detections || []).map(d => ({
+                        id: d.id,
+                        t: nowS - (data.total_duration - d.timestamp),
+                        object_class: d.object_class,
+                        confidence: d.confidence,
+                    }));
+                    const ids = currentDetections.map(d => d.id).join(',');
+                    // Rebuilding closes any open card, so skip when nothing
+                    // changed or while the user is reading one.
+                    if (ids !== lastDetIds && !openMarker) {
+                        rebuildMarkers();
+                    }
                 }
             } catch (err) {
                 console.error('Failed to fetch detection data:', err);
@@ -1133,7 +1273,7 @@ document.addEventListener('DOMContentLoaded', async () => {
                         ...ev,
                         start_ms: Number(BigInt(ev.start_pts_ns) / 1_000_000n),
                     }));
-                    updateEventsSummary();
+                    renderHistoryPanel();
                     // Re-render event list if visible
                     if (!eventsView.hidden) renderEventList();
                     // Update nav if in playback
@@ -1148,71 +1288,113 @@ document.addEventListener('DOMContentLoaded', async () => {
         warmEventPollInterval = setInterval(poll, 15000);
     }
 
-    // === Live Monitor: Detection Gallery ===
+    // === Live Monitor: Detection Markers ===
 
-    function renderDetectionGallery() {
-        detectionGallery.innerHTML = '';
-        currentDetections.forEach(det => {
-            const card = document.createElement('div');
-            card.className = 'detection-card';
-            const imgSrc = `api/cameras/${encodeURIComponent(currentDetailCameraId)}/detections/${det.id}/frame`;
-            card.innerHTML = `
-                <img src="${imgSrc}" loading="lazy" alt="${det.object_class}">
-                <div class="det-label">${det.object_class} (${Math.round(det.confidence * 100)}%)</div>
-                <div class="det-time">${formatTime(det.timestamp)}</div>
-            `;
-            card.addEventListener('click', () => {
-                detailVideo.currentTime = det.timestamp;
-            });
-            detectionGallery.appendChild(card);
-        });
-    }
+    // Detections closer than this fraction of the track collapse into one
+    // marker with a count badge.
+    const CLUSTER_FRAC = 0.03;
 
-    // === Live Monitor: Hot Events Strip ===
+    function rebuildMarkers() {
+        const r = timelineRange();
+        if (!r) return;
+        lastDetIds = currentDetections.map(d => d.id).join(',');
+        closeMarkerCard();
+        tlMarkers.innerHTML = '';
+        const nowS = Date.now() / 1000;
 
-    async function fetchHotEvents(cameraId) {
-        if (hotEventPollInterval) clearInterval(hotEventPollInterval);
-
-        async function poll() {
-            try {
-                const response = await fetch(`api/cameras/${encodeURIComponent(cameraId)}/hot-events`);
-                if (currentDetailCameraId !== cameraId) return;
-                if (response.ok) {
-                    const events = await response.json();
-                    hotEventsFetchedAt = Date.now() / 1000;
-                    renderHotEvents(events);
-                }
-            } catch (err) {
-                console.error('Failed to fetch hot events:', err);
+        // Newest first, so a cluster's dot and top card row show the latest
+        // sighting at that spot.
+        const sorted = [...currentDetections].sort((a, b) => b.t - a.t);
+        const clusters = [];
+        sorted.forEach(det => {
+            const frac = timeToFrac(det.t, r, nowS);
+            const near = clusters.find(c => Math.abs(c.frac - frac) < CLUSTER_FRAC);
+            if (near) {
+                near.dets.push(det);
+            } else {
+                clusters.push({ frac, dets: [det] });
             }
-        }
+        });
 
-        await poll();
-        hotEventPollInterval = setInterval(poll, 5000);
-    }
+        clusters.forEach(cluster => {
+            const marker = document.createElement('div');
+            marker.className = 'tl-marker';
+            marker._cluster = cluster;
 
-    function renderHotEvents(events) {
-        hotEventsStrip.innerHTML = '';
-        if (events.length === 0) return;
+            const rows = cluster.dets.slice(0, 3).map(det => {
+                const conf = Math.round(det.confidence * 100);
+                const src = `api/cameras/${encodeURIComponent(currentDetailCameraId)}/detections/${det.id}/frame`;
+                return `<div class="tl-card-row" data-t="${det.t}">
+                    <img src="${src}" loading="lazy" alt="${det.object_class}">
+                    <div class="tl-card-text">
+                        <span class="tl-card-class">${det.object_class}</span>
+                        <span class="tl-card-conf">${conf}%</span>
+                        <span class="tl-card-ago"></span>
+                    </div>
+                </div>`;
+            }).join('');
+            const more = cluster.dets.length > 3
+                ? `<div class="tl-card-more">+${cluster.dets.length - 3} more</div>`
+                : '';
 
-        events.forEach(ev => {
-            const card = document.createElement('div');
-            card.className = 'hot-event-card';
-
-            const agoText = formatAgo(ev.ago_secs);
-            const durText = formatDurationShort(ev.duration_secs);
-
-            card.innerHTML = `
-                <span class="hot-event-ago">${agoText}</span>
-                <span class="hot-event-dur">${durText}</span>
+            marker.innerHTML = `
+                <div class="tl-card">${rows}${more}</div>
+                <div class="tl-dot">${cluster.dets.length > 1 ? cluster.dets.length : ''}</div>
             `;
 
-            card.addEventListener('click', () => {
-                seekLiveByAgo(ev.ago_secs);
+            marker.querySelectorAll('.tl-card-row').forEach(row => {
+                row.addEventListener('click', (e) => {
+                    e.stopPropagation();
+                    seekToTime(Number(row.dataset.t));
+                    closeMarkerCard();
+                });
             });
 
-            hotEventsStrip.appendChild(card);
+            // Desktop (hover shows the card): click seeks. Touch: first tap
+            // opens the card, tapping the dot again seeks.
+            marker.querySelector('.tl-dot').addEventListener('click', (e) => {
+                e.stopPropagation();
+                if (hoverCapable || openMarker === marker) {
+                    seekToTime(cluster.dets[0].t);
+                    closeMarkerCard();
+                } else {
+                    closeMarkerCard();
+                    openMarker = marker;
+                    marker.classList.add('open');
+                }
+            });
+
+            tlMarkers.appendChild(marker);
         });
+
+        positionMarkers(r, nowS);
+    }
+
+    function positionMarkers(r, nowS) {
+        tlMarkers.querySelectorAll('.tl-marker').forEach(marker => {
+            const cluster = marker._cluster;
+            const frac = timeToFrac(cluster.dets[0].t, r, nowS);
+            if (frac < 0) {
+                // Slid out of the buffer.
+                if (openMarker === marker) closeMarkerCard();
+                marker.remove();
+                return;
+            }
+            marker.style.left = (Math.min(1, frac) * 100) + '%';
+            marker.classList.toggle('edge-l', frac < 0.12);
+            marker.classList.toggle('edge-r', frac > 0.88);
+            marker.querySelectorAll('.tl-card-ago').forEach((el, i) => {
+                const det = cluster.dets[i];
+                if (det) el.textContent = formatAgo(nowS - det.t);
+            });
+        });
+    }
+
+    function closeMarkerCard() {
+        if (openMarker) {
+            openMarker.classList.remove('open');
+            openMarker = null;
+        }
     }
 
     function formatAgo(secs) {
@@ -1221,57 +1403,66 @@ document.addEventListener('DOMContentLoaded', async () => {
         return `${Math.round(secs / 3600)}h ago`;
     }
 
-    function formatDurationShort(secs) {
-        if (secs < 1) return '<1s';
-        if (secs < 60) return `${Math.round(secs)}s`;
-        const m = Math.floor(secs / 60);
-        const s = Math.round(secs % 60);
-        return s > 0 ? `${m}m ${s}s` : `${m}m`;
-    }
+    // === Live Monitor: Warm History Day Maps ===
 
-    function seekLiveByAgo(agoAtFetch) {
-        const seekable = detailVideo.seekable;
-        if (seekable.length === 0) return;
-        const end = seekable.end(seekable.length - 1);
-        const elapsed = Date.now() / 1000 - hotEventsFetchedAt;
-        detailVideo.currentTime = end - (agoAtFetch + elapsed);
-        setLiveEdge(false);
-    }
-
-    function updateEventsSummary() {
+    function renderHistoryPanel() {
         if (warmEvents.length === 0) {
-            eventsSummaryBtn.hidden = true;
+            historyPanel.hidden = true;
             return;
         }
+        historyPanel.hidden = false;
 
-        eventsSummaryBtn.hidden = false;
+        // One row per local calendar day that has events, newest day first.
+        // Days shown follow the data, so server retention config (which can
+        // differ per event type) needs no mirroring here.
+        const groups = new Map();
+        const sorted = [...warmEvents].sort((a, b) => b.start_ms - a.start_ms);
+        sorted.forEach(ev => {
+            const d = new Date(ev.start_ms);
+            const key = `${d.getFullYear()}-${d.getMonth()}-${d.getDate()}`;
+            if (!groups.has(key)) groups.set(key, { label: formatDateLabel(d), events: [] });
+            groups.get(key).events.push(ev);
+        });
 
-        const now = Date.now();
-        const oneHourAgo = now - 3600_000;
-        const todayStart = new Date();
-        todayStart.setHours(0, 0, 0, 0);
+        const now = new Date();
+        const todayFrac = (now.getHours() * 3600 + now.getMinutes() * 60 + now.getSeconds()) / 86400;
 
-        const todayCount = warmEvents.filter(e => e.start_ms >= todayStart.getTime()).length;
-        const recentCount = warmEvents.filter(e => e.start_ms >= oneHourAgo).length;
+        historyDays.innerHTML = '';
+        groups.forEach(group => {
+            const objects = group.events.filter(e => e.event_type === 'object').length;
+            const row = document.createElement('div');
+            row.className = 'history-day';
 
-        const parts = [];
-        parts.push(`${todayCount} event${todayCount !== 1 ? 's' : ''} today`);
-        if (recentCount > 0) {
-            parts.push(`${recentCount} in last hour`);
-        }
-        eventsSummaryText.textContent = parts.join('  \u00b7  ');
-    }
+            const ticks = group.events.map(ev => {
+                const d = new Date(ev.start_ms);
+                const frac = (d.getHours() * 3600 + d.getMinutes() * 60 + d.getSeconds()) / 86400;
+                const cls = ev.event_type === 'object' ? ' obj' : '';
+                return `<span class="history-tick${cls}" style="left:${(frac * 100).toFixed(2)}%"></span>`;
+            }).join('');
+            const future = group.label === 'Today'
+                ? `<span class="history-future" style="left:${(todayFrac * 100).toFixed(2)}%"></span>`
+                : '';
 
-    function showTooltip(x, y, detection) {
-        tooltipImage.src = `api/cameras/${encodeURIComponent(currentDetailCameraId)}/detections/${detection.id}/frame`;
-        tooltipLabel.textContent = `${detection.object_class} (${Math.round(detection.confidence * 100)}%)`;
-        detectionTooltip.style.left = `${x + 10}px`;
-        detectionTooltip.style.top = `${y - 170}px`;
-        detectionTooltip.hidden = false;
-    }
+            let counts = `${group.events.length} event${group.events.length !== 1 ? 's' : ''}`;
+            if (objects > 0) {
+                counts += ` \u00b7 ${objects} object${objects !== 1 ? 's' : ''}`;
+            }
 
-    function hideTooltip() {
-        detectionTooltip.hidden = true;
+            row.innerHTML = `
+                <div class="history-day-head">
+                    <span class="history-day-label">${group.label}</span>
+                    <span class="history-day-count">${counts}
+                        <svg viewBox="0 0 24 24" fill="currentColor"><path d="M8.59 16.59L13.17 12 8.59 7.41 10 6l6 6-6 6z"/></svg>
+                    </span>
+                </div>
+                <div class="history-map">${ticks}${future}</div>
+            `;
+            row.addEventListener('click', () => {
+                eventsScrollDay = group.label;
+                window.location.hash = `/camera/${encodeURIComponent(currentDetailCameraId)}/events`;
+            });
+            historyDays.appendChild(row);
+        });
     }
 
     // === View 2: Event List Rendering ===
@@ -1316,6 +1507,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         groups.forEach((events, label) => {
             const groupEl = document.createElement('div');
             groupEl.className = 'event-day-group';
+            groupEl.dataset.day = label;
 
             const dayLabel = document.createElement('div');
             dayLabel.className = 'event-day-label';
@@ -1380,6 +1572,13 @@ document.addEventListener('DOMContentLoaded', async () => {
 
             eventList.appendChild(groupEl);
         });
+
+        // Arriving from a history day row: jump to that day's section.
+        if (eventsScrollDay) {
+            const target = eventList.querySelector(`.event-day-group[data-day="${CSS.escape(eventsScrollDay)}"]`);
+            eventsScrollDay = null;
+            if (target) target.scrollIntoView({ block: 'start', behavior: 'smooth' });
+        }
     }
 
     // === View 3: Playback Controls ===
