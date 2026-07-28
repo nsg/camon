@@ -1,21 +1,24 @@
 //! Storage-backend abstraction over warm event storage.
 //!
-//! The warm writer and the playback API do not touch the filesystem directly;
-//! they go through a [`WarmStorageBackend`]. Today the only implementation is
-//! [`LocalDiskBackend`], which owns the on-disk layout, the atomic write ladder,
-//! crash recovery, retention, and lazy ffmpeg thumbnailing that used to live in
-//! `buffer/warm.rs` and `api/server.rs`.
+//! The warm writer and the playback API do not touch storage directly; they go
+//! through a [`WarmStorageBackend`]. [`LocalDiskBackend`] lives here and owns
+//! the on-disk layout, the atomic write ladder, crash recovery and lazy ffmpeg
+//! thumbnailing that used to live in `buffer/warm.rs` and `api/server.rs`;
+//! [`StathostBackend`](crate::storage::StathostBackend) is the remote one. What
+//! they have in common — the in-RAM index and the retention skeletons over it —
+//! is in [`event_index`](crate::storage::event_index), so a backend here is
+//! object I/O and the policy that goes with it, nothing more.
 //!
-//! The trait is shaped so a remote HTTP backend can slot in later without
-//! changing a single caller:
+//! The trait is shaped so the two can differ where they must, without a caller
+//! ever knowing which one it has:
 //!
 //! * an upgrade is expressed as an *intent* ([`upgrade_event`](WarmStorageBackend::upgrade_event))
-//!   rather than "rename these paths" — LocalDisk moves files, a remote backend
-//!   would rewrite a sidecar in place (it has no rename);
+//!   rather than "rename these paths" — LocalDisk moves files, the remote
+//!   backend rewrites a sidecar in place (it has no rename);
 //! * thumbnails are *acquired through the backend*
 //!   ([`read_thumbnail`](WarmStorageBackend::read_thumbnail)) — LocalDisk keeps
-//!   today's lazy ffmpeg generation + on-disk caching, a remote backend fetches
-//!   a pre-rendered image;
+//!   today's lazy ffmpeg generation + on-disk caching, the remote backend
+//!   fetches a pre-rendered image;
 //! * video is returned as a *stream*
 //!   ([`read_video`](WarmStorageBackend::read_video)) — callers never see a
 //!   `PathBuf` or a fully-buffered `Vec<u8>`; the body is an async byte stream
@@ -31,9 +34,8 @@ use futures_core::Stream;
 use tokio_util::io::ReaderStream;
 
 use crate::buffer::warm::{EventUpgrade, FinishedEvent};
-use crate::storage::warm_index::{
-    free_space_bytes, should_emergency_prune, DetectionDetail, EmergencyOutcome,
-};
+use crate::storage::event_index::EmergencyOutcome;
+use crate::storage::warm_index::{free_space_bytes, should_emergency_prune, sidecar_json};
 use crate::storage::{EventType, StorageAnchor, WarmEventEntry, WarmEventIndex};
 
 const NANOS_PER_MS: u64 = 1_000_000;
@@ -158,9 +160,10 @@ fn resolve_range(req: RangeRequest, total: u64) -> Option<(u64, u64)> {
 
 /// Everything the warm writer and the playback API need from storage.
 ///
-/// The in-RAM index ([`WarmEventIndex`]) that answers `query`/`find_event` and
-/// backs `prune`/`emergency_prune` is an implementation detail of the concrete
-/// backend, not part of this contract.
+/// The in-RAM index that answers `query`/`find_event` and backs
+/// `prune`/`emergency_prune` is not part of this contract: both backends own an
+/// [`EventIndex`](crate::storage::event_index::EventIndex) and neither exposes
+/// it.
 #[async_trait]
 pub trait WarmStorageBackend: Send + Sync {
     // ---- writer path ----
@@ -548,55 +551,16 @@ impl WarmStorageBackend for LocalDiskBackend {
 // exercise them exactly as before.
 // ---------------------------------------------------------------------------
 
+/// Local sidecars carry no `event_type`: the directory an event lives in is
+/// what says what it is, and the scan reads it from there.
 fn build_sidecar_json(event: &FinishedEvent) -> String {
     sidecar_json(
+        None,
         event.backend.as_deref(),
         event.model.as_deref(),
         &event.detection_details,
         event.continues,
     )
-}
-
-/// Sidecar JSON shared by fresh writes and post-hoc upgrades.
-fn sidecar_json(
-    backend: Option<&str>,
-    model: Option<&str>,
-    detection_details: &[DetectionDetail],
-    continues: bool,
-) -> String {
-    let mut meta = serde_json::Map::new();
-    if let Some(backend) = backend {
-        meta.insert("backend".to_string(), serde_json::json!(backend));
-    }
-    if let Some(model) = model {
-        meta.insert("model".to_string(), serde_json::json!(model));
-    }
-
-    let deduped = deduplicate_detections(detection_details);
-    let detections: Vec<serde_json::Value> = deduped
-        .iter()
-        .map(|(class, confidence)| serde_json::json!({"class": class, "confidence": confidence}))
-        .collect();
-    meta.insert("detections".to_string(), serde_json::json!(detections));
-
-    // Only follow-on chunks carry `continues`; omit it otherwise so ordinary
-    // sidecars stay unchanged.
-    if continues {
-        meta.insert("continues".to_string(), serde_json::json!(true));
-    }
-
-    serde_json::to_string(&meta).unwrap()
-}
-
-pub(crate) fn deduplicate_detections(details: &[DetectionDetail]) -> Vec<(String, f32)> {
-    let mut best: std::collections::HashMap<String, f32> = std::collections::HashMap::new();
-    for d in details {
-        let entry = best.entry(d.class.clone()).or_insert(0.0);
-        if d.confidence > *entry {
-            *entry = d.confidence;
-        }
-    }
-    best.into_iter().collect()
 }
 
 fn is_no_space(e: &std::io::Error) -> bool {
@@ -850,6 +814,7 @@ async fn upgrade_event(
 
     // Step 1: the new sidecar, under its final name in objects/.
     let sidecar = sidecar_json(
+        None,
         Some(&upgrade.backend),
         Some(&upgrade.model),
         &upgrade.detections,
@@ -886,13 +851,18 @@ async fn upgrade_event(
     }
 
     if let Some(index) = warm_index {
-        let updated = index.update_event(camera_id, upgrade.start_pts_ns, |entry| {
-            entry.event_type = EventType::Object;
-            entry.object_classes = upgrade.object_classes.clone();
-            entry.detections = upgrade.detections.clone();
-            entry.backend = Some(upgrade.backend.clone());
-            entry.model = Some(upgrade.model.clone());
-        });
+        let updated = index.update_event(
+            camera_id,
+            upgrade.start_pts_ns,
+            upgrade.duration_ms,
+            |entry| {
+                entry.event_type = EventType::Object;
+                entry.object_classes = upgrade.object_classes.clone();
+                entry.detections = upgrade.detections.clone();
+                entry.backend = Some(upgrade.backend.clone());
+                entry.model = Some(upgrade.model.clone());
+            },
+        );
         if !updated {
             // A retention sweep that snapshotted this event as a movement,
             // then found `movements/{stem}.ts` already renamed away, drops the
@@ -1006,6 +976,7 @@ mod tests {
     use crate::buffer::warm::{assemble_continuous_chunk, assemble_event};
     use crate::buffer::{GopSegment, HotBuffer};
     use crate::locks::LockExt;
+    use crate::storage::event_index::DetectionDetail;
 
     const SEC: u64 = 1_000_000_000;
 
@@ -1311,6 +1282,142 @@ mod tests {
         assert_eq!(
             index.resolve_file_path("cam", &entry),
             objects.join(format!("{stem}.ts"))
+        );
+    }
+
+    /// One camera's events, newest information first — the only way to reach a
+    /// particular member of a run of equal start PTS, which `find_event` cannot
+    /// tell apart.
+    fn sibling(index: &WarmEventIndex, duration_ms: u32) -> Option<WarmEventEntry> {
+        index
+            .query("cam", 0, u64::MAX)
+            .into_iter()
+            .find(|e| e.duration_ms == duration_ms)
+    }
+
+    /// Two events sharing a start PTS are two events. The upgrade rewrites the
+    /// one it named — not whichever of the pair a binary search on the start
+    /// returns — and the sweep afterwards deletes the one *it* names. The
+    /// remote backend has had this test; the local index reached in by start
+    /// alone, so an upgrade could flip a sibling to `Object` while the event
+    /// actually upgraded stayed a movement pointing at a path the rename had
+    /// moved away from.
+    #[tokio::test]
+    async fn siblings_sharing_a_start_pts_are_upgraded_and_pruned_by_full_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let buffer = populated_buffer(10);
+        // Same first segment, so the same start PTS; different lengths, so two
+        // distinct files and two distinct keys.
+        let (short, long) = {
+            let buf = buffer.read_recover();
+            (
+                assemble_event(&buf, None, "cam", 5, 5, 0, 0, false, None).unwrap(),
+                assemble_event(&buf, None, "cam", 5, 7, 0, 0, false, None).unwrap(),
+            )
+        };
+        let first_pts = long.first_pts;
+        assert_eq!(short.first_pts, first_pts);
+        let (short_ms, long_ms) = (short.duration_ms() as u32, long.duration_ms() as u32);
+        assert_ne!(short_ms, long_ms);
+
+        let index = WarmEventIndex::new(&["cam".to_string()], dir.path().to_path_buf());
+        write_event(dir.path(), "cam", &short, Some(&index)).await;
+        write_event(dir.path(), "cam", &long, Some(&index)).await;
+        assert_eq!(index.query("cam", 0, u64::MAX).len(), 2);
+
+        // Upgrade the sibling `find_event` does *not* return. Which member of a
+        // run of equal starts a binary search lands on is unspecified — so
+        // picking the other one is what makes this test about the code and not
+        // about std: the start-only lookup this replaced finds what `find_event`
+        // finds, and therefore reclassifies the wrong sibling every run, on
+        // every std implementation.
+        let found = index
+            .find_event("cam", first_pts)
+            .expect("both siblings are indexed under this start");
+        let (target, spared) = if found.duration_ms == long_ms {
+            (&short, &long)
+        } else {
+            (&long, &short)
+        };
+        let (target_ms, spared_ms) = (target.duration_ms() as u32, spared.duration_ms() as u32);
+        upgrade_event(dir.path(), "cam", &upgrade_for(target), Some(&index)).await;
+
+        let movements = dir.path().join("cam").join("movements");
+        let objects = dir.path().join("cam").join("objects");
+        let upgraded = sibling(&index, target_ms).expect("the upgraded event left the index");
+        assert_eq!(upgraded.event_type, EventType::Object);
+        assert_eq!(upgraded.object_classes, vec!["person".to_string()]);
+        assert_eq!(
+            index.resolve_file_path("cam", &upgraded),
+            objects.join(format!("{first_pts}_{target_ms}.ts"))
+        );
+
+        let untouched = sibling(&index, spared_ms).expect("the sibling left the index");
+        assert_eq!(
+            untouched.event_type,
+            EventType::Movement,
+            "the upgrade reclassified its sibling"
+        );
+        assert!(untouched.object_classes.is_empty());
+        assert!(untouched.backend.is_none());
+        assert_eq!(
+            index.resolve_file_path("cam", &untouched),
+            movements.join(format!("{first_pts}_{spared_ms}.ts"))
+        );
+        assert!(movements
+            .join(format!("{first_pts}_{spared_ms}.ts"))
+            .exists());
+        assert!(!movements
+            .join(format!("{first_pts}_{target_ms}.ts"))
+            .exists());
+
+        // The movement sibling expires; the object one does not.
+        index.prune(1, u64::MAX, u64::MAX, || false).await;
+        assert!(sibling(&index, spared_ms).is_none());
+        assert!(sibling(&index, target_ms).is_some());
+        assert!(!movements
+            .join(format!("{first_pts}_{spared_ms}.ts"))
+            .exists());
+        assert!(objects.join(format!("{first_pts}_{target_ms}.ts")).exists());
+    }
+
+    /// Local sidecars carry no `event_type`: the directory an event lives in is
+    /// what says what it is, and a second answer in the JSON could only drift
+    /// from it. Both local writers pass `None` — the fresh write and the
+    /// upgrade — and every other assertion here parses the sidecar for the
+    /// fields it wants, so a `Some` slipping into either would go unseen.
+    #[tokio::test]
+    async fn local_sidecars_name_no_event_type() {
+        let dir = tempfile::tempdir().unwrap();
+        let buffer = populated_buffer(10);
+        // A continuing movement, so the fresh write produces a sidecar at all.
+        let event = {
+            let buf = buffer.read_recover();
+            assemble_event(&buf, None, "cam", 5, 7, 5, 0, true, None).unwrap()
+        };
+        let first_pts = event.first_pts;
+
+        let fresh: serde_json::Value = serde_json::from_str(&build_sidecar_json(&event)).unwrap();
+        assert!(
+            fresh.get("event_type").is_none(),
+            "a local sidecar named its own type: {fresh}"
+        );
+
+        let index = WarmEventIndex::new(&["cam".to_string()], dir.path().to_path_buf());
+        write_event(dir.path(), "cam", &event, Some(&index)).await;
+        upgrade_event(dir.path(), "cam", &upgrade_for(&event), Some(&index)).await;
+
+        let json = std::fs::read_to_string(
+            dir.path()
+                .join("cam")
+                .join("objects")
+                .join(format!("{first_pts}_3000.json")),
+        )
+        .unwrap();
+        let upgraded: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(
+            upgraded.get("event_type").is_none(),
+            "the upgrade's sidecar named its type: {upgraded}"
         );
     }
 

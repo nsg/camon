@@ -9,7 +9,7 @@ use crate::buffer::HotBuffer;
 use crate::config::WarmConfig;
 use crate::locks::LockExt;
 use crate::storage::backend::{WarmStorageBackend, WriteOutcome};
-use crate::storage::warm_index::DetectionDetail;
+use crate::storage::event_index::DetectionDetail;
 use crate::storage::{DetectionStore, EventType, RecordingWatchdog};
 
 const NANOS_PER_MS: u64 = 1_000_000;
@@ -499,7 +499,7 @@ impl RetentionTask {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::backend::deduplicate_detections;
+    use crate::storage::event_index::deduplicate_detections;
     use crate::storage::{DetectionEntry, RecordingMode, WarmEventEntry};
 
     const SEC: u64 = 1_000_000_000;

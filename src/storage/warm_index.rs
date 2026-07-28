@@ -1,137 +1,23 @@
-use std::collections::{HashMap, HashSet};
+//! The local-disk warm index: the filesystem half of
+//! [`LocalDiskBackend`](crate::storage::LocalDiskBackend) — the directory scan,
+//! the sidecar format, and the unlinks retention performs — over the shared
+//! in-RAM [`EventIndex`].
+
 use std::path::PathBuf;
-use std::sync::{Arc, RwLock};
 
-use crate::locks::LockExt;
+use crate::storage::event_index::{
+    deduplicate_detections, evict_tiers, sweep_expired, DetectionDetail, EmergencyOutcome,
+    EventIndex, EventType, EvictionPolicy, Removal, WarmEventEntry,
+};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum EventType {
-    Movement,
-    Object,
-    /// A chunk of gapless continuous recording (analytics disabled — "dumb NVR"
-    /// mode). Not motion-gated; every segment reaches disk.
-    Continuous,
-}
-
-impl EventType {
-    pub(crate) fn dir_name(self) -> &'static str {
-        match self {
-            EventType::Movement => "movements",
-            EventType::Object => "objects",
-            EventType::Continuous => "continuous",
-        }
-    }
-
-    /// Wire name used by the remote (stathost) backend's sidecar, which carries
-    /// the event type in JSON rather than in a directory name.
-    pub(crate) fn as_str(self) -> &'static str {
-        match self {
-            EventType::Movement => "movement",
-            EventType::Object => "object",
-            EventType::Continuous => "continuous",
-        }
-    }
-
-    /// Parse a wire name back into an [`EventType`]; unknown strings yield `None`.
-    pub(crate) fn from_str(s: &str) -> Option<Self> {
-        match s {
-            "movement" => Some(EventType::Movement),
-            "object" => Some(EventType::Object),
-            "continuous" => Some(EventType::Continuous),
-            _ => None,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct DetectionDetail {
-    pub class: String,
-    pub confidence: f32,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-#[allow(dead_code)]
-pub struct WarmEventEntry {
-    pub start_pts_ns: u64,
-    pub duration_ms: u32,
-    pub event_type: EventType,
-    pub file_size: u64,
-    pub object_classes: Vec<String>,
-    pub backend: Option<String>,
-    pub model: Option<String>,
-    pub detections: Vec<DetectionDetail>,
-    /// Number of filmstrip thumbnail frames on disk for this event
-    /// (`{stem}_thumb_{0..n-1}.jpg`). A motion run is subsampled to at most 4
-    /// frames, and short runs yield fewer — the UI renders exactly this many.
-    pub filmstrip_frames: usize,
-    /// True when this event is a follow-on chunk of a longer motion run split
-    /// at the duration cap (from the sidecar `"continues"` flag).
-    pub continues: bool,
-    /// True when this event was salvaged from an orphaned `.ts.tmp` at startup
-    /// after a crash or power cut (from the sidecar `"recovered"` flag). The
-    /// tail may be truncated at the last intact packet.
-    pub recovered: bool,
-    /// Set once a deletion of this event has failed. Purely in-RAM (a restart
-    /// clears it, and the scan retries everything): it takes the event out of
-    /// *emergency* candidate selection, so a low-space pass ahead of every
-    /// write does not re-attempt a file the filesystem has already refused.
-    /// The hourly sweep ignores this and keeps retrying — that is where a
-    /// transient failure gets its second chance.
-    pub delete_failed: bool,
-}
-
-/// What identifies one indexed event, and with it exactly one file on disk:
-/// `{data_dir}/{camera}/{event_type}/{start_pts_ns}_{duration_ms}.ts`.
-///
-/// The start PTS alone does not. Nothing enforces its uniqueness — `scan`
-/// happily indexes the same start under two event types with two durations,
-/// and `insert` never checks — and a movement→object upgrade changes an
-/// entry's type while a prune is mid-flight. Unindexing on the start alone
-/// would then drop a surviving entry on the strength of some other entry's
-/// delete, which is the leak this whole path exists to prevent.
+/// Local disk's event identity: `{data_dir}/{camera}/{event_type}/{start_pts_ns}_{duration_ms}.ts`
+/// names exactly one file, and the event type is a directory in it. See
+/// [`EventIdentity`](crate::storage::event_index::EventIdentity) for why the
+/// remote backend spells this differently.
 type EventKey = (u64, EventType, u32);
 
-fn event_key(entry: &WarmEventEntry) -> EventKey {
-    (entry.start_pts_ns, entry.event_type, entry.duration_ms)
-}
-
-/// Outcome of deleting one indexed event's files.
-enum Removal {
-    /// The video file was deleted; its bytes are back.
-    Deleted,
-    /// The video file was already gone. Nothing was reclaimed, but the index
-    /// entry has to go too — it describes a file that does not exist.
-    Missing,
-    /// The video file is still on disk (EACCES, EIO, ...). The entry stays
-    /// indexed so the next prune retries it instead of leaking the file.
-    ///
-    /// The cost is deliberate: such an event stays listed, and stays offered
-    /// for playback, indefinitely past its configured retention — for as long
-    /// as the deletion keeps failing. A visible retention violation an
-    /// operator can see and act on beats a file that is gone from the index,
-    /// still eating disk, and never retried by anything.
-    Failed,
-}
-
-/// What one pass of [`WarmEventIndex::emergency_prune`] actually achieved.
-/// The three counts are distinct outcomes with distinct operator meanings —
-/// "nothing to delete", "deletions are failing", and "someone else already
-/// reclaimed it" all produce zero deleted events and call for different
-/// reactions.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub struct EmergencyOutcome {
-    /// Events deleted; the only count that reflects reclaimed bytes.
-    pub deleted: u64,
-    /// Events whose deletion failed. They are still on disk and still indexed.
-    pub failed: u64,
-    /// Events whose file had already vanished. Nothing was reclaimed here, but
-    /// the stale index entries were dropped.
-    pub missing: u64,
-}
-
-#[derive(Clone)]
 pub struct WarmEventIndex {
-    cameras: Arc<HashMap<String, RwLock<Vec<WarmEventEntry>>>>,
+    events: EventIndex<EventKey>,
     data_dir: PathBuf,
 }
 
@@ -210,6 +96,51 @@ pub(crate) fn parse_sidecar_json(parsed: &serde_json::Value) -> SidecarData {
     }
 }
 
+/// Render a sidecar, for fresh writes and post-hoc upgrades on either backend.
+///
+/// `event_type` is `Some` only for the remote store, where the sidecar is the
+/// sole carrier of the type; local disk passes `None` because the directory
+/// already says it, and writing the field there would change an on-disk format
+/// nothing reads. Everything else is identical, which is why this is one
+/// function: the two copies of it drifted, and a field added to one is a field
+/// the other backend's scan silently loses.
+pub(crate) fn sidecar_json(
+    event_type: Option<EventType>,
+    backend: Option<&str>,
+    model: Option<&str>,
+    detection_details: &[DetectionDetail],
+    continues: bool,
+) -> String {
+    let mut meta = serde_json::Map::new();
+    if let Some(event_type) = event_type {
+        meta.insert(
+            "event_type".to_string(),
+            serde_json::json!(event_type.as_str()),
+        );
+    }
+    if let Some(backend) = backend {
+        meta.insert("backend".to_string(), serde_json::json!(backend));
+    }
+    if let Some(model) = model {
+        meta.insert("model".to_string(), serde_json::json!(model));
+    }
+
+    let deduped = deduplicate_detections(detection_details);
+    let detections: Vec<serde_json::Value> = deduped
+        .iter()
+        .map(|(class, confidence)| serde_json::json!({"class": class, "confidence": confidence}))
+        .collect();
+    meta.insert("detections".to_string(), serde_json::json!(detections));
+
+    // Only follow-on chunks carry `continues`; omit it otherwise so ordinary
+    // sidecars stay unchanged.
+    if continues {
+        meta.insert("continues".to_string(), serde_json::json!(true));
+    }
+
+    serde_json::to_string(&meta).unwrap()
+}
+
 fn load_sidecar(path: &std::path::Path) -> SidecarData {
     let empty = SidecarData {
         classes: Vec::new(),
@@ -232,12 +163,8 @@ fn load_sidecar(path: &std::path::Path) -> SidecarData {
 
 impl WarmEventIndex {
     pub fn new(camera_ids: &[String], data_dir: PathBuf) -> Self {
-        let mut cameras = HashMap::new();
-        for id in camera_ids {
-            cameras.insert(id.clone(), RwLock::new(Vec::new()));
-        }
         Self {
-            cameras: Arc::new(cameras),
+            events: EventIndex::new(camera_ids),
             data_dir,
         }
     }
@@ -245,10 +172,13 @@ impl WarmEventIndex {
     pub fn scan(&self) {
         let start = std::time::Instant::now();
         let mut total_events = 0;
-        for (camera_id, lock) in self.cameras.iter() {
-            let entries = self.scan_camera(camera_id);
+        // Collected first: `replace_camera` takes the write lock the iterator
+        // would otherwise be holding open across a whole directory walk.
+        let camera_ids: Vec<String> = self.events.camera_ids().map(String::from).collect();
+        for camera_id in camera_ids {
+            let entries = self.scan_camera(&camera_id);
             let count = entries.len();
-            *lock.write_recover() = entries;
+            self.events.replace_camera(&camera_id, entries);
             total_events += count;
             if count > 0 {
                 tracing::info!(camera = %camera_id, events = count, "scanned warm events");
@@ -295,7 +225,6 @@ impl WarmEventIndex {
                 }
             }
         }
-        entries.sort_by_key(|e| e.start_pts_ns);
         entries
     }
 
@@ -339,82 +268,38 @@ impl WarmEventIndex {
     }
 
     pub fn insert(&self, camera_id: &str, entry: WarmEventEntry) {
-        if let Some(lock) = self.cameras.get(camera_id) {
-            let mut entries = lock.write_recover();
-            let pos = entries
-                .binary_search_by_key(&entry.start_pts_ns, |e| e.start_pts_ns)
-                .unwrap_or_else(|p| p);
-            entries.insert(pos, entry);
-        }
+        self.events.insert(camera_id, entry);
     }
 
-    /// Every event overlapping `[from_ns, to_ns]`. An inverted range is empty.
-    ///
-    /// Entries are ordered by start PTS only, so the upper bound binary-searches
-    /// but the lower one cannot: a long event (a continuous chunk) can start
-    /// far before the window and still reach into it, and "ends after `from_ns`"
-    /// is not monotone in start order. The candidate prefix is filtered instead.
     pub fn query(&self, camera_id: &str, from_ns: u64, to_ns: u64) -> Vec<WarmEventEntry> {
-        if from_ns > to_ns {
-            return Vec::new();
-        }
-        match self.cameras.get(camera_id) {
-            Some(lock) => {
-                let entries = lock.read_recover();
-                let end = entries.partition_point(|e| e.start_pts_ns <= to_ns);
-                entries[..end]
-                    .iter()
-                    .filter(|e| {
-                        e.start_pts_ns
-                            .saturating_add((e.duration_ms as u64) * 1_000_000)
-                            >= from_ns
-                    })
-                    .cloned()
-                    .collect()
-            }
-            None => Vec::new(),
-        }
+        self.events.query(camera_id, from_ns, to_ns)
     }
 
-    /// End of the newest indexed event, in wall-clock nanoseconds. Entries are
-    /// kept sorted by start, so the last one is the newest.
     pub fn newest_event_end_ns(&self, camera_id: &str) -> Option<u64> {
-        let entries = self.cameras.get(camera_id)?.read_recover();
-        entries.last().map(|e| {
-            e.start_pts_ns
-                .saturating_add((e.duration_ms as u64) * 1_000_000)
-        })
+        self.events.newest_event_end_ns(camera_id)
     }
 
     pub fn find_event(&self, camera_id: &str, start_pts_ns: u64) -> Option<WarmEventEntry> {
-        let lock = self.cameras.get(camera_id)?;
-        let entries = lock.read_recover();
-        entries
-            .binary_search_by_key(&start_pts_ns, |e| e.start_pts_ns)
-            .ok()
-            .map(|i| entries[i].clone())
+        self.events.find(camera_id, start_pts_ns)
     }
 
-    /// Mutate the entry with the given start PTS in place (used by the
-    /// post-hoc movement→object upgrade; the sort key never changes).
+    /// Apply the post-hoc movement→object upgrade to the indexed entry.
     /// Returns false when no such event is indexed.
+    ///
+    /// The entry is named by its whole key, not by its start PTS: two events
+    /// can share a start, and reaching in by the start alone reclassifies
+    /// whichever of them a binary search returns. Only the type has to be
+    /// assumed, and it is not a guess — an upgrade is by definition applied to
+    /// a movement.
     pub fn update_event(
         &self,
         camera_id: &str,
         start_pts_ns: u64,
+        duration_ms: u32,
         f: impl FnOnce(&mut WarmEventEntry),
     ) -> bool {
-        let Some(lock) = self.cameras.get(camera_id) else {
-            return false;
-        };
-        let mut entries = lock.write_recover();
-        match entries.binary_search_by_key(&start_pts_ns, |e| e.start_pts_ns) {
-            Ok(i) => {
-                f(&mut entries[i]);
-                true
-            }
-            Err(_) => false,
-        }
+        let key = (start_pts_ns, EventType::Movement, duration_ms);
+        self.events.reidentify(camera_id, key, f)
     }
 
     pub fn resolve_file_path(&self, camera_id: &str, entry: &WarmEventEntry) -> PathBuf {
@@ -426,10 +311,9 @@ impl WarmEventIndex {
     }
 
     /// Delete events past their per-class retention, up to this sweep's share
-    /// of the camera (see [`cap_sweep_deletions`]), and drop each one from the
-    /// index once its video is gone — an event whose files could not be deleted
-    /// stays listed for the next sweep to retry. Returns the number of events
-    /// actually deleted.
+    /// of the camera, and drop each one from the index once its video is gone.
+    /// Returns the number of events actually deleted; the shared
+    /// [`sweep_expired`] does the rest.
     ///
     /// `cancel` is polled between events and between cameras so a shutdown does
     /// not wait out a whole sweep. Stopping part-way through one event would be
@@ -472,64 +356,38 @@ impl WarmEventIndex {
         };
 
         let mut total_deleted = 0u64;
-        for (camera_id, lock) in self.cameras.iter() {
+        for camera_id in self.events.camera_ids() {
             if cancel() {
                 break;
             }
-            let (indexed, expired) = {
-                let entries = lock.read_recover();
-                let expired: Vec<WarmEventEntry> = entries
-                    .iter()
-                    .filter(|e| now_ns.saturating_sub(e.start_pts_ns) > max_age(e.event_type))
-                    .cloned()
-                    .collect();
-                (entries.len(), expired)
-            };
-
+            let expired = self
+                .events
+                .expired_for_sweep(camera_id, now_ns, |e| max_age(e.event_type));
             if expired.is_empty() {
                 continue;
             }
-            let expired = cap_sweep_deletions(camera_id, indexed, expired);
 
-            let mut deleted = 0u64;
-            let mut failed = 0u64;
-            let mut unindex: HashSet<EventKey> = HashSet::new();
-            for entry in &expired {
-                if cancel() {
-                    break;
-                }
-                match self.remove_event_files(camera_id, entry).await {
-                    Removal::Deleted => {
-                        deleted += 1;
-                        unindex.insert(event_key(entry));
-                    }
-                    Removal::Missing => {
-                        unindex.insert(event_key(entry));
-                    }
-                    Removal::Failed => {
-                        failed += 1;
-                        self.mark_delete_failed(camera_id, event_key(entry));
-                    }
-                }
-            }
+            let outcome = sweep_expired(
+                &self.events,
+                camera_id,
+                expired,
+                &mut cancel,
+                |entry| async move { self.remove_event_files(camera_id, &entry).await },
+            )
+            .await;
 
-            {
-                let mut entries = lock.write_recover();
-                entries.retain(|e| !unindex.contains(&event_key(e)));
-            }
-
-            total_deleted += deleted;
-            if deleted > 0 {
+            total_deleted += outcome.deleted;
+            if outcome.deleted > 0 {
                 tracing::info!(
                     camera = %camera_id,
-                    deleted,
+                    deleted = outcome.deleted,
                     "pruned expired warm events"
                 );
             }
-            if failed > 0 {
+            if outcome.failed > 0 {
                 tracing::warn!(
                     camera = %camera_id,
-                    failed,
+                    failed = outcome.failed,
                     "expired warm events are still on disk after a failed delete, \
                      kept indexed for the next prune (paths at debug level)"
                 );
@@ -591,103 +449,31 @@ impl WarmEventIndex {
         }
     }
 
-    /// Remember that this event resisted deletion, so the low-space guard
-    /// stops offering it as reclaimable space. Keyed on the full
-    /// [`EventKey`]: an entry that has been upgraded since is a different
-    /// event and must not inherit the flag.
-    fn mark_delete_failed(&self, camera_id: &str, key: EventKey) {
-        let Some(lock) = self.cameras.get(camera_id) else {
-            return;
-        };
-        let mut entries = lock.write_recover();
-        // Entries are sorted by start PTS, which repeats across event types, so
-        // walk the run of equal starts rather than trusting one hit.
-        let from = entries.partition_point(|e| e.start_pts_ns < key.0);
-        for entry in entries[from..]
-            .iter_mut()
-            .take_while(|e| e.start_pts_ns == key.0)
-        {
-            if event_key(entry) == key {
-                entry.delete_failed = true;
-                return;
-            }
-        }
-    }
-
     /// Emergency prune for low-disk-space conditions: delete the oldest events
-    /// first, cheapest-to-lose tier first (continuous → movements → objects),
-    /// until `satisfied()` reports the pressure is gone (in production: free
-    /// space back above `min_free_bytes`) or nothing is left to delete.
+    /// first, cheapest-to-lose tier first, until `satisfied()` reports the
+    /// pressure is gone (in production: free space back above `min_free_bytes`)
+    /// or nothing is left to delete. Reports what it achieved: see
+    /// [`EmergencyOutcome`].
     ///
-    /// Reports what it achieved: see [`EmergencyOutcome`]. A pass ends when the
-    /// pressure is gone or its candidates are exhausted — never on a failure
-    /// count, which would let the oldest few undeletable events starve every
-    /// newer deletable one and stop recording outright.
-    ///
-    /// This path is deliberately outside [`cap_sweep_deletions`]: space
-    /// pressure is not clock-derived, and a full disk stops recording
-    /// altogether. So a low-space pass during a held-back drain can delete the
-    /// very footage the sweep's cap is holding.
-    ///
-    /// Candidates exclude events whose deletion has already failed once
-    /// ([`WarmEventEntry::delete_failed`]). That is what bounds the work: this
-    /// runs ahead of every single write, and re-attempting a file the
-    /// filesystem has refused costs a syscall to learn nothing. The hourly
-    /// sweep does the retrying.
-    pub async fn emergency_prune<F: FnMut() -> bool>(&self, mut satisfied: F) -> EmergencyOutcome {
-        let mut outcome = EmergencyOutcome::default();
-        'tiers: for tier in [
-            EventType::Continuous,
-            EventType::Movement,
-            EventType::Object,
-        ] {
-            // Snapshot this tier's candidates across all cameras, oldest first.
-            let mut candidates: Vec<(String, WarmEventEntry)> = Vec::new();
-            for (camera_id, lock) in self.cameras.iter() {
-                let entries = lock.read_recover();
-                candidates.extend(
-                    entries
-                        .iter()
-                        .filter(|e| e.event_type == tier && !e.delete_failed)
-                        .cloned()
-                        .map(|e| (camera_id.clone(), e)),
-                );
-            }
-            candidates.sort_by_key(|(_, e)| e.start_pts_ns);
-
-            for (camera_id, entry) in candidates {
-                if satisfied() {
-                    break 'tiers;
-                }
-                // A failed delete keeps its entry: the file is still on disk and
-                // occupying the space this prune is trying to reclaim, so the
-                // hourly sweep must see it again. One poisoned file must not
-                // block the rest, hence `continue` and not `break` — the
-                // events behind it are the space this pass exists to reclaim.
-                let removal = self.remove_event_files(&camera_id, &entry).await;
-                if matches!(removal, Removal::Failed) {
-                    outcome.failed += 1;
-                    self.mark_delete_failed(&camera_id, event_key(&entry));
-                    continue;
-                }
-                let key = event_key(&entry);
-                if let Some(lock) = self.cameras.get(&camera_id) {
-                    lock.write_recover().retain(|e| event_key(e) != key);
-                }
-                if matches!(removal, Removal::Deleted) {
-                    outcome.deleted += 1;
-                    tracing::warn!(
-                        camera = %camera_id,
-                        start_pts_ns = entry.start_pts_ns,
-                        event_type = ?entry.event_type,
-                        "emergency prune: deleted event to reclaim disk space"
-                    );
-                } else {
-                    outcome.missing += 1;
-                }
-            }
-        }
-        outcome
+    /// The policy is where this differs from the remote store's budget
+    /// eviction, and [`EvictionPolicy`] says why: a filesystem that refuses one
+    /// file has said nothing about the next, so the pass steps over it and
+    /// stops offering it — this runs ahead of every single write, and
+    /// re-attempting a file the filesystem has refused costs a syscall to learn
+    /// nothing. The hourly sweep does the retrying.
+    pub async fn emergency_prune<F: FnMut() -> bool>(&self, satisfied: F) -> EmergencyOutcome {
+        evict_tiers(
+            &self.events,
+            EvictionPolicy {
+                skip_failed: true,
+                stop_on_failure: false,
+                reason: "emergency prune: deleted event to reclaim disk space",
+            },
+            |_, entry| entry.event_type,
+            satisfied,
+            |camera_id, entry| async move { self.remove_event_files(&camera_id, &entry).await },
+        )
+        .await
     }
 }
 
@@ -715,8 +501,8 @@ pub(crate) fn should_emergency_prune(free_bytes: u64, min_free_bytes: u64) -> bo
 /// Wall-clock nanoseconds since the epoch: the clock event start times are
 /// stamped with, and so the only one their age can be measured against. A clock
 /// set before 1970 reads as 0 rather than panicking — a box booting with no
-/// idea what time it is, which is the scenario [`cap_sweep_deletions`] exists
-/// for, must not take the process down.
+/// idea what time it is, which is the scenario the sweep's per-pass deletion
+/// cap exists for, must not take the process down.
 pub(crate) fn wall_clock_ns() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -724,109 +510,10 @@ pub(crate) fn wall_clock_ns() -> u64 {
         .as_nanos() as u64
 }
 
-/// Share of a camera's archive one sweep may delete — a quarter.
-const SWEEP_DELETE_SHARE: usize = 4;
-
-/// Floor under the share, so an archive of a handful of events still expires in
-/// one sweep. Losing four events is not the loss the cap exists to prevent, and
-/// dribbling them out an hour at a time would only make retention look broken
-/// on small installs.
-const SWEEP_DELETE_FLOOR: usize = 4;
-
-fn sweep_delete_limit(indexed: usize) -> usize {
-    indexed.div_ceil(SWEEP_DELETE_SHARE).max(SWEEP_DELETE_FLOOR)
-}
-
-/// Hold back the tail of an over-large expiry, so no single sweep can empty an
-/// archive.
-///
-/// An event's start time is wall clock at keyframe time and its age is
-/// `now - start`, so a forward clock correction of J ages every stored event by
-/// J at once. A box with no battery-backed RTC does exactly that on an ordinary
-/// boot: systemd-timesyncd (and fake-hwclock) restore the clock they saved at
-/// shutdown, so the box comes up as far behind as it was switched off and jumps
-/// forward when NTP lands — J is the off-time, and a box switched off over a
-/// weekend jumps a weekend. Once J reaches the retention window, every event
-/// ever recorded is expired in the same sweep. That sweep used to delete the
-/// lot, and report it at `info!`.
-///
-/// So one flat cap covers every expiry: at most [`sweep_delete_limit`] events
-/// per camera per sweep, oldest first, with a `warn!` naming the counts
-/// whenever anything is held back. The cap is deliberately blind to *why* an
-/// event expired. A clock jump, a shortened retention and a long outage are
-/// indistinguishable from inside a sweep, and every test that tries to tell
-/// them apart is a hole at the jump sizes it guesses wrong about — "how far
-/// past due is it" leaves J up to 1.25 retention windows uncapped, and "does
-/// anything recent survive" disengages the moment the first post-jump event is
-/// recorded, which is within seconds.
-///
-/// Ordinary retention never comes near the cap: an hourly sweep of an R-day
-/// retention expires 1/(24R) of an archive, under 4% at the one-day minimum
-/// camon accepts. What does reach it is a real mass expiry — retention cut from
-/// 30 days to 2, a camera whose whole archive aged out while it was offline —
-/// and that still drains completely, a quarter of what is left per sweep (never
-/// fewer than [`SWEEP_DELETE_FLOOR`]) until only what the retention keeps
-/// remains. It takes a working day instead of one pass, and says so at `warn!`
-/// the whole way down.
-///
-/// Two paths deliberately bypass the cap, because neither is clock-derived: the
-/// low-space emergency prune and the stathost storage budget. So a disk filling
-/// up during a held-back drain can still delete the footage this cap is holding
-/// — running out of space stops recording altogether, which is the more urgent
-/// failure.
-///
-/// Events whose deletion already failed do not count against the cap: they were
-/// let through an earlier sweep's cap and are only being retried, and charging
-/// them again would let a few undeletable events at the head of the queue
-/// starve every deletion behind them for good. That relies on the caller
-/// marking its failures ([`WarmEventEntry::delete_failed`]); both backends do.
-pub(crate) fn cap_sweep_deletions(
-    camera_id: &str,
-    indexed: usize,
-    expired: Vec<WarmEventEntry>,
-) -> Vec<WarmEventEntry> {
-    let expired_count = expired.len();
-    let limit = sweep_delete_limit(indexed);
-    let mut budget = limit;
-    let mut held_back = 0usize;
-    // Filtering in place keeps the index's oldest-first order, so the oldest
-    // footage goes first and a sweep cut short by shutdown has still deleted
-    // the events nearest their retention.
-    let deleting: Vec<WarmEventEntry> = expired
-        .into_iter()
-        .filter(|entry| {
-            if entry.delete_failed {
-                return true;
-            }
-            if budget > 0 {
-                budget -= 1;
-                return true;
-            }
-            held_back += 1;
-            false
-        })
-        .collect();
-
-    let deleting_count = deleting.len();
-    if held_back > 0 {
-        tracing::warn!(
-            camera = %camera_id,
-            indexed,
-            expired = expired_count,
-            deleting = deleting_count,
-            held_back,
-            "more warm events expired at once than one sweep may delete — a forward clock \
-             jump, a shortened retention and a long outage all look like this. Deleting the \
-             oldest {deleting_count} of {expired_count} expired; the {held_back} held back \
-             follow on later sweeps"
-        );
-    }
-    deleting
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::event_index::EventIdentity;
 
     fn write_event_files(dir: &std::path::Path, subdir: &str, stem: &str, sidecar: Option<&str>) {
         let d = dir.join("cam").join(subdir);
@@ -1446,11 +1133,11 @@ mod tests {
                 delete_failed: false,
             },
         );
-        let snapshot_key = event_key(&index.find_event("cam", 1000).unwrap());
+        let snapshot_key = EventKey::of(&index.find_event("cam", 1000).unwrap());
 
-        index.update_event("cam", 1000, |e| e.event_type = EventType::Object);
+        index.update_event("cam", 1000, 5000, |e| e.event_type = EventType::Object);
 
-        let after = event_key(&index.find_event("cam", 1000).unwrap());
+        let after = EventKey::of(&index.find_event("cam", 1000).unwrap());
         assert_ne!(
             snapshot_key, after,
             "an upgraded event would be unindexed by the sweep it raced"

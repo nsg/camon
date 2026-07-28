@@ -31,7 +31,7 @@ use tokio::sync::{mpsc, Notify};
 
 use crate::buffer::warm::{EventUpgrade, WriterMessage};
 use crate::mqtt::{send_event, MqttEvent, Sighting};
-use crate::storage::warm_index::DetectionDetail;
+use crate::storage::event_index::DetectionDetail;
 use crate::storage::{DetectionDebugStore, DetectionEntry, DetectionStore, EventRegistry};
 
 use super::ollama::{Detection, OllamaClient};

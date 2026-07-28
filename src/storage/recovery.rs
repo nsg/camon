@@ -24,7 +24,7 @@
 
 use std::path::Path;
 
-use super::warm_index::EventType;
+use super::event_index::EventType;
 use crate::mpegts;
 
 /// Scan every event directory of every configured camera for `*.tmp` orphans

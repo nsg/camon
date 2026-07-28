@@ -21,13 +21,22 @@
 //! as — *required*: a write that cannot store it is failed rather than
 //! reported as written.
 //!
+//! The in-RAM index is not this backend's own: it is an
+//! [`EventIndex`](crate::storage::event_index::EventIndex) like local disk's,
+//! keyed by the stem ([`EventKey`]) instead of by a path, and the retention
+//! sweep and space-pressure eviction run through the shared skeletons in
+//! [`event_index`](crate::storage::event_index). What is genuinely this
+//! backend's is below.
+//!
 //! Notable divergences from [`LocalDiskBackend`], all deliberate:
 //!
 //! * **Retention-by-space is a client-side budget.** The client can't see the
 //!   server's disk, so `max_stored_bytes` caps tracked usage; when it is
-//!   exceeded the oldest events are pruned (continuous → movements → objects),
-//!   mirroring the local emergency prune order. The disk-shaped
-//!   `min_free_bytes` guard argument is ignored here.
+//!   exceeded the oldest events are evicted cheapest tier first, the same order
+//!   and the same skeleton as the local emergency prune — but with the opposite
+//!   failure policy, for the reason
+//!   [`EvictionPolicy`](crate::storage::event_index::EvictionPolicy) gives. The
+//!   disk-shaped `min_free_bytes` guard argument is ignored here.
 //! * **Thumbnails are eager.** Filmstrip frame 0 doubles as the poster; there
 //!   is no ffmpeg on remote bytes. [`read_thumbnail`] fetches `thumb_0` or
 //!   returns a clear error when the event has no frames.
@@ -78,7 +87,7 @@
 //!   client replays from the start).
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::RwLock;
 use std::time::Duration;
 
@@ -92,66 +101,31 @@ use crate::buffer::GopSegment;
 use crate::config::StathostConfig;
 use crate::locks::LockExt;
 use crate::storage::backend::{
-    deduplicate_detections, RangeRequest, ServedRange, ThumbnailError, VideoStream,
-    WarmStorageBackend, WriteOutcome,
+    RangeRequest, ServedRange, ThumbnailError, VideoStream, WarmStorageBackend, WriteOutcome,
+};
+use crate::storage::event_index::{
+    evict_tiers, sweep_expired, EmergencyOutcome, EventIdentity, EventIndex, EvictionPolicy,
+    Removal,
 };
 use crate::storage::warm_index::{
-    cap_sweep_deletions, parse_event_filename, parse_sidecar_json, wall_clock_ns, DetectionDetail,
-    SidecarData,
+    parse_event_filename, parse_sidecar_json, sidecar_json, wall_clock_ns, SidecarData,
 };
 use crate::storage::{EventType, WarmEventEntry};
 
 const NANOS_PER_MS: u64 = 1_000_000;
 
-/// What identifies one indexed event, and with it exactly one set of objects on
-/// the host: the stem every one of its keys is built from,
-/// `{camera_id}/{start_pts_ns}_{duration_ms}.*`.
-///
-/// The start PTS alone does not — nothing enforces its uniqueness, here or in
-/// the local index — so unindexing on it would drop a surviving entry on the
-/// strength of some other entry's delete, and refund the wrong number of bytes
-/// to the budget.
-///
-/// Local disk keys on `(start, event_type, duration)` because the type is a
-/// directory there and so part of the path. It is *not* part of any path here:
-/// the type lives inside the sidecar, an upgrade rewrites that sidecar without
-/// moving a single object, and two entries differing only in type would name
-/// the same objects. Both keys say the same thing — "the one stored event these
-/// bytes belong to" — spelled in the layout each backend actually has.
+/// This backend's event identity: the stem every one of an event's keys is
+/// built from, `{camera_id}/{start_pts_ns}_{duration_ms}.*`. See
+/// [`EventIdentity`] for why local disk spells this differently and why neither
+/// spelling can be imposed on the other.
 type EventKey = (u64, u32);
 
 fn event_key(entry: &WarmEventEntry) -> EventKey {
-    (entry.start_pts_ns, entry.duration_ms)
+    EventIdentity::of(entry)
 }
 
 fn key_stem(key: EventKey) -> String {
     format!("{}_{}", key.0, key.1)
-}
-
-/// Position of the entry with this key. Entries are sorted by start PTS, which
-/// repeats across durations, so the run of equal starts is walked rather than
-/// trusting a single binary-search hit.
-fn position(entries: &[WarmEventEntry], key: EventKey) -> Option<usize> {
-    let from = entries.partition_point(|e| e.start_pts_ns < key.0);
-    entries[from..]
-        .iter()
-        .take_while(|e| e.start_pts_ns == key.0)
-        .position(|e| e.duration_ms == key.1)
-        .map(|i| from + i)
-}
-
-/// What deleting one event's objects achieved. Mirrors the local backend's
-/// `Removal`: the three outcomes mean different things to the budget, and only
-/// [`Removal::Deleted`] reclaimed any remote bytes.
-enum Removal {
-    /// The video object is gone; its bytes are back.
-    Deleted,
-    /// The video object was already absent. Nothing was reclaimed, but the
-    /// index entry has to go too — it describes an object that does not exist.
-    Missing,
-    /// The store refused or could not be reached. The entry stays indexed so a
-    /// later tick retries it instead of leaking the objects.
-    Failed,
 }
 
 /// Writes, deletes and the scan are awaited inline by the serial per-camera
@@ -201,20 +175,19 @@ const STREAM_READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// under parallel load; serving static files has no such property.
 const SCAN_CONCURRENCY: usize = 16;
 
-/// The remote warm store: an HTTP client plus a self-maintained in-RAM index.
+/// The remote warm store: an HTTP client over the shared in-RAM index.
 pub struct StathostBackend {
     http: Http,
-    /// Client-side storage budget in bytes; 0 means unlimited.
+    /// Client-side storage budget in bytes; 0 means unlimited. Measured against
+    /// [`EventIndex::used_bytes`], which the index maintains as the sum of what
+    /// it holds — the two cannot drift.
     max_stored_bytes: u64,
-    /// Per-camera event lists, each sorted by `start_pts_ns` (the query/find
-    /// key). Kept coherent on write/upgrade/prune.
-    cameras: HashMap<String, RwLock<Vec<WarmEventEntry>>>,
+    events: EventIndex<EventKey>,
     /// Events whose sidecar the scan could not read, per camera. Their
     /// [`WarmEventEntry::event_type`] is a placeholder, not a fact — see
-    /// [`Self::mark_unknown_type`].
+    /// [`Self::mark_unknown_type`]. This has no local-disk counterpart: there
+    /// the type is the directory, so it cannot be unreadable.
     unknown_type: HashMap<String, RwLock<HashSet<EventKey>>>,
-    /// Sum of indexed `file_size` — the figure the budget is measured against.
-    used_bytes: AtomicU64,
 }
 
 impl StathostBackend {
@@ -224,12 +197,6 @@ impl StathostBackend {
             config.url.trim_end_matches('/'),
             config.bucket.trim_matches('/')
         );
-        let mut cameras = HashMap::new();
-        let mut unknown_type = HashMap::new();
-        for id in camera_ids {
-            cameras.insert(id.clone(), RwLock::new(Vec::new()));
-            unknown_type.insert(id.clone(), RwLock::new(HashSet::new()));
-        }
         Self {
             http: Http {
                 client: reqwest::Client::builder()
@@ -245,102 +212,16 @@ impl StathostBackend {
                 token: config.token.clone(),
             },
             max_stored_bytes: config.max_stored_bytes,
-            cameras,
-            unknown_type,
-            used_bytes: AtomicU64::new(0),
+            events: EventIndex::new(camera_ids),
+            unknown_type: camera_ids
+                .iter()
+                .map(|id| (id.clone(), RwLock::new(HashSet::new())))
+                .collect(),
         }
     }
 
     fn used(&self) -> u64 {
-        self.used_bytes.load(Ordering::Relaxed)
-    }
-
-    // ---- in-RAM index (self-contained; mirrors WarmEventIndex's RAM half) ----
-
-    /// Index one event, replacing whatever entry held the same stem and
-    /// returning it. A `PUT` is an upload *or* an update, so a second entry for
-    /// a stem that already has one would describe objects that do not exist.
-    fn insert_entry(&self, camera_id: &str, entry: WarmEventEntry) -> Option<WarmEventEntry> {
-        let lock = self.cameras.get(camera_id)?;
-        let mut entries = lock.write_recover();
-        match position(&entries, event_key(&entry)) {
-            Some(i) => Some(std::mem::replace(&mut entries[i], entry)),
-            None => {
-                let pos = entries.partition_point(|e| e.start_pts_ns < entry.start_pts_ns);
-                entries.insert(pos, entry);
-                None
-            }
-        }
-    }
-
-    /// Index one event and charge the budget for it, refunding whatever entry
-    /// it replaced. Every insertion goes through here, so tracked usage cannot
-    /// drift from the index it is supposed to be the sum of.
-    ///
-    /// A replacement moves usage by the *difference*, in one atomic operation:
-    /// an add followed by a subtract would let a concurrent reader — the budget
-    /// guard runs on every camera's writer task — see a total inflated by the
-    /// old entry's whole size and evict against it.
-    fn index_entry(&self, camera_id: &str, entry: WarmEventEntry) -> Option<WarmEventEntry> {
-        let file_size = entry.file_size;
-        let replaced = self.insert_entry(camera_id, entry);
-        match replaced.as_ref().map(|previous| previous.file_size) {
-            Some(previous) if previous > file_size => {
-                self.used_bytes
-                    .fetch_sub(previous - file_size, Ordering::Relaxed);
-            }
-            Some(previous) => {
-                self.used_bytes
-                    .fetch_add(file_size - previous, Ordering::Relaxed);
-            }
-            None => {
-                self.used_bytes.fetch_add(file_size, Ordering::Relaxed);
-            }
-        }
-        replaced
-    }
-
-    /// Remove one event from the index and refund its bytes, returning the
-    /// removed entry.
-    fn remove_entry(&self, camera_id: &str, key: EventKey) -> Option<WarmEventEntry> {
-        self.clear_unknown_type(camera_id, key);
-        let lock = self.cameras.get(camera_id)?;
-        let mut entries = lock.write_recover();
-        let idx = position(&entries, key)?;
-        let removed = entries.remove(idx);
-        self.used_bytes
-            .fetch_sub(removed.file_size, Ordering::Relaxed);
-        Some(removed)
-    }
-
-    /// Mutate the entry with this key in place (the sort key never changes).
-    /// `None` when no such event is indexed.
-    fn update_entry<R>(
-        &self,
-        camera_id: &str,
-        key: EventKey,
-        f: impl FnOnce(&mut WarmEventEntry) -> R,
-    ) -> Option<R> {
-        let lock = self.cameras.get(camera_id)?;
-        let mut entries = lock.write_recover();
-        let idx = position(&entries, key)?;
-        Some(f(&mut entries[idx]))
-    }
-
-    fn is_indexed(&self, camera_id: &str, key: EventKey) -> bool {
-        self.cameras
-            .get(camera_id)
-            .is_some_and(|lock| position(&lock.read_recover(), key).is_some())
-    }
-
-    /// Remember that this event resisted deletion, so the sweep's per-sweep
-    /// deletion cap stops being spent on it: a store that refuses one event for
-    /// good would otherwise block every deletion behind it, sweep after sweep.
-    /// It also takes the event out of budget eviction, which runs ahead of
-    /// every write and would otherwise spend each pass re-attempting it.
-    /// The flag is in-RAM and a restart clears it, which is the retry.
-    fn mark_delete_failed(&self, camera_id: &str, key: EventKey) {
-        self.update_entry(camera_id, key, |entry| entry.delete_failed = true);
+        self.events.used_bytes()
     }
 
     /// Record that this event's type could not be established. `event_type` on
@@ -362,11 +243,16 @@ impl StathostBackend {
             .is_some_and(|lock| lock.read_recover().contains(&key))
     }
 
-    /// Drop the marker once the type is settled or the event is gone. Only
-    /// [`Self::scan`] ever sets one, and it runs once per process, so in
-    /// practice this fires when an entry leaves the index; it also keeps
-    /// `upgrade_event` from leaving a "type unknown" marker on an event it just
-    /// proved to be an object.
+    /// Drop the marker once the type is settled. Only [`Self::scan`] ever sets
+    /// one, and it runs once per process, so in practice this fires where a
+    /// type becomes a fact — `write_event` and `upgrade_event`, neither of which
+    /// may leave a "type unknown" marker on an event it just proved.
+    ///
+    /// A marker for an event that has *left* the index is collected by
+    /// [`Self::resolve_unknown_types`] on the next prune tick instead: removal
+    /// runs inside the shared index, which knows nothing about this backend's
+    /// side table, and nothing between the two reads a marker whose entry is
+    /// gone (both the age filter and eviction only ever walk indexed entries).
     fn clear_unknown_type(&self, camera_id: &str, key: EventKey) {
         if let Some(lock) = self.unknown_type.get(camera_id) {
             lock.write_recover().remove(&key);
@@ -427,11 +313,6 @@ impl StathostBackend {
         )
     }
 
-    /// Delete every object belonging to one event — sidecar and thumbnails
-    /// first, the video last. The video's outcome is the event's outcome: only
-    /// once it is gone (or was already) may the index entry go.
-    ///
-    /// That order mirrors local disk's unlink order, and is the reverse of this
     /// Delete every object belonging to one event: **thumbnails, then the
     /// video, then the sidecar**. The video's outcome is the event's outcome —
     /// only once it is gone (or was already) may the index entry go, and only
@@ -519,7 +400,8 @@ impl StathostBackend {
                 tracing::warn!(camera = %camera_id, stem = %stem, frame = i,
                     "could not delete a filmstrip frame this event no longer has; \
                      it stays part of the event and is deleted with it");
-                self.update_entry(camera_id, key, |entry| entry.filmstrip_frames = i + 1);
+                self.events
+                    .update(camera_id, key, |entry| entry.filmstrip_frames = i + 1);
                 return;
             }
         }
@@ -586,7 +468,7 @@ impl StathostBackend {
             let Some((camera_id, stem)) = split_metadata_key(&item.path) else {
                 continue;
             };
-            if !self.cameras.contains_key(camera_id) || parse_event_filename(stem).is_none() {
+            if !self.events.owns_camera(camera_id) || parse_event_filename(stem).is_none() {
                 continue;
             }
             let ts_key = format!("{camera_id}/{stem}.ts");
@@ -677,7 +559,7 @@ impl StathostBackend {
             if cancel.load(Ordering::Relaxed) {
                 break;
             }
-            if !self.is_indexed(camera_id, key) {
+            if !self.events.contains(camera_id, key) {
                 self.clear_unknown_type(camera_id, key);
                 continue;
             }
@@ -687,7 +569,7 @@ impl StathostBackend {
                 // Still unreadable, or still naming no type: keep the hold.
                 SidecarRead::Unreadable | SidecarRead::Typeless(_) => continue,
             };
-            self.update_entry(camera_id, key, |entry| {
+            self.events.update(camera_id, key, |entry| {
                 apply_sidecar(entry, sidecar.as_ref())
             });
             self.clear_unknown_type(camera_id, key);
@@ -700,106 +582,45 @@ impl StathostBackend {
     }
 
     /// Enforce the client-side storage budget: while tracked usage exceeds
-    /// `max_stored_bytes`, delete the oldest events cheapest-tier-first
-    /// (continuous → movements → objects). No-op when the budget is unlimited.
+    /// `max_stored_bytes`, delete the oldest events cheapest-tier-first. No-op
+    /// when the budget is unlimited.
     ///
-    /// Like the local low-space guard, this is deliberately outside the sweep's
-    /// [`cap_sweep_deletions`] cap — the budget is not clock-derived — so a
-    /// full budget during a held-back drain can delete the footage the sweep is
-    /// holding.
-    ///
-    /// Two things about failures, which have to be read together:
-    ///
-    /// * A failure **stops the pass**, where local disk continues past it. A
-    ///   refusal here is a network answer, not one poisoned file, so the next
-    ///   candidate is overwhelmingly likely to fail the same way — and each
-    ///   attempt can sit for [`REQUEST_TIMEOUT`] inline in a warm writer with a
-    ///   camera's recording waiting behind it.
-    /// * A failure **demotes** the event to the back of its tier
-    ///   ([`WarmEventEntry::delete_failed`]) rather than excluding it. Local
-    ///   disk excludes, and can afford to: it continues past failures, so a
-    ///   flagged file never blocks the rest. Excluding *and* stopping would
-    ///   starve this pass outright — an outage flags a candidate per pass, and
-    ///   the hourly sweep only ever retries events that are already age-expired,
-    ///   so once the store came back nothing under retention would be
-    ///   reclaimable and the budget would sit over its limit permanently, with
-    ///   only newly written events left to evict. Demotion keeps the ordering
-    ///   benefit (a known-bad object is never tried ahead of a good one) and
-    ///   costs at most one failed request per pass, which is the bound.
-    ///
-    /// An object that was already gone unindexes like a deleted one, but is
-    /// reported separately: it reclaimed nothing on the host, it only corrected
-    /// an index entry that was describing nothing.
+    /// This is the local low-space guard's counterpart, sharing its skeleton and
+    /// differing only in [`EvictionPolicy`] — which is where the argument for
+    /// stopping on a failure and demoting rather than excluding is written down.
     async fn enforce_budget(&self, camera_id: &str) {
         if self.max_stored_bytes == 0 || self.used() <= self.max_stored_bytes {
             return;
         }
-        let mut deleted = 0u64;
-        let mut missing = 0u64;
-        let mut failed = 0u64;
-        'tiers: for tier in [
-            EventType::Continuous,
-            EventType::Movement,
-            EventType::Object,
-        ] {
-            let mut candidates: Vec<(String, WarmEventEntry)> = Vec::new();
-            for (cam, lock) in self.cameras.iter() {
-                let entries = lock.read_recover();
-                candidates.extend(
-                    entries
-                        .iter()
-                        // An event of unknown type is evicted with the objects,
-                        // the tier kept longest: its placeholder says movement,
-                        // and evicting on that guess would throw away footage
-                        // this whole path exists to keep.
-                        .filter(|e| {
-                            if self.has_unknown_type(cam, event_key(e)) {
-                                tier == EventType::Object
-                            } else {
-                                e.event_type == tier
-                            }
-                        })
-                        .cloned()
-                        .map(|e| (cam.clone(), e)),
-                );
-            }
-            // Oldest first, but everything that has already refused to be
-            // deleted after everything that has not: reached only once this
-            // tier's untried candidates are exhausted and the budget is still
-            // unmet — the point at which the pass would otherwise give up.
-            candidates.sort_by_key(|(_, e)| (e.delete_failed, e.start_pts_ns));
-
-            for (cam, entry) in candidates {
-                if self.used() <= self.max_stored_bytes {
-                    break 'tiers;
+        let outcome = evict_tiers(
+            &self.events,
+            EvictionPolicy {
+                skip_failed: false,
+                stop_on_failure: true,
+                reason: "budget prune: deleted event to stay under max_stored_bytes",
+            },
+            // An event of unknown type is evicted with the objects, the tier
+            // kept longest: its placeholder says movement, and evicting on that
+            // guess would throw away footage this whole path exists to keep.
+            |cam, entry| {
+                if self.has_unknown_type(cam, event_key(entry)) {
+                    EventType::Object
+                } else {
+                    entry.event_type
                 }
-                let key = event_key(&entry);
-                match self.delete_event_objects(&cam, &entry).await {
-                    Removal::Failed => {
-                        failed += 1;
-                        self.mark_delete_failed(&cam, key);
-                        break 'tiers;
-                    }
-                    Removal::Missing => {
-                        self.remove_entry(&cam, key);
-                        missing += 1;
-                    }
-                    Removal::Deleted => {
-                        self.remove_entry(&cam, key);
-                        deleted += 1;
-                        tracing::warn!(
-                            camera = %cam,
-                            start_pts_ns = entry.start_pts_ns,
-                            event_type = ?entry.event_type,
-                            "budget prune: deleted event to stay under max_stored_bytes"
-                        );
-                    }
-                }
-            }
-        }
-        if deleted > 0 || missing > 0 || failed > 0 {
-            tracing::warn!(camera = %camera_id, deleted, missing, failed,
-                "budget prune complete");
+            },
+            || self.used() <= self.max_stored_bytes,
+            |cam, entry| async move { self.delete_event_objects(&cam, &entry).await },
+        )
+        .await;
+        if outcome != EmergencyOutcome::default() {
+            tracing::warn!(
+                camera = %camera_id,
+                deleted = outcome.deleted,
+                missing = outcome.missing,
+                failed = outcome.failed,
+                "budget prune complete"
+            );
         }
     }
 }
@@ -843,7 +664,7 @@ impl WarmStorageBackend for StathostBackend {
         let sidecar_key = format!("{camera_id}/{stem}.json");
         let sidecar = Bytes::from(
             sidecar_json(
-                event_type,
+                Some(event_type),
                 event.backend.as_deref(),
                 event.model.as_deref(),
                 &event.detection_details,
@@ -916,7 +737,7 @@ impl WarmStorageBackend for StathostBackend {
             None => 0,
         };
 
-        let replaced = self.index_entry(
+        let replaced = self.events.insert(
             camera_id,
             WarmEventEntry {
                 start_pts_ns: event.first_pts,
@@ -955,7 +776,7 @@ impl WarmStorageBackend for StathostBackend {
         // event was never indexed (write failed, or already pruned) there is
         // nothing to rewrite; the detections remain in the detection store.
         let key = (upgrade.start_pts_ns, upgrade.duration_ms);
-        if !self.is_indexed(camera_id, key) {
+        if !self.events.contains(camera_id, key) {
             tracing::warn!(
                 camera = %camera_id,
                 start_pts_ns = upgrade.start_pts_ns,
@@ -966,7 +787,7 @@ impl WarmStorageBackend for StathostBackend {
         }
         let stem = key_stem(key);
         let sidecar = sidecar_json(
-            EventType::Object,
+            Some(EventType::Object),
             Some(&upgrade.backend),
             Some(&upgrade.model),
             &upgrade.detections,
@@ -986,7 +807,7 @@ impl WarmStorageBackend for StathostBackend {
             return;
         }
 
-        self.update_entry(camera_id, key, |entry| {
+        self.events.update(camera_id, key, |entry| {
             entry.event_type = EventType::Object;
             entry.object_classes = upgrade.object_classes.clone();
             entry.detections = upgrade.detections.clone();
@@ -1036,64 +857,44 @@ impl WarmStorageBackend for StathostBackend {
         // able to sit on a request timeout, so shutdown gets checked between
         // events and between cameras — never part-way through an event.
         let stop = || cancel.load(Ordering::Relaxed);
-        for (camera_id, lock) in self.cameras.iter() {
+        for camera_id in self.events.camera_ids() {
             if stop() {
                 break;
             }
             // First give held events a chance to be typed, so one that resolves
-            // is pruned on its real retention in this same sweep.
+            // is pruned on its real retention in this same sweep. This is also
+            // what drops holds on events a previous sweep deleted: unindexing
+            // does not clear them, and nothing between here and there reads one.
             self.resolve_unknown_types(camera_id, cancel).await;
-            let (indexed, expired) = {
-                let entries = lock.read_recover();
-                let expired: Vec<WarmEventEntry> = entries
-                    .iter()
-                    .filter(|e| {
-                        let limit = if self.has_unknown_type(camera_id, event_key(e)) {
-                            unknown_max_age
-                        } else {
-                            max_age(e.event_type)
-                        };
-                        now_ns.saturating_sub(e.start_pts_ns) > limit
-                    })
-                    .cloned()
-                    .collect();
-                (entries.len(), expired)
-            };
+
+            let expired = self.events.expired_for_sweep(camera_id, now_ns, |e| {
+                if self.has_unknown_type(camera_id, event_key(e)) {
+                    unknown_max_age
+                } else {
+                    max_age(e.event_type)
+                }
+            });
             if expired.is_empty() {
                 continue;
             }
-            let expired = cap_sweep_deletions(camera_id, indexed, expired);
 
-            let mut deleted = 0u64;
-            let mut failed = 0u64;
-            for entry in &expired {
-                if stop() {
-                    break;
-                }
-                let key = event_key(entry);
-                match self.delete_event_objects(camera_id, entry).await {
-                    Removal::Deleted => {
-                        self.remove_entry(camera_id, key);
-                        deleted += 1;
-                    }
-                    // Already gone on the host: nothing was reclaimed, but the
-                    // entry describes an object that does not exist.
-                    Removal::Missing => {
-                        self.remove_entry(camera_id, key);
-                    }
-                    Removal::Failed => {
-                        failed += 1;
-                        self.mark_delete_failed(camera_id, key);
-                    }
-                }
+            let outcome =
+                sweep_expired(&self.events, camera_id, expired, stop, |entry| async move {
+                    self.delete_event_objects(camera_id, &entry).await
+                })
+                .await;
+
+            if outcome.deleted > 0 {
+                tracing::info!(
+                    camera = %camera_id,
+                    deleted = outcome.deleted,
+                    "pruned expired warm events"
+                );
             }
-            if deleted > 0 {
-                tracing::info!(camera = %camera_id, deleted, "pruned expired warm events");
-            }
-            if failed > 0 {
+            if outcome.failed > 0 {
                 tracing::warn!(
                     camera = %camera_id,
-                    failed,
+                    failed = outcome.failed,
                     "expired warm events are still on stathost after a failed delete, \
                      kept indexed for the next prune tick (stems at debug level)"
                 );
@@ -1141,7 +942,7 @@ impl WarmStorageBackend for StathostBackend {
             let Some((camera_id, stem)) = split_ts_key(&item.path) else {
                 continue;
             };
-            if !self.cameras.contains_key(camera_id) {
+            if !self.events.owns_camera(camera_id) {
                 continue;
             }
             let Some((start_pts_ns, duration_ms)) = parse_event_filename(stem) else {
@@ -1216,7 +1017,7 @@ impl WarmStorageBackend for StathostBackend {
                 delete_failed: false,
             };
             apply_sidecar(&mut entry, sidecar.as_ref());
-            self.index_entry(&event.camera_id, entry);
+            self.events.insert(&event.camera_id, entry);
             if !type_known {
                 self.mark_unknown_type(&event.camera_id, (event.start_pts_ns, event.duration_ms));
                 unknown_type += 1;
@@ -1248,49 +1049,16 @@ impl WarmStorageBackend for StathostBackend {
         // collects during the scan — it needs the listing the scan already has.
     }
 
-    /// Every event overlapping `[from_ns, to_ns]`. An inverted range is empty.
-    ///
-    /// Entries are ordered by start PTS only, so the upper bound binary-searches
-    /// but the lower one cannot: a long event (a continuous chunk) can start
-    /// far before the window and still reach into it, and "ends after `from_ns`"
-    /// is not monotone in start order. The candidate prefix is filtered instead.
     fn query(&self, camera_id: &str, from_ns: u64, to_ns: u64) -> Vec<WarmEventEntry> {
-        if from_ns > to_ns {
-            return Vec::new();
-        }
-        match self.cameras.get(camera_id) {
-            Some(lock) => {
-                let entries = lock.read_recover();
-                let end = entries.partition_point(|e| e.start_pts_ns <= to_ns);
-                entries[..end]
-                    .iter()
-                    .filter(|e| {
-                        e.start_pts_ns
-                            .saturating_add((e.duration_ms as u64) * NANOS_PER_MS)
-                            >= from_ns
-                    })
-                    .cloned()
-                    .collect()
-            }
-            None => Vec::new(),
-        }
+        self.events.query(camera_id, from_ns, to_ns)
     }
 
     fn newest_event_end_ns(&self, camera_id: &str) -> Option<u64> {
-        let entries = self.cameras.get(camera_id)?.read_recover();
-        entries.last().map(|e| {
-            e.start_pts_ns
-                .saturating_add((e.duration_ms as u64) * NANOS_PER_MS)
-        })
+        self.events.newest_event_end_ns(camera_id)
     }
 
     fn find_event(&self, camera_id: &str, start_pts_ns: u64) -> Option<WarmEventEntry> {
-        let lock = self.cameras.get(camera_id)?;
-        let entries = lock.read_recover();
-        entries
-            .binary_search_by_key(&start_pts_ns, |e| e.start_pts_ns)
-            .ok()
-            .map(|i| entries[i].clone())
+        self.events.find(camera_id, start_pts_ns)
     }
 
     async fn read_video(
@@ -1659,38 +1427,6 @@ fn sidecar_required(event: &FinishedEvent) -> bool {
     event.event_type() != EventType::Movement || event.continues
 }
 
-/// Sidecar JSON for the remote backend — identical to the local sidecar plus a
-/// leading `"event_type"`, the only carrier of the type without a directory.
-fn sidecar_json(
-    event_type: EventType,
-    backend: Option<&str>,
-    model: Option<&str>,
-    detection_details: &[DetectionDetail],
-    continues: bool,
-) -> String {
-    let mut meta = serde_json::Map::new();
-    meta.insert(
-        "event_type".to_string(),
-        serde_json::json!(event_type.as_str()),
-    );
-    if let Some(backend) = backend {
-        meta.insert("backend".to_string(), serde_json::json!(backend));
-    }
-    if let Some(model) = model {
-        meta.insert("model".to_string(), serde_json::json!(model));
-    }
-    let deduped = deduplicate_detections(detection_details);
-    let detections: Vec<serde_json::Value> = deduped
-        .iter()
-        .map(|(class, confidence)| serde_json::json!({"class": class, "confidence": confidence}))
-        .collect();
-    meta.insert("detections".to_string(), serde_json::json!(detections));
-    if continues {
-        meta.insert("continues".to_string(), serde_json::json!(true));
-    }
-    serde_json::to_string(&meta).unwrap()
-}
-
 fn reqwest_io(e: reqwest::Error) -> std::io::Error {
     std::io::Error::other(e)
 }
@@ -1715,7 +1451,8 @@ fn parse_content_range_total(value: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicBool, AtomicUsize};
+    use crate::storage::event_index::DetectionDetail;
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize};
     use std::sync::{Arc, Mutex};
 
     use axum::{
@@ -2162,7 +1899,7 @@ mod tests {
 
         assert_eq!(backend.query("cam", 0, u64::MAX).len(), 1);
         assert_eq!(backend.find_event("cam", 1_000).unwrap().file_size, 25);
-        assert_eq!(backend.used_bytes.load(Ordering::Relaxed), 25);
+        assert_eq!(backend.used(), 25);
         // ts + json + 2 thumbs, overwritten in place.
         assert_eq!(stub.files.lock().unwrap().len(), 4);
     }
@@ -2216,7 +1953,7 @@ mod tests {
             .write_event("cam", &longer_movement_event(OLD_PTS, 40))
             .await;
         assert_eq!(backend.query("cam", 0, u64::MAX).len(), 2);
-        assert_eq!(backend.used_bytes.load(Ordering::Relaxed), 40 + 80);
+        assert_eq!(backend.used(), 40 + 80);
 
         // Upgrade only the longer one.
         let mut upgrade = upgrade_for(OLD_PTS);
@@ -2252,7 +1989,7 @@ mod tests {
         assert!(!stub.has(&format!("cam/{OLD_PTS}_1000.ts")));
         assert!(stub.has(&format!("cam/{OLD_PTS}_2000.ts")));
         assert_eq!(
-            backend.used_bytes.load(Ordering::Relaxed),
+            backend.used(),
             80,
             "the wrong sibling's bytes were refunded"
         );
@@ -2372,7 +2109,7 @@ mod tests {
 
         assert!(backend.find_event("cam", old_pts).is_none());
         assert!(stub.files.lock().unwrap().is_empty());
-        assert_eq!(backend.used_bytes.load(Ordering::Relaxed), 0);
+        assert_eq!(backend.used(), 0);
     }
 
     /// The per-sweep deletion cap is the remote store's protection against a
@@ -2485,7 +2222,7 @@ mod tests {
         assert!(backend.find_event("cam", 1_000).is_none()); // continuous evicted
         assert!(backend.find_event("cam", 2_000).is_none()); // movement evicted
         assert!(backend.find_event("cam", 3_000).is_some()); // object survives
-        assert!(backend.used_bytes.load(Ordering::Relaxed) <= 60);
+        assert!(backend.used() <= 60);
     }
 
     /// Budget eviction runs ahead of every write, so an object the store
@@ -2536,7 +2273,7 @@ mod tests {
         assert!(backend.find_event("cam", 1_000).is_none());
         assert!(backend.find_event("cam", 2_000).is_none());
         assert!(backend.find_event("cam", 3_000).is_some());
-        assert_eq!(backend.used_bytes.load(Ordering::Relaxed), 40);
+        assert_eq!(backend.used(), 40);
     }
 
     /// An outage flags one candidate per pass (the pass stops at the first
@@ -2572,7 +2309,7 @@ mod tests {
         // budget stays at 160 of 60 for the life of the process.
         stub.fail_delete_paths.lock().unwrap().clear();
         backend.guard_free_space("cam", 0).await;
-        assert!(backend.used_bytes.load(Ordering::Relaxed) <= 60);
+        assert!(backend.used() <= 60);
         assert_eq!(backend.query("cam", 0, u64::MAX).len(), 1);
     }
 
@@ -2768,7 +2505,7 @@ mod tests {
             );
         }
         // The budget is the sum of the index, so a double insertion shows here.
-        assert_eq!(backend.used_bytes.load(Ordering::Relaxed), 40 * 10);
+        assert_eq!(backend.used(), 40 * 10);
     }
 
     /// The distinction the whole sidecar path rests on survives the fan-out: a
@@ -2831,7 +2568,7 @@ mod tests {
 
         assert_eq!(outcome, WriteOutcome::Failed);
         assert!(backend.find_event("cam", 11_000).is_none());
-        assert_eq!(backend.used_bytes.load(Ordering::Relaxed), 0);
+        assert_eq!(backend.used(), 0);
         // The video was never attempted, so there is no bare .ts for a later
         // scan to call a movement event.
         assert!(!stub.has("cam/11000_1000.ts"));
@@ -3258,7 +2995,7 @@ mod tests {
     #[test]
     fn a_plain_movement_sidecar_carries_nothing_but_its_type() {
         assert_eq!(
-            sidecar_json(EventType::Movement, None, None, &[], false),
+            sidecar_json(Some(EventType::Movement), None, None, &[], false),
             r#"{"detections":[],"event_type":"movement"}"#
         );
     }
@@ -3366,7 +3103,7 @@ mod tests {
     fn indexed(spans: &[(u64, u32)]) -> StathostBackend {
         let backend = backend_for("http://127.0.0.1:1", "secret", 0);
         for &(start_pts_ns, duration_ms) in spans {
-            backend.insert_entry(
+            backend.events.insert(
                 "cam",
                 WarmEventEntry {
                     start_pts_ns,
