@@ -1,6 +1,7 @@
 use std::io::{Read, Write};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
+use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -48,7 +49,10 @@ pub const DETECTION_CROP_SIZE: (u32, u32) = (1920, 1080);
 pub const THUMBNAIL_CROP_SIZE: (u32, u32) = (640, 360);
 
 struct FfmpegPipe {
-    segment_tx: Option<SyncSender<Vec<u8>>>,
+    /// Segments are handed over as they are held in the hot buffer — shared,
+    /// not copied: the channel keeps up to `segment_channel_size` of them in
+    /// flight, and each is a whole GOP.
+    segment_tx: Option<SyncSender<Arc<Vec<u8>>>>,
     frame_rx: Receiver<Vec<u8>>,
     child: Option<Child>,
     _writer_handle: JoinHandle<()>,
@@ -71,7 +75,7 @@ fn spawn_ffmpeg_pipe(
     let stdin = child.stdin.take().expect("stdin piped");
     let stdout = child.stdout.take().expect("stdout piped");
 
-    let (segment_tx, segment_rx) = mpsc::sync_channel::<Vec<u8>>(segment_channel_size);
+    let (segment_tx, segment_rx) = mpsc::sync_channel::<Arc<Vec<u8>>>(segment_channel_size);
     let (frame_tx, frame_rx) = mpsc::sync_channel::<Vec<u8>>(frame_channel_size);
 
     let writer_handle = thread::spawn(move || {
@@ -88,9 +92,19 @@ fn spawn_ffmpeg_pipe(
 
     let reader_handle = thread::spawn(move || {
         let mut stdout = stdout;
-        let mut buf = vec![0u8; frame_size];
-        while stdout.read_exact(&mut buf).is_ok() {
-            if frame_tx.send(buf.clone()).is_err() {
+        loop {
+            // A buffer per frame, handed over by move. Reading into one reused
+            // buffer and cloning it out would memcpy the whole frame — 6 MB at
+            // the detection crop size, on every frame of every crop decode —
+            // where a fresh allocation of that size is served by lazily zeroed
+            // pages the read overwrites anyway. A frame that fails to read is
+            // dropped rather than sent, exactly as the reused buffer's partial
+            // contents were before.
+            let mut buf = vec![0u8; frame_size];
+            if stdout.read_exact(&mut buf).is_err() {
+                break;
+            }
+            if frame_tx.send(buf).is_err() {
                 break;
             }
         }
@@ -127,9 +141,8 @@ impl Drop for FfmpegPipe {
 /// Hand `data` to the pipe's writer thread, giving up after `deadline` of a
 /// permanently full channel. The deadline is a parameter so tests can trip the
 /// wedge path without waiting out [`SEND_DEADLINE`].
-fn send_with_deadline(tx: &SyncSender<Vec<u8>>, data: Vec<u8>, deadline: Duration) -> SendOutcome {
+fn send_with_deadline<T>(tx: &SyncSender<T>, mut data: T, deadline: Duration) -> SendOutcome {
     let start = Instant::now();
-    let mut data = data;
     loop {
         match tx.try_send(data) {
             Ok(()) => return SendOutcome::Sent,
@@ -238,9 +251,9 @@ fn frames_still_unclaimed(ledger: &FrameLedger) -> usize {
     }
 }
 
-fn send_segment(pipe: &FfmpegPipe, data: &[u8]) -> SendOutcome {
+fn send_segment(pipe: &FfmpegPipe, data: Arc<Vec<u8>>) -> SendOutcome {
     match pipe.segment_tx.as_ref() {
-        Some(tx) => send_with_deadline(tx, data.to_vec(), SEND_DEADLINE),
+        Some(tx) => send_with_deadline(tx, data, SEND_DEADLINE),
         None => SendOutcome::Closed,
     }
 }
@@ -306,8 +319,8 @@ impl FrameDecoder {
         })
     }
 
-    pub fn decode_segment(&mut self, data: &[u8]) -> DecodeOutcome {
-        match send_segment(&self.pipe, data) {
+    pub fn decode_segment(&mut self, data: &Arc<Vec<u8>>) -> DecodeOutcome {
+        match send_segment(&self.pipe, Arc::clone(data)) {
             SendOutcome::Sent => {}
             // A closed pipe means the child already died; `is_alive` reports it
             // and the caller respawns without any special handling here.
@@ -420,8 +433,8 @@ impl CropDecoder {
         })
     }
 
-    pub fn decode_segment(&self, data: &[u8], duration_ns: u64) -> Vec<Vec<u8>> {
-        match send_segment(&self.pipe, data) {
+    pub fn decode_segment(&self, data: &Arc<Vec<u8>>, duration_ns: u64) -> Vec<Vec<u8>> {
+        match send_segment(&self.pipe, Arc::clone(data)) {
             SendOutcome::Sent => {}
             SendOutcome::Closed => return Vec::new(),
             // A crop decoder is spawned per batch and dropped after it, which
@@ -671,7 +684,7 @@ mod tests {
     /// One-GOP MPEG-TS segments with an audio track, straight out of ffmpeg's
     /// muxer — what the hot buffer holds, near enough. Needs an `ffmpeg`
     /// binary, so only the `#[ignore]`d tests use it.
-    fn recorded_segments(count: usize) -> Vec<Vec<u8>> {
+    fn recorded_segments(count: usize) -> Vec<Arc<Vec<u8>>> {
         let dir = tempfile::TempDir::new().expect("temp dir");
         let status = Command::new("ffmpeg")
             .args([
@@ -708,7 +721,9 @@ mod tests {
             .expect("run ffmpeg");
         assert!(status.success(), "ffmpeg failed to generate segments");
         (0..count)
-            .map(|i| std::fs::read(dir.path().join(format!("seg{i:03}.ts"))).expect("segment"))
+            .map(|i| {
+                Arc::new(std::fs::read(dir.path().join(format!("seg{i:03}.ts"))).expect("segment"))
+            })
             .collect()
     }
 
@@ -797,7 +812,7 @@ mod tests {
         // Junk bytes: ffmpeg never gets to parse them. Enough per segment that
         // the kernel pipe buffer fills within a few sends, after which the 16
         // channel slots are all that is left.
-        let segment = vec![0u8; 256 * 1024];
+        let segment = Arc::new(vec![0u8; 256 * 1024]);
         let mut outcome = None;
         for _ in 0..64 {
             match decoder.decode_segment(&segment) {

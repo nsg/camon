@@ -37,11 +37,16 @@ pub fn write_synced(path: &Path, data: &[u8]) -> std::io::Result<()> {
     file.sync_all()
 }
 
-/// Async twin of [`write_synced`].
-pub async fn write_synced_async(path: &Path, data: &[u8]) -> std::io::Result<()> {
+/// Async twin of [`write_synced`], taking the contents in pieces: the chunks
+/// land back to back, so a caller holding an event as shared segments writes
+/// them as they are instead of concatenating tens of megabytes into one buffer
+/// first.
+pub async fn write_all_synced_async(path: &Path, chunks: &[&[u8]]) -> std::io::Result<()> {
     use tokio::io::AsyncWriteExt;
     let mut file = tokio::fs::File::create(path).await?;
-    file.write_all(data).await?;
+    for chunk in chunks {
+        file.write_all(chunk).await?;
+    }
     file.sync_all().await?;
     Ok(())
 }
@@ -174,6 +179,32 @@ mod tests {
         std::fs::create_dir(tmp_path(&path)).unwrap();
         assert!(replace_atomic_async(&path, b"second").await.is_err());
         assert_eq!(std::fs::read(&path).unwrap(), b"first");
+    }
+
+    #[tokio::test]
+    async fn write_all_synced_async_lands_the_chunks_back_to_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let chunked = dir.path().join("chunked");
+        let pieces: [&[u8]; 3] = [b"one", b"two", b"three"];
+
+        write_all_synced_async(&chunked, &pieces).await.unwrap();
+        assert_eq!(std::fs::read(&chunked).unwrap(), b"onetwothree");
+
+        // One buffer is the degenerate case of the same call.
+        let whole = dir.path().join("whole");
+        write_all_synced_async(&whole, &[b"onetwothree"])
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read(&whole).unwrap(),
+            std::fs::read(&chunked).unwrap()
+        );
+
+        // No chunks is an empty file, not a missing one: an event with no
+        // segments still has to leave something for the commit rename.
+        let empty = dir.path().join("empty");
+        write_all_synced_async(&empty, &[]).await.unwrap();
+        assert_eq!(std::fs::read(&empty).unwrap(), b"");
     }
 
     /// Whether the fsync reached the platter is not observable from a test; what

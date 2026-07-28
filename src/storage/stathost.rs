@@ -75,6 +75,7 @@ use std::sync::RwLock;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use bytes::Bytes;
 use futures_util::TryStreamExt;
 use serde::Deserialize;
 
@@ -753,7 +754,13 @@ impl WarmStorageBackend for StathostBackend {
         };
         let key = (event.first_pts, duration_ms);
         let stem = key_stem(key);
-        let data = concatenate_segments(&event.segments, event.total_bytes);
+        // Contiguous, unlike the local backend's write, by choice rather than
+        // by necessity: reqwest can stream a body from the segments as they
+        // are, but only as a second request shape for the server to accept —
+        // and a wire change that cannot be tested against the real stathost is
+        // not worth the megabytes. Held as `Bytes` so the retry below shares
+        // the buffer instead of doubling the event's footprint.
+        let data = Bytes::from(concatenate_segments(&event.segments, event.total_bytes));
         let file_size = data.len() as u64;
         let event_type = event.event_type();
 
@@ -763,14 +770,16 @@ impl WarmStorageBackend for StathostBackend {
         // retention after the next scan. One retry, then fail the write before
         // the video is uploaded at all.
         let sidecar_key = format!("{camera_id}/{stem}.json");
-        let sidecar = sidecar_json(
-            event_type,
-            event.backend.as_deref(),
-            event.model.as_deref(),
-            &event.detection_details,
-            event.continues,
-        )
-        .into_bytes();
+        let sidecar = Bytes::from(
+            sidecar_json(
+                event_type,
+                event.backend.as_deref(),
+                event.model.as_deref(),
+                &event.detection_details,
+                event.continues,
+            )
+            .into_bytes(),
+        );
         if self.http.put(&sidecar_key, sidecar.clone()).await.is_err() {
             tracing::warn!(camera = %camera_id, stem = %stem,
                 "stathost sidecar upload failed, retrying once");
@@ -819,7 +828,12 @@ impl WarmStorageBackend for StathostBackend {
                 let mut wrote = 0;
                 for (i, jpeg) in frames.iter().enumerate() {
                     let key = format!("{camera_id}/{stem}_thumb_{i}.jpg");
-                    if self.http.put(&key, jpeg.clone()).await.is_err() {
+                    // Copied, not shared, because the filmstrip is typed
+                    // `Arc<Vec<Vec<u8>>>` where the event assembles it. Making
+                    // it shareable all the way here would mean retyping it at
+                    // the source for four JPEGs an event.
+                    let body = Bytes::from(jpeg.clone());
+                    if self.http.put(&key, body).await.is_err() {
                         tracing::warn!(camera = %camera_id, stem = %stem, frame = i,
                             "failed to upload filmstrip thumbnail to stathost");
                         break;
@@ -889,7 +903,10 @@ impl WarmStorageBackend for StathostBackend {
         );
         if self
             .http
-            .put(&format!("{camera_id}/{stem}.json"), sidecar.into_bytes())
+            .put(
+                &format!("{camera_id}/{stem}.json"),
+                Bytes::from(sidecar.into_bytes()),
+            )
             .await
             .is_err()
         {
@@ -1325,7 +1342,9 @@ impl Http {
         format!("{}/{}", self.base, path)
     }
 
-    async fn put(&self, path: &str, body: Vec<u8>) -> Result<(), reqwest::Error> {
+    /// `Bytes` rather than `Vec<u8>`: an upload that has to be retried needs a
+    /// second body, and a whole event is tens of megabytes to hold twice.
+    async fn put(&self, path: &str, body: Bytes) -> Result<(), reqwest::Error> {
         self.client
             .put(self.url(path))
             .bearer_auth(&self.token)

@@ -1039,7 +1039,7 @@ impl MotionAnalyzer {
     /// — see [`SegmentAnalysis`].
     fn analyze_segment(
         &mut self,
-        data: &[u8],
+        data: &Arc<Vec<u8>>,
     ) -> Result<Option<SegmentAnalysis>, Box<dyn std::error::Error + Send + Sync>> {
         let raw_frames = match self.decoder.decode_segment(data) {
             DecodeOutcome::Frames(frames) => frames,
@@ -1281,7 +1281,7 @@ fn sample_indices(len: usize) -> Vec<usize> {
 
 fn decode_to_frames_tagged(
     decoder: &CropDecoder,
-    data: &[u8],
+    data: &Arc<Vec<u8>>,
     duration_ns: u64,
     crop: Option<NormalizedRect>,
     out: &mut Vec<(RgbFrame, Option<NormalizedRect>)>,
@@ -1311,9 +1311,15 @@ fn subsample_tagged(
         return frames;
     }
     let n = frames.len();
-    [0, n / 3, 2 * n / 3, n - 1]
-        .iter()
-        .map(|&i| frames[i].clone())
+    // Moved out rather than indexed and cloned, as in [`subsample_filmstrip`]:
+    // a kept frame is a whole raw RGB image, several megabytes at the detection
+    // crop size.
+    let picks = [0, n / 3, 2 * n / 3, n - 1];
+    frames
+        .into_iter()
+        .enumerate()
+        .filter(|(i, _)| picks.contains(i))
+        .map(|(_, tagged)| tagged)
         .collect()
 }
 
@@ -2053,6 +2059,49 @@ mod tests {
         strip.push(frames(&[3]));
         assert_eq!(tags(&closed), vec![1, 2]);
         assert_eq!(tags(&strip.take().unwrap()), vec![3]);
+    }
+
+    /// The tagged frames are moved out of the vector, not copied out of it, so
+    /// which frames survive — and that each keeps its own crop tag — has to be
+    /// pinned: taking the wrong index is invisible in a filmstrip.
+    #[test]
+    fn subsample_tagged_keeps_four_frames_spread_over_the_run() {
+        fn tagged(n: usize) -> Vec<(RgbFrame, Option<NormalizedRect>)> {
+            (0..n)
+                .map(|i| {
+                    let frame = RgbFrame {
+                        data: vec![i as u8; 3],
+                        width: 1,
+                        height: 1,
+                    };
+                    let crop = NormalizedRect {
+                        x: i as f32,
+                        y: 0.0,
+                        w: 1.0,
+                        h: 1.0,
+                    };
+                    (frame, Some(crop))
+                })
+                .collect()
+        }
+        fn picked(frames: Vec<(RgbFrame, Option<NormalizedRect>)>) -> Vec<u8> {
+            frames
+                .iter()
+                .map(|(frame, crop)| {
+                    assert_eq!(crop.unwrap().x, frame.data[0] as f32, "tag follows frame");
+                    frame.data[0]
+                })
+                .collect()
+        }
+
+        // Four or fewer are all kept, untouched.
+        assert_eq!(picked(subsample_tagged(tagged(4))), vec![0, 1, 2, 3]);
+        // Five is the first length past the short-circuit, and the one where
+        // the four picks pack tightest — a collision would silently return
+        // three frames.
+        assert_eq!(picked(subsample_tagged(tagged(5))), vec![0, 1, 3, 4]);
+        assert_eq!(picked(subsample_tagged(tagged(6))), vec![0, 2, 4, 5]);
+        assert_eq!(picked(subsample_tagged(tagged(12))), vec![0, 4, 8, 11]);
     }
 
     #[test]

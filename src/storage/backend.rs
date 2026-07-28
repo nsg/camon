@@ -30,7 +30,6 @@ use futures_core::Stream;
 use tokio_util::io::ReaderStream;
 
 use crate::buffer::warm::{EventUpgrade, FinishedEvent};
-use crate::buffer::GopSegment;
 use crate::storage::warm_index::{
     free_space_bytes, should_emergency_prune, DetectionDetail, EmergencyOutcome,
 };
@@ -504,14 +503,6 @@ impl WarmStorageBackend for LocalDiskBackend {
 // exercise them exactly as before.
 // ---------------------------------------------------------------------------
 
-fn concatenate_segments(segments: &[GopSegment], capacity: usize) -> Vec<u8> {
-    let mut data = Vec::with_capacity(capacity);
-    for seg in segments {
-        data.extend_from_slice(&seg.data);
-    }
-    data
-}
-
 fn build_sidecar_json(event: &FinishedEvent) -> String {
     sidecar_json(
         event.backend.as_deref(),
@@ -665,11 +656,14 @@ async fn write_event(
     let stem = format!("{}_{}", event.first_pts, duration_ms);
     let file_path = camera_dir.join(format!("{}.ts", stem));
     let staging_path = crate::durable::tmp_path(&file_path);
-    let data = concatenate_segments(&event.segments, event.total_bytes);
-    let file_size = data.len() as u64;
+    // The segments are written as they are held: the event's bytes reach the
+    // file back to back either way, and nothing here needs them contiguous in
+    // memory first.
+    let chunks: Vec<&[u8]> = event.segments.iter().map(|s| s.data.as_slice()).collect();
+    let file_size = chunks.iter().map(|c| c.len() as u64).sum();
 
     // Step 1: footage first. Once this returns, the video survives a crash.
-    if let Err(e) = crate::durable::write_synced_async(&staging_path, &data).await {
+    if let Err(e) = crate::durable::write_all_synced_async(&staging_path, &chunks).await {
         // A partial staging file from a failed write is deleted rather than
         // left for recovery: the disk is under pressure and the writer is
         // about to either retry from scratch or drop the event knowingly.
@@ -965,7 +959,7 @@ async fn generate_thumbnail(ts_path: &Path, thumb_path: &Path) -> Result<(), Thu
 mod tests {
     use super::*;
     use crate::buffer::warm::{assemble_continuous_chunk, assemble_event};
-    use crate::buffer::HotBuffer;
+    use crate::buffer::{GopSegment, HotBuffer};
     use crate::locks::LockExt;
 
     const SEC: u64 = 1_000_000_000;
@@ -1064,6 +1058,36 @@ mod tests {
             index.resolve_file_path("cam", &entry),
             movements.join(format!("{}.ts", stem))
         );
+    }
+
+    /// The video is written straight from the event's shared segments rather
+    /// than from one buffer holding a copy of them all, so the file has to be
+    /// pinned as their bytes in order: a chunk written twice, skipped or
+    /// reordered would still produce a plausible `.ts` of the right size.
+    #[tokio::test]
+    async fn written_event_bytes_are_the_segments_back_to_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let buffer = populated_buffer(10);
+        let event = {
+            let buf = buffer.read_recover();
+            assemble_event(&buf, None, "cam", 5, 7, 0, SEC, false, None).unwrap()
+        };
+
+        let outcome = write_event(dir.path(), "cam", &event, None).await;
+        assert_eq!(outcome, WriteOutcome::Written);
+
+        let expected: Vec<u8> = event
+            .segments
+            .iter()
+            .flat_map(|s| s.data.iter().copied())
+            .collect();
+        let path = dir.path().join("cam").join("movements").join(format!(
+            "{}_{}.ts",
+            event.first_pts,
+            event.duration_ms()
+        ));
+        assert_eq!(std::fs::read(&path).unwrap(), expected);
+        assert_eq!(expected.len(), event.total_bytes);
     }
 
     /// Whether an fsync reached the platter is not observable from a test, and
