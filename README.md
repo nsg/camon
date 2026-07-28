@@ -319,8 +319,13 @@ min_free_bytes = 2147483648
 # Supervisor and normally needs no manual settings. On every (re)connect camon
 # restates every configured entity explicitly, on or off, and flips
 # availability to "online" last, so a retained ON left behind by a camon that
-# died mid-motion is always contradicted. Snapshots are not queued while the
-# broker is unreachable — an image would be long superseded by the time it
+# died mid-motion is always contradicted. Entities the config no longer
+# describes — a renamed or removed camera, a dropped class — are cleared from
+# the broker before that flip, using the set camon last announced, which it
+# remembers in {data_dir}/mqtt_entities.json together with the broker it
+# announced to; a record naming a different broker is never acted on.
+# Snapshots are not queued while
+# the broker is unreachable — an image would be long superseded by the time it
 # could be delivered — and each snapshot decode gives up after 15 seconds.
 # While enabled, camera ids must not contain "+" or "#" (MQTT wildcards) and
 # must stay unique once lowercased with non-alphanumerics folded to "_"; the
@@ -409,6 +414,8 @@ See the [add-on documentation](camon-addon/DOCS.md) for install steps, ingress n
 With the `[mqtt]` section enabled (automatic in the add-on when the Mosquitto broker add-on is installed), each camera also appears as native Home Assistant entities via MQTT discovery: a motion-gated snapshot camera, a motion sensor, per-class occupancy sensors, and a per-class snapshot camera showing the cropped frame from the last sighting of that class (retained, so it persists across restarts) — no custom integration required.
 
 Because every state is published retained, a connection that drops mid-motion would otherwise leave Home Assistant showing movement that never ends. Every reconnect therefore restates *every* configured entity — the ones that are off just as loudly as the ones that are on — and only then marks the device available again, so nothing is trusted while the broker still holds a stale value.
+
+An entity the config *stops* describing is the same problem one step removed: rename or remove a camera, or drop an object class, and its retained discovery document and state stay in the broker, ready to be made available again by the very next "online". Camon remembers the entity set it announced (in `{data_dir}/mqtt_entities.json`, together with the broker it announced to — a record from a different broker is never acted on) and clears what the current set no longer explains — discovery document and state alike — ahead of the availability flip. Cameras are read from the config outright; classes are carried forward when a run has none, so object detection being off, or its vision server unreachable, keeps the occupancy entities and their history, restated for what they are rather than deleted. Because queueing a message is not sending it, the clears stay recorded as owed until a clean disconnect proves they went out: an unclean stop costs one redundant round of clears next start, which is a no-op on a topic that no longer holds anything.
 
 ## License
 

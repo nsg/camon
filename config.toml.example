@@ -269,6 +269,16 @@ topic_prefix = "camon"
 # Prefix the Home Assistant MQTT integration watches for discovery messages
 # (default: "homeassistant")
 discovery_prefix = "homeassistant"
+# Renaming or removing a camera, dropping an object detection class, or moving
+# either prefix leaves the entity's retained discovery message and state in the
+# broker. camon remembers the set it announced — and the broker it announced it
+# to — in {storage.data_dir}/mqtt_entities.json, and clears whatever the
+# current set no longer describes on the next connect, before it marks the
+# device available again. A record naming a different broker is never acted on.
+# Classes are the one exception to "gone from the config means gone": a run
+# with none (object detection off, or its vision server unreachable) keeps
+# announcing the remembered ones, so their entities and history survive
+# instead of being deleted by a temporary condition.
 # How often the snapshot camera image is republished while motion is active,
 # in seconds (default: 5)
 snapshot_interval_secs = 5

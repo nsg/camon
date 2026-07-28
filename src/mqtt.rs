@@ -72,9 +72,8 @@
 //! be ON, because the broker can be holding a retained ON that no live state
 //! corresponds to: camon dying mid-motion-run leaves one behind, the LWT only
 //! flips availability, and a fresh process would otherwise never contradict it.
-//! "Every configured entity" means every entity *this* config describes — a
-//! camera that has since been renamed or removed still has whatever the broker
-//! retained for it, and nothing here cleans that up.
+//! "Every configured entity" means every entity *this* config describes; what a
+//! previous one described is dealt with below.
 //!
 //! The burst is queued at its least favourable moment: nothing has drained the
 //! request queue for the length of the outage, so it can be rejected in full.
@@ -84,23 +83,72 @@
 //! that retry to be able to converge the queue is sized from the config to hold
 //! a whole burst; see [`request_queue_capacity`].
 //!
-//! Order within the burst is discovery, then states, then `online`. MQTT only
-//! guarantees ordering per topic, so this is not a promise about what Home
-//! Assistant observes in what instant; it is that camon never leaves the
-//! *final* retained set inconsistent, and that the availability flip is the
-//! last thing queued rather than the first.
+//! Order within the burst is orphan clears, then discovery, then states, then
+//! `online`. MQTT only guarantees ordering per topic, so this is not a promise
+//! about what Home Assistant observes in what instant; it is that camon never
+//! leaves the *final* retained set inconsistent, and that the availability flip
+//! is the last thing queued rather than the first.
+//!
+//! # Forgetting an entity the config dropped
+//!
+//! Renaming or removing a camera, or dropping an object class, leaves the
+//! broker holding that entity's retained discovery document and its retained
+//! state. The burst above contradicts neither — it enumerates the current
+//! config — and since every entity shares one availability topic, publishing
+//! `online` makes those orphans available again: an entity showing whatever
+//! motion happened to be open when the camera was removed, permanently, in
+//! every restart.
+//!
+//! So the bridge remembers the entity set it announced, in
+//! `{data_dir}/mqtt_entities.json`, and clears what the current set no longer
+//! explains at the head of the next reconnect burst: an empty retained payload
+//! on the discovery topic, which is how Home Assistant is told to forget a
+//! discovered entity, and one on the topic that document pointed at, which the
+//! broker otherwise keeps holding for good — a per-class sighting crop is
+//! hundreds of KiB of it.
+//!
+//! Clearing something that was only *temporarily* absent costs the operator an
+//! entity's history and its place on a dashboard, so what counts as dropped is
+//! deliberately narrow. Cameras come from the config outright, so one that is
+//! not in it was renamed or removed. Classes do not: an empty class list means
+//! object detection is off *this run*, which is equally what a misconfigured or
+//! unreachable vision server looks like, so the remembered classes are carried
+//! forward. Carried forward *and announced* — the burst is built from the same
+//! record, so those entities keep their discovery documents and are restated
+//! OFF, rather than being left for `online` to resurrect with whatever the
+//! broker still held. No record at all — a first start, or one that cannot be
+//! read — clears nothing.
+//!
+//! Deleting is only camon's to do where camon published: the record names the
+//! broker it announced to and its format version, and a record that does not
+//! match this build and this broker is not acted on. Two camon instances
+//! sharing a broker, a discovery prefix *and* a camera id do co-own that
+//! camera's entities, and a removal in one is a removal for both; give them
+//! distinct camera ids or distinct discovery prefixes.
+//!
+//! Delivery is where the record is careful. `try_publish` only queues, so
+//! acceptance is recorded *with the clears still marked owed*: a process that
+//! dies before the eventloop writes them clears the same topics again on the
+//! next start. They are dropped from the record only when the shutdown
+//! `Disconnect` goes out, which — requests being written in queue order — puts
+//! everything queued before it on the wire. An unclean exit therefore costs one
+//! redundant round of clears, which is a no-op on a topic that no longer holds
+//! anything; the opposite trade would cost an entity that never came back.
 
 use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use rumqttc::{AsyncClient, Event, Incoming, LastWill, MqttOptions, QoS};
+use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::buffer::HotBuffer;
 use crate::config::MqttConfig;
+use crate::durable::{create_dir_all_synced, parent_dir, sync_dir, tmp_path, write_synced};
 use crate::locks::LockExt;
 
 /// Depth of the analyzer/detector -> bridge event channel. Events are tiny and
@@ -113,12 +161,12 @@ pub const MQTT_EVENT_CAPACITY: usize = 64;
 /// raised while that burst is still being drained.
 const REQUEST_QUEUE_HEADROOM: usize = 256;
 
-/// How many publishes one reconnect burst is — per camera two discovery
-/// payloads plus two per class, one state plus one per class, then the
-/// availability marker. A test ties this to what [`reconnect_burst`] actually
-/// produces.
-fn burst_len(cameras: usize, classes: usize) -> usize {
-    cameras * (3 + 3 * classes) + 1
+/// How many publishes one reconnect burst is — one clear per orphaned topic,
+/// then per camera two discovery payloads plus two per class, one state plus
+/// one per class, then the availability marker. A test ties this to what
+/// [`reconnect_burst`] actually produces.
+fn burst_len(cameras: usize, classes: usize, orphans: usize) -> usize {
+    orphans + cameras * (3 + 3 * classes) + 1
 }
 /// Depth of the rumqttc request queue, sized from the config so that one whole
 /// reconnect burst always fits in it.
@@ -134,8 +182,8 @@ fn burst_len(cameras: usize, classes: usize) -> usize {
 /// disconnected: the slots this adds can hold nothing bigger than a few bytes
 /// of retained state each, not the hundreds of KiB a JPEG would park here for
 /// the length of an outage.
-fn request_queue_capacity(cameras: usize, classes: usize) -> usize {
-    burst_len(cameras, classes) + REQUEST_QUEUE_HEADROOM
+fn request_queue_capacity(cameras: usize, classes: usize, orphans: usize) -> usize {
+    burst_len(cameras, classes, orphans) + REQUEST_QUEUE_HEADROOM
 }
 
 /// Outgoing packet-size ceiling. rumqttc defaults to 10 KiB, which every
@@ -254,9 +302,15 @@ struct Topics {
 
 impl Topics {
     fn new(config: &MqttConfig) -> Self {
+        Self::from_prefixes(&config.topic_prefix, &config.discovery_prefix)
+    }
+
+    /// Trailing slashes are trimmed here rather than at the call sites, so a
+    /// remembered prefix compares equal to the same prefix written with one.
+    fn from_prefixes(prefix: &str, discovery_prefix: &str) -> Self {
         Self {
-            prefix: config.topic_prefix.trim_end_matches('/').to_string(),
-            discovery_prefix: config.discovery_prefix.trim_end_matches('/').to_string(),
+            prefix: prefix.trim_end_matches('/').to_string(),
+            discovery_prefix: discovery_prefix.trim_end_matches('/').to_string(),
         }
     }
 
@@ -369,6 +423,274 @@ fn discovery_payloads(
     }
 
     out
+}
+
+/// Every retained topic one camera's entities occupy: each discovery document
+/// and the topic that document points Home Assistant at. Read back out of the
+/// payloads rather than rebuilt alongside them, so an entity kind cannot be
+/// announced without also being clearable.
+fn retained_topics(topics: &Topics, camera_id: &str, classes: &[String]) -> Vec<String> {
+    discovery_payloads(topics, camera_id, classes)
+        .into_iter()
+        .flat_map(|(discovery, payload)| {
+            let state = payload["state_topic"]
+                .as_str()
+                .or_else(|| payload["topic"].as_str())
+                .map(str::to_string);
+            std::iter::once(discovery).chain(state)
+        })
+        .collect()
+}
+
+/// Format of [`EntityRecord`]. A record that does not say exactly this is not
+/// camon's to act on: deleting a Home Assistant entity on the strength of a
+/// document this build does not fully understand is how a wrong deletion
+/// happens.
+const ENTITY_RECORD_VERSION: u32 = 1;
+
+/// The broker an entity set belongs to, as the record names it.
+fn broker_id(config: &MqttConfig) -> String {
+    format!("{}:{}", config.host, config.port)
+}
+
+/// The entity set camon announced to a broker, remembered across restarts so
+/// the next start can tell Home Assistant to forget what the config dropped.
+///
+/// Every field is deletion authority, so every field is required and unknown
+/// ones are refused: a record that is not exactly this shape reads as no record
+/// rather than as an entity set with empty prefixes. `broker` scopes the
+/// authority to where the entities were actually published — a data dir carried
+/// to another broker, or pointed at one, must not delete entities inferred from
+/// what a different broker was told. The prefixes decide every topic, so moving
+/// one orphans that whole side of the set.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EntityRecord {
+    version: u32,
+    /// `host:port` of the broker this set was announced to.
+    broker: String,
+    topic_prefix: String,
+    discovery_prefix: String,
+    cameras: Vec<String>,
+    classes: Vec<String>,
+    /// Clears that were queued but are not known to have left the process. They
+    /// ride the next run's burst as well, until a clean disconnect proves the
+    /// socket took them: re-clearing a cleared topic is a no-op, while
+    /// forgetting one that never went out is a permanent ghost entity.
+    pending_clears: Vec<String>,
+}
+
+impl EntityRecord {
+    /// The set this run announces, given what the last one announced.
+    ///
+    /// Classes are carried forward when this run has none: an empty list means
+    /// object detection produced no classes *this run* — it is off, or its
+    /// vision client could not be built — which is no evidence that the
+    /// operator dropped those entities. What is carried forward is announced,
+    /// not merely remembered: the burst is built from this record, so those
+    /// occupancy entities keep their discovery documents and are restated OFF,
+    /// which is what they are while nothing is looking for them. Cameras are
+    /// taken as they are — that list is the config's own.
+    fn current(previous: Option<&Self>, topics: &Topics, ctx: &BridgeContext) -> Self {
+        let classes = match previous {
+            Some(previous) if ctx.classes.is_empty() => previous.classes.clone(),
+            _ => ctx.classes.clone(),
+        };
+        Self {
+            version: ENTITY_RECORD_VERSION,
+            broker: broker_id(&ctx.config),
+            topic_prefix: topics.prefix.clone(),
+            discovery_prefix: topics.discovery_prefix.clone(),
+            cameras: ctx.camera_ids.clone(),
+            classes,
+            pending_clears: Vec::new(),
+        }
+    }
+
+    fn topics(&self) -> Topics {
+        Topics::from_prefixes(&self.topic_prefix, &self.discovery_prefix)
+    }
+
+    fn retained_topics(&self) -> HashSet<String> {
+        let topics = self.topics();
+        self.cameras
+            .iter()
+            .flat_map(|camera_id| retained_topics(&topics, camera_id, &self.classes))
+            .collect()
+    }
+}
+
+/// Retained topics the previous record holds that the current set does not
+/// explain, plus whatever it left owed. Anything the current set does announce
+/// is filtered back out — a camera removed and then added again is live, and
+/// clearing it would delete an entity camon is publishing to. Sorted and
+/// deduplicated so the burst is the same every time it is rebuilt.
+fn orphaned_topics(previous: &EntityRecord, current: &EntityRecord) -> Vec<String> {
+    let live = current.retained_topics();
+    let mut orphans: Vec<String> = previous
+        .retained_topics()
+        .into_iter()
+        .chain(previous.pending_clears.iter().cloned())
+        .filter(|topic| !live.contains(topic))
+        .collect();
+    // The availability topic belongs to no single entity — every one of them
+    // shares it — so it is only ever orphaned by the prefix itself moving.
+    if previous.topic_prefix != current.topic_prefix {
+        orphans.push(previous.topics().availability());
+    }
+    orphans.sort();
+    orphans.dedup();
+    orphans
+}
+
+fn load_record(path: &Path) -> Option<EntityRecord> {
+    let data = std::fs::read(path).ok()?;
+    let record: EntityRecord = match serde_json::from_slice(&data) {
+        Ok(record) => record,
+        Err(e) => {
+            tracing::warn!(path = %path.display(), error = %e,
+                "mqtt entity record unreadable, clearing no entities this start");
+            return None;
+        }
+    };
+    if record.version != ENTITY_RECORD_VERSION {
+        tracing::warn!(path = %path.display(), version = record.version,
+            "mqtt entity record is a format this build does not know, clearing no entities");
+        return None;
+    }
+    Some(record)
+}
+
+/// Persist the record the way every other small camon file is written: stage,
+/// fsync, rename, fsync the directory. A torn record reads as no record, which
+/// costs a cleanup that would have happened; the rename makes even that
+/// unreachable.
+fn save_record(path: &Path, record: &EntityRecord) -> std::io::Result<()> {
+    let dir = parent_dir(path).unwrap_or(Path::new("."));
+    create_dir_all_synced(dir)?;
+
+    let json = serde_json::to_vec_pretty(record).map_err(std::io::Error::other)?;
+    let tmp = tmp_path(path);
+    if let Err(e) = write_synced(&tmp, &json).and_then(|()| std::fs::rename(&tmp, path)) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    sync_dir(dir)
+}
+
+/// The bridge's memory of what Home Assistant has been told about.
+///
+/// The writes are small, synchronous and at most two per process (one when the
+/// burst is first accepted, one when the disconnect proves it went out). They
+/// are not handed to a blocking task because the failure has to come back here:
+/// a record that did not reach disk must stay owed, or a transient write error
+/// silently costs the operator's *next* removal its cleanup.
+struct EntityMemory {
+    /// `None` disables the memory entirely: nothing is read, cleared or
+    /// written.
+    path: Option<PathBuf>,
+    /// The set this run announces. The burst is built from it rather than from
+    /// the config directly, so what is recorded is exactly what was published.
+    announced: EntityRecord,
+    /// Retained topics of entities the current set does not explain. Published
+    /// empty at the head of every reconnect burst for the life of the process.
+    orphans: Vec<String>,
+    /// The record believed to be on disk, so a write is skipped when it would
+    /// change nothing and retried when it failed.
+    on_disk: Option<EntityRecord>,
+    /// Whether a burst carrying the clears has been taken by the request queue.
+    /// Without one there is nothing for a disconnect to prove.
+    burst_accepted: bool,
+}
+
+impl EntityMemory {
+    fn load(topics: &Topics, ctx: &BridgeContext) -> Self {
+        let Some(path) = ctx.entities_path.clone() else {
+            return Self {
+                path: None,
+                announced: EntityRecord::current(None, topics, ctx),
+                orphans: Vec::new(),
+                on_disk: None,
+                burst_accepted: false,
+            };
+        };
+        let previous = load_record(&path);
+        // A record is authority over one broker's entities only. One from
+        // another broker describes entities over there: acting on it here would
+        // delete entities this broker was never told about — or that another
+        // camon still serves — and it is no reason to announce that broker's
+        // classes here either.
+        let broker = broker_id(&ctx.config);
+        let authority = previous.as_ref().filter(|previous| {
+            if previous.broker == broker {
+                return true;
+            }
+            tracing::info!(
+                recorded = %previous.broker,
+                broker = %broker,
+                "mqtt entity record was written for another broker, clearing no entities"
+            );
+            false
+        });
+        let announced = EntityRecord::current(authority, topics, ctx);
+        let orphans = authority
+            .map(|previous| orphaned_topics(previous, &announced))
+            .unwrap_or_default();
+        if !orphans.is_empty() {
+            tracing::info!(
+                topics = orphans.len(),
+                "clearing retained topics of entities this config no longer describes"
+            );
+        }
+        Self {
+            path: Some(path),
+            announced,
+            orphans,
+            on_disk: previous,
+            burst_accepted: false,
+        }
+    }
+
+    /// Record the announced set, now that a burst carrying the clears has been
+    /// taken by the request queue. The clears stay in the record as owed: the
+    /// queue having taken them is not the socket having written them, and a
+    /// process that dies in between must clear them again rather than believe
+    /// the job done.
+    fn note_burst_accepted(&mut self) {
+        self.burst_accepted = true;
+        let owed = self.orphans.clone();
+        self.write(owed);
+    }
+
+    /// Drop the owed clears, now that a `Disconnect` has gone out. Requests are
+    /// written in the order they were queued, so a disconnect on the wire means
+    /// every publish queued before it — the clears among them — is on the wire
+    /// too. Only ever reached from a clean shutdown; a killed camon simply
+    /// clears the same topics again next start, which is a no-op on a topic
+    /// that no longer holds anything.
+    fn note_clears_flushed(&mut self) {
+        if self.burst_accepted {
+            self.write(Vec::new());
+        }
+    }
+
+    fn write(&mut self, pending_clears: Vec<String>) {
+        let Some(path) = self.path.clone() else {
+            return;
+        };
+        let mut record = self.announced.clone();
+        record.pending_clears = pending_clears;
+        if self.on_disk.as_ref() == Some(&record) {
+            return;
+        }
+        match save_record(&path, &record) {
+            // Only now: an unwritten record must stay owed so the next attempt
+            // — the next accepted burst, or the shutdown — tries again.
+            Ok(()) => self.on_disk = Some(record),
+            Err(e) => tracing::warn!(path = %path.display(), error = %e,
+                "failed to record the mqtt entity set; a later removal cannot be cleaned up"),
+        }
+    }
 }
 
 /// What the bridge believes about the broker connection.
@@ -506,6 +828,10 @@ pub struct BridgeContext {
     /// Object-detection classes to expose occupancy sensors for. Empty when
     /// object detection is off — no occupancy entities are then created.
     pub classes: Vec<String>,
+    /// Where the announced entity set is remembered between runs, so entities
+    /// a later config no longer describes can be cleared from the broker.
+    /// `None` keeps no memory: nothing is read, cleared or written.
+    pub entities_path: Option<PathBuf>,
     pub shutdown: Arc<AtomicBool>,
 }
 
@@ -520,6 +846,8 @@ pub fn spawn_bridge(
 
 async fn run_bridge(ctx: BridgeContext, mut rx: tokio::sync::mpsc::Receiver<MqttEvent>) {
     let topics = Topics::new(&ctx.config);
+    // Before the client: its queue has to be sized for the clears too.
+    let mut memory = EntityMemory::load(&topics, &ctx);
     let mut options = MqttOptions::new("camon", &ctx.config.host, ctx.config.port);
     options.set_keep_alive(Duration::from_secs(30));
     options.set_max_packet_size(10 * 1024, MAX_OUTGOING_PACKET_BYTES);
@@ -537,7 +865,11 @@ async fn run_bridge(ctx: BridgeContext, mut rx: tokio::sync::mpsc::Receiver<Mqtt
 
     let (client, mut eventloop) = AsyncClient::new(
         options,
-        request_queue_capacity(ctx.camera_ids.len(), ctx.classes.len()),
+        request_queue_capacity(
+            memory.announced.cameras.len(),
+            memory.announced.classes.len(),
+            memory.orphans.len(),
+        ),
     );
     let mut state = SensorState::new(
         Duration::from_secs(ctx.config.snapshot_interval_secs),
@@ -566,8 +898,7 @@ async fn run_bridge(ctx: BridgeContext, mut rx: tokio::sync::mpsc::Receiver<Mqtt
                 Ok(Event::Incoming(Incoming::ConnAck(_))) => {
                     tracing::info!(host = %ctx.config.host, "mqtt connected, publishing discovery");
                     link.connected = true;
-                    link.republish_pending =
-                        !publish_burst(&client, reconnect_burst(&topics, &state, &ctx));
+                    link.republish_pending = republish(&client, &topics, &state, &mut memory);
                 }
                 Ok(_) => {}
                 Err(e) => {
@@ -601,12 +932,28 @@ async fn run_bridge(ctx: BridgeContext, mut rx: tokio::sync::mpsc::Receiver<Mqtt
                 if ctx.shutdown.load(Ordering::Relaxed) {
                     break;
                 }
-                on_tick(&client, &topics, &mut state, &ctx, &mut snapshot_tasks, &mut link);
+                on_tick(
+                    &client,
+                    &topics,
+                    &mut state,
+                    &ctx,
+                    &mut snapshot_tasks,
+                    &mut link,
+                    &mut memory,
+                );
             }
         }
     }
 
-    shutdown_bridge(client, &topics, &mut eventloop, snapshot_tasks).await;
+    shutdown_bridge(
+        client,
+        &topics,
+        &mut eventloop,
+        snapshot_tasks,
+        &mut memory,
+        link.republish_pending,
+    )
+    .await;
 }
 
 fn handle_event(
@@ -686,6 +1033,7 @@ fn on_tick(
     ctx: &BridgeContext,
     snapshot_tasks: &mut HashMap<String, tokio::task::JoinHandle<()>>,
     link: &mut Link,
+    memory: &mut EntityMemory,
 ) {
     let now = Instant::now();
 
@@ -693,7 +1041,7 @@ fn on_tick(
     // failed one: a retry a few seconds later must not assert a value that has
     // since changed.
     if link.connected && link.republish_pending {
-        link.republish_pending = !publish_burst(client, reconnect_burst(topics, state, ctx));
+        link.republish_pending = republish(client, topics, state, memory);
     }
 
     for camera_id in state.due_snapshots(now) {
@@ -749,22 +1097,53 @@ fn publish_state(client: &AsyncClient, topic: &str, payload: &str) -> Published 
     publish_retained(client, topic, QoS::AtLeastOnce, payload.as_bytes().to_vec())
 }
 
-/// Everything a (re)connect owes the broker, in publish order: every camera's
-/// discovery payloads, then every configured entity's current state, then the
+/// Queue everything the connection owes the broker and, if all of it was taken,
+/// record the entity set it announced. Reports whether the burst is still owed.
+fn republish(
+    client: &AsyncClient,
+    topics: &Topics,
+    state: &SensorState,
+    memory: &mut EntityMemory,
+) -> bool {
+    let burst = reconnect_burst(topics, state, &memory.announced, &memory.orphans);
+    let accepted = publish_burst(client, burst);
+    if accepted {
+        memory.note_burst_accepted();
+    }
+    !accepted
+}
+
+/// Everything a (re)connect owes the broker, in publish order: the retained
+/// topics of entities the announced set dropped, cleared; then every camera's
+/// discovery payloads; then every announced entity's current state; then the
 /// availability marker.
 ///
-/// One list rather than three calls so the order is a value that can be
+/// Built from the announced set rather than from the config, so what a run
+/// records having announced is exactly what it published — including the
+/// classes carried forward through a run that detects nothing, which are
+/// discovered and restated OFF rather than being left for `online` to bring
+/// back with whatever the broker still held.
+///
+/// One list rather than four calls so the order is a value that can be
 /// asserted, instead of an implication of how a `select!` arm happens to be
 /// written. Every payload is retained and idempotent, so republishing the whole
 /// thing on a retry costs nothing but the bytes.
 fn reconnect_burst(
     topics: &Topics,
     state: &SensorState,
-    ctx: &BridgeContext,
+    announced: &EntityRecord,
+    orphans: &[String],
 ) -> Vec<(String, Vec<u8>)> {
     let mut burst = Vec::new();
-    for camera_id in &ctx.camera_ids {
-        for (topic, payload) in discovery_payloads(topics, camera_id, &ctx.classes) {
+    // First: Home Assistant is told to forget these before it is told the
+    // device is available again, which is what would otherwise resurrect them.
+    // An empty retained payload both deletes the discovery document and clears
+    // whatever state the broker was holding under it.
+    for topic in orphans {
+        burst.push((topic.clone(), Vec::new()));
+    }
+    for camera_id in &announced.cameras {
+        for (topic, payload) in discovery_payloads(topics, camera_id, &announced.classes) {
             match serde_json::to_vec(&payload) {
                 Ok(bytes) => burst.push((topic, bytes)),
                 Err(e) => {
@@ -773,7 +1152,7 @@ fn reconnect_burst(
             }
         }
     }
-    for (topic, payload) in state_payloads(topics, state, &ctx.camera_ids, &ctx.classes) {
+    for (topic, payload) in state_payloads(topics, state, &announced.cameras, &announced.classes) {
         burst.push((topic, payload.as_bytes().to_vec()));
     }
     // Last: with every state already queued ahead of it, the connection Home
@@ -1027,11 +1406,21 @@ fn encode_jpeg(rgb: &[u8], width: u32, height: u32) -> Option<Vec<u8>> {
 /// Publish the retained `offline` marker and disconnect cleanly, then keep
 /// polling briefly so both packets actually reach the socket — `try_publish`
 /// only queues them, `poll()` is what writes them.
+///
+/// The `Disconnect` this waits for is also the only evidence camon gets that
+/// the clears at the head of the reconnect burst were written rather than
+/// merely queued: requests go out in the order they were queued, so a
+/// disconnect on the wire puts everything queued before it on the wire too.
+/// That is where the owed clears are dropped from the record — `burst_owed`
+/// says the burst was still waiting for room, in which case they were never
+/// queued at all and stay owed.
 async fn shutdown_bridge(
     client: AsyncClient,
     topics: &Topics,
     eventloop: &mut rumqttc::EventLoop,
     snapshot_tasks: HashMap<String, tokio::task::JoinHandle<()>>,
+    memory: &mut EntityMemory,
+    burst_owed: bool,
 ) {
     abort_snapshots(snapshot_tasks).await;
 
@@ -1045,13 +1434,15 @@ async fn shutdown_bridge(
     let flush = tokio::time::timeout(SHUTDOWN_FLUSH, async {
         loop {
             match eventloop.poll().await {
-                Ok(Event::Outgoing(rumqttc::Outgoing::Disconnect)) => break,
+                Ok(Event::Outgoing(rumqttc::Outgoing::Disconnect)) => return true,
                 Ok(_) => {}
-                Err(_) => break,
+                Err(_) => return false,
             }
         }
     });
-    let _ = flush.await;
+    if flush.await == Ok(true) && !burst_owed {
+        memory.note_clears_flushed();
+    }
     tracing::info!("mqtt bridge stopped");
 }
 
@@ -1384,12 +1775,24 @@ mod tests {
             buffers: Arc::new(HashMap::new()),
             camera_ids: cameras.iter().map(|c| c.to_string()).collect(),
             classes: classes.iter().map(|c| c.to_string()).collect(),
+            entities_path: None,
             shutdown: Arc::new(AtomicBool::new(false)),
         }
     }
 
+    /// A bridge that remembers nothing across restarts, which is every test
+    /// that is not about the memory itself.
+    fn no_memory(ctx: &BridgeContext) -> EntityMemory {
+        EntityMemory::load(&Topics::new(&ctx.config), ctx)
+    }
+
+    /// The set a run with nothing remembered announces: the config's own.
+    fn announced_for(ctx: &BridgeContext) -> EntityRecord {
+        EntityRecord::current(None, &Topics::new(&ctx.config), ctx)
+    }
+
     fn capacity_for(ctx: &BridgeContext) -> usize {
-        request_queue_capacity(ctx.camera_ids.len(), ctx.classes.len())
+        request_queue_capacity(ctx.camera_ids.len(), ctx.classes.len(), 0)
     }
 
     /// A client whose event loop is never polled, so its request queue only
@@ -1402,10 +1805,21 @@ mod tests {
     }
 
     #[test]
-    fn the_burst_is_discovery_then_states_then_availability() {
+    fn the_burst_is_clears_then_discovery_then_states_then_availability() {
         let topics = Topics::new(&MqttConfig::default());
         let ctx = bridge_context(&["yard", "gate"], &["person"]);
-        let burst = reconnect_burst(&topics, &state(), &ctx);
+        let orphans = vec![
+            "camon/old/snapshot".to_string(),
+            "homeassistant/camera/camon_old/config".to_string(),
+        ];
+        let burst = reconnect_burst(&topics, &state(), &announced_for(&ctx), &orphans);
+
+        // The clears lead, and they are empty payloads: that is both how Home
+        // Assistant is told to forget a discovered entity and how a retained
+        // state stops being held. Anything after them says something.
+        assert_eq!(burst[0], (orphans[0].clone(), Vec::new()));
+        assert_eq!(burst[1], (orphans[1].clone(), Vec::new()));
+        assert!(burst[2..].iter().all(|(_, payload)| !payload.is_empty()));
 
         let discovery = burst
             .iter()
@@ -1416,15 +1830,17 @@ mod tests {
             .position(|(topic, _)| topic.ends_with("/motion"))
             .unwrap();
         assert!(discovery < first_state);
-        // The availability flip is the last thing queued, never the first.
+        // The availability flip is the last thing queued, never the first —
+        // publishing it before the clears is exactly what resurrects an entity
+        // the config dropped.
         let (topic, payload) = burst.last().unwrap();
         assert_eq!(topic, "camon/availability");
         assert_eq!(payload, b"online");
 
-        // Per camera: two discovery payloads plus two per class, one state
-        // plus one per class. Then the marker.
+        // One clear per orphaned topic, then per camera two discovery payloads
+        // plus two per class, one state plus one per class. Then the marker.
         let (cameras, classes) = (ctx.camera_ids.len(), ctx.classes.len());
-        assert_eq!(burst.len(), cameras * (3 + 3 * classes) + 1);
+        assert_eq!(burst.len(), orphans.len() + cameras * (3 + 3 * classes) + 1);
     }
 
     #[test]
@@ -1441,12 +1857,18 @@ mod tests {
                 .map(|(_, payload)| payload)
                 .unwrap()
         };
-        assert_eq!(motion(reconnect_burst(&topics, &s, &ctx)), b"ON");
+        assert_eq!(
+            motion(reconnect_burst(&topics, &s, &announced_for(&ctx), &[])),
+            b"ON"
+        );
 
         // The run ends while the burst is still owed to the broker. Rebuilding
         // is what keeps the retry from re-asserting the value that has gone.
         s.motion_end("yard");
-        assert_eq!(motion(reconnect_burst(&topics, &s, &ctx)), b"OFF");
+        assert_eq!(
+            motion(reconnect_burst(&topics, &s, &announced_for(&ctx), &[])),
+            b"OFF"
+        );
     }
 
     #[test]
@@ -1454,25 +1876,33 @@ mod tests {
         let topics = Topics::new(&MqttConfig::default());
         // Well past any supported install, and past the fifteen-camera default
         // -class shape that does not fit a fixed 256.
-        for (cameras, classes) in [(1, 0), (15, 5), (64, 16)] {
+        // The orphan counts are a whole previous config's worth of entities:
+        // clears ride in the same all-or-nothing burst, so the queue has to
+        // hold them too.
+        for (cameras, classes, orphans) in [(1, 0, 0), (15, 5, 0), (15, 5, 180), (64, 16, 1)] {
             let camera_ids: Vec<String> = (0..cameras).map(|i| format!("cam{i}")).collect();
             let class_names: Vec<String> = (0..classes).map(|i| format!("class{i}")).collect();
+            let orphan_topics: Vec<String> = (0..orphans)
+                .map(|i| format!("camon/gone{i}/motion"))
+                .collect();
             let ctx = BridgeContext {
                 config: MqttConfig::default(),
                 buffers: Arc::new(HashMap::new()),
                 camera_ids,
                 classes: class_names,
+                entities_path: None,
                 shutdown: Arc::new(AtomicBool::new(false)),
             };
 
             // The formula the queue is sized from must be the burst that is
             // actually built, or the sizing means nothing.
-            let burst = reconnect_burst(&topics, &state(), &ctx);
-            assert_eq!(burst.len(), burst_len(cameras, classes));
+            let burst = reconnect_burst(&topics, &state(), &announced_for(&ctx), &orphan_topics);
+            assert_eq!(burst.len(), burst_len(cameras, classes, orphans));
 
             // All-or-nothing publishing plus a burst that cannot fit is a
             // permanent retry loop that never reaches `online`.
-            let (client, _eventloop) = unpolled_client(capacity_for(&ctx));
+            let (client, _eventloop) =
+                unpolled_client(request_queue_capacity(cameras, classes, orphans));
             assert!(publish_burst(&client, burst));
         }
     }
@@ -1481,7 +1911,7 @@ mod tests {
     fn a_rejected_burst_goes_out_once_the_queue_drains() {
         let topics = Topics::new(&MqttConfig::default());
         let ctx = bridge_context(&["yard", "gate"], &["person"]);
-        let burst = reconnect_burst(&topics, &state(), &ctx);
+        let burst = reconnect_burst(&topics, &state(), &announced_for(&ctx), &[]);
 
         // One message already queued leaves the burst a slot short of fitting.
         let (client, mut eventloop) = unpolled_client(burst.len());
@@ -1494,6 +1924,314 @@ mod tests {
         // one that was never full.
         eventloop.clean();
         assert!(publish_burst(&client, burst));
+    }
+
+    /// A record for the broker `MqttConfig::default()` names, which is the one
+    /// every `bridge_context` here announces to.
+    fn record(prefix: &str, cameras: &[&str], classes: &[&str]) -> EntityRecord {
+        EntityRecord {
+            version: ENTITY_RECORD_VERSION,
+            broker: broker_id(&MqttConfig::default()),
+            topic_prefix: prefix.to_string(),
+            discovery_prefix: "homeassistant".to_string(),
+            cameras: cameras.iter().map(|c| c.to_string()).collect(),
+            classes: classes.iter().map(|c| c.to_string()).collect(),
+            pending_clears: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn every_announced_entity_has_both_of_its_retained_topics() {
+        let topics = Topics::new(&MqttConfig::default());
+        let classes = ["person".to_string()];
+        let announced = retained_topics(&topics, "yard", &classes);
+        let discovery = discovery_payloads(&topics, "yard", &classes);
+
+        // The discovery document and the topic it points at, for every entity:
+        // clearing only the first would leave the broker holding the state —
+        // including a sighting crop, which is hundreds of KiB of it.
+        assert_eq!(announced.len(), 2 * discovery.len());
+        for (topic, payload) in discovery {
+            assert!(announced.contains(&topic));
+            let state = payload["state_topic"]
+                .as_str()
+                .or_else(|| payload["topic"].as_str())
+                .unwrap();
+            assert!(announced.contains(&state.to_string()));
+        }
+    }
+
+    #[test]
+    fn a_removed_camera_takes_every_retained_topic_with_it() {
+        let orphans = orphaned_topics(
+            &record("camon", &["yard", "gate"], &["person"]),
+            &record("camon", &["yard"], &["person"]),
+        );
+        assert_eq!(
+            orphans,
+            vec![
+                "camon/gate/motion",
+                "camon/gate/occupancy/person",
+                "camon/gate/occupancy/person/snapshot",
+                "camon/gate/snapshot",
+                "homeassistant/binary_sensor/camon_gate_motion/config",
+                "homeassistant/binary_sensor/camon_gate_occupancy_person/config",
+                "homeassistant/camera/camon_gate/config",
+                "homeassistant/camera/camon_gate_occupancy_person/config",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_removed_class_is_cleared_for_every_camera() {
+        let orphans = orphaned_topics(
+            &record("camon", &["yard", "gate"], &["person", "cat"]),
+            &record("camon", &["yard", "gate"], &["person"]),
+        );
+        // Two entities per camera per class, two retained topics each.
+        assert_eq!(orphans.len(), 2 * 2 * 2);
+        assert!(orphans.iter().all(|topic| topic.contains("cat")));
+        assert!(orphans.contains(&"camon/yard/occupancy/cat/snapshot".to_string()));
+        assert!(orphans
+            .contains(&"homeassistant/binary_sensor/camon_gate_occupancy_cat/config".to_string()));
+    }
+
+    #[test]
+    fn object_detection_off_for_one_run_keeps_announcing_its_classes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mqtt_entities.json");
+        let topics = Topics::new(&MqttConfig::default());
+        save_record(&path, &record("camon", &["yard"], &["person"])).unwrap();
+
+        // No classes this run: object detection is off, or its client could
+        // not be built. Neither is the operator dropping the entity, and being
+        // wrong costs them its history and its place on a dashboard.
+        let mut ctx = bridge_context(&["yard"], &[]);
+        ctx.entities_path = Some(path.clone());
+        let memory = EntityMemory::load(&topics, &ctx);
+        assert_eq!(memory.announced.classes, vec!["person".to_string()]);
+        assert!(memory.orphans.is_empty());
+
+        // Carrying them only through the diff would be worse than useless: the
+        // burst would omit them and then publish `online`, which is exactly
+        // how the retained ON of an occupancy sensor comes back to life. So
+        // they are announced — discovered, and restated for what they are.
+        let burst = reconnect_burst(&topics, &state(), &memory.announced, &memory.orphans);
+        assert!(burst
+            .iter()
+            .any(|(topic, _)| topic
+                == "homeassistant/binary_sensor/camon_yard_occupancy_person/config"));
+        assert!(burst
+            .iter()
+            .any(|(topic, payload)| topic == "camon/yard/occupancy/person" && payload == b"OFF"));
+
+        // ...and the queue is sized from that same set, not from the empty
+        // class list the config handed in.
+        let (client, _eventloop) = unpolled_client(request_queue_capacity(
+            memory.announced.cameras.len(),
+            memory.announced.classes.len(),
+            memory.orphans.len(),
+        ));
+        assert!(publish_burst(&client, burst));
+
+        // The camera dimension still answers for itself while they are carried,
+        // and a camera added during such a run is recorded with the classes it
+        // was actually announced with.
+        let mut ctx = bridge_context(&["front", "yard"], &[]);
+        ctx.entities_path = Some(path);
+        let memory = EntityMemory::load(&topics, &ctx);
+        assert!(memory.orphans.is_empty());
+        let burst = reconnect_burst(&topics, &state(), &memory.announced, &memory.orphans);
+        assert!(burst
+            .iter()
+            .any(|(topic, _)| topic
+                == "homeassistant/binary_sensor/camon_front_occupancy_person/config"));
+    }
+
+    #[test]
+    fn a_moved_topic_prefix_orphans_the_state_it_left_behind() {
+        let previous = record("camon", &["yard"], &[]);
+        let orphans = orphaned_topics(&previous, &record("nvr", &["yard"], &[]));
+        assert!(orphans.contains(&"camon/yard/motion".to_string()));
+        assert!(orphans.contains(&"camon/yard/snapshot".to_string()));
+        // Shared by every entity rather than owned by one, so it is only ever
+        // orphaned by the prefix itself moving — and nothing under the new
+        // prefix is cleared, since the burst is about to publish it.
+        assert!(orphans.contains(&"camon/availability".to_string()));
+        assert!(orphans.iter().all(|topic| !topic.starts_with("nvr/")));
+
+        // A config that only gained a camera has orphaned nothing at all, the
+        // availability topic included.
+        assert!(orphaned_topics(&previous, &record("camon", &["yard", "gate"], &[])).is_empty());
+    }
+
+    #[test]
+    fn nothing_is_cleared_without_a_record_this_build_and_broker_own() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mqtt_entities.json");
+        let topics = Topics::new(&MqttConfig::default());
+        let mut ctx = bridge_context(&["yard"], &["person"]);
+        ctx.entities_path = Some(path.clone());
+        let previous = record("camon", &["yard", "gate"], &["person"]);
+        // What that record costs `gate` when it *is* acted on, so every case
+        // below asserts a refusal rather than an empty diff.
+        save_record(&path, &previous).unwrap();
+        assert_eq!(EntityMemory::load(&topics, &ctx).orphans.len(), 8);
+
+        // A first start knows nothing about the past, which is not evidence
+        // that anything was removed.
+        std::fs::remove_file(&path).unwrap();
+        let memory = EntityMemory::load(&topics, &ctx);
+        assert!(memory.orphans.is_empty());
+        assert!(memory.on_disk.is_none());
+
+        // Neither is a record camon cannot read...
+        std::fs::write(&path, b"{ not json").unwrap();
+        assert!(EntityMemory::load(&topics, &ctx).orphans.is_empty());
+
+        // ...nor one carrying fields this build does not know, whatever else
+        // it gets right: an unrecognized document is not deletion authority.
+        let mut json = serde_json::to_value(&previous).unwrap();
+        json["entities"] = serde_json::json!(["camon_gate_motion"]);
+        std::fs::write(&path, serde_json::to_vec(&json).unwrap()).unwrap();
+        assert!(EntityMemory::load(&topics, &ctx).orphans.is_empty());
+
+        // ...nor one written to a format version this build does not speak.
+        let mut json = serde_json::to_value(&previous).unwrap();
+        json["version"] = serde_json::json!(ENTITY_RECORD_VERSION + 1);
+        std::fs::write(&path, serde_json::to_vec(&json).unwrap()).unwrap();
+        assert!(EntityMemory::load(&topics, &ctx).orphans.is_empty());
+    }
+
+    #[test]
+    fn a_record_from_another_broker_is_not_deletion_authority() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mqtt_entities.json");
+        let mut elsewhere = record("camon", &["yard", "gate"], &["person"]);
+        elsewhere.broker = "other.example:1883".to_string();
+        save_record(&path, &elsewhere).unwrap();
+
+        // Same data dir, same prefixes, a different broker: `gate`'s entities
+        // over there say nothing about the entities over here, which may never
+        // have existed — or may belong to the camon still serving them.
+        let topics = Topics::new(&MqttConfig::default());
+        let mut ctx = bridge_context(&["yard"], &[]);
+        ctx.entities_path = Some(path);
+        let memory = EntityMemory::load(&topics, &ctx);
+        assert!(memory.orphans.is_empty());
+        assert_eq!(memory.announced.broker, "localhost:1883");
+        // Nor is it a reason to announce that broker's classes here: a record
+        // camon will not delete from is not one it will publish from either.
+        assert!(memory.announced.classes.is_empty());
+    }
+
+    #[test]
+    fn a_clear_stays_owed_until_a_disconnect_proves_it_went_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mqtt_entities.json");
+        let topics = Topics::new(&MqttConfig::default());
+        save_record(&path, &record("camon", &["yard", "gate"], &["person"])).unwrap();
+        let mut ctx = bridge_context(&["yard"], &["person"]);
+        ctx.entities_path = Some(path.clone());
+
+        let mut memory = EntityMemory::load(&topics, &ctx);
+        assert_eq!(memory.orphans.len(), 8);
+
+        let mut link = Link {
+            connected: true,
+            republish_pending: true,
+        };
+        let mut tasks = HashMap::new();
+        let mut s = state();
+
+        // A burst the queue refuses is evidence of nothing: the record on disk
+        // still describes the run that announced `gate`.
+        let (full, _full_loop) = unpolled_client(1);
+        on_tick(
+            &full,
+            &topics,
+            &mut s,
+            &ctx,
+            &mut tasks,
+            &mut link,
+            &mut memory,
+        );
+        assert!(link.republish_pending);
+        assert_eq!(load_record(&path).unwrap().cameras, ["yard", "gate"]);
+
+        // Accepted, so the announced set is recorded — with the clears marked
+        // still owed, because `try_publish` only queued them.
+        let (roomy, _roomy_loop) = unpolled_client(request_queue_capacity(1, 1, 8));
+        on_tick(
+            &roomy,
+            &topics,
+            &mut s,
+            &ctx,
+            &mut tasks,
+            &mut link,
+            &mut memory,
+        );
+        assert!(!link.republish_pending);
+        let written = load_record(&path).unwrap();
+        assert_eq!(written.cameras, ["yard"]);
+        assert_eq!(written.pending_clears, memory.orphans);
+
+        // A process killed here — queued, never written to the socket — finds
+        // the same clears owed on the next start instead of a forgotten ghost.
+        assert_eq!(EntityMemory::load(&topics, &ctx).orphans, memory.orphans);
+
+        // The disconnect is what proves the socket took them.
+        memory.note_clears_flushed();
+        assert!(load_record(&path).unwrap().pending_clears.is_empty());
+        assert!(EntityMemory::load(&topics, &ctx).orphans.is_empty());
+    }
+
+    #[test]
+    fn an_owed_clear_is_dropped_when_its_topic_is_announced_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mqtt_entities.json");
+        let topics = Topics::new(&MqttConfig::default());
+        let mut previous = record("camon", &["yard"], &["person"]);
+        // Removed last run, put back before this one. Clearing what the burst
+        // is about to publish would delete a live entity.
+        previous.pending_clears = vec![
+            "camon/yard/motion".to_string(),
+            "camon/gate/motion".to_string(),
+        ];
+        save_record(&path, &previous).unwrap();
+
+        let mut ctx = bridge_context(&["yard"], &["person"]);
+        ctx.entities_path = Some(path);
+        assert_eq!(
+            EntityMemory::load(&topics, &ctx).orphans,
+            vec!["camon/gate/motion".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_record_that_cannot_be_written_stays_owed() {
+        let dir = tempfile::tempdir().unwrap();
+        // A file where the directory has to be, so every write against this
+        // path fails the way a read-only or full disk does.
+        let blocked = dir.path().join("blocked");
+        std::fs::write(&blocked, b"not a directory").unwrap();
+        let path = blocked.join("mqtt_entities.json");
+
+        let topics = Topics::new(&MqttConfig::default());
+        let mut ctx = bridge_context(&["yard"], &["person"]);
+        ctx.entities_path = Some(path.clone());
+        let mut memory = EntityMemory::load(&topics, &ctx);
+
+        memory.note_burst_accepted();
+        // Nothing reached disk, so nothing may be believed to be there: a run
+        // that announced entities and recorded none of it turns the operator's
+        // next removal into a ghost nothing cleans up.
+        assert!(memory.on_disk.is_none());
+
+        std::fs::remove_file(&blocked).unwrap();
+        memory.note_burst_accepted();
+        assert_eq!(memory.on_disk, load_record(&path));
+        assert_eq!(load_record(&path).unwrap().cameras, ["yard"]);
     }
 
     #[tokio::test]
@@ -1512,7 +2250,15 @@ mod tests {
             republish_pending: false,
         };
         let mut tasks = HashMap::new();
-        on_tick(&client, &topics, &mut s, &ctx, &mut tasks, &mut link);
+        on_tick(
+            &client,
+            &topics,
+            &mut s,
+            &ctx,
+            &mut tasks,
+            &mut link,
+            &mut no_memory(&ctx),
+        );
 
         // The OFF had nowhere to go. Nothing else would ever re-assert it, so
         // the tick has to come back with the whole state or that sensor stays
@@ -1527,7 +2273,7 @@ mod tests {
         // the bridge defends itself anyway, because retrying it forever would
         // mean `online` never goes out.
         let ctx = bridge_context(&["ya+rd"], &[]);
-        let burst = reconnect_burst(&topics, &state(), &ctx);
+        let burst = reconnect_burst(&topics, &state(), &announced_for(&ctx), &[]);
         let (client, _eventloop) = unpolled_client(capacity_for(&ctx));
         assert!(publish_burst(&client, burst));
 
@@ -1551,13 +2297,13 @@ mod tests {
         // Fill it, exactly as an outage does.
         assert!(!publish_burst(
             &client,
-            reconnect_burst(&topics, &state(), &ctx)
+            reconnect_burst(&topics, &state(), &announced_for(&ctx), &[])
         ));
         // Nothing drains it, so a retry gets nowhere either — and reports so
         // rather than leaving `online` unsent and the entities unavailable.
         assert!(!publish_burst(
             &client,
-            reconnect_burst(&topics, &state(), &ctx)
+            reconnect_burst(&topics, &state(), &announced_for(&ctx), &[])
         ));
     }
 
@@ -1573,13 +2319,29 @@ mod tests {
         };
 
         let (small, _small_loop) = unpolled_client(2);
-        on_tick(&small, &topics, &mut s, &ctx, &mut tasks, &mut link);
+        on_tick(
+            &small,
+            &topics,
+            &mut s,
+            &ctx,
+            &mut tasks,
+            &mut link,
+            &mut no_memory(&ctx),
+        );
         // Still owed to the broker: the flag is what brings the next tick back
         // here, instead of leaving `online` unsent on a healthy connection.
         assert!(link.republish_pending);
 
         let (roomy, _roomy_loop) = unpolled_client(capacity_for(&ctx));
-        on_tick(&roomy, &topics, &mut s, &ctx, &mut tasks, &mut link);
+        on_tick(
+            &roomy,
+            &topics,
+            &mut s,
+            &ctx,
+            &mut tasks,
+            &mut link,
+            &mut no_memory(&ctx),
+        );
         assert!(!link.republish_pending);
 
         // A tick while disconnected must not spend the retry on a queue that
@@ -1588,7 +2350,15 @@ mod tests {
         link.republish_pending = true;
         link.connected = false;
         let (idle, _idle_loop) = unpolled_client(capacity_for(&ctx));
-        on_tick(&idle, &topics, &mut s, &ctx, &mut tasks, &mut link);
+        on_tick(
+            &idle,
+            &topics,
+            &mut s,
+            &ctx,
+            &mut tasks,
+            &mut link,
+            &mut no_memory(&ctx),
+        );
         assert!(link.republish_pending);
     }
 

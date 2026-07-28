@@ -308,6 +308,14 @@ fn mqtt_object_classes(client: Option<&OllamaClient>) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Where the bridge remembers the entity set it announced to Home Assistant.
+/// Beside the per-camera state in the data dir, and written even when warm
+/// storage is off: the file is a few hundred bytes and the entities exist
+/// either way.
+fn mqtt_entities_path(config: &Config) -> std::path::PathBuf {
+    std::path::PathBuf::from(&config.storage.data_dir).join("mqtt_entities.json")
+}
+
 fn create_ollama_client(config: &Config) -> Option<OllamaClient> {
     let od = &config.analytics.object_detection;
     let fallback = od
@@ -851,6 +859,7 @@ where
                 buffers: Arc::new(camera_handles.buffers_map.clone()),
                 camera_ids: camera_ids.clone(),
                 classes: object_classes,
+                entities_path: Some(mqtt_entities_path(&config)),
                 shutdown: Arc::clone(&shutdown.flag),
             },
             rx,

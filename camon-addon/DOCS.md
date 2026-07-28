@@ -159,6 +159,17 @@ id>`"**, containing:
   persists across restarts and keeps the picture long after the occupancy
   sensor has cleared.
 
+Rename a camera in `camon.toml`, remove one, or drop a class from
+`analytics.object_detection.classes`, and Camon removes the entities that went
+with it on the next start — Home Assistant is told to forget them before the
+device is marked available again, so no entity is left behind showing the
+motion that was open when you edited the config. Classes are the careful case:
+a start with object detection off, or with its vision server unreachable, keeps
+announcing the occupancy entities — they simply read off — rather than deleting
+them and their history. Removals are also scoped to the broker they were
+announced to, so pointing Camon at a different broker never deletes entities
+there on the strength of what the old one was told.
+
 See `config.toml.example`'s `[mqtt]` section for the full set of keys (broker
 host/port/credentials, topic prefixes, timing) if you need to override the
 auto-configuration or point at an external broker.
