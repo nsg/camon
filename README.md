@@ -371,11 +371,7 @@ url = "rtsp://admin:password@192.168.1.100:554/stream1"
 | `GET` | `/api/stream/{id}/segment/{n}` | Live HLS segment |
 | `GET` | `/api/cameras/{id}/motion` | Motion segments with timestamps |
 | `GET` | `/api/cameras/{id}/motion/{seq}/mask` | JPEG motion mask for a segment |
-| `GET` | `/api/cameras/{id}/motion/stability` | JPEG final motion mask (after component filtering) |
-| `GET` | `/api/cameras/{id}/motion/stability/raw` | JPEG raw MOG2 foreground mask |
-| `GET` | `/api/cameras/{id}/motion/stability/no-shadow` | JPEG alias of the raw mask (shadow stage removed) |
-| `GET` | `/api/cameras/{id}/motion/stability/morph` | JPEG after morphological opening |
-| `GET` | `/api/cameras/{id}/motion/background` | JPEG learned background model |
+| `GET` | `/api/cameras/{id}/motion/maps/{stage}` | JPEG view of one detector stage (see below) |
 | `GET` | `/api/cameras/{id}/motion/settings` | Motion settings: sensitivity, min object size, movement mask, detection mask (JSON) |
 | `PUT` | `/api/cameras/{id}/motion/settings` | Update motion settings (partial JSON: `var_threshold`, `min_contour_area`, `mask`, `detection_mask`) |
 | `GET` | `/api/cameras/{id}/detections` | Detected objects with confidence |
@@ -391,6 +387,8 @@ url = "rtsp://admin:password@192.168.1.100:554/stream1"
 | `GET` | `/api/cameras/{id}/detection-debug/{id}/full-frame` | Detection debug full frame JPEG |
 
 Every route above sits behind `[http] token` when one is set: a request without it answers `401` with `WWW-Authenticate: Bearer`. Only `/api` is covered — the UI shell (`/`) and its assets stay open so the token prompt can load. A GET may carry the token as `?token=` instead of the header; a `PUT` may not.
+
+`{stage}` on the motion-map route names one of the detector's pipeline stages: `stability` (the final motion mask, after component filtering), `raw` (the raw MOG2 foreground mask), `no-shadow` (an alias of the raw mask, kept from when a shadow stage existed), `morph` (after morphological opening) and `background` (the learned background model). A stage that has not been published yet, or a name that is not one of these, answers `404`.
 
 `from` and `to` on the event query are wall-clock nanoseconds, and either may be left out (an omitted `from` reaches back to the start of the archive, an omitted `to` runs to the end). The range is matched by **overlap**, so an event that started before `from` and is still running inside it is returned; that is how a long continuous chunk shows up in a window it merely spans. A range with `from` greater than `to` answers `400` rather than guessing at what was meant.
 

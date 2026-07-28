@@ -21,8 +21,8 @@ use crate::analytics::{MotionSettingsStore, SettingsUpdate, UpdateError};
 use crate::buffer::HotBuffer;
 use crate::locks::LockExt;
 use crate::storage::{
-    DetectionDebugStore, DetectionStore, MotionStore, RangeRequest, ServedRange, ThumbnailError,
-    VideoStream, WarmStorageBackend,
+    DetectionDebugStore, DetectionStore, MapKind, MotionStore, RangeRequest, ServedRange,
+    ThumbnailError, VideoStream, WarmStorageBackend,
 };
 
 use super::hls;
@@ -205,24 +205,8 @@ fn api_routes() -> Router<AppState> {
             get(motion_mask_handler),
         )
         .route(
-            "/api/cameras/{id}/motion/stability",
-            get(stability_map_handler),
-        )
-        .route(
-            "/api/cameras/{id}/motion/background",
-            get(background_map_handler),
-        )
-        .route(
-            "/api/cameras/{id}/motion/stability/raw",
-            get(raw_mog2_map_handler),
-        )
-        .route(
-            "/api/cameras/{id}/motion/stability/no-shadow",
-            get(no_shadow_map_handler),
-        )
-        .route(
-            "/api/cameras/{id}/motion/stability/morph",
-            get(morph_map_handler),
+            "/api/cameras/{id}/motion/maps/{stage}",
+            get(motion_map_handler),
         )
         .route(
             "/api/cameras/{id}/motion/settings",
@@ -444,55 +428,25 @@ async fn motion_mask_handler(
     }
 }
 
-async fn stability_map_handler(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+async fn motion_map_handler(
+    State(state): State<AppState>,
+    Path((id, stage)): Path<(String, String)>,
+) -> Response {
     if !state.buffers.contains_key(&id) {
         return (StatusCode::NOT_FOUND, "camera not found").into_response();
     }
 
-    match state.motion_store.get_stability_map(&id) {
-        Some(jpeg) => ([(header::CONTENT_TYPE, "image/jpeg")], jpeg).into_response(),
-        None => (StatusCode::NOT_FOUND, "stability map not available yet").into_response(),
-    }
-}
+    let Some(kind) = MapKind::parse(&stage) else {
+        return (StatusCode::NOT_FOUND, "unknown motion map").into_response();
+    };
 
-async fn background_map_handler(State(state): State<AppState>, Path(id): Path<String>) -> Response {
-    if !state.buffers.contains_key(&id) {
-        return (StatusCode::NOT_FOUND, "camera not found").into_response();
-    }
-
-    match state.motion_store.get_background_map(&id) {
+    match state.motion_store.get_map(&id, kind) {
         Some(jpeg) => ([(header::CONTENT_TYPE, "image/jpeg")], jpeg).into_response(),
-        None => (StatusCode::NOT_FOUND, "background not available yet").into_response(),
-    }
-}
-
-async fn raw_mog2_map_handler(State(state): State<AppState>, Path(id): Path<String>) -> Response {
-    if !state.buffers.contains_key(&id) {
-        return (StatusCode::NOT_FOUND, "camera not found").into_response();
-    }
-    match state.motion_store.get_raw_mog2_map(&id) {
-        Some(jpeg) => ([(header::CONTENT_TYPE, "image/jpeg")], jpeg).into_response(),
-        None => (StatusCode::NOT_FOUND, "raw mask not available yet").into_response(),
-    }
-}
-
-async fn no_shadow_map_handler(State(state): State<AppState>, Path(id): Path<String>) -> Response {
-    if !state.buffers.contains_key(&id) {
-        return (StatusCode::NOT_FOUND, "camera not found").into_response();
-    }
-    match state.motion_store.get_no_shadow_map(&id) {
-        Some(jpeg) => ([(header::CONTENT_TYPE, "image/jpeg")], jpeg).into_response(),
-        None => (StatusCode::NOT_FOUND, "no-shadow mask not available yet").into_response(),
-    }
-}
-
-async fn morph_map_handler(State(state): State<AppState>, Path(id): Path<String>) -> Response {
-    if !state.buffers.contains_key(&id) {
-        return (StatusCode::NOT_FOUND, "camera not found").into_response();
-    }
-    match state.motion_store.get_morph_map(&id) {
-        Some(jpeg) => ([(header::CONTENT_TYPE, "image/jpeg")], jpeg).into_response(),
-        None => (StatusCode::NOT_FOUND, "morph mask not available yet").into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            format!("{stage} map not available yet"),
+        )
+            .into_response(),
     }
 }
 
@@ -1080,6 +1034,68 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         format!("http://{addr}")
+    }
+
+    /// Like [`serve`], but hands back the motion store so a test can publish
+    /// what the debug endpoints read.
+    async fn serve_with_motion_store() -> (String, MotionStore) {
+        let ids = vec!["cam".to_string()];
+        let buffers = HashMap::from([("cam".to_string(), HotBuffer::new("cam".to_string(), 60))]);
+        let motion_store = MotionStore::new(&ids);
+        let state = AppState::new(
+            buffers,
+            motion_store.clone(),
+            DetectionStore::new(&ids),
+            DetectionDebugStore::new(&ids),
+            None,
+            None,
+        );
+        let app = build_router(state, None);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{addr}"), motion_store)
+    }
+
+    /// Every stage the UI asks for has to resolve to its own map — one route
+    /// serving them all makes a mixed-up stage a silent wrong picture rather
+    /// than a compile error.
+    #[tokio::test]
+    async fn each_motion_map_stage_serves_its_own_jpeg() {
+        let (base, motion_store) = serve_with_motion_store().await;
+        for kind in MapKind::ALL {
+            motion_store.set_map("cam", kind, kind.as_str().as_bytes().to_vec());
+        }
+
+        for kind in MapKind::ALL {
+            let response = reqwest::get(format!(
+                "{base}/api/cameras/cam/motion/maps/{}",
+                kind.as_str()
+            ))
+            .await
+            .unwrap();
+            assert_eq!(response.status(), reqwest::StatusCode::OK, "{kind:?}");
+            assert_eq!(
+                response.headers()[reqwest::header::CONTENT_TYPE],
+                "image/jpeg"
+            );
+            assert_eq!(response.text().await.unwrap(), kind.as_str(), "{kind:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn unpublished_stages_unknown_stages_and_unknown_cameras_are_all_not_found() {
+        let (base, motion_store) = serve_with_motion_store().await;
+        motion_store.set_map("cam", MapKind::Morph, vec![0xFF]);
+
+        for url in [
+            format!("{base}/api/cameras/cam/motion/maps/stability"),
+            format!("{base}/api/cameras/cam/motion/maps/nonsense"),
+            format!("{base}/api/cameras/nope/motion/maps/morph"),
+        ] {
+            let status = reqwest::get(&url).await.unwrap().status();
+            assert_eq!(status, reqwest::StatusCode::NOT_FOUND, "{url}");
+        }
     }
 
     /// Like [`serve`], but with warm storage enabled over an empty data dir.

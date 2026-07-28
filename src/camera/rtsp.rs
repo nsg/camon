@@ -428,41 +428,15 @@ impl FfmpegPipeline {
 
     fn process_stream<R: Read + AsRawFd>(
         &self,
-        mut reader: R,
+        reader: R,
         shutdown: &std::sync::atomic::AtomicBool,
     ) -> Result<(), RtspError> {
         let mut segmenter = MpegTsSegmenter::new(self.camera_id.clone(), Arc::clone(&self.buffer));
-        let mut buf = [0u8; 188 * 64];
-        let fd = reader.as_raw_fd();
-        let mut last_data = Instant::now();
-
-        while !shutdown.load(std::sync::atomic::Ordering::Relaxed) {
-            // Data watchdog: no bytes at all for too long means the stream wedged.
-            if last_data.elapsed() >= Duration::from_secs(DATA_TIMEOUT_SECS) {
-                return Err(segmenter.failure(RunEnd::DataTimeout));
-            }
-            // No-segment tripwire: bytes flowing but no keyframe-bounded segment produced.
-            if segmenter.last_segment_at().elapsed() >= Duration::from_secs(NO_SEGMENT_TIMEOUT_SECS)
-            {
-                return Err(segmenter.failure(RunEnd::SegmentTimeout));
-            }
-
-            // Poll with timeout so we can check the shutdown flag
-            if !poll_readable(fd, 500) {
-                continue;
-            }
-            let n = reader.read(&mut buf)?;
-            if n == 0 {
-                // ffmpeg gave up on its own. Reported through the same path as
-                // the watchdogs so a stream that ends before it ever records
-                // gets the diagnosis, not a bare "stream ended" per reconnect.
-                return Err(segmenter.failure(RunEnd::Eof));
-            }
-            last_data = Instant::now();
-            segmenter.process(&buf[..n]);
-        }
-
-        Ok(())
+        let result = segmenter.read_stream(reader, shutdown);
+        // After the diagnosis is built, so the flushed segment cannot turn a run
+        // that recorded nothing into one that appears to have recorded.
+        segmenter.flush_end_of_stream();
+        result
     }
 }
 
@@ -483,6 +457,10 @@ struct MpegTsSegmenter {
     partial_packet: Vec<u8>,
     current_media_pts: Option<u64>,
     prev_media_pts: Option<u64>,
+    /// PES starts on the video PID inside the segment being filled. Two of them
+    /// mean its first frame is complete, which is what an end-of-stream flush
+    /// needs to know.
+    video_pes_starts: u32,
     last_segment_at: Instant,
     counts: StreamCounts,
     started: Instant,
@@ -508,6 +486,7 @@ impl MpegTsSegmenter {
             partial_packet: Vec::with_capacity(188),
             current_media_pts: None,
             prev_media_pts: None,
+            video_pes_starts: 0,
             last_segment_at: Instant::now(),
             counts: StreamCounts::default(),
             started: Instant::now(),
@@ -517,9 +496,59 @@ impl MpegTsSegmenter {
         }
     }
 
-    /// When a segment was last actually pushed into the hot buffer.
-    fn last_segment_at(&self) -> Instant {
-        self.last_segment_at
+    fn read_stream<R: Read + AsRawFd>(
+        &mut self,
+        mut reader: R,
+        shutdown: &std::sync::atomic::AtomicBool,
+    ) -> Result<(), RtspError> {
+        let mut buf = [0u8; 188 * 64];
+        let fd = reader.as_raw_fd();
+        let mut last_data = Instant::now();
+
+        while !shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+            // Data watchdog: no bytes at all for too long means the stream wedged.
+            if last_data.elapsed() >= Duration::from_secs(DATA_TIMEOUT_SECS) {
+                return Err(self.failure(RunEnd::DataTimeout));
+            }
+            // No-segment tripwire: bytes flowing but no keyframe-bounded segment produced.
+            if self.last_segment_at.elapsed() >= Duration::from_secs(NO_SEGMENT_TIMEOUT_SECS) {
+                return Err(self.failure(RunEnd::SegmentTimeout));
+            }
+
+            // Poll with timeout so we can check the shutdown flag
+            if !poll_readable(fd, 500) {
+                continue;
+            }
+            let n = reader.read(&mut buf)?;
+            if n == 0 {
+                // ffmpeg gave up on its own. Reported through the same path as
+                // the watchdogs so a stream that ends before it ever records
+                // gets the diagnosis, not a bare "stream ended" per reconnect.
+                return Err(self.failure(RunEnd::Eof));
+            }
+            last_data = Instant::now();
+            self.process(&buf[..n]);
+        }
+
+        Ok(())
+    }
+
+    /// Push the GOP that was still being filled when the stream ended, instead
+    /// of losing it with the connection.
+    ///
+    /// The cut lands mid-packet, so the segment's last frame is truncated. It is
+    /// only offered once a second frame has started, which proves the keyframe
+    /// the segment opens on arrived whole: with PAT and PMT already prepended
+    /// that segment decodes on its own like any other, a decoder discarding the
+    /// unterminated tail. Below that the segment holds a fragment of a keyframe
+    /// and nothing can be decoded from it, so it is dropped rather than left in
+    /// the buffer for the analyzer and the player to choke on.
+    fn flush_end_of_stream(&mut self) {
+        if self.video_pes_starts < 2 {
+            return;
+        }
+        let now_ns = wall_clock_ns();
+        self.finalize_segment(now_ns);
     }
 
     fn failure(&self, end: RunEnd) -> RtspError {
@@ -605,6 +634,8 @@ impl MpegTsSegmenter {
         let is_keyframe =
             Some(pid) == self.video_pid && crate::mpegts::has_random_access_indicator(packet);
 
+        let pusi = (packet[1] & 0x40) != 0;
+
         // Extract media PTS from video packets with PES header
         if Some(pid) == self.video_pid {
             self.counts.video_packets += 1;
@@ -614,7 +645,6 @@ impl MpegTsSegmenter {
                 self.first_keyframe_at.get_or_insert(now);
                 self.last_keyframe_at = Some(now);
             }
-            let pusi = (packet[1] & 0x40) != 0;
             if pusi {
                 if let Some(pts) = crate::mpegts::extract_pes_pts(packet) {
                     self.current_media_pts = Some(pts);
@@ -624,10 +654,7 @@ impl MpegTsSegmenter {
 
         // Start new segment on keyframe
         if is_keyframe {
-            let pts_ns = SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos() as u64;
+            let pts_ns = wall_clock_ns();
             self.finalize_segment(pts_ns);
             self.start_segment(pts_ns);
         }
@@ -637,12 +664,16 @@ impl MpegTsSegmenter {
             self.current_data.extend_from_slice(packet);
             if Some(pid) == self.video_pid {
                 segment.frame_count += 1;
+                if pusi {
+                    self.video_pes_starts += 1;
+                }
             }
         }
     }
 
     fn start_segment(&mut self, pts_ns: u64) {
         let segment = GopSegment::new(pts_ns);
+        self.video_pes_starts = 0;
 
         // Prepend PAT and PMT for segment independence
         // Reset continuity counters to 0 for clean segment start
@@ -737,6 +768,13 @@ impl MpegTsSegmenter {
             pos += 5 + es_info_len;
         }
     }
+}
+
+fn wall_clock_ns() -> u64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as u64
 }
 
 /// Compute the start of a PSI table section inside an MPEG-TS packet.
@@ -1125,6 +1163,55 @@ mod tests {
         assert!(!failed(no_video_packets, RunEnd::SegmentTimeout)
             .summary()
             .contains("no readable PMT"));
+    }
+
+    /// The GOP being filled when the connection drops is worth up to a second
+    /// of footage, and nothing else will ever finalize it.
+    #[test]
+    fn the_open_gop_is_flushed_when_the_stream_ends() {
+        let mut segmenter = segmenter();
+        for packet in [pat(PMT_PID), pmt(H264, VIDEO_PID)] {
+            segmenter.process(&packet);
+        }
+        segmenter.process(&keyframe_packet(VIDEO_PID, 0, VIDEO_STREAM_ID));
+        segmenter.process(&pes_packet(VIDEO_PID, 3_000));
+        segmenter.process(&keyframe_packet(VIDEO_PID, 90_000, VIDEO_STREAM_ID));
+        for pts in [93_000, 96_000] {
+            segmenter.process(&pes_packet(VIDEO_PID, pts));
+        }
+        // Only the closed GOP is in the buffer; nothing else will ever close
+        // the one still being filled.
+        assert_eq!(segmenter.buffer.read_recover().segment_count(), 1);
+
+        segmenter.flush_end_of_stream();
+
+        let buffer = segmenter.buffer.read_recover();
+        assert_eq!(buffer.segment_count(), 2);
+        let segment = buffer.segments().back().unwrap();
+        // PAT and PMT are prepended, so the flushed segment opens on its
+        // keyframe and stands alone like every other one.
+        assert_eq!(crate::mpegts::keyframe_count(&segment.data), 1);
+        // Media PTS, not the wall clock: the flush closes the segment on the
+        // last frame that arrived, not on the moment the connection dropped.
+        assert_eq!(segment.duration_ns, 6_000 * 1_000_000_000 / 90_000);
+    }
+
+    /// A segment cut before its second frame started holds a fragment of a
+    /// keyframe and decodes to nothing. Publishing it would put a broken
+    /// segment in the buffer for the sake of no picture at all.
+    #[test]
+    fn a_keyframe_fragment_is_dropped_rather_than_flushed() {
+        let mut segmenter = segmenter();
+        for packet in [pat(PMT_PID), pmt(H264, VIDEO_PID)] {
+            segmenter.process(&packet);
+        }
+        segmenter.process(&keyframe_packet(VIDEO_PID, 0, VIDEO_STREAM_ID));
+        segmenter.process(&pes_packet(VIDEO_PID, 3_000));
+        segmenter.process(&keyframe_packet(VIDEO_PID, 90_000, VIDEO_STREAM_ID));
+
+        segmenter.flush_end_of_stream();
+
+        assert_eq!(segmenter.buffer.read_recover().segment_count(), 1);
     }
 
     #[test]

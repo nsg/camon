@@ -1118,10 +1118,10 @@ document.addEventListener('DOMContentLoaded', async () => {
         const t = Date.now();
 
         const [raw, noShadow, morph, filtered] = await Promise.all([
-            loadOverlayImage(`api/cameras/${cam}/motion/stability/raw?t=${t}`),
-            loadOverlayImage(`api/cameras/${cam}/motion/stability/no-shadow?t=${t}`),
-            loadOverlayImage(`api/cameras/${cam}/motion/stability/morph?t=${t}`),
-            loadOverlayImage(`api/cameras/${cam}/motion/stability?t=${t}`),
+            loadOverlayImage(`api/cameras/${cam}/motion/maps/raw?t=${t}`),
+            loadOverlayImage(`api/cameras/${cam}/motion/maps/no-shadow?t=${t}`),
+            loadOverlayImage(`api/cameras/${cam}/motion/maps/morph?t=${t}`),
+            loadOverlayImage(`api/cameras/${cam}/motion/maps/stability?t=${t}`),
         ]);
         // The overlay may have been switched off, or the view moved to another
         // camera, while these were loading.
@@ -1207,7 +1207,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         if (!bgOverlayEnabled || !currentDetailCameraId) return;
         const cameraId = currentDetailCameraId;
         const img = await loadOverlayImage(
-            `api/cameras/${encodeURIComponent(cameraId)}/motion/background?t=${Date.now()}`);
+            `api/cameras/${encodeURIComponent(cameraId)}/motion/maps/background?t=${Date.now()}`);
         if (!bgOverlayEnabled || currentDetailCameraId !== cameraId) return;
         bgImage = img;
         drawBackground();
