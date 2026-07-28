@@ -764,6 +764,13 @@ where
     let debug_store = DetectionDebugStore::new(&camera_ids);
     let object_detection_ready = log_object_detection_config(&config);
     let storage = init_storage(&config, &camera_ids).await;
+    // The recording-silence watchdog cannot see the storage volume being
+    // unmounted: writes to the bare mountpoint succeed and keep resetting it.
+    // So the volume is watched directly — by the backends that have one to
+    // lose, which is the local-disk one only.
+    let volume_anchor = storage
+        .as_ref()
+        .and_then(|backend| backend.volume_anchor().cloned());
     let motion_settings = init_motion_settings(&config, &camera_ids);
 
     log_recording_mode(&config);
@@ -898,11 +905,16 @@ where
     let watchdog_handle =
         recording_mode(&config).map(|_| tokio::spawn(Arc::clone(&recording_watchdog).run()));
 
+    let anchor_handle = volume_anchor.map(|anchor| tokio::spawn(anchor.run()));
+
     let reason = wait_for_shutdown(&shutdown).await;
     server_handle.abort();
     // Aborted rather than drained: it holds nothing that has to reach disk, and
     // a camera being quiet is not news while the process is stopping.
     if let Some(handle) = watchdog_handle {
+        handle.abort();
+    }
+    if let Some(handle) = anchor_handle {
         handle.abort();
     }
 

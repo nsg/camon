@@ -23,6 +23,7 @@
 
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -33,7 +34,7 @@ use crate::buffer::warm::{EventUpgrade, FinishedEvent};
 use crate::storage::warm_index::{
     free_space_bytes, should_emergency_prune, DetectionDetail, EmergencyOutcome,
 };
-use crate::storage::{EventType, WarmEventEntry, WarmEventIndex};
+use crate::storage::{EventType, StorageAnchor, WarmEventEntry, WarmEventIndex};
 
 const NANOS_PER_MS: u64 = 1_000_000;
 
@@ -214,6 +215,17 @@ pub trait WarmStorageBackend: Send + Sync {
     /// Salvage writes interrupted by a crash or power cut, before the scan.
     fn recover_orphans(&self);
 
+    /// The volume watch, for a backend that has a local filesystem to lose.
+    ///
+    /// `None` by default, which is the honest answer for a backend that owns no
+    /// filesystem: nothing can be unmounted out from under a remote store, and
+    /// a host that has gone away fails its uploads outright rather than letting
+    /// them land somewhere else and report success. That silent redirection is
+    /// the entire fault [`StorageAnchor`] exists to notice.
+    fn volume_anchor(&self) -> Option<&Arc<StorageAnchor>> {
+        None
+    }
+
     // ---- API read path ----
 
     /// Events overlapping `[from_ns, to_ns]`, oldest first.
@@ -266,15 +278,20 @@ pub struct LocalDiskBackend {
     data_dir: PathBuf,
     index: WarmEventIndex,
     camera_ids: Vec<String>,
+    anchor: Arc<StorageAnchor>,
 }
 
 impl LocalDiskBackend {
+    /// Marks `data_dir` on the way through — the only I/O in here — so the
+    /// device the archive is on is recorded before anything is written to it.
     pub fn new(data_dir: PathBuf, camera_ids: &[String]) -> Self {
         let index = WarmEventIndex::new(camera_ids, data_dir.clone());
+        let anchor = Arc::new(StorageAnchor::new(data_dir.clone()));
         Self {
             data_dir,
             index,
             camera_ids: camera_ids.to_vec(),
+            anchor,
         }
     }
 }
@@ -310,6 +327,13 @@ impl WarmStorageBackend for LocalDiskBackend {
         if min_free_bytes == 0 {
             return;
         }
+        // With the volume gone this whole guard is about the wrong disk: the
+        // `create_dir_all` below would rebuild the storage tree on whatever is
+        // behind the mountpoint, and statvfs would report that filesystem's
+        // free space. See `emergency_prune` for why nothing is deleted either.
+        if !self.anchor.is_intact() {
+            return;
+        }
         // data_dir may not exist before the first write; statvfs needs it.
         // Synced, because this runs before every write and would otherwise be
         // what creates the storage root: the event write's own synced
@@ -335,6 +359,23 @@ impl WarmStorageBackend for LocalDiskBackend {
     }
 
     async fn emergency_prune(&self, camera_id: &str, min_free_bytes: u64) {
+        // Free space read through a path that no longer leads to the storage
+        // volume is a figure about some other disk, and the response to a low
+        // figure here is to delete footage. Deleting the archive to make room
+        // on a filesystem the archive is not on is the one thing camon does in
+        // this situation that cannot be undone afterwards, so it stops until
+        // the volume is back. Writing carries on — footage in the wrong place
+        // beats no footage, and it can be moved. The verdict is a cached flag,
+        // so this costs no syscall on the write path, and it reads intact until
+        // a check has actually proved otherwise.
+        if !self.anchor.is_intact() {
+            tracing::warn!(
+                camera = %camera_id,
+                "skipping emergency prune: the storage volume is not the one camon started \
+                 with, so free space here says nothing about the archive"
+            );
+            return;
+        }
         let data_dir = self.data_dir.clone();
         let outcome = self
             .index
@@ -407,6 +448,10 @@ impl WarmStorageBackend for LocalDiskBackend {
 
     fn recover_orphans(&self) {
         crate::storage::recover_orphans(&self.data_dir, &self.camera_ids);
+    }
+
+    fn volume_anchor(&self) -> Option<&Arc<StorageAnchor>> {
+        Some(&self.anchor)
     }
 
     fn query(&self, camera_id: &str, from_ns: u64, to_ns: u64) -> Vec<WarmEventEntry> {
@@ -1359,6 +1404,39 @@ mod tests {
             .await;
         assert!(backend.find_event("cam", start_pts).is_none());
         drop(dir);
+    }
+
+    /// A `min_free_bytes` of `u64::MAX` makes every filesystem look full, which
+    /// is exactly what an unmounted `data_dir` does to the guard: it reads a
+    /// device that has nothing to do with the archive. Deleting real footage on
+    /// the strength of that reading is the one move here with no way back, so
+    /// while the anchor says the volume moved, nothing is deleted — and the
+    /// same call with the volume in place still deletes, so the veto is what
+    /// stopped it and not the setup.
+    #[tokio::test]
+    async fn a_storage_volume_that_moved_stops_the_emergency_prune() {
+        let (backend, entry, dir) = backend_with_event().await;
+        let start_pts = entry.start_pts_ns;
+
+        std::fs::remove_file(dir.path().join(".camon-volume")).unwrap();
+        backend
+            .volume_anchor()
+            .unwrap()
+            .check(std::time::Instant::now());
+        backend.guard_free_space("cam", u64::MAX).await;
+        backend.emergency_prune("cam", u64::MAX).await;
+        assert!(
+            backend.find_event("cam", start_pts).is_some(),
+            "pruned the archive to free space on a filesystem it is not on"
+        );
+
+        std::fs::write(dir.path().join(".camon-volume"), b"back").unwrap();
+        backend
+            .volume_anchor()
+            .unwrap()
+            .check(std::time::Instant::now());
+        backend.emergency_prune("cam", u64::MAX).await;
+        assert!(backend.find_event("cam", start_pts).is_none());
     }
 
     #[tokio::test]

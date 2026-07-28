@@ -271,7 +271,23 @@ impl WarmEventIndex {
             let dir = self.data_dir.join(camera_id).join(event_type.dir_name());
             let read_dir = match std::fs::read_dir(&dir) {
                 Ok(rd) => rd,
-                Err(_) => continue,
+                // A tier this camera has never written has no directory, which
+                // is the ordinary case and says nothing. Anything else is a
+                // storage fault that would otherwise scan back as an empty
+                // archive — indistinguishable from a camera that has recorded
+                // nothing, and the reason an unreadable data_dir used to look
+                // exactly like a fresh install.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => {
+                    tracing::warn!(
+                        camera = %camera_id,
+                        dir = %dir.display(),
+                        error = %e,
+                        "cannot read a stored event directory; its events are missing from \
+                         the index and will not be served, pruned or counted"
+                    );
+                    continue;
+                }
             };
             for entry in read_dir.flatten() {
                 if let Some(warm_entry) = self.scan_entry(&entry, *event_type) {

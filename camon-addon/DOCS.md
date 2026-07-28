@@ -119,7 +119,10 @@ Five values are **forced by `run.sh`** via `camon --set`, overriding whatever
   token` as well is supported and harmless, but not needed.
 - **`storage.data_dir = /data/storage`.** `/data` is the add-on's own
   persistent volume — always mounted and preserved across restarts/updates — so
-  recordings survive there automatically.
+  recordings survive there automatically. Camon marks the directory at startup
+  with a small `.camon-volume` file and re-checks it once a minute, so a storage
+  volume that goes away under a running camon is reported instead of quietly
+  redirecting recordings elsewhere; on the add-on that check simply never fires.
 
 Everything else — analytics, object detection, the Ollama server (including the
 fallback), retention, motion tuning, remote stathost storage, and the camera

@@ -1,3 +1,4 @@
+pub mod anchor;
 pub mod backend;
 mod debug_store;
 mod detection_store;
@@ -8,6 +9,7 @@ mod store;
 pub mod warm_index;
 pub mod watchdog;
 
+pub use anchor::StorageAnchor;
 pub use backend::{
     LocalDiskBackend, RangeRequest, ServedRange, ThumbnailError, VideoStream, WarmStorageBackend,
 };
