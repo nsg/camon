@@ -14,7 +14,9 @@ use crate::config::AnalyticsConfig;
 use crate::locks::LockExt;
 use crate::mqtt::{send_event, MqttEvent};
 use crate::retry::{jittered, RetrySchedule, Streak};
-use crate::storage::{DetectionStore, EventRecord, EventRegistry, MotionEntry, MotionStore};
+use crate::storage::{
+    DetectionStore, EventRecord, EventRegistry, MapKind, MotionEntry, MotionStore,
+};
 
 use super::decoder::{
     CropDecoder, DecodeOutcome, FrameDecoder, DETECTION_CROP_SIZE, THUMBNAIL_CROP_SIZE,
@@ -853,7 +855,7 @@ impl MotionAnalyzer {
                     continue;
                 }
             };
-            self.publish_debug_maps();
+            publish_debug_maps(&self.motion_store, &self.camera_id, &self.detector);
 
             let has_motion = analysis.has_motion();
             let SegmentAnalysis {
@@ -997,34 +999,6 @@ impl MotionAnalyzer {
             self.send_motion_event(MqttEvent::MotionEnd {
                 camera_id: self.camera_id.clone(),
             });
-        }
-    }
-
-    /// Publish the detector's pipeline-stage views for the debug UI:
-    /// - stability: final motion mask (after opening + area filter)
-    /// - raw: raw MOG2 foreground mask
-    /// - no-shadow: alias of raw (the pure-Rust detector has no shadow class;
-    ///   the stage name is kept so the API/UI stay stable)
-    /// - morph: after morphological opening
-    /// - background: the learned MOG2 background model
-    fn publish_debug_maps(&mut self) {
-        if let Some(jpeg) = self.detector.fg_mask().and_then(gray_jpeg) {
-            self.motion_store.set_stability_map(&self.camera_id, jpeg);
-        }
-        let mut bg = Vec::new();
-        if let Some((w, h)) = self.detector.background_into(&mut bg) {
-            if let Some(jpeg) = gray_jpeg((&bg, w, h)) {
-                self.motion_store.set_background_map(&self.camera_id, jpeg);
-            }
-        }
-        if let Some(jpeg) = self.detector.raw_mask().and_then(gray_jpeg) {
-            self.motion_store.set_raw_mog2_map(&self.camera_id, jpeg);
-        }
-        if let Some(jpeg) = self.detector.no_shadow_mask().and_then(gray_jpeg) {
-            self.motion_store.set_no_shadow_map(&self.camera_id, jpeg);
-        }
-        if let Some(jpeg) = self.detector.morph_mask().and_then(gray_jpeg) {
-            self.motion_store.set_morph_map(&self.camera_id, jpeg);
         }
     }
 
@@ -1477,6 +1451,56 @@ fn gray_jpeg((data, w, h): (&[u8], usize, usize)) -> Option<Vec<u8>> {
     encode_jpeg_raw(data, w, h, image::ExtendedColorType::L8)
 }
 
+/// Publish the detector's pipeline-stage views for the debug UI:
+/// - stability: final motion mask (after opening + area filter)
+/// - raw: raw MOG2 foreground mask
+/// - no-shadow: alias of raw (the pure-Rust detector has no shadow class;
+///   the stage name is kept so the API/UI stay stable)
+/// - morph: after morphological opening
+/// - background: the learned MOG2 background model
+///
+/// A stage is only encoded while somebody is looking at it: five greyscale
+/// JPEGs per camera per analysis tick is real CPU, and outside the debug view
+/// nothing ever reads them. [`MotionStore::map_wanted`] answers from the last
+/// time the API was asked for that stage on that camera, so the encode — and
+/// the background copy that feeds it — is skipped outright rather than thrown
+/// away afterwards.
+fn publish_debug_maps(store: &MotionStore, camera_id: &str, detector: &MotionDetector) {
+    if store.map_wanted(camera_id, MapKind::Stability) {
+        if let Some(jpeg) = detector.fg_mask().and_then(gray_jpeg) {
+            store.set_map(camera_id, MapKind::Stability, jpeg);
+        }
+    }
+    if store.map_wanted(camera_id, MapKind::Background) {
+        let mut bg = Vec::new();
+        if let Some((w, h)) = detector.background_into(&mut bg) {
+            if let Some(jpeg) = gray_jpeg((&bg, w, h)) {
+                store.set_map(camera_id, MapKind::Background, jpeg);
+            }
+        }
+    }
+    // `no_shadow_mask()` is the raw mask, so the two stages are one encode. The
+    // motion overlay asks for both, which makes doing it twice the common case
+    // rather than the exotic one.
+    let raw_wanted = store.map_wanted(camera_id, MapKind::RawMog2);
+    let no_shadow_wanted = store.map_wanted(camera_id, MapKind::NoShadow);
+    if raw_wanted || no_shadow_wanted {
+        if let Some(jpeg) = detector.raw_mask().and_then(gray_jpeg) {
+            if no_shadow_wanted {
+                store.set_map(camera_id, MapKind::NoShadow, jpeg.clone());
+            }
+            if raw_wanted {
+                store.set_map(camera_id, MapKind::RawMog2, jpeg);
+            }
+        }
+    }
+    if store.map_wanted(camera_id, MapKind::Morph) {
+        if let Some(jpeg) = detector.morph_mask().and_then(gray_jpeg) {
+            store.set_map(camera_id, MapKind::Morph, jpeg);
+        }
+    }
+}
+
 /// Build until it succeeds or shutdown is requested; `None` means only the
 /// latter. The sleep between attempts is shutdown-aware, so a camera stuck in
 /// here never holds the drain up.
@@ -1543,6 +1567,137 @@ pub fn spawn_analyzer(
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicU32;
+
+    /// A detector past warmup with a blob in view, so every stage has
+    /// something to publish.
+    fn detector_with_masks() -> MotionDetector {
+        const W: usize = 64;
+        const H: usize = 48;
+        let mut detector = MotionDetector::new(16.0, 4.0);
+        let still = vec![60u8; W * H];
+        for _ in 0..20 {
+            detector.process_frame(&still, W, H);
+        }
+        let mut moved = still.clone();
+        for y in 8..24 {
+            for x in 8..24 {
+                moved[y * W + x] = 220;
+            }
+        }
+        detector.process_frame(&moved, W, H);
+        detector
+    }
+
+    /// Five JPEG encodes per camera per tick, for a view that is almost never
+    /// open: a camera nobody has asked about recently gets none of them.
+    #[test]
+    fn debug_maps_are_only_encoded_while_somebody_is_watching() {
+        let store = MotionStore::new(&["watched".to_string(), "idle".to_string()]);
+        let detector = detector_with_masks();
+        for kind in MapKind::ALL {
+            store.mark_map_requested_ago("watched", kind, Duration::ZERO);
+            store.mark_map_requested_ago("idle", kind, Duration::from_secs(600));
+        }
+
+        publish_debug_maps(&store, "watched", &detector);
+        publish_debug_maps(&store, "idle", &detector);
+
+        for kind in MapKind::ALL {
+            assert!(
+                store.get_map("watched", kind).is_some(),
+                "{} was not published for the camera being watched",
+                kind.as_str()
+            );
+            assert!(
+                store.get_map("idle", kind).is_none(),
+                "{} was encoded for a camera nobody is watching",
+                kind.as_str()
+            );
+        }
+    }
+
+    /// The overlays are toggled one at a time, so demand is tracked that way
+    /// too — a request for one stage does not pay for the other four.
+    #[test]
+    fn debug_map_demand_is_tracked_per_stage() {
+        let store = MotionStore::new(&["cam".to_string()]);
+        let detector = detector_with_masks();
+        store.mark_map_requested_ago("cam", MapKind::Background, Duration::ZERO);
+
+        publish_debug_maps(&store, "cam", &detector);
+
+        assert!(store.get_map("cam", MapKind::Background).is_some());
+        for kind in MapKind::ALL
+            .into_iter()
+            .filter(|k| *k != MapKind::Background)
+        {
+            assert!(
+                store.get_map("cam", kind).is_none(),
+                "{} rode along on a request for another stage",
+                kind.as_str()
+            );
+        }
+    }
+
+    /// The whole point of the gate is that demand expires. If publishing were
+    /// ever to count as a request, the first tick after somebody looked once
+    /// would hold the gate open forever and every other test here would still
+    /// pass.
+    #[test]
+    fn publishing_a_map_does_not_renew_its_own_demand() {
+        let store = MotionStore::new(&["cam".to_string()]);
+        let detector = detector_with_masks();
+        store.mark_map_requested_ago("cam", MapKind::Stability, Duration::ZERO);
+
+        publish_debug_maps(&store, "cam", &detector);
+        store.mark_map_requested_ago("cam", MapKind::Stability, Duration::from_secs(600));
+
+        assert!(
+            !store.map_wanted("cam", MapKind::Stability),
+            "publishing latched the gate open, so the encode never stops"
+        );
+    }
+
+    /// `no-shadow` is an alias of `raw`, and the motion overlay asks for both,
+    /// so the common case must not pay for the same JPEG twice.
+    #[test]
+    fn the_raw_and_no_shadow_stages_share_one_encode() {
+        let store = MotionStore::new(&["cam".to_string()]);
+        let detector = detector_with_masks();
+        store.mark_map_requested_ago("cam", MapKind::RawMog2, Duration::ZERO);
+        store.mark_map_requested_ago("cam", MapKind::NoShadow, Duration::ZERO);
+
+        publish_debug_maps(&store, "cam", &detector);
+
+        let raw = store.get_map("cam", MapKind::RawMog2);
+        assert!(raw.is_some());
+        assert_eq!(raw, store.get_map("cam", MapKind::NoShadow));
+    }
+
+    /// Sharing the encode must not merge the two stages: each still answers to
+    /// its own demand, and one asked for alone leaves the other empty.
+    #[test]
+    fn the_raw_and_no_shadow_stages_are_still_gated_apart() {
+        let store = MotionStore::new(&["cam".to_string()]);
+        let detector = detector_with_masks();
+
+        store.mark_map_requested_ago("cam", MapKind::NoShadow, Duration::ZERO);
+        publish_debug_maps(&store, "cam", &detector);
+        assert!(store.get_map("cam", MapKind::NoShadow).is_some());
+        assert!(
+            store.get_map("cam", MapKind::RawMog2).is_none(),
+            "raw was filled by a request for no-shadow"
+        );
+
+        let store = MotionStore::new(&["cam".to_string()]);
+        store.mark_map_requested_ago("cam", MapKind::RawMog2, Duration::ZERO);
+        publish_debug_maps(&store, "cam", &detector);
+        assert!(store.get_map("cam", MapKind::RawMog2).is_some());
+        assert!(
+            store.get_map("cam", MapKind::NoShadow).is_none(),
+            "no-shadow was filled by a request for raw"
+        );
+    }
 
     /// The decoder-restart backoff must not outlive a shutdown request: the
     /// analyzer is joined by the drain, and five seconds per camera is time the
