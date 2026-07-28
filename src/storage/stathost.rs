@@ -64,6 +64,14 @@
 //!   tiers it with the objects. The prune tick re-reads its sidecar, which is
 //!   the only in-process retry there is — [`scan`](StathostBackend::scan) runs
 //!   once at startup.
+//! * **The startup scan fans out.** It blocks startup by design — the index,
+//!   the byte budget and the orphan sweep's safety all depend on it finishing
+//!   before the first camera writes — and it needs one sidecar GET per stored
+//!   event, so awaiting them one at a time made "no camera is recording yet" a
+//!   function of the archive's size. Reads and orphan probes run
+//!   [`SCAN_CONCURRENCY`] at a time instead. What that changes is when requests
+//!   are *issued*; results are still consumed in listing order on one task, and
+//!   each request still decides its own 404-versus-failure.
 //! * **`read_video` streams the object with Range support.** The body is never
 //!   fully buffered; a forwarded `Range` header yields a `206`. A `200` to a
 //!   range request is legal HTTP and degrades to streaming the full body (the
@@ -76,7 +84,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use futures_util::TryStreamExt;
+use futures_util::{StreamExt, TryStreamExt};
 use serde::Deserialize;
 
 use crate::buffer::warm::{EventUpgrade, FinishedEvent};
@@ -166,6 +174,32 @@ const UPLOAD_TIMEOUT: Duration = Duration::from_secs(300);
 /// right shape for a body a player drains at its own pace. The flat phase is
 /// harmless here because a ranged GET carries no request body.
 const STREAM_READ_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How many requests [`StathostBackend::scan`] keeps in flight — its sidecar
+/// reads, and the orphan sweep's probes and deletes.
+///
+/// The scan is awaited by `init_storage` *before* the first camera is spawned,
+/// so every round trip it makes is time nothing is recording. Its work is one
+/// small GET per stored event, and those are latency-bound rather than
+/// bandwidth-bound — a sidecar is a few hundred bytes — so awaiting them one at
+/// a time makes startup a function of the archive's size: a bucket holding a
+/// few thousand events costs that many round trips, minutes of them on any link
+/// that is not a LAN. The per-request timeouts bound each one, not the total.
+///
+/// 16 is sized against what the far end is. stathost is a small single-process
+/// static file host, typically the same box camon runs on or next to, and each
+/// in-flight request is one HTTP/1.1 connection — so this is also the number of
+/// sockets camon opens at once. Deep enough that the round trip is hidden
+/// (16 × a 40 ms RTT ≈ 400 events/s, so the same few thousand events finish in
+/// seconds), shallow enough not to be a burst worth calling a load, and it
+/// leaves the host able to answer whatever else is asking. Doubling it would
+/// save a few seconds of startup for twice the connections, against a server
+/// that is about to start absorbing this process's uploads.
+///
+/// Note that camon's other remote dependency, Ollama, is deliberately held to
+/// exactly *one* in-flight request. That limit is about a GPU that degrades
+/// under parallel load; serving static files has no such property.
+const SCAN_CONCURRENCY: usize = 16;
 
 /// The remote warm store: an HTTP client plus a self-maintained in-RAM index.
 pub struct StathostBackend {
@@ -379,6 +413,13 @@ impl StathostBackend {
         SidecarRead::Unreadable
     }
 
+    /// [`Self::read_sidecar`] with the event carried through, so the scan's
+    /// fan-out can pair each result with what it belongs to.
+    async fn read_sidecar_for(&self, event: ScannedEvent) -> (ScannedEvent, SidecarRead) {
+        let read = self.read_sidecar(&event.camera_id, &event.stem).await;
+        (event, read)
+    }
+
     fn ts_key(camera_id: &str, entry: &WarmEventEntry) -> String {
         format!(
             "{camera_id}/{}_{}.ts",
@@ -534,9 +575,13 @@ impl StathostBackend {
     /// looks like, and collecting it would destroy the sidecar of footage about
     /// to be salvaged. This backend stages nothing and recovers nothing.
     async fn sweep_orphaned_metadata(&self, items: &[ListEntry], all_paths: &HashSet<&str>) {
-        let mut deleted = 0usize;
-        let mut failed = 0usize;
-        let mut landed = 0usize;
+        // Grouped by stem before anything is asked of the host: a failed upload
+        // orphans a sidecar and every filmstrip frame together, and all of them
+        // turn on the one question the probe answers — is the video there? One
+        // probe settles the whole stem, where probing per object asked it again
+        // for each frame.
+        let mut orphans: Vec<(String, Vec<String>)> = Vec::new();
+        let mut by_stem: HashMap<String, usize> = HashMap::new();
         for item in items {
             let Some((camera_id, stem)) = split_metadata_key(&item.path) else {
                 continue;
@@ -548,26 +593,24 @@ impl StathostBackend {
             if all_paths.contains(ts_key.as_str()) {
                 continue;
             }
-            match self.http.probe_exists(&ts_key).await {
-                // Confirmed absent: an orphan, as of one request ago.
-                Ok(false) => {}
-                // It landed after the listing was taken — not an orphan at all.
-                Ok(true) => {
-                    landed += 1;
-                    continue;
+            match by_stem.get(&ts_key) {
+                Some(&at) => orphans[at].1.push(item.path.clone()),
+                None => {
+                    by_stem.insert(ts_key.clone(), orphans.len());
+                    orphans.push((ts_key, vec![item.path.clone()]));
                 }
-                // Could not find out. Nothing is deleted on a maybe.
-                Err(_) => {
-                    failed += 1;
-                    continue;
-                }
-            }
-            match self.http.delete(&item.path).await {
-                DeleteOutcome::Deleted => deleted += 1,
-                DeleteOutcome::Missing => {}
-                DeleteOutcome::Failed => failed += 1,
             }
         }
+
+        // Unordered: these tallies are sums, and one stem's outcome never
+        // depends on another's.
+        let (deleted, landed, failed) = futures_util::stream::iter(orphans)
+            .map(|(ts_key, paths)| self.sweep_one_stem(ts_key, paths))
+            .buffer_unordered(SCAN_CONCURRENCY)
+            .fold((0usize, 0usize, 0usize), |acc, one| async move {
+                (acc.0 + one.0, acc.1 + one.1, acc.2 + one.2)
+            })
+            .await;
         if deleted > 0 {
             tracing::info!(
                 deleted,
@@ -577,7 +620,7 @@ impl StathostBackend {
         if landed > 0 {
             tracing::info!(
                 landed,
-                "stathost metadata whose video appeared after the listing was taken; kept"
+                "stathost events whose video appeared after the listing was taken; metadata kept"
             );
         }
         if failed > 0 {
@@ -585,6 +628,34 @@ impl StathostBackend {
                 failed,
                 "could not collect orphaned stathost metadata; the next startup retries"
             );
+        }
+    }
+
+    /// One stem's share of [`Self::sweep_orphaned_metadata`]: probe the video
+    /// once, and delete this stem's metadata objects only if the probe came
+    /// back with a confirmed absence. Returns `(deleted, landed, failed)`.
+    ///
+    /// The probe and the deletes it authorises stay in one future, so running
+    /// stems concurrently does not widen the window the module header calls the
+    /// residual race: it is still the one round trip between the two requests.
+    async fn sweep_one_stem(&self, ts_key: String, paths: Vec<String>) -> (usize, usize, usize) {
+        match self.http.probe_exists(&ts_key).await {
+            // Confirmed absent: an orphan, as of one request ago.
+            Ok(false) => {
+                let (mut deleted, mut failed) = (0usize, 0usize);
+                for path in &paths {
+                    match self.http.delete(path).await {
+                        DeleteOutcome::Deleted => deleted += 1,
+                        DeleteOutcome::Missing => {}
+                        DeleteOutcome::Failed => failed += 1,
+                    }
+                }
+                (deleted, 0, failed)
+            }
+            // It landed after the listing was taken — not an orphan at all.
+            Ok(true) => (0, 1, 0),
+            // Could not find out. Nothing is deleted on a maybe.
+            Err(_) => (0, 0, 1),
         }
     }
 
@@ -1062,10 +1133,10 @@ impl WarmStorageBackend for StathostBackend {
 
         // Full path set, so filmstrip frames can be counted without extra GETs.
         let all_paths: HashSet<&str> = items.iter().map(|i| i.path.as_str()).collect();
-        let mut total = 0usize;
-        let mut unknown_type = 0usize;
-        let mut typeless = 0usize;
 
+        // Everything the listing alone settles, in listing order. Only the
+        // sidecar reads below need the network.
+        let mut pending: Vec<ScannedEvent> = Vec::new();
         for item in &items {
             let Some((camera_id, stem)) = split_ts_key(&item.path) else {
                 continue;
@@ -1081,51 +1152,75 @@ impl WarmStorageBackend for StathostBackend {
                 tracing::warn!(path = %item.path,
                     "zero-byte .ts on stathost (interrupted upload?)");
             }
-
-            // Fetch the sibling sidecar. Only a confirmed absence means
-            // "movement" — that is the one event written without a sidecar.
-            let (sidecar, type_known) = match self.read_sidecar(camera_id, stem).await {
-                SidecarRead::Parsed(s) => (Some(s), true),
-                SidecarRead::Absent => (None, true),
-                SidecarRead::Unreadable => (None, false),
-                SidecarRead::Typeless(s) => {
-                    // Deterministic, so no later scan will clear this by
-                    // itself: name the object so it can actually be fixed.
-                    tracing::warn!(path = %item.path,
-                        "stathost sidecar names no event type; retention falls back to the \
-                         longest configured age until the sidecar is repaired");
-                    typeless += 1;
-                    (Some(s), false)
-                }
-            };
             let mut filmstrip_frames = 0usize;
             while all_paths
                 .contains(format!("{camera_id}/{stem}_thumb_{filmstrip_frames}.jpg").as_str())
             {
                 filmstrip_frames += 1;
             }
-
-            let mut entry = WarmEventEntry {
+            pending.push(ScannedEvent {
+                camera_id: camera_id.to_string(),
+                stem: stem.to_string(),
                 start_pts_ns,
                 duration_ms,
-                event_type: EventType::Movement,
                 file_size: item.size,
+                filmstrip_frames,
+            });
+        }
+
+        let total = pending.len();
+        let mut unknown_type = 0usize;
+        let mut typeless = 0usize;
+
+        // `buffered`, not `buffer_unordered`: the reads overlap, but their
+        // results are handed back in listing order, so the index is built by
+        // exactly the sequence of insertions a serial scan made and the
+        // warnings below keep a stable order. Every insertion still happens
+        // here, on one task — the fan-out covers the request, not the index.
+        let mut reads = futures_util::stream::iter(pending)
+            .map(|event| self.read_sidecar_for(event))
+            .buffered(SCAN_CONCURRENCY);
+
+        while let Some((event, read)) = reads.next().await {
+            // Only a confirmed absence means "movement" — that is the one event
+            // written without a sidecar. Concurrency does not touch this: the
+            // 404 that says "absent" and the error that says "could not find
+            // out" are both decided inside the one request they belong to.
+            let (sidecar, type_known) = match read {
+                SidecarRead::Parsed(s) => (Some(s), true),
+                SidecarRead::Absent => (None, true),
+                SidecarRead::Unreadable => (None, false),
+                SidecarRead::Typeless(s) => {
+                    // Deterministic, so no later scan will clear this by
+                    // itself: name the object so it can actually be fixed.
+                    tracing::warn!(path = %format_args!("{}/{}.ts", event.camera_id, event.stem),
+                        "stathost sidecar names no event type; retention falls back to the \
+                         longest configured age until the sidecar is repaired");
+                    typeless += 1;
+                    (Some(s), false)
+                }
+            };
+
+            let mut entry = WarmEventEntry {
+                start_pts_ns: event.start_pts_ns,
+                duration_ms: event.duration_ms,
+                event_type: EventType::Movement,
+                file_size: event.file_size,
                 object_classes: Vec::new(),
                 backend: None,
                 model: None,
                 detections: Vec::new(),
-                filmstrip_frames,
+                filmstrip_frames: event.filmstrip_frames,
                 continues: false,
                 recovered: false,
                 delete_failed: false,
             };
             apply_sidecar(&mut entry, sidecar.as_ref());
-            self.index_entry(camera_id, entry);
+            self.index_entry(&event.camera_id, entry);
             if !type_known {
-                self.mark_unknown_type(camera_id, (start_pts_ns, duration_ms));
+                self.mark_unknown_type(&event.camera_id, (event.start_pts_ns, event.duration_ms));
                 unknown_type += 1;
             }
-            total += 1;
         }
 
         self.sweep_orphaned_metadata(&items, &all_paths).await;
@@ -1478,6 +1573,24 @@ struct ListEntry {
     size: u64,
 }
 
+/// One `.ts` object [`StathostBackend::scan`] is going to index, carrying
+/// everything the listing alone settles about it. Splitting that off from the
+/// sidecar read is what lets the reads overlap while the index is still built
+/// in listing order.
+///
+/// The names are owned rather than borrowed from the listing: a borrowed
+/// `ScannedEvent<'a>` makes the scan's fan-out closure higher-ranked over `'a`,
+/// which rustc cannot infer for a closure returning a future. Two short strings
+/// per stored event, once at startup, buys a readable fan-out.
+struct ScannedEvent {
+    camera_id: String,
+    stem: String,
+    start_pts_ns: u64,
+    duration_ms: u32,
+    file_size: u64,
+    filmstrip_frames: usize,
+}
+
 // ---------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------
@@ -1602,7 +1715,7 @@ fn parse_content_range_total(value: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
     use std::sync::{Arc, Mutex};
 
     use axum::{
@@ -1633,6 +1746,16 @@ mod tests {
         /// Paths that appear the instant after a listing is served: an upload
         /// committing while a scan walks the snapshot it took.
         commit_after_list: Arc<Mutex<Vec<String>>>,
+        /// Every GET path served, in arrival order — what a caller asked for,
+        /// and how many times.
+        gets: Arc<Mutex<Vec<String>>>,
+        /// GETs currently being served, and the high-water mark: the client's
+        /// fan-out width as the server actually saw it.
+        in_flight: Arc<AtomicUsize>,
+        peak_gets: Arc<AtomicUsize>,
+        /// Latency added to every GET, so a serial caller is distinguishable
+        /// from a concurrent one by the clock.
+        get_delay_ms: Arc<AtomicU64>,
     }
 
     /// A PUT failure injected by path suffix. `stored` decides whether the
@@ -1664,6 +1787,16 @@ mod tests {
 
         fn has(&self, path: &str) -> bool {
             self.files.lock().unwrap().contains_key(path)
+        }
+
+        /// How many times this exact path was fetched.
+        fn get_count(&self, path: &str) -> usize {
+            self.gets
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|p| *p == path)
+                .count()
         }
     }
 
@@ -1788,43 +1921,56 @@ mod tests {
             }
             // GET is public.
             _ => {
-                let fail_get = stub.fail_get_suffix.lock().unwrap().clone();
-                if fail_get.is_some_and(|s| path.ends_with(&s)) {
-                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                stub.gets.lock().unwrap().push(path.clone());
+                let now = stub.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                stub.peak_gets.fetch_max(now, Ordering::SeqCst);
+                let delay = stub.get_delay_ms.load(Ordering::Relaxed);
+                if delay > 0 {
+                    tokio::time::sleep(Duration::from_millis(delay)).await;
                 }
-                let bytes = match stub.files.lock().unwrap().get(&path) {
-                    Some(bytes) => bytes.clone(),
-                    None => return StatusCode::NOT_FOUND.into_response(),
-                };
-                let total = bytes.len() as u64;
-                let range = headers.get("range").and_then(|v| v.to_str().ok());
-                match range {
-                    // A server may legally answer a range request with a full 200.
-                    Some(_) if stub.ignore_range.load(Ordering::Relaxed) => full_200(bytes),
-                    Some(r) => match parse_stub_range(r, total) {
-                        Some((start, end)) => {
-                            let slice = bytes[start as usize..=end as usize].to_vec();
-                            let mut resp = (StatusCode::PARTIAL_CONTENT, slice).into_response();
-                            resp.headers_mut().insert(
-                                "content-range",
-                                format!("bytes {start}-{end}/{total}").parse().unwrap(),
-                            );
-                            resp.headers_mut()
-                                .insert("accept-ranges", "bytes".parse().unwrap());
-                            resp
-                        }
-                        None => {
-                            let mut resp = StatusCode::RANGE_NOT_SATISFIABLE.into_response();
-                            resp.headers_mut().insert(
-                                "content-range",
-                                format!("bytes */{total}").parse().unwrap(),
-                            );
-                            resp
-                        }
-                    },
-                    None => full_200(bytes),
-                }
+                let resp = get_response(&stub, &path, &headers);
+                stub.in_flight.fetch_sub(1, Ordering::SeqCst);
+                resp
             }
+        }
+    }
+
+    fn get_response(stub: &Stub, path: &str, headers: &HeaderMap) -> axum::response::Response {
+        use axum::response::IntoResponse;
+
+        let fail_get = stub.fail_get_suffix.lock().unwrap().clone();
+        if fail_get.is_some_and(|s| path.ends_with(&s)) {
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+        let bytes = match stub.files.lock().unwrap().get(path) {
+            Some(bytes) => bytes.clone(),
+            None => return StatusCode::NOT_FOUND.into_response(),
+        };
+        let total = bytes.len() as u64;
+        let range = headers.get("range").and_then(|v| v.to_str().ok());
+        match range {
+            // A server may legally answer a range request with a full 200.
+            Some(_) if stub.ignore_range.load(Ordering::Relaxed) => full_200(bytes),
+            Some(r) => match parse_stub_range(r, total) {
+                Some((start, end)) => {
+                    let slice = bytes[start as usize..=end as usize].to_vec();
+                    let mut resp = (StatusCode::PARTIAL_CONTENT, slice).into_response();
+                    resp.headers_mut().insert(
+                        "content-range",
+                        format!("bytes {start}-{end}/{total}").parse().unwrap(),
+                    );
+                    resp.headers_mut()
+                        .insert("accept-ranges", "bytes".parse().unwrap());
+                    resp
+                }
+                None => {
+                    let mut resp = StatusCode::RANGE_NOT_SATISFIABLE.into_response();
+                    resp.headers_mut()
+                        .insert("content-range", format!("bytes */{total}").parse().unwrap());
+                    resp
+                }
+            },
+            None => full_200(bytes),
         }
     }
 
@@ -1847,6 +1993,10 @@ mod tests {
             fail_delete_paths: Arc::new(Mutex::new(HashSet::new())),
             ignore_range: Arc::new(AtomicBool::new(false)),
             commit_after_list: Arc::new(Mutex::new(Vec::new())),
+            gets: Arc::new(Mutex::new(Vec::new())),
+            in_flight: Arc::new(AtomicUsize::new(0)),
+            peak_gets: Arc::new(AtomicUsize::new(0)),
+            get_delay_ms: Arc::new(AtomicU64::new(0)),
         };
         let app = Router::new()
             .route("/{bucket}/{*path}", any(handler))
@@ -2536,6 +2686,124 @@ mod tests {
         assert!(e.object_classes.is_empty());
     }
 
+    /// Seed `count` stored events, one `.ts` plus one sidecar each, at 1s
+    /// intervals from `first_pts`. `event_type` is written into every sidecar.
+    fn seed_events(stub: &Stub, first_pts: u64, count: u64, duration_ms: u32, event_type: &str) {
+        let mut files = stub.files.lock().unwrap();
+        for i in 0..count {
+            let stem = format!("{}_{duration_ms}", first_pts + i * SEC);
+            files.insert(format!("cam/{stem}.ts"), vec![0u8; 10]);
+            files.insert(
+                format!("cam/{stem}.json"),
+                format!(r#"{{"event_type":"{event_type}"}}"#).into_bytes(),
+            );
+        }
+    }
+
+    /// The scan is awaited before the first camera is spawned, so its cost is
+    /// startup latency with nothing recording. One awaited round trip per
+    /// stored event made that a function of the archive's size; the reads now
+    /// overlap [`SCAN_CONCURRENCY`]-wide.
+    #[tokio::test]
+    async fn the_scan_reads_sidecars_concurrently() {
+        let (url, stub) = spawn_stub("secret").await;
+        seed_events(&stub, 1_000, 64, 1000, "object");
+        // Enough per-request latency that a serial scan cannot hide in the
+        // noise: 64 × 50ms = 3.2s of it.
+        stub.get_delay_ms.store(50, Ordering::Relaxed);
+
+        let backend = backend_for(&url, "secret", 0);
+        let started = std::time::Instant::now();
+        backend.scan().await;
+        let elapsed = started.elapsed();
+
+        assert_eq!(backend.query("cam", 0, u64::MAX).len(), 64);
+        // Serial is 3.2s of injected latency alone and measures at ~3.4s;
+        // sixteen at a time is four waves, ~0.24s. The bound sits between them
+        // with room for a loaded machine on either count.
+        assert!(
+            elapsed < Duration::from_millis(2_000),
+            "sidecar reads were serial: {elapsed:?}"
+        );
+        let peak = stub.peak_gets.load(Ordering::SeqCst);
+        assert!(peak > 1, "no reads overlapped");
+        assert!(peak <= SCAN_CONCURRENCY, "fan-out ran unbounded: {peak}");
+    }
+
+    /// Overlapping the reads must not reach the index: entries stay sorted, and
+    /// each stored event is indexed exactly once and charged once.
+    #[tokio::test]
+    async fn a_concurrent_scan_indexes_every_event_once_and_in_order() {
+        let (url, stub) = spawn_stub("secret").await;
+        {
+            let mut files = stub.files.lock().unwrap();
+            for i in 0..40u64 {
+                let stem = format!("{}_1000", 1_000 + i * SEC);
+                files.insert(format!("cam/{stem}.ts"), vec![0u8; 10]);
+                // Alternating types, so a result delivered against the wrong
+                // event would show up as a type on the wrong entry.
+                let event_type = if i % 2 == 0 { "object" } else { "continuous" };
+                files.insert(
+                    format!("cam/{stem}.json"),
+                    format!(r#"{{"event_type":"{event_type}"}}"#).into_bytes(),
+                );
+            }
+        }
+        stub.get_delay_ms.store(5, Ordering::Relaxed);
+
+        let backend = backend_for(&url, "secret", 0);
+        backend.scan().await;
+
+        let entries = backend.query("cam", 0, u64::MAX);
+        assert_eq!(entries.len(), 40, "an event was dropped or duplicated");
+        for (i, entry) in entries.iter().enumerate() {
+            assert_eq!(entry.start_pts_ns, 1_000 + i as u64 * SEC);
+            assert_eq!(
+                entry.event_type,
+                if i % 2 == 0 {
+                    EventType::Object
+                } else {
+                    EventType::Continuous
+                }
+            );
+        }
+        // The budget is the sum of the index, so a double insertion shows here.
+        assert_eq!(backend.used_bytes.load(Ordering::Relaxed), 40 * 10);
+    }
+
+    /// The distinction the whole sidecar path rests on survives the fan-out: a
+    /// read that failed is "unknown", never the confirmed absence that means
+    /// "movement". Half of these sidecars answer `500` while the other half
+    /// answer normally, in the same pass.
+    #[tokio::test]
+    async fn a_concurrent_scan_never_reads_a_failure_as_an_absence() {
+        let (url, stub) = spawn_stub("secret").await;
+        seed_events(&stub, 1_000, 20, 1000, "object");
+        seed_events(&stub, 1_000, 20, 2000, "object");
+        // Only the 2000ms-duration events' sidecars are unreadable.
+        stub.fail_gets("_2000.json");
+
+        let backend = backend_for(&url, "secret", 0);
+        backend.scan().await;
+
+        let entries = backend.query("cam", 0, u64::MAX);
+        assert_eq!(entries.len(), 40);
+        for entry in &entries {
+            let key = event_key(entry);
+            if entry.duration_ms == 1000 {
+                assert_eq!(entry.event_type, EventType::Object);
+                assert!(!backend.has_unknown_type("cam", key), "held a read event");
+            } else {
+                // Not indexed as a movement event: the type is on hold, so
+                // pruning measures it against the longest retention.
+                assert!(
+                    backend.has_unknown_type("cam", key),
+                    "a failed read was taken for a confirmed absence"
+                );
+            }
+        }
+    }
+
     #[tokio::test]
     async fn write_retries_then_drops_on_persistent_failure() {
         let (url, stub) = spawn_stub("secret").await;
@@ -2688,6 +2956,34 @@ mod tests {
         );
         assert!(stub.has("cam/19000_1000.json"));
         assert!(stub.has("cam/19000_1000_thumb_1.jpg"));
+    }
+
+    /// One failed upload orphans a sidecar and every filmstrip frame at once,
+    /// and all of them turn on the same question. The sweep asks the host once
+    /// per stem, not once per object it is about to delete.
+    #[tokio::test]
+    async fn the_sweep_probes_an_orphaned_stem_once() {
+        let (url, stub) = spawn_stub("secret").await;
+        {
+            let mut files = stub.files.lock().unwrap();
+            files.insert("cam/24000_1000.json".to_string(), b"{}".to_vec());
+            for i in 0..6 {
+                files.insert(format!("cam/24000_1000_thumb_{i}.jpg"), vec![0x01]);
+            }
+        }
+
+        let backend = backend_for(&url, "secret", 0);
+        backend.scan().await;
+
+        assert_eq!(
+            stub.get_count("cam/24000_1000.ts"),
+            1,
+            "the same video was probed once per orphaned object"
+        );
+        assert!(
+            stub.files.lock().unwrap().is_empty(),
+            "an orphaned object survived the sweep"
+        );
     }
 
     /// The listing is a snapshot, and it is not necessarily *this* process's
