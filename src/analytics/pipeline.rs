@@ -331,19 +331,32 @@ struct RunFilmstrip {
     frames: Vec<Vec<u8>>,
 }
 
+/// Drop every second entry once `acc` outgrows `cap`. Halving keeps the whole
+/// span covered at coarser spacing instead of truncating it to its beginning or
+/// end, and the first entry always survives.
+///
+/// Used wherever the final length is not known while the entries arrive: an
+/// open run lasts for as many batches as the motion does, and a segment holds
+/// `sample_fps` frames per second of footage, which is config with no ceiling.
+/// Where the count *is* known up front, thinning to it directly beats halving
+/// down to it — see [`frames_per_segment`].
+fn halve_past<T>(acc: &mut Vec<T>, cap: usize) {
+    if acc.len() <= cap {
+        return;
+    }
+    let mut seen = 0;
+    acc.retain(|_| {
+        seen += 1;
+        seen % 2 == 1
+    });
+}
+
 impl RunFilmstrip {
-    /// Add a batch's frames, dropping every second frame whenever the
-    /// accumulator outgrows its cap. Halving keeps the whole run covered at
-    /// coarser spacing instead of truncating it to its beginning or end.
+    /// Add a batch's frames, halving the accumulator whenever it outgrows its
+    /// cap.
     fn push(&mut self, frames: Vec<Vec<u8>>) {
         self.frames.extend(frames);
-        if self.frames.len() > FILMSTRIP_ACCUMULATOR_CAP {
-            let mut keep = 0;
-            self.frames.retain(|_| {
-                keep += 1;
-                keep % 2 == 1
-            });
-        }
+        halve_past(&mut self.frames, FILMSTRIP_ACCUMULATOR_CAP);
     }
 
     /// Snapshot and reset, subsampled to at most [`FILMSTRIP_FRAMES`] frames
@@ -1112,44 +1125,49 @@ impl MotionAnalyzer {
         }
     }
 
+    /// Decode the sampled segments of one run down to the handful of frames
+    /// [`subsample_tagged`] can still use, holding no more than
+    /// [`RUN_FRAME_ACCUMULATOR_CAP`] of them at once.
+    ///
+    /// The preceding segments are fed only to get ffmpeg past its stream probe;
+    /// their footage predates the motion, so it is decoded and dropped rather
+    /// than accumulated. What ffmpeg emitted by the end of that — including the
+    /// frames it swallowed while probing, which surface late — is then drained,
+    /// because a leftover taken by the first sampled segment's read would be
+    /// tagged with a crop measured on a different picture. The drain reaches
+    /// only what has arrived, so it narrows that window rather than closing it;
+    /// [`frames_per_segment`] keeps more than one frame per segment so a lagged
+    /// pipe costs the strip a frame instead of all of them.
     fn extract_run_frames(
         &self,
         run: &[MotionSegment],
         crop_decoder: &CropDecoder,
     ) -> Vec<(RgbFrame, Option<NormalizedRect>)> {
-        let indices = sample_indices(run.len());
-        let mut all_frames: Vec<(RgbFrame, Option<NormalizedRect>)> = Vec::new();
-
-        // Feed preceding segments to prime the decoder (no crop — not motion-positive)
         let first_seq = run[0].seq;
         if first_seq >= 3 {
             let buffer = self.buffer.read_recover();
             for prime_seq in (first_seq - 3)..first_seq {
                 if let Some(seg) = buffer.get_segment_by_sequence(prime_seq) {
-                    decode_to_frames_tagged(
-                        crop_decoder,
-                        &seg.data,
-                        seg.duration_ns,
-                        None,
-                        &mut all_frames,
-                    );
+                    crop_decoder.decode_segment(&seg.data, seg.duration_ns, |_| {});
                 }
             }
         }
-
-        for &idx in &indices {
-            let seg = &run[idx];
-            let crop = self.segment_crops.get(&seg.seq).copied();
-            decode_to_frames_tagged(
-                crop_decoder,
-                &seg.data,
-                seg.duration_ns,
-                crop,
-                &mut all_frames,
+        let stale = crop_decoder.drain();
+        if stale > 0 {
+            tracing::debug!(
+                camera = %self.camera_id,
+                frames = stale,
+                "dropped frames predating the motion run"
             );
         }
 
-        subsample_tagged(all_frames)
+        sample_run_frames(
+            run,
+            &self.segment_crops,
+            crop_decoder.width() as usize,
+            crop_decoder.height() as usize,
+            |data, duration_ns, sink| crop_decoder.decode_segment(data, duration_ns, sink),
+        )
     }
 
     /// Extract, crop and JPEG-encode the color frames of one contiguous motion
@@ -1279,29 +1297,103 @@ fn sample_indices(len: usize) -> Vec<usize> {
     }
 }
 
-fn decode_to_frames_tagged(
-    decoder: &CropDecoder,
-    data: &Arc<Vec<u8>>,
-    duration_ns: u64,
-    crop: Option<NormalizedRect>,
-    out: &mut Vec<(RgbFrame, Option<NormalizedRect>)>,
-) {
-    let width = decoder.width() as usize;
-    let height = decoder.height() as usize;
-    for frame_data in decoder.decode_segment(data, duration_ns) {
-        // The pipe delivers exact fixed-size frames; anything else is a
-        // torn read from a dying ffmpeg and gets skipped.
-        if frame_data.len() == width * height * 3 {
-            out.push((
+/// Frames kept out of one segment's decode, given how many segments the run
+/// contributes. [`sample_indices`] has already spread those segments over the
+/// run and the final pick is positional — it never compares pixels — so one
+/// frame per segment is all [`subsample_tagged`] strictly needs; the spare is
+/// what keeps a segment that decoded short, or a pipe running a frame behind
+/// its segments, from costing the strip a picture it cannot backfill.
+fn frames_per_segment(segments: usize) -> usize {
+    FILMSTRIP_FRAMES.div_ceil(segments.max(1)) + 1
+}
+
+/// Live raw frames one run may hold while its filmstrip is chosen. Not a policy
+/// of its own — the largest [`frames_per_segment`] ever grants across the
+/// segments [`sample_indices`] yields — but pinned so the peak stays a number
+/// this file states rather than one a reader has to derive.
+const RUN_FRAME_ACCUMULATOR_CAP: usize = 9;
+
+/// Keep at most `keep` of one segment's frames, spread from its first to its
+/// last. Both ends are kept because they are the two the run's selection can
+/// least afford to lose: the first frame is the segment's keyframe, the one the
+/// crop tag was measured on, and the last is the furthest whatever moved has
+/// travelled by the time the next segment starts.
+///
+/// The two picks over a whole run — [`subsample_filmstrip`] and
+/// [`subsample_tagged`] — instead space themselves at `n/3` and land on the
+/// last frame only by way of `n - 1`. They are picking moments out of an event,
+/// where the exact endpoints carry nothing in particular; this is picking
+/// frames out of one segment, where they carry the two things above.
+fn thin_evenly<T>(frames: Vec<T>, keep: usize) -> Vec<T> {
+    let n = frames.len();
+    if n <= keep {
+        return frames;
+    }
+    let span = keep.saturating_sub(1).max(1);
+    let picks: Vec<usize> = (0..keep).map(|k| k * (n - 1) / span).collect();
+    frames
+        .into_iter()
+        .enumerate()
+        .filter(|(i, _)| picks.contains(i))
+        .map(|(_, frame)| frame)
+        .collect()
+}
+
+/// Decode the sampled segments of `run` and reduce them to the frames the event
+/// filmstrip and the vision model get, each tagged with its own segment's crop.
+///
+/// `decode` is a parameter so the selection can be driven without an ffmpeg;
+/// [`MotionAnalyzer::extract_run_frames`] passes the crop decoder.
+///
+/// No segment is ever materialised whole. Frames are thinned as they arrive,
+/// through an accumulator [`halve_past`] holds just above `keep` — a segment
+/// owns `sample_fps` frames per second and `sample_fps` has no configured
+/// ceiling, so the live cost has to be a function of what is kept rather than
+/// of what is decoded.
+fn sample_run_frames(
+    run: &[MotionSegment],
+    crops: &HashMap<u64, NormalizedRect>,
+    width: usize,
+    height: usize,
+    mut decode: impl FnMut(&Arc<Vec<u8>>, u64, &mut dyn FnMut(Vec<u8>)),
+) -> Vec<(RgbFrame, Option<NormalizedRect>)> {
+    let indices = sample_indices(run.len());
+    let keep = frames_per_segment(indices.len());
+    let mut all_frames: Vec<(RgbFrame, Option<NormalizedRect>)> =
+        Vec::with_capacity(RUN_FRAME_ACCUMULATOR_CAP);
+
+    for &idx in &indices {
+        let seg = &run[idx];
+        let crop = crops.get(&seg.seq).copied();
+        // One frame past `keep`, because `halve_past` needs one in hand beyond
+        // its cap to halve against, and one more transiently while it is held.
+        // Stated once: the two must not drift apart, and every frame either
+        // covers is 6 MB at the detection crop size. The width is invisible in
+        // the result — the final thin lands on the same frames whatever it is —
+        // so it is purely how much memory the decode is allowed to use.
+        let reservoir = keep + 1;
+        let mut held: Vec<Vec<u8>> = Vec::with_capacity(reservoir + 1);
+        decode(&seg.data, seg.duration_ns, &mut |frame_data: Vec<u8>| {
+            // The pipe delivers exact fixed-size frames; anything else is a
+            // torn read from a dying ffmpeg and gets skipped.
+            if frame_data.len() == width * height * 3 {
+                held.push(frame_data);
+                halve_past(&mut held, reservoir);
+            }
+        });
+        all_frames.extend(thin_evenly(held, keep).into_iter().map(|data| {
+            (
                 RgbFrame {
-                    data: frame_data,
+                    data,
                     width,
                     height,
                 },
                 crop,
-            ));
-        }
+            )
+        }));
     }
+
+    subsample_tagged(all_frames)
 }
 
 fn subsample_tagged(
@@ -2102,6 +2194,175 @@ mod tests {
         assert_eq!(picked(subsample_tagged(tagged(5))), vec![0, 1, 3, 4]);
         assert_eq!(picked(subsample_tagged(tagged(6))), vec![0, 2, 4, 5]);
         assert_eq!(picked(subsample_tagged(tagged(12))), vec![0, 4, 8, 11]);
+    }
+
+    #[test]
+    fn frames_per_segment_covers_the_final_pick_and_one_spare() {
+        assert_eq!(frames_per_segment(1), FILMSTRIP_FRAMES + 1);
+        assert_eq!(frames_per_segment(2), 3);
+        assert_eq!(frames_per_segment(3), 3);
+        assert_eq!(frames_per_segment(4), 2);
+        // `sample_indices` never yields none, but a zero must not divide.
+        assert_eq!(frames_per_segment(0), FILMSTRIP_FRAMES + 1);
+    }
+
+    /// The in-flight bound behind [`sample_run_frames`]: one push then one
+    /// halve, so the accumulator is never more than a frame over its cap
+    /// however many arrive. This is what keeps `sample_fps` — config with no
+    /// ceiling — out of the memory peak.
+    #[test]
+    fn halve_past_never_settles_above_its_cap() {
+        for cap in 1..8usize {
+            let mut acc: Vec<usize> = Vec::new();
+            for i in 0..1000usize {
+                acc.push(i);
+                assert!(acc.len() <= cap + 1, "cap {cap} peaked at {}", acc.len());
+                halve_past(&mut acc, cap);
+                assert!(acc.len() <= cap, "cap {cap} settled at {}", acc.len());
+            }
+            assert_eq!(acc[0], 0, "the first entry always survives");
+        }
+    }
+
+    #[test]
+    fn thin_evenly_keeps_both_ends_and_spreads_the_rest() {
+        fn picked(n: usize, keep: usize) -> Vec<usize> {
+            thin_evenly((0..n).collect(), keep)
+        }
+        // One frame is the segment's keyframe — the frame its crop tag was
+        // measured on — not an arbitrary one from the middle.
+        assert_eq!(picked(5, 1), vec![0]);
+        assert_eq!(picked(5, 2), vec![0, 4]);
+        assert_eq!(picked(5, 4), vec![0, 1, 2, 4]);
+        assert_eq!(picked(10, 2), vec![0, 9]);
+        assert_eq!(picked(10, 4), vec![0, 3, 6, 9]);
+        // Fewer frames than asked for are kept whole, in order.
+        assert_eq!(picked(3, 4), vec![0, 1, 2]);
+        assert!(picked(0, 4).is_empty());
+        assert!(picked(5, 0).is_empty());
+    }
+
+    /// The accumulator used to grow with every frame of every decoded segment
+    /// — a run's worth of full-HD RGB, hundreds of megabytes live at once on a
+    /// box with a history of OOM kills. Its size is now a property of the run
+    /// length alone, and this is the ceiling.
+    #[test]
+    fn the_run_accumulator_cannot_outgrow_its_cap() {
+        for run_len in 1..64usize {
+            let sampled = sample_indices(run_len).len();
+            let held = sampled * frames_per_segment(sampled);
+            assert!(
+                held <= RUN_FRAME_ACCUMULATOR_CAP,
+                "a run of {run_len} segments holds {held} frames"
+            );
+        }
+    }
+
+    /// Drive the real [`sample_run_frames`] with a decoder that emits
+    /// `frames(seq)` frames for each segment, every frame carrying its own
+    /// segment and its position within that segment. Returns what the vision
+    /// model and the event filmstrip are handed, as (run position, frame).
+    fn run_selection(run_len: usize, frames: impl Fn(u64) -> usize) -> Vec<(u8, u8)> {
+        let run: Vec<MotionSegment> = (0..run_len as u64)
+            .map(|seq| MotionSegment {
+                seq,
+                // The decode closure reads the segment back out of its own
+                // bytes, the way ffmpeg reads it out of the footage.
+                data: Arc::new(vec![seq as u8]),
+                duration_ns: 1_000_000_000,
+            })
+            .collect();
+        let crops: HashMap<u64, NormalizedRect> = (0..run_len as u64)
+            .map(|seq| {
+                let crop = NormalizedRect {
+                    x: seq as f32,
+                    y: 0.0,
+                    w: 1.0,
+                    h: 1.0,
+                };
+                (seq, crop)
+            })
+            .collect();
+
+        sample_run_frames(&run, &crops, 1, 1, |data, _duration_ns, sink| {
+            let seq = data[0];
+            for i in 0..frames(seq as u64) {
+                sink(vec![seq, i as u8, 0]);
+            }
+        })
+        .iter()
+        .map(|(frame, crop)| {
+            // The crop was measured on one segment's keyframe; a frame that
+            // reached the accumulator under another segment's tag is the
+            // failure this asserts against, not a cosmetic mismatch.
+            assert_eq!(
+                crop.expect("a sampled segment always carries its crop").x,
+                frame.data[0] as f32,
+                "crop tag followed the wrong segment"
+            );
+            (frame.data[0], frame.data[1])
+        })
+        .collect()
+    }
+
+    /// Which frames the vision model and the event filmstrip end up with.
+    /// Pinned because nothing downstream can tell a badly chosen frame from a
+    /// well chosen one — the model simply answers about whatever it is handed.
+    #[test]
+    fn a_run_is_reduced_to_four_frames_of_its_own_motion() {
+        // A long run: one frame from each of the four sampled segments, spread
+        // across it, never a frame from before it.
+        assert_eq!(
+            run_selection(9, |_| 5),
+            vec![(0, 0), (3, 0), (6, 4), (8, 4)]
+        );
+        assert_eq!(
+            run_selection(4, |_| 5),
+            vec![(0, 0), (1, 0), (2, 4), (3, 4)]
+        );
+        // Too few segments to spend one frame each: the extras come from
+        // within the segments.
+        assert_eq!(
+            run_selection(3, |_| 5),
+            vec![(0, 0), (1, 0), (2, 0), (2, 4)]
+        );
+        assert_eq!(
+            run_selection(2, |_| 5),
+            vec![(0, 0), (0, 4), (1, 2), (1, 4)]
+        );
+        assert_eq!(
+            run_selection(1, |_| 5),
+            vec![(0, 0), (0, 1), (0, 3), (0, 4)]
+        );
+        // A segment that decoded fewer frames than asked for shortens the strip
+        // rather than padding it from somewhere else.
+        assert_eq!(run_selection(1, |_| 2), vec![(0, 0), (0, 1)]);
+    }
+
+    /// What the spare frame per segment buys. A crop decoder runs behind its
+    /// segments whenever ffmpeg is still releasing what it swallowed while
+    /// probing, so a short decode is the ordinary case rather than an exotic
+    /// one — and with a single frame per segment there is nothing to fall back
+    /// on when one goes missing.
+    #[test]
+    fn a_segment_that_decoded_short_costs_a_frame_not_its_place_in_the_strip() {
+        let picked = run_selection(9, |seq| if seq == 3 { 1 } else { 5 });
+        assert_eq!(picked, vec![(0, 0), (3, 0), (6, 4), (8, 4)]);
+    }
+
+    /// `sample_fps` is config with no ceiling, so a segment's decode is
+    /// unbounded: at 30 fps over a 2s GOP it is 60 frames, 373 MB of raw RGB at
+    /// the detection crop size. What the run keeps must not follow it.
+    #[test]
+    fn a_high_sample_fps_moves_the_frames_picked_but_not_how_many() {
+        // Still four, still one per sampled segment — and still spanning each
+        // segment rather than clustering at its start, which is what the
+        // halving reservoir buys over keeping the first arrivals. The exact
+        // frames pin the reservoir's size: widen it and these move.
+        assert_eq!(
+            run_selection(9, |_| 60),
+            vec![(0, 0), (3, 0), (6, 58), (8, 58)]
+        );
     }
 
     #[test]

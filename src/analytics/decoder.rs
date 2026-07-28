@@ -422,7 +422,13 @@ impl CropDecoder {
             ],
             (width * height * 3) as usize,
             16,
-            16,
+            // Four frames, not the sixteen a gray analysis frame can afford:
+            // these are 6 MB each at the detection crop size, so the channel
+            // alone was 100 MB of headroom no decode ever needed — a read takes
+            // at most one segment's frames and consumes them as they arrive.
+            // A full channel simply backpressures ffmpeg, which the reader
+            // thread is there to absorb.
+            4,
         )?;
 
         Ok(Self {
@@ -433,28 +439,60 @@ impl CropDecoder {
         })
     }
 
-    pub fn decode_segment(&self, data: &Arc<Vec<u8>>, duration_ns: u64) -> Vec<Vec<u8>> {
+    /// Feed one segment and hand each frame it yields to `sink` as it arrives.
+    ///
+    /// Streamed rather than returned as a `Vec` because a segment owns
+    /// `sample_fps` frames per second of footage and `sample_fps` is config
+    /// with no ceiling, while every caller keeps a fixed handful. Collecting
+    /// the segment first would put the whole decode live at once — at the
+    /// detection crop size, 6 MB a frame — and make the peak scale with a
+    /// number an operator can set to anything.
+    pub fn decode_segment(
+        &self,
+        data: &Arc<Vec<u8>>,
+        duration_ns: u64,
+        mut sink: impl FnMut(Vec<u8>),
+    ) {
         match send_segment(&self.pipe, Arc::clone(data)) {
             SendOutcome::Sent => {}
-            SendOutcome::Closed => return Vec::new(),
+            SendOutcome::Closed => return,
             // A crop decoder is spawned per batch and dropped after it, which
             // kills the child — so the segment is simply skipped rather than
             // respawned. The blast radius is this batch's event frames.
             SendOutcome::Wedged => {
                 tracing::warn!("crop decoder stopped consuming input, skipping segment");
-                return Vec::new();
+                return;
             }
         }
 
-        let expected_frames = expected_frame_count(duration_ns, self.sample_fps);
-        let mut frames = Vec::with_capacity(expected_frames);
-        for _ in 0..expected_frames {
+        for _ in 0..expected_frame_count(duration_ns, self.sample_fps) {
             match self.pipe.frame_rx.recv_timeout(FRAME_READ_TIMEOUT) {
-                Ok(frame) => frames.push(frame),
+                Ok(frame) => sink(frame),
                 Err(_) => break,
             }
         }
-        frames
+    }
+
+    /// Throw away every frame already waiting in the pipe, reporting how many.
+    ///
+    /// This decoder has no arrears ledger of the kind [`FrameDecoder`] keeps,
+    /// and cannot usefully have one: its expected count is `sample_fps` times a
+    /// duration, an estimate of what ffmpeg's `fps` filter will emit rather
+    /// than a parsed keyframe count, so a debt tracked against it would drift
+    /// and start discarding real frames. What a caller *can* say is "everything
+    /// emitted up to here belongs to footage I am not keeping", which is
+    /// exactly the priming segments' case.
+    ///
+    /// Only what has already arrived is dropped. A frame still inside ffmpeg is
+    /// not waited for, so this bounds the misalignment between segments and
+    /// frames rather than removing it — no caller may depend on the frame after
+    /// a drain belonging to the next segment fed.
+    pub fn drain(&self) -> usize {
+        let mut dropped = 0;
+        while self.pipe.frame_rx.try_recv().is_ok() {
+            dropped += 1;
+        }
+        dropped
     }
 
     pub fn width(&self) -> u32 {
@@ -829,6 +867,53 @@ mod tests {
         assert!(
             matches!(outcome, Some(DecodeOutcome::Wedged)),
             "a stopped ffmpeg should wedge the segment hand-off"
+        );
+    }
+
+    /// The crop decoder driven exactly as the analyzer drives it — three
+    /// priming segments discarded, a drain, then the sampled segments — against
+    /// a real ffmpeg.
+    ///
+    /// The frame channel holds four of these rather than sixteen, because at
+    /// the detection crop size sixteen is 100 MB of headroom no decode ever
+    /// reads. A channel that small is only safe if a full one backpressures
+    /// ffmpeg instead of deadlocking it: the writer thread would stop draining
+    /// stdin, the segment hand-off would fill, and `SEND_DEADLINE` would report
+    /// the pipe wedged. That cannot be reasoned about from the types, so it is
+    /// tested. Ignored by default: it needs an `ffmpeg` binary.
+    #[test]
+    #[ignore]
+    fn crop_decoder_streams_a_run_through_a_four_slot_channel() {
+        const PRIMING: usize = 3;
+        const SAMPLED: usize = 4;
+        let segments = recorded_segments(PRIMING + SAMPLED);
+        let decoder = CropDecoder::new(5, (320, 180)).expect("spawn ffmpeg");
+
+        for segment in &segments[..PRIMING] {
+            decoder.decode_segment(segment, 1_000_000_000, |_| {});
+        }
+        decoder.drain();
+        assert_eq!(decoder.drain(), 0, "a drained pipe drains to nothing");
+
+        let mut sizes = Vec::new();
+        let started = Instant::now();
+        for segment in &segments[PRIMING..] {
+            decoder.decode_segment(segment, 1_000_000_000, |frame| sizes.push(frame.len()));
+        }
+        let elapsed = started.elapsed();
+
+        assert!(
+            !sizes.is_empty(),
+            "no frames survived the run: a wedged hand-off returns empty"
+        );
+        assert!(
+            sizes.iter().all(|&len| len == 320 * 180 * 3),
+            "the pipe must deliver whole frames: {sizes:?}"
+        );
+        // A wedge costs SEND_DEADLINE per segment before it is reported.
+        assert!(
+            elapsed < SEND_DEADLINE,
+            "the sampled segments took {elapsed:?}, which is wedge territory"
         );
     }
 }
