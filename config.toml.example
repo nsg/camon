@@ -66,7 +66,9 @@ enabled = true
 # Frame rate ffmpeg decodes at when pulling frames out of a motion run for
 # object detection (default: 5). Motion analysis itself is keyframe-driven —
 # one frame per keyframe, so about one per second at a 1-second GOP — and is
-# not affected by this.
+# not affected by this. Four frames per run reach the vision model whatever
+# this is set to: a higher rate only widens what they are chosen from, it
+# does not make the run hold more of them.
 sample_fps = 5
 
 # Default motion-detection settings. These seed each camera's
@@ -125,6 +127,14 @@ timeout_secs = 90
 # continuous/. Continuous is heavy — roughly 43 GB/day/camera at 4 Mbps.
 enabled = true
 # Directory for event files (default: /var/camon/storage)
+# On a dedicated volume, mount it here before starting camon: at startup camon
+# drops a small ".camon-volume" marker in this directory and re-stats it once a
+# minute, so a volume that is unmounted, swapped or mounted over while camon
+# runs is reported at error level instead of silently redirecting every write
+# to the filesystem behind the mountpoint. Recording carries on either way; the
+# emergency prune below does not, since free space measured there is about the
+# wrong disk. The marker is rewritten on every start, so it is safe to delete
+# while camon is stopped.
 data_dir = "/var/camon/storage"
 # Seconds of context before first motion in an event (default: 5)
 pre_padding_secs = 5
