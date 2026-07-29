@@ -17,8 +17,9 @@
 //!   backend rewrites a sidecar in place (it has no rename);
 //! * thumbnails are *acquired through the backend*
 //!   ([`read_thumbnail`](WarmStorageBackend::read_thumbnail)) — LocalDisk keeps
-//!   today's lazy ffmpeg generation + on-disk caching, the remote backend
-//!   fetches a pre-rendered image;
+//!   today's lazy ffmpeg generation + on-disk caching, single-flighted per
+//!   thumbnail so a page of posters is one render each rather than one per
+//!   request, the remote backend fetches a pre-rendered image;
 //! * video is returned as a *stream*
 //!   ([`read_video`](WarmStorageBackend::read_video)) — callers never see a
 //!   `PathBuf` or a fully-buffered `Vec<u8>`; the body is an async byte stream
@@ -27,6 +28,7 @@
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -34,6 +36,7 @@ use futures_core::Stream;
 use tokio_util::io::ReaderStream;
 
 use crate::buffer::warm::{EventUpgrade, FinishedEvent};
+use crate::locks::SingleFlight;
 use crate::storage::event_index::EmergencyOutcome;
 use crate::storage::warm_index::{free_space_bytes, should_emergency_prune, sidecar_json};
 use crate::storage::{EventType, StorageAnchor, WarmEventEntry, WarmEventIndex};
@@ -255,7 +258,8 @@ pub trait WarmStorageBackend: Send + Sync {
     ) -> std::io::Result<VideoStream>;
 
     /// Acquire the event's poster thumbnail. LocalDisk lazily generates it from
-    /// the stored video via ffmpeg on first request and caches the result.
+    /// the stored video via ffmpeg on first request and caches the result;
+    /// concurrent requests for the same missing thumbnail share that one render.
     async fn read_thumbnail(
         &self,
         camera_id: &str,
@@ -282,6 +286,10 @@ pub struct LocalDiskBackend {
     index: WarmEventIndex,
     camera_ids: Vec<String>,
     anchor: Arc<StorageAnchor>,
+    /// One ffmpeg render per missing poster frame, however many requests ask
+    /// for it at once — the event list loads a whole page of posters, so the
+    /// simultaneous miss is the normal case rather than the rare one.
+    thumbnails: SingleFlight<PathBuf>,
 }
 
 impl LocalDiskBackend {
@@ -295,6 +303,7 @@ impl LocalDiskBackend {
             index,
             camera_ids: camera_ids.to_vec(),
             anchor,
+            thumbnails: SingleFlight::new(),
         }
     }
 }
@@ -517,16 +526,10 @@ impl WarmStorageBackend for LocalDiskBackend {
         let ts_path = self.index.resolve_file_path(camera_id, entry);
         let thumb_path = ts_path.with_extension("jpg");
 
-        // Cache hit: the poster frame was already rendered.
-        if let Ok(data) = tokio::fs::read(&thumb_path).await {
-            return Ok(data);
-        }
-
-        // Lazily render + cache the poster frame from the stored video.
-        generate_thumbnail(&ts_path, &thumb_path).await?;
-        tokio::fs::read(&thumb_path)
-            .await
-            .map_err(|_| ThumbnailError::ReadFailed)
+        read_or_generate_thumbnail(&self.thumbnails, &thumb_path, || {
+            generate_thumbnail(&ts_path, &thumb_path)
+        })
+        .await
     }
 
     async fn read_filmstrip(
@@ -945,14 +948,130 @@ async fn reindexed_upgrade(
     }
 }
 
+/// Read the cached poster frame at `thumb_path`, calling `generate` to render
+/// it if it is missing — once, however many callers miss it together.
+///
+/// The page-load pattern is N requests for the same not-yet-rendered thumbnail
+/// arriving at once; without the guard each one spawns its own ffmpeg for the
+/// identical output file. Waiters re-read the cache after the guard, so they
+/// find the finished file instead of rendering it again, and the guard is keyed
+/// on the thumbnail path so unrelated thumbnails never queue behind each other.
+/// A failed render is not remembered: the guard is released, the key is dropped
+/// and the next request is free to try again.
+///
+/// Split out from [`LocalDiskBackend::read_thumbnail`] so tests can count
+/// renders without an ffmpeg on the machine.
+async fn read_or_generate_thumbnail<F, Fut>(
+    flight: &SingleFlight<PathBuf>,
+    thumb_path: &Path,
+    generate: F,
+) -> Result<Vec<u8>, ThumbnailError>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<(), ThumbnailError>>,
+{
+    // Cache hit: the poster frame was already rendered.
+    if let Ok(data) = tokio::fs::read(thumb_path).await {
+        return Ok(data);
+    }
+
+    let _flight = flight.acquire(thumb_path.to_path_buf()).await;
+
+    // Whoever we queued behind has just rendered it.
+    if let Ok(data) = tokio::fs::read(thumb_path).await {
+        return Ok(data);
+    }
+
+    generate().await?;
+    tokio::fs::read(thumb_path)
+        .await
+        .map_err(|_| ThumbnailError::ReadFailed)
+}
+
+/// How long one poster render may take before its ffmpeg is killed. The work
+/// is decoding the *first* frame of a local file and scaling it to 320px — no
+/// seek, no encode of any length — which is a fraction of a second even on an
+/// SBC, so this is not a budget but a ceiling on a wedged process. It has to be
+/// one, because the render holds the thumbnail's single-flight key: without it
+/// one stuck ffmpeg parks every other request for that poster forever, where
+/// before it only cost its own request.
+const THUMBNAIL_RENDER_TIMEOUT: Duration = Duration::from_secs(15);
+
 /// Render a single poster frame from `ts_path` into `thumb_path` with ffmpeg.
 /// Local-only: a remote backend serves pre-rendered thumbnails instead.
 async fn generate_thumbnail(ts_path: &Path, thumb_path: &Path) -> Result<(), ThumbnailError> {
+    publish_rendered(thumb_path, |staged| render_poster_frame(ts_path, staged)).await
+}
+
+/// Run `render` against a staging path and publish its output to `thumb_path`
+/// by rename, bounded by [`THUMBNAIL_RENDER_TIMEOUT`].
+///
+/// ffmpeg fills its output file in place, so pointing it at the live name
+/// publishes the image progressively: the unguarded cache read in
+/// [`read_or_generate_thumbnail`] can pick up a half-written frame and serve it
+/// as the poster, and a render that is killed part-way — the timeout here, or a
+/// disconnecting client dropping this future onto `kill_on_drop` — leaves a
+/// truncated `.jpg` that every later request treats as a permanent cache hit.
+/// Staging is what the rest of the storage layer already does for exactly this
+/// reason ([`crate::durable`]); a reader here therefore sees either no file or
+/// the whole image.
+///
+/// The staging file is removed on every failure this function observes. A
+/// cancellation it never returns from can still leave one behind, which is why
+/// the name is `{stem}.jpg.tmp` — one per thumbnail, overwritten by the next
+/// attempt rather than accumulating, and swept by startup orphan recovery.
+async fn publish_rendered<F, Fut>(thumb_path: &Path, render: F) -> Result<(), ThumbnailError>
+where
+    F: FnOnce(PathBuf) -> Fut,
+    Fut: std::future::Future<Output = Result<(), ThumbnailError>>,
+{
+    let staged = crate::durable::tmp_path(thumb_path);
+    let rendered = tokio::time::timeout(THUMBNAIL_RENDER_TIMEOUT, render(staged.clone())).await;
+
+    let result = match rendered {
+        Ok(Ok(())) => tokio::fs::rename(&staged, thumb_path)
+            .await
+            .map_err(|_| ThumbnailError::GenerationFailed),
+        Ok(Err(e)) => Err(e),
+        Err(_) => {
+            // Dropping the render future is what kills the child: the timeout
+            // has already done that by the time we get here.
+            tracing::warn!(
+                timeout = ?THUMBNAIL_RENDER_TIMEOUT,
+                thumbnail = %thumb_path.display(),
+                "thumbnail render timed out, killed ffmpeg"
+            );
+            Err(ThumbnailError::GenerationFailed)
+        }
+    };
+
+    if result.is_err() {
+        let _ = tokio::fs::remove_file(&staged).await;
+    }
+    result
+}
+
+/// The ffmpeg half of a poster render, writing wherever it is pointed.
+///
+/// `-f image2` is what the staging name costs: ffmpeg picks its output format
+/// from the extension, and `.jpg.tmp` is not one it knows. Naming the muxer
+/// explicitly produces the same bytes the `.jpg` name used to.
+async fn render_poster_frame(ts_path: &Path, out_path: PathBuf) -> Result<(), ThumbnailError> {
     let mut child = tokio::process::Command::new("ffmpeg")
         .args(["-hide_banner", "-loglevel", "error", "-i"])
         .arg(ts_path)
-        .args(["-frames:v", "1", "-vf", "scale=320:-1", "-q:v", "5", "-y"])
-        .arg(thumb_path)
+        .args([
+            "-frames:v",
+            "1",
+            "-vf",
+            "scale=320:-1",
+            "-q:v",
+            "5",
+            "-f",
+            "image2",
+            "-y",
+        ])
+        .arg(&out_path)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .kill_on_drop(true)
@@ -1939,5 +2058,249 @@ mod tests {
         assert!(matches!(vs.range, ServedRange::Unsatisfiable));
         assert_eq!(vs.total_size, 16);
         assert!(drain(vs).await.is_empty());
+    }
+
+    // --- lazy thumbnail generation -----------------------------------------
+    //
+    // Against `read_or_generate_thumbnail` rather than `read_thumbnail`, so a
+    // render can be counted and made slow without an ffmpeg on the machine.
+
+    /// Counts renders and the renders running at once, and refuses to finish
+    /// until the gate opens — so a missing guard shows up as overlap, not as a
+    /// race the scheduler happens to serialize.
+    #[derive(Default)]
+    struct Renders {
+        total: std::sync::atomic::AtomicUsize,
+        live: std::sync::atomic::AtomicUsize,
+        peak: std::sync::atomic::AtomicUsize,
+    }
+
+    impl Renders {
+        async fn run(&self, path: &Path, gate: &tokio::sync::Semaphore) {
+            use std::sync::atomic::Ordering;
+            self.total.fetch_add(1, Ordering::SeqCst);
+            let now = self.live.fetch_add(1, Ordering::SeqCst) + 1;
+            self.peak.fetch_max(now, Ordering::SeqCst);
+            gate.acquire().await.unwrap().forget();
+            // Publish the way production does — staged, then renamed — so a
+            // request whose unguarded cache read lands mid-render sees no file
+            // rather than an empty or half-written one.
+            let staged = crate::durable::tmp_path(path);
+            tokio::fs::write(&staged, b"jpeg").await.unwrap();
+            tokio::fs::rename(&staged, path).await.unwrap();
+            self.live.fetch_sub(1, Ordering::SeqCst);
+        }
+
+        fn total(&self) -> usize {
+            self.total.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn peak(&self) -> usize {
+            self.peak.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn concurrent_thumbnail_requests_render_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("poster.jpg");
+        let flight = std::sync::Arc::new(SingleFlight::<PathBuf>::new());
+        let renders = std::sync::Arc::new(Renders::default());
+        let gate = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+        // All eight requests leave the line together; the file cannot exist
+        // before the gate opens, so every one of them takes the miss path.
+        let start = std::sync::Arc::new(tokio::sync::Barrier::new(9));
+
+        let tasks: Vec<_> = (0..8)
+            .map(|_| {
+                let (flight, renders, gate, start, path) = (
+                    std::sync::Arc::clone(&flight),
+                    std::sync::Arc::clone(&renders),
+                    std::sync::Arc::clone(&gate),
+                    std::sync::Arc::clone(&start),
+                    path.clone(),
+                );
+                tokio::spawn(async move {
+                    start.wait().await;
+                    read_or_generate_thumbnail(&flight, &path, || async {
+                        renders.run(&path, &gate).await;
+                        Ok(())
+                    })
+                    .await
+                })
+            })
+            .collect();
+
+        start.wait().await;
+        gate.add_permits(8);
+        for t in tasks {
+            assert_eq!(t.await.unwrap().unwrap(), b"jpeg");
+        }
+
+        assert_eq!(
+            renders.total(),
+            1,
+            "one ffmpeg per thumbnail, not per request"
+        );
+        assert_eq!(renders.peak(), 1, "renders of one thumbnail overlapped");
+        assert_eq!(flight.live_keys(), 0, "in-flight entry outlived the render");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn different_thumbnails_render_concurrently() {
+        let dir = tempfile::tempdir().unwrap();
+        let flight = std::sync::Arc::new(SingleFlight::<PathBuf>::new());
+        // Both renders only clear the barrier if they run at the same time; a
+        // guard shared across thumbnails would deadlock into the timeout.
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+
+        let tasks: Vec<_> = (0..2)
+            .map(|i| {
+                let (flight, barrier) = (
+                    std::sync::Arc::clone(&flight),
+                    std::sync::Arc::clone(&barrier),
+                );
+                let path = dir.path().join(format!("poster{i}.jpg"));
+                tokio::spawn(async move {
+                    read_or_generate_thumbnail(&flight, &path, || async {
+                        barrier.wait().await;
+                        tokio::fs::write(&path, b"jpeg").await.unwrap();
+                        Ok(())
+                    })
+                    .await
+                })
+            })
+            .collect();
+
+        for t in tasks {
+            let served = tokio::time::timeout(std::time::Duration::from_secs(5), t)
+                .await
+                .expect("distinct thumbnails serialized against each other")
+                .unwrap()
+                .unwrap();
+            assert_eq!(served, b"jpeg");
+        }
+        assert_eq!(flight.live_keys(), 0);
+    }
+
+    #[tokio::test]
+    async fn failed_thumbnail_generation_stays_retryable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("poster.jpg");
+        let flight = SingleFlight::<PathBuf>::new();
+
+        let failed = read_or_generate_thumbnail(&flight, &path, || async {
+            Err(ThumbnailError::SpawnFailed)
+        })
+        .await;
+        assert!(matches!(failed, Err(ThumbnailError::SpawnFailed)));
+        assert_eq!(flight.live_keys(), 0, "failure left the key held");
+
+        // Nothing was remembered: the next request renders and is served.
+        let served = read_or_generate_thumbnail(&flight, &path, || async {
+            tokio::fs::write(&path, b"jpeg").await.unwrap();
+            Ok(())
+        })
+        .await
+        .unwrap();
+        assert_eq!(served, b"jpeg");
+    }
+
+    /// A render that dies part-way through its output must not poison the
+    /// cache: the half-written bytes stay on the staging path, never the live
+    /// one, so no request ever reads them and the next request renders afresh.
+    #[tokio::test]
+    async fn partially_written_thumbnail_is_never_served() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("poster.jpg");
+        let flight = SingleFlight::<PathBuf>::new();
+
+        let failed = read_or_generate_thumbnail(&flight, &path, || async {
+            publish_rendered(&path, |staged| async move {
+                tokio::fs::write(&staged, b"jp").await.unwrap();
+                Err(ThumbnailError::GenerationFailed)
+            })
+            .await
+        })
+        .await;
+        assert!(matches!(failed, Err(ThumbnailError::GenerationFailed)));
+        assert!(!path.exists(), "a failed render published its half-image");
+        assert!(
+            !crate::durable::tmp_path(&path).exists(),
+            "a failed render left its staging file behind"
+        );
+
+        // The truncated attempt was not remembered as a cache hit.
+        let served = read_or_generate_thumbnail(&flight, &path, || async {
+            publish_rendered(&path, |staged| async move {
+                tokio::fs::write(&staged, b"jpeg").await.unwrap();
+                Ok(())
+            })
+            .await
+        })
+        .await
+        .unwrap();
+        assert_eq!(served, b"jpeg");
+    }
+
+    /// A wedged render is killed at the timeout instead of holding its
+    /// single-flight key forever, and whatever it had written is cleaned up.
+    ///
+    /// Paused time: the runtime jumps the clock when nothing is runnable, so
+    /// the 15-second ceiling elapses instantly. The partial write is done with
+    /// the blocking API to keep the pause deterministic — an async write could
+    /// still be in flight on the blocking pool when the clock jumps, and land
+    /// after the cleanup it is supposed to precede.
+    #[tokio::test(start_paused = true)]
+    async fn wedged_render_times_out_and_leaves_no_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("poster.jpg");
+
+        let err = publish_rendered(&path, |staged| async move {
+            std::fs::write(&staged, b"jp").unwrap();
+            std::future::pending::<()>().await;
+            unreachable!("the timeout must cancel a render that never finishes")
+        })
+        .await
+        .unwrap_err();
+
+        assert!(matches!(err, ThumbnailError::GenerationFailed));
+        assert!(
+            !path.exists(),
+            "a timed-out render published its half-image"
+        );
+        assert!(
+            !crate::durable::tmp_path(&path).exists(),
+            "a timed-out render left its staging file behind"
+        );
+    }
+
+    #[tokio::test]
+    async fn cached_thumbnail_skips_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("poster.jpg");
+        tokio::fs::write(&path, b"cached").await.unwrap();
+        let flight = SingleFlight::<PathBuf>::new();
+
+        let served = read_or_generate_thumbnail(&flight, &path, || async {
+            panic!("cache hit must not render");
+        })
+        .await
+        .unwrap();
+        assert_eq!(served, b"cached");
+    }
+
+    #[tokio::test]
+    async fn thumbnail_read_failure_after_generation_is_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("poster.jpg");
+        let flight = SingleFlight::<PathBuf>::new();
+
+        // Generation "succeeds" without leaving a file behind — unchanged
+        // behaviour: the read afterwards fails and that is what is reported.
+        let err = read_or_generate_thumbnail(&flight, &path, || async { Ok(()) })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ThumbnailError::ReadFailed));
     }
 }
