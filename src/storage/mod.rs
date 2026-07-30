@@ -16,7 +16,7 @@ pub use backend::{
 };
 pub use debug_store::DetectionDebugStore;
 pub use detection_store::{DetectionEntry, DetectionStore};
-pub use event_index::{EventType, WarmEventEntry};
+pub use event_index::{EventRef, EventType, WarmEventEntry};
 pub use event_registry::{EventRecord, EventRegistry};
 pub use recovery::recover_orphans;
 pub use stathost::StathostBackend;

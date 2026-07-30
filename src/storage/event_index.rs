@@ -14,6 +14,14 @@
 //! events — so the index is generic over an [`EventIdentity`] rather than
 //! picking one spelling and making the other backend live with it. See that
 //! trait for the argument in full.
+//!
+//! Every lookup — the read path's `find_event` included — names an entry by a
+//! whole key and walks the run of equal starts ([`position`]). There is no
+//! by-start-PTS variant to reach for: nothing makes a start unique, so a binary
+//! search on one returns an arbitrary member of its run, which on the read path
+//! meant serving the wrong recording of a same-start pair. What an API request
+//! names is an [`EventRef`], and each backend narrows that to the identity its
+//! own layout has.
 
 use std::collections::HashMap;
 use std::marker::PhantomData;
@@ -153,6 +161,73 @@ pub(crate) trait EventIdentity: Copy + Eq {
     /// The start PTS this key sorts and searches under. Every identity has one:
     /// it is the index's sort key.
     fn start_pts_ns(self) -> u64;
+}
+
+/// The whole identity of one event, as an API request spells it: the composite
+/// path segment `{start_pts_ns}_{duration_ms}_{event_type}`, e.g.
+/// `81234000000_5200_movement`.
+///
+/// The read path used to name an event by its start PTS alone, which is not an
+/// identity — a movement event and a continuous chunk can begin on the same
+/// keyframe, and the lookup then served whichever of them a binary search
+/// landed on. So the URL carries everything either backend's identity is made
+/// of, and each [`WarmStorageBackend`](crate::storage::WarmStorageBackend)
+/// narrows it to its own: local disk uses all three fields, the remote store
+/// only the stem, deliberately (see its `find_event`).
+///
+/// The `{start}_{duration}` prefix is the remote store's object stem, and the
+/// type is spelled as the event listing spells it ([`EventType::as_str`]), so a
+/// key in a URL is readable against both the listing and the bucket.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EventRef {
+    pub start_pts_ns: u64,
+    pub duration_ms: u32,
+    pub event_type: EventType,
+}
+
+impl EventRef {
+    pub fn new(start_pts_ns: u64, duration_ms: u32, event_type: EventType) -> Self {
+        Self {
+            start_pts_ns,
+            duration_ms,
+            event_type,
+        }
+    }
+
+    /// The key an indexed entry answers to.
+    pub fn of(entry: &WarmEventEntry) -> Self {
+        Self::new(entry.start_pts_ns, entry.duration_ms, entry.event_type)
+    }
+
+    /// Parse one path segment. Every part must be there and be exactly what it
+    /// claims: two integers that fit, and a type spelled the way the listing
+    /// spells it. Anything else is `None` and answers `400` — a key that
+    /// resolved partially would be the start-PTS-only lookup back again.
+    ///
+    /// Splitting from the left is what makes this unambiguous: no type name
+    /// contains an underscore, so a segment with extra parts fails on the type
+    /// rather than being silently truncated.
+    pub fn parse(segment: &str) -> Option<Self> {
+        let (start, rest) = segment.split_once('_')?;
+        let (duration, event_type) = rest.split_once('_')?;
+        Some(Self::new(
+            start.parse().ok()?,
+            duration.parse().ok()?,
+            EventType::from_str(event_type)?,
+        ))
+    }
+}
+
+impl std::fmt::Display for EventRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}_{}_{}",
+            self.start_pts_ns,
+            self.duration_ms,
+            self.event_type.as_str()
+        )
+    }
 }
 
 /// Local disk: the event type is a directory, and so part of the path.
@@ -457,12 +532,15 @@ impl<K: EventIdentity> EventIndex<K> {
             .collect()
     }
 
-    pub(crate) fn find(&self, camera_id: &str, start_pts_ns: u64) -> Option<WarmEventEntry> {
+    /// The entry with this key, for the API read path.
+    ///
+    /// Keyed like every other lookup here, and for the same reason: two events
+    /// can share a start PTS, so a search on the start alone would offer an
+    /// arbitrary one of them for playback — the wrong recording, its own
+    /// duration and thumbnails included.
+    pub(crate) fn find(&self, camera_id: &str, key: K) -> Option<WarmEventEntry> {
         let entries = self.cameras.get(camera_id)?.read_recover();
-        entries
-            .binary_search_by_key(&start_pts_ns, |e| e.start_pts_ns)
-            .ok()
-            .map(|i| entries[i].clone())
+        position(&entries, key).map(|i| entries[i].clone())
     }
 
     /// End of the newest indexed event, in wall-clock nanoseconds. Entries are
@@ -845,6 +923,90 @@ mod tests {
         assert_eq!(position(&entries, (2000u64, 1000u32)), Some(0));
         assert_eq!(position(&entries, (2000u64, 2000u32)), Some(1));
         assert_eq!(position(&entries, (2000u64, 3000u32)), None);
+    }
+
+    /// The read path's lookup, under both identities: each member of a run of
+    /// equal starts comes back as itself. The old `find` binary-searched the
+    /// start alone and returned whichever member it landed on, so one of the
+    /// two lookups below was always the wrong event.
+    #[test]
+    fn find_returns_the_named_member_of_a_run_of_equal_starts() {
+        let local: EventIndex<(u64, EventType, u32)> = EventIndex::new(&["cam".to_string()]);
+        local.insert("cam", sized(entry(2000, EventType::Movement, 1000), 10));
+        local.insert("cam", sized(entry(2000, EventType::Continuous, 1000), 20));
+        assert_eq!(
+            local
+                .find("cam", (2000, EventType::Movement, 1000))
+                .unwrap()
+                .file_size,
+            10
+        );
+        assert_eq!(
+            local
+                .find("cam", (2000, EventType::Continuous, 1000))
+                .unwrap()
+                .file_size,
+            20
+        );
+        // A start nothing has, and a start something has under another key.
+        assert!(local
+            .find("cam", (2500, EventType::Movement, 1000))
+            .is_none());
+        assert!(local.find("cam", (2000, EventType::Object, 1000)).is_none());
+        assert!(local
+            .find("other", (2000, EventType::Movement, 1000))
+            .is_none());
+
+        // The remote store's identity: the duration separates the run.
+        let remote: EventIndex<(u64, u32)> = EventIndex::new(&["cam".to_string()]);
+        remote.insert("cam", sized(entry(2000, EventType::Movement, 1000), 30));
+        remote.insert("cam", sized(entry(2000, EventType::Object, 2000), 40));
+        assert_eq!(remote.find("cam", (2000, 1000)).unwrap().file_size, 30);
+        assert_eq!(remote.find("cam", (2000, 2000)).unwrap().file_size, 40);
+        assert!(remote.find("cam", (2000, 3000)).is_none());
+    }
+
+    /// The wire spelling of a key, both ways. A URL that resolved partially —
+    /// a missing part, a type this build does not know — would be the start-only
+    /// lookup back again, so nothing here is optional.
+    #[test]
+    fn an_event_ref_round_trips_through_its_path_segment() {
+        for event_type in [
+            EventType::Movement,
+            EventType::Object,
+            EventType::Continuous,
+        ] {
+            let key = EventRef::new(81_234_000_000, 5200, event_type);
+            assert_eq!(
+                key.to_string(),
+                format!("81234000000_5200_{}", event_type.as_str())
+            );
+            assert_eq!(EventRef::parse(&key.to_string()), Some(key));
+        }
+        assert_eq!(
+            EventRef::parse("81234000000_5200_movement"),
+            Some(EventRef::new(81_234_000_000, 5200, EventType::Movement))
+        );
+
+        for bad in [
+            "81234000000",                // the old bare start PTS
+            "81234000000_5200",           // stem only, no type
+            "81234000000_5200_",          // empty type
+            "_5200_movement",             // empty start
+            "81234000000__movement",      // empty duration
+            "81234000000_5200_movements", // the directory name, not the type
+            "81234000000_5200_movement_", // trailing junk
+            "81234000000_5200_movement_extra",
+            "81234000000_5200_MOVEMENT",
+            "-1_5200_movement",
+            "81234000000_-5_movement",
+            "81234000000_99999999999_movement",   // past u32
+            "99999999999999999999_5200_movement", // past u64
+            " 81234000000_5200_movement",
+            "",
+        ] {
+            assert_eq!(EventRef::parse(bad), None, "{bad:?} parsed");
+        }
     }
 
     /// `used_bytes` moves by the difference between what was indexed and what

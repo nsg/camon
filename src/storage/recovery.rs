@@ -233,7 +233,7 @@ fn file_mtime_ns(path: &Path) -> u64 {
 mod tests {
     use super::*;
     use crate::mpegts::testutil::{null_packet, pes_packet};
-    use crate::storage::WarmEventIndex;
+    use crate::storage::{EventRef, WarmEventIndex};
 
     const CAM: &str = "cam";
 
@@ -287,7 +287,9 @@ mod tests {
         // The normal startup scan indexes it like any other event.
         let index = WarmEventIndex::new(&[CAM.to_string()], tmp_dir.path().to_path_buf());
         index.scan();
-        let entry = index.find_event(CAM, 7_777_000_000).unwrap();
+        let entry = index
+            .find_event(CAM, EventRef::new(7_777_000_000, 5000, EventType::Movement))
+            .unwrap();
         assert_eq!(entry.duration_ms, 5000);
         assert!(entry.recovered);
         assert!(!entry.continues);
@@ -363,7 +365,9 @@ mod tests {
 
         let index = WarmEventIndex::new(&[CAM.to_string()], tmp_dir.path().to_path_buf());
         index.scan();
-        let entry = index.find_event(CAM, 5000).unwrap();
+        let entry = index
+            .find_event(CAM, EventRef::new(5000, 3000, EventType::Movement))
+            .unwrap();
         assert!(entry.recovered);
         assert!(entry.continues);
         assert_eq!(entry.object_classes, vec!["person".to_string()]);

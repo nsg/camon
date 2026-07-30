@@ -39,7 +39,7 @@ use crate::buffer::warm::{EventUpgrade, FinishedEvent};
 use crate::locks::SingleFlight;
 use crate::storage::event_index::EmergencyOutcome;
 use crate::storage::warm_index::{free_space_bytes, should_emergency_prune, sidecar_json};
-use crate::storage::{EventType, StorageAnchor, WarmEventEntry, WarmEventIndex};
+use crate::storage::{EventRef, EventType, StorageAnchor, WarmEventEntry, WarmEventIndex};
 
 const NANOS_PER_MS: u64 = 1_000_000;
 
@@ -237,8 +237,14 @@ pub trait WarmStorageBackend: Send + Sync {
     /// Events overlapping `[from_ns, to_ns]`, oldest first.
     fn query(&self, camera_id: &str, from_ns: u64, to_ns: u64) -> Vec<WarmEventEntry>;
 
-    /// The event with exactly this start PTS, if indexed.
-    fn find_event(&self, camera_id: &str, start_pts_ns: u64) -> Option<WarmEventEntry>;
+    /// The one indexed event this key names, if it is still there.
+    ///
+    /// The key is whole ([`EventRef`]) because a start PTS is not an identity:
+    /// two events can begin on the same keyframe — a movement event and the
+    /// continuous chunk covering it, or a run and the shorter chunk it was split
+    /// from — and a lookup by start alone offered an arbitrary one of them for
+    /// playback. What each backend does with the parts differs; see the impls.
+    fn find_event(&self, camera_id: &str, event: EventRef) -> Option<WarmEventEntry>;
 
     /// End of this camera's newest stored event, in wall-clock nanoseconds, or
     /// `None` when it has nothing stored. Seeds the recording watchdog: silence
@@ -470,8 +476,11 @@ impl WarmStorageBackend for LocalDiskBackend {
         self.index.query(camera_id, from_ns, to_ns)
     }
 
-    fn find_event(&self, camera_id: &str, start_pts_ns: u64) -> Option<WarmEventEntry> {
-        self.index.find_event(camera_id, start_pts_ns)
+    /// Resolved by the whole key: here the event type is a directory and the
+    /// duration is in the filename, so all three fields together name exactly
+    /// one stored file.
+    fn find_event(&self, camera_id: &str, event: EventRef) -> Option<WarmEventEntry> {
+        self.index.find_event(camera_id, event)
     }
 
     fn newest_event_end_ns(&self, camera_id: &str) -> Option<u64> {
@@ -1184,7 +1193,9 @@ mod tests {
             .collect();
         assert!(leftovers.is_empty(), "staging residue: {leftovers:?}");
 
-        let entry = index.find_event("cam", first_pts).unwrap();
+        let entry = index
+            .find_event("cam", EventRef::new(first_pts, 4000, EventType::Movement))
+            .unwrap();
         assert_eq!(entry.duration_ms, 4000);
         assert_eq!(entry.event_type, EventType::Movement);
         assert_eq!(entry.file_size, 16);
@@ -1313,7 +1324,12 @@ mod tests {
         let index = WarmEventIndex::new(&["cam".to_string()], dir.path().to_path_buf());
         let outcome = write_event(dir.path(), "cam", &event, Some(&index)).await;
         assert_eq!(outcome, WriteOutcome::Failed);
-        assert!(index.find_event("cam", event.first_pts).is_none());
+        assert!(index
+            .find_event(
+                "cam",
+                EventRef::new(event.first_pts, 4000, EventType::Movement)
+            )
+            .is_none());
     }
 
     #[tokio::test]
@@ -1343,7 +1359,12 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["continues"], serde_json::json!(true));
 
-        let entry = index.find_event("cam", first_pts).unwrap();
+        let entry = index
+            .find_event(
+                "cam",
+                EventRef::new(first_pts, duration_ms as u32, EventType::Movement),
+            )
+            .unwrap();
         assert_eq!(entry.event_type, EventType::Movement);
         assert!(entry.continues);
     }
@@ -1362,7 +1383,10 @@ mod tests {
         let index = WarmEventIndex::new(&["cam".to_string()], dir.path().to_path_buf());
         write_event(dir.path(), "cam", &event, Some(&index)).await;
         assert_eq!(
-            index.find_event("cam", first_pts).unwrap().event_type,
+            index
+                .find_event("cam", EventRef::new(first_pts, 4000, EventType::Movement))
+                .unwrap()
+                .event_type,
             EventType::Movement
         );
 
@@ -1392,7 +1416,9 @@ mod tests {
         assert!(parsed.get("continues").is_none());
 
         // Index entry updated in place: retention class is now Object.
-        let entry = index.find_event("cam", first_pts).unwrap();
+        let entry = index
+            .find_event("cam", EventRef::new(first_pts, 4000, EventType::Object))
+            .unwrap();
         assert_eq!(entry.event_type, EventType::Object);
         assert_eq!(entry.object_classes, vec!["person".to_string()]);
         assert_eq!(entry.backend.as_deref(), Some("ollama"));
@@ -1404,9 +1430,9 @@ mod tests {
         );
     }
 
-    /// One camera's events, newest information first — the only way to reach a
-    /// particular member of a run of equal start PTS, which `find_event` cannot
-    /// tell apart.
+    /// One camera's events, newest information first, reached by duration alone
+    /// — which is how a test names a member of a run of equal starts whose
+    /// *type* is the thing under test and so cannot be part of the lookup.
     fn sibling(index: &WarmEventIndex, duration_ms: u32) -> Option<WarmEventEntry> {
         index
             .query("cam", 0, u64::MAX)
@@ -1444,22 +1470,12 @@ mod tests {
         write_event(dir.path(), "cam", &long, Some(&index)).await;
         assert_eq!(index.query("cam", 0, u64::MAX).len(), 2);
 
-        // Upgrade the sibling `find_event` does *not* return. Which member of a
-        // run of equal starts a binary search lands on is unspecified — so
-        // picking the other one is what makes this test about the code and not
-        // about std: the start-only lookup this replaced finds what `find_event`
-        // finds, and therefore reclassifies the wrong sibling every run, on
-        // every std implementation.
-        let found = index
-            .find_event("cam", first_pts)
-            .expect("both siblings are indexed under this start");
-        let (target, spared) = if found.duration_ms == long_ms {
-            (&short, &long)
-        } else {
-            (&long, &short)
-        };
-        let (target_ms, spared_ms) = (target.duration_ms() as u32, spared.duration_ms() as u32);
-        upgrade_event(dir.path(), "cam", &upgrade_for(target), Some(&index)).await;
+        // Upgrade one named sibling. Which of the two it is does not matter now
+        // that every path into the index carries a whole key; the start-only
+        // lookup this replaced returned an unspecified member of the run, so
+        // whichever one was named, the other could be the one rewritten.
+        let (target_ms, spared_ms) = (short_ms, long_ms);
+        upgrade_event(dir.path(), "cam", &upgrade_for(&short), Some(&index)).await;
 
         let movements = dir.path().join("cam").join("movements");
         let objects = dir.path().join("cam").join("objects");
@@ -1498,6 +1514,81 @@ mod tests {
             .join(format!("{first_pts}_{spared_ms}.ts"))
             .exists());
         assert!(objects.join(format!("{first_pts}_{target_ms}.ts")).exists());
+    }
+
+    /// The read path, on the same pair: each sibling is served as itself.
+    ///
+    /// Two stored events share this start — one movement, one continuous chunk
+    /// of the same length, which is what a camera recording continuously while
+    /// something moves in front of it produces — so the URLs asking for them
+    /// differ only in the type. The lookup this replaced binary-searched the
+    /// start and could only ever answer with one of the two, whichever std
+    /// landed on: a request for the movement served the continuous chunk's
+    /// video, duration and poster frame, or the other way round. Nothing about
+    /// it looked like an error.
+    ///
+    /// It also pins the paths those bytes come from apart. The poster frame is
+    /// rendered lazily and single-flighted on its output path
+    /// ([`LocalDiskBackend::thumbnails`]), so two events resolving to one
+    /// thumbnail path would share a render and serve one picture for both.
+    #[tokio::test]
+    async fn same_start_siblings_are_each_served_by_their_own_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let buffer = populated_buffer(10);
+        let (movement, chunk) = {
+            let buf = buffer.read_recover();
+            (
+                assemble_event(&buf, None, "cam", 5, 7, 0, 0, false, None).unwrap(),
+                assemble_continuous_chunk(&buf, "cam", 5, 7, false).unwrap(),
+            )
+        };
+        let first_pts = movement.first_pts;
+        assert_eq!(chunk.first_pts, first_pts);
+        let duration_ms = movement.duration_ms() as u32;
+        assert_eq!(chunk.duration_ms() as u32, duration_ms);
+
+        let backend = LocalDiskBackend::new(dir.path().to_path_buf(), &["cam".to_string()]);
+        backend.write_event("cam", &movement).await;
+        backend.write_event("cam", &chunk).await;
+        assert_eq!(backend.query("cam", 0, u64::MAX).len(), 2);
+
+        let mut posters = Vec::new();
+        for event_type in [EventType::Movement, EventType::Continuous] {
+            let key = EventRef::new(first_pts, duration_ms, event_type);
+            let entry = backend
+                .find_event("cam", key)
+                .unwrap_or_else(|| panic!("{key} is not indexed"));
+            assert_eq!(EventRef::of(&entry), key, "{key} served another event");
+            // And the objects behind it are that event's own: the same stem
+            // under its own tier directory.
+            let ts = dir
+                .path()
+                .join("cam")
+                .join(event_type.dir_name())
+                .join(format!("{first_pts}_{duration_ms}.ts"));
+            let resolved = backend.index.resolve_file_path("cam", &entry);
+            assert_eq!(resolved, ts);
+            assert!(ts.exists());
+            posters.push(resolved.with_extension("jpg"));
+        }
+        // The single-flight key for a lazily rendered poster frame is its output
+        // path, so the pair must not share one.
+        assert_ne!(posters[0], posters[1]);
+
+        // A key nothing is stored under is absent rather than nearly-matching:
+        // the same start and type with another duration, and the third type.
+        assert!(backend
+            .find_event(
+                "cam",
+                EventRef::new(first_pts, duration_ms + 1000, EventType::Movement)
+            )
+            .is_none());
+        assert!(backend
+            .find_event(
+                "cam",
+                EventRef::new(first_pts, duration_ms, EventType::Object)
+            )
+            .is_none());
     }
 
     /// Local sidecars carry no `event_type`: the directory an event lives in is
@@ -1560,7 +1651,9 @@ mod tests {
         // continues flag preserved; no stale movement sidecar remains.
         let scanned = WarmEventIndex::new(&["cam".to_string()], dir.path().to_path_buf());
         scanned.scan();
-        let entry = scanned.find_event("cam", first_pts).unwrap();
+        let entry = scanned
+            .find_event("cam", EventRef::new(first_pts, 3000, EventType::Object))
+            .unwrap();
         assert_eq!(entry.event_type, EventType::Object);
         assert!(entry.continues);
         assert_eq!(entry.object_classes, vec!["person".to_string()]);
@@ -1591,12 +1684,14 @@ mod tests {
         // a racing sweep leaves behind when it unindexes as vanished.
         let index = WarmEventIndex::new(&["cam".to_string()], dir.path().to_path_buf());
         write_event(dir.path(), "cam", &event, None).await;
-        assert!(index.find_event("cam", first_pts).is_none());
+        assert!(index
+            .find_event("cam", EventRef::new(first_pts, 4000, EventType::Movement))
+            .is_none());
 
         upgrade_event(dir.path(), "cam", &upgrade_for(&event), Some(&index)).await;
 
         let entry = index
-            .find_event("cam", first_pts)
+            .find_event("cam", EventRef::new(first_pts, 4000, EventType::Object))
             .expect("upgraded event stayed invisible until the next restart");
         assert_eq!(entry.event_type, EventType::Object);
         assert_eq!(entry.object_classes, vec!["person".to_string()]);
@@ -1618,17 +1713,17 @@ mod tests {
     #[tokio::test]
     async fn local_disk_prune_honors_the_cancel_flag() {
         let (backend, entry, dir) = backend_with_event().await;
-        let start_pts = entry.start_pts_ns;
+        let key = EventRef::of(&entry);
 
         backend
             .prune(1, 1, 1, &std::sync::atomic::AtomicBool::new(true))
             .await;
-        assert!(backend.find_event("cam", start_pts).is_some());
+        assert!(backend.find_event("cam", key).is_some());
 
         backend
             .prune(1, 1, 1, &std::sync::atomic::AtomicBool::new(false))
             .await;
-        assert!(backend.find_event("cam", start_pts).is_none());
+        assert!(backend.find_event("cam", key).is_none());
         drop(dir);
     }
 
@@ -1642,7 +1737,7 @@ mod tests {
     #[tokio::test]
     async fn a_storage_volume_that_moved_stops_the_emergency_prune() {
         let (backend, entry, dir) = backend_with_event().await;
-        let start_pts = entry.start_pts_ns;
+        let key = EventRef::of(&entry);
 
         std::fs::remove_file(dir.path().join(".camon-volume")).unwrap();
         backend
@@ -1652,7 +1747,7 @@ mod tests {
         backend.guard_free_space("cam", u64::MAX).await;
         backend.emergency_prune("cam", u64::MAX).await;
         assert!(
-            backend.find_event("cam", start_pts).is_some(),
+            backend.find_event("cam", key).is_some(),
             "pruned the archive to free space on a filesystem it is not on"
         );
 
@@ -1662,7 +1757,7 @@ mod tests {
             .unwrap()
             .check(std::time::Instant::now());
         backend.emergency_prune("cam", u64::MAX).await;
-        assert!(backend.find_event("cam", start_pts).is_none());
+        assert!(backend.find_event("cam", key).is_none());
     }
 
     #[tokio::test]
@@ -1681,7 +1776,9 @@ mod tests {
         // Never written (or already pruned): nothing happens, nothing panics.
         upgrade_event(dir.path(), "cam", &upgrade, Some(&index)).await;
         assert!(!dir.path().join("cam").join("objects").exists());
-        assert!(index.find_event("cam", 12345).is_none());
+        assert!(index
+            .find_event("cam", EventRef::new(12345, 4000, EventType::Movement))
+            .is_none());
     }
 
     #[tokio::test]
@@ -1716,10 +1813,17 @@ mod tests {
             .join(format!("{}_5000.json", second_pts))
             .exists());
 
-        let e1 = index.find_event("cam", first_pts).unwrap();
+        let e1 = index
+            .find_event("cam", EventRef::new(first_pts, 5000, EventType::Continuous))
+            .unwrap();
         assert_eq!(e1.event_type, EventType::Continuous);
         assert!(!e1.continues);
-        let e2 = index.find_event("cam", second_pts).unwrap();
+        let e2 = index
+            .find_event(
+                "cam",
+                EventRef::new(second_pts, 5000, EventType::Continuous),
+            )
+            .unwrap();
         assert_eq!(e2.event_type, EventType::Continuous);
         assert!(e2.continues);
         assert_eq!(
@@ -1775,7 +1879,9 @@ mod tests {
         );
 
         // Indexed and queryable through the trait.
-        let entry = backend.find_event("cam", first_pts).unwrap();
+        let entry = backend
+            .find_event("cam", EventRef::new(first_pts, 4000, EventType::Movement))
+            .unwrap();
         assert_eq!(entry.event_type, EventType::Movement);
         assert_eq!(backend.query("cam", 0, u64::MAX).len(), 1);
 
@@ -1789,7 +1895,9 @@ mod tests {
 
         // Upgrade intent reclassifies the event to Object.
         backend.upgrade_event("cam", &upgrade_for(&event)).await;
-        let upgraded = backend.find_event("cam", first_pts).unwrap();
+        let upgraded = backend
+            .find_event("cam", EventRef::new(first_pts, 4000, EventType::Object))
+            .unwrap();
         assert_eq!(upgraded.event_type, EventType::Object);
         assert_eq!(upgraded.object_classes, vec!["person".to_string()]);
     }
@@ -1931,7 +2039,9 @@ mod tests {
             backend.write_event("cam", &event).await,
             WriteOutcome::Written
         );
-        let entry = backend.find_event("cam", first_pts).unwrap();
+        let entry = backend
+            .find_event("cam", EventRef::new(first_pts, 4000, EventType::Movement))
+            .unwrap();
         (backend, entry, dir)
     }
 

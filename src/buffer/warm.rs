@@ -786,7 +786,11 @@ mod tests {
             unimplemented!("read path unused in writer tests")
         }
 
-        fn find_event(&self, _camera_id: &str, _start_pts_ns: u64) -> Option<WarmEventEntry> {
+        fn find_event(
+            &self,
+            _camera_id: &str,
+            _event: crate::storage::EventRef,
+        ) -> Option<WarmEventEntry> {
             unimplemented!("read path unused in writer tests")
         }
 

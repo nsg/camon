@@ -61,6 +61,12 @@
 //!   second: the index replaces the entry under that stem, the budget is
 //!   charged the difference, and thumbnails the shorter event has no frame for
 //!   are deleted. See [`event_key`] for what identifies an event here.
+//! * **A read resolves by stem, type and all.** An API request names an event
+//!   by its whole key ([`EventRef`]), and
+//!   [`find_event`](StathostBackend::find_event) matches only the stem part of
+//!   it: the same objects answer to both types across a movement→object
+//!   upgrade, so a link made before one still plays after it. Local disk, where
+//!   the type is a directory, has to match all three.
 //! * **Metadata whose video never landed is collected at startup.** Nothing
 //!   else can: the index walks `.ts` objects, and an event's siblings are only
 //!   deleted with it. See [`StathostBackend::sweep_orphaned_metadata`].
@@ -110,7 +116,7 @@ use crate::storage::event_index::{
 use crate::storage::warm_index::{
     parse_event_filename, parse_sidecar_json, sidecar_json, wall_clock_ns, SidecarData,
 };
-use crate::storage::{EventType, WarmEventEntry};
+use crate::storage::{EventRef, EventType, WarmEventEntry};
 
 const NANOS_PER_MS: u64 = 1_000_000;
 
@@ -1057,8 +1063,22 @@ impl WarmStorageBackend for StathostBackend {
         self.events.newest_event_end_ns(camera_id)
     }
 
-    fn find_event(&self, camera_id: &str, start_pts_ns: u64) -> Option<WarmEventEntry> {
-        self.events.find(camera_id, start_pts_ns)
+    /// Resolved by stem — start and duration — with the event type in the key
+    /// deliberately ignored.
+    ///
+    /// This is the one place the two backends read a request differently, and it
+    /// follows from their layouts. Here the type lives *inside* the sidecar:
+    /// a movement→object upgrade rewrites that one object in place and moves
+    /// nothing, so the same bytes answer to both types over their lifetime and
+    /// the stem is the whole identity ([`EventIdentity`]). Honoring the type
+    /// would 404 every URL a client already holds the moment an event is
+    /// upgraded — a link taken from the event list, or the playlist a player is
+    /// part way through — while pointing at footage that is still right there.
+    /// Local disk cannot do the same: the type is a directory there, so two
+    /// types under one stem are two different files.
+    fn find_event(&self, camera_id: &str, event: EventRef) -> Option<WarmEventEntry> {
+        self.events
+            .find(camera_id, (event.start_pts_ns, event.duration_ms))
     }
 
     async fn read_video(
@@ -1811,6 +1831,15 @@ mod tests {
         e
     }
 
+    /// The key an API request carries for one stem. This backend resolves by
+    /// stem alone and ignores the type in the key (see its `find_event`), so
+    /// these lookups name `Movement` whatever the event turns out to be — a
+    /// deliberate choice, pinned by
+    /// `find_event_resolves_by_stem_across_an_upgrade`.
+    fn url_key(start_pts_ns: u64, duration_ms: u32) -> EventRef {
+        EventRef::new(start_pts_ns, duration_ms, EventType::Movement)
+    }
+
     fn sibling(backend: &StathostBackend, duration_ms: u32) -> Option<WarmEventEntry> {
         backend
             .query("cam", 0, u64::MAX)
@@ -1854,7 +1883,7 @@ mod tests {
         );
 
         // Indexed and queryable in the writer's own index.
-        let entry = backend.find_event("cam", 1_000).unwrap();
+        let entry = backend.find_event("cam", url_key(1_000, 1000)).unwrap();
         assert_eq!(entry.event_type, EventType::Movement);
         assert_eq!(entry.file_size, 40);
         assert_eq!(entry.filmstrip_frames, 2);
@@ -1877,7 +1906,7 @@ mod tests {
         // its type, size (detailed list), and filmstrip count.
         let scanned = backend_for(&url, "secret", 0);
         scanned.scan().await;
-        let e = scanned.find_event("cam", 1_000).unwrap();
+        let e = scanned.find_event("cam", url_key(1_000, 1000)).unwrap();
         assert_eq!(e.event_type, EventType::Movement);
         assert_eq!(e.file_size, 40);
         assert_eq!(e.filmstrip_frames, 2);
@@ -1898,7 +1927,13 @@ mod tests {
         backend.write_event("cam", &movement_event(1_000, 25)).await;
 
         assert_eq!(backend.query("cam", 0, u64::MAX).len(), 1);
-        assert_eq!(backend.find_event("cam", 1_000).unwrap().file_size, 25);
+        assert_eq!(
+            backend
+                .find_event("cam", url_key(1_000, 1000))
+                .unwrap()
+                .file_size,
+            25
+        );
         assert_eq!(backend.used(), 25);
         // ts + json + 2 thumbs, overwritten in place.
         assert_eq!(stub.files.lock().unwrap().len(), 4);
@@ -1922,7 +1957,10 @@ mod tests {
         backend.write_event("cam", &shorter).await;
 
         assert_eq!(
-            backend.find_event("cam", 2_000).unwrap().filmstrip_frames,
+            backend
+                .find_event("cam", url_key(2_000, 1000))
+                .unwrap()
+                .filmstrip_frames,
             1
         );
         assert!(stub.has("cam/2000_1000_thumb_0.jpg"));
@@ -1933,7 +1971,10 @@ mod tests {
         let scanned = backend_for(&url, "secret", 0);
         scanned.scan().await;
         assert_eq!(
-            scanned.find_event("cam", 2_000).unwrap().filmstrip_frames,
+            scanned
+                .find_event("cam", url_key(2_000, 1000))
+                .unwrap()
+                .filmstrip_frames,
             1
         );
     }
@@ -1995,6 +2036,75 @@ mod tests {
         );
     }
 
+    /// The read path, on the same pair: each sibling is served as itself.
+    ///
+    /// An API request names a stem, and the two events under this start hold
+    /// different objects on the host — different videos, different lengths. The
+    /// lookup this replaced binary-searched the start alone, so one of the two
+    /// URLs was always answered with the other event's recording: the wrong
+    /// video streamed under the right link, at the wrong duration.
+    #[tokio::test]
+    async fn same_start_siblings_are_each_served_by_their_own_key() {
+        let (url, _stub) = spawn_stub("secret").await;
+        let backend = backend_for(&url, "secret", 0);
+        backend
+            .write_event("cam", &movement_event(30_000, 40))
+            .await;
+        backend
+            .write_event("cam", &longer_movement_event(30_000, 40))
+            .await;
+        assert_eq!(backend.query("cam", 0, u64::MAX).len(), 2);
+
+        for (duration_ms, file_size) in [(1000u32, 40u64), (2000, 80)] {
+            let entry = backend
+                .find_event("cam", url_key(30_000, duration_ms))
+                .unwrap_or_else(|| panic!("{duration_ms}ms sibling is not indexed"));
+            assert_eq!(entry.duration_ms, duration_ms);
+            assert_eq!(entry.file_size, file_size);
+            // And the bytes behind it are that event's own.
+            let vs = backend.read_video("cam", &entry, None).await.unwrap();
+            assert_eq!(vs.total_size, file_size);
+            assert_eq!(drain(vs).await.len(), file_size as usize);
+        }
+
+        // A stem nothing is stored under: this start, no such duration.
+        assert!(backend.find_event("cam", url_key(30_000, 3000)).is_none());
+    }
+
+    /// The one asymmetry between the backends: the event type in a request's key
+    /// is ignored here, because the objects it names do not depend on it. An
+    /// upgrade rewrites the sidecar in place and moves nothing, so honoring the
+    /// type would 404 a link a client already holds — the event list it came
+    /// from, or the playlist a player is part way through — while the footage
+    /// sits right where it was. Local disk cannot do this: the type is a
+    /// directory there, so it is part of the path.
+    #[tokio::test]
+    async fn find_event_resolves_by_stem_across_an_upgrade() {
+        let (url, _stub) = spawn_stub("secret").await;
+        let backend = backend_for(&url, "secret", 0);
+        backend
+            .write_event("cam", &movement_event(31_000, 40))
+            .await;
+        backend.upgrade_event("cam", &upgrade_for(31_000)).await;
+
+        // The key a client took from the listing before the upgrade still
+        // resolves, and to the event as it is now.
+        for event_type in [
+            EventType::Movement,
+            EventType::Object,
+            EventType::Continuous,
+        ] {
+            let entry = backend
+                .find_event("cam", EventRef::new(31_000, 1000, event_type))
+                .unwrap_or_else(|| panic!("{event_type:?} key stopped resolving"));
+            assert_eq!(entry.event_type, EventType::Object);
+        }
+        // The stem is still the whole identity: the duration has to be right.
+        assert!(backend
+            .find_event("cam", EventRef::new(31_000, 2000, EventType::Object))
+            .is_none());
+    }
+
     /// The same for the two flags an entry carries: a failed delete and a type
     /// the scan could not read both belong to one stem, not to a start PTS.
     #[tokio::test]
@@ -2044,7 +2154,7 @@ mod tests {
 
         let scanned = backend_for(&url, "secret", 0);
         scanned.scan().await;
-        let e = scanned.find_event("cam", 4_000).unwrap();
+        let e = scanned.find_event("cam", url_key(4_000, 1000)).unwrap();
         assert_eq!(e.event_type, EventType::Object);
         assert_eq!(e.object_classes, vec!["car".to_string()]);
         assert_eq!(e.detections.len(), 1);
@@ -2068,7 +2178,7 @@ mod tests {
         backend.upgrade_event("cam", &upgrade).await;
 
         // The index flipped to Object...
-        let e = backend.find_event("cam", 5_000).unwrap();
+        let e = backend.find_event("cam", url_key(5_000, 1000)).unwrap();
         assert!(e.continues);
         assert_eq!(e.event_type, EventType::Object);
         assert_eq!(e.object_classes, vec!["person".to_string()]);
@@ -2107,7 +2217,7 @@ mod tests {
             .prune(1, u64::MAX, u64::MAX, &AtomicBool::new(false))
             .await;
 
-        assert!(backend.find_event("cam", old_pts).is_none());
+        assert!(backend.find_event("cam", url_key(old_pts, 1000)).is_none());
         assert!(stub.files.lock().unwrap().is_empty());
         assert_eq!(backend.used(), 0);
     }
@@ -2190,7 +2300,7 @@ mod tests {
             .prune(1, u64::MAX, u64::MAX, &AtomicBool::new(true))
             .await;
 
-        assert!(backend.find_event("cam", old_pts).is_some());
+        assert!(backend.find_event("cam", url_key(old_pts, 1000)).is_some());
         assert_eq!(stub.files.lock().unwrap().len(), before);
     }
 
@@ -2219,9 +2329,9 @@ mod tests {
         // and object survive (usage 80 > 60 would need another eviction, but
         // the movement is next-cheapest — check exact survivors).
         // 120 - 40 (continuous) = 80, still > 60, so the movement goes too.
-        assert!(backend.find_event("cam", 1_000).is_none()); // continuous evicted
-        assert!(backend.find_event("cam", 2_000).is_none()); // movement evicted
-        assert!(backend.find_event("cam", 3_000).is_some()); // object survives
+        assert!(backend.find_event("cam", url_key(1_000, 1000)).is_none()); // continuous evicted
+        assert!(backend.find_event("cam", url_key(2_000, 1000)).is_none()); // movement evicted
+        assert!(backend.find_event("cam", url_key(3_000, 1000)).is_some()); // object survives
         assert!(backend.used() <= 60);
     }
 
@@ -2245,13 +2355,18 @@ mod tests {
         // First pass: the oldest refuses, and the pass stops there.
         backend.guard_free_space("cam", 0).await;
         assert_eq!(backend.query("cam", 0, u64::MAX).len(), 3);
-        assert!(backend.find_event("cam", 1_000).unwrap().delete_failed);
+        assert!(
+            backend
+                .find_event("cam", url_key(1_000, 1000))
+                .unwrap()
+                .delete_failed
+        );
 
         // Second: it is skipped, and the budget is enforced around it.
         backend.guard_free_space("cam", 0).await;
-        assert!(backend.find_event("cam", 1_000).is_some());
-        assert!(backend.find_event("cam", 2_000).is_none());
-        assert!(backend.find_event("cam", 3_000).is_none());
+        assert!(backend.find_event("cam", url_key(1_000, 1000)).is_some());
+        assert!(backend.find_event("cam", url_key(2_000, 1000)).is_none());
+        assert!(backend.find_event("cam", url_key(3_000, 1000)).is_none());
         assert!(stub.has("cam/1000_1000.ts"));
     }
 
@@ -2270,9 +2385,9 @@ mod tests {
 
         backend.guard_free_space("cam", 0).await;
 
-        assert!(backend.find_event("cam", 1_000).is_none());
-        assert!(backend.find_event("cam", 2_000).is_none());
-        assert!(backend.find_event("cam", 3_000).is_some());
+        assert!(backend.find_event("cam", url_key(1_000, 1000)).is_none());
+        assert!(backend.find_event("cam", url_key(2_000, 1000)).is_none());
+        assert!(backend.find_event("cam", url_key(3_000, 1000)).is_some());
         assert_eq!(backend.used(), 40);
     }
 
@@ -2336,7 +2451,7 @@ mod tests {
             .prune(u64::MAX, u64::MAX, 1, &AtomicBool::new(false))
             .await;
 
-        let entry = backend.find_event("cam", OLD_PTS).unwrap();
+        let entry = backend.find_event("cam", url_key(OLD_PTS, 1000)).unwrap();
         assert!(entry.delete_failed);
         assert!(stub.has(&format!("cam/{OLD_PTS}_1000.ts")));
         assert!(stub.has(&format!("cam/{OLD_PTS}_1000.json")), "type lost");
@@ -2348,7 +2463,10 @@ mod tests {
         let scanned = backend_for(&url, "secret", 0);
         scanned.scan().await;
         assert_eq!(
-            scanned.find_event("cam", OLD_PTS).unwrap().event_type,
+            scanned
+                .find_event("cam", url_key(OLD_PTS, 1000))
+                .unwrap()
+                .event_type,
             EventType::Continuous
         );
         // ...and once the store lets go, the whole event goes.
@@ -2356,7 +2474,7 @@ mod tests {
         scanned
             .prune(u64::MAX, u64::MAX, 1, &AtomicBool::new(false))
             .await;
-        assert!(scanned.find_event("cam", OLD_PTS).is_none());
+        assert!(scanned.find_event("cam", url_key(OLD_PTS, 1000)).is_none());
         assert!(stub.files.lock().unwrap().is_empty());
     }
 
@@ -2384,7 +2502,10 @@ mod tests {
         assert!(!stub.has("cam/24000_1000_thumb_2.jpg"));
         assert!(stub.has("cam/24000_1000_thumb_1.jpg"));
         assert_eq!(
-            backend.find_event("cam", 24_000).unwrap().filmstrip_frames,
+            backend
+                .find_event("cam", url_key(24_000, 1000))
+                .unwrap()
+                .filmstrip_frames,
             2,
             "index disagrees with the host about what exists"
         );
@@ -2393,7 +2514,10 @@ mod tests {
         let scanned = backend_for(&url, "secret", 0);
         scanned.scan().await;
         assert_eq!(
-            scanned.find_event("cam", 24_000).unwrap().filmstrip_frames,
+            scanned
+                .find_event("cam", url_key(24_000, 1000))
+                .unwrap()
+                .filmstrip_frames,
             2
         );
         stub.fail_delete_paths.lock().unwrap().clear();
@@ -2415,7 +2539,7 @@ mod tests {
 
         let backend = backend_for(&url, "secret", 0);
         backend.scan().await;
-        let e = backend.find_event("cam", 9_000).unwrap();
+        let e = backend.find_event("cam", url_key(9_000, 1000)).unwrap();
         // A confirmed-absent sidecar is what a plain movement event is written
         // with, so the default is a fact about the write path, not a fallback.
         assert_eq!(e.event_type, EventType::Movement);
@@ -2550,7 +2674,7 @@ mod tests {
         let outcome = backend.write_event("cam", &movement_event(6_000, 30)).await;
         assert_eq!(outcome, WriteOutcome::Failed);
         // The event was not indexed and nothing landed on the host.
-        assert!(backend.find_event("cam", 6_000).is_none());
+        assert!(backend.find_event("cam", url_key(6_000, 1000)).is_none());
         assert!(stub.files.lock().unwrap().is_empty());
     }
 
@@ -2567,14 +2691,14 @@ mod tests {
         let outcome = backend.write_event("cam", &object_event(11_000, 30)).await;
 
         assert_eq!(outcome, WriteOutcome::Failed);
-        assert!(backend.find_event("cam", 11_000).is_none());
+        assert!(backend.find_event("cam", url_key(11_000, 1000)).is_none());
         assert_eq!(backend.used(), 0);
         // The video was never attempted, so there is no bare .ts for a later
         // scan to call a movement event.
         assert!(!stub.has("cam/11000_1000.ts"));
         let scanned = backend_for(&url, "secret", 0);
         scanned.scan().await;
-        assert!(scanned.find_event("cam", 11_000).is_none());
+        assert!(scanned.find_event("cam", url_key(11_000, 1000)).is_none());
     }
 
     /// A plain movement event is the one event a sidecar-less `.ts` already
@@ -2605,13 +2729,16 @@ mod tests {
         backend
             .write_event("cam", &movement_event(16_000, 30))
             .await;
-        let written = backend.find_event("cam", 16_000).unwrap();
+        let written = backend.find_event("cam", url_key(16_000, 1000)).unwrap();
 
         stub.files.lock().unwrap().remove("cam/16000_1000.json");
         let scanned = backend_for(&url, "secret", 0);
         scanned.scan().await;
 
-        assert_eq!(scanned.find_event("cam", 16_000).unwrap(), written);
+        assert_eq!(
+            scanned.find_event("cam", url_key(16_000, 1000)).unwrap(),
+            written
+        );
     }
 
     /// A PUT that reports failure may still have committed — an upload timeout
@@ -2627,14 +2754,14 @@ mod tests {
         let outcome = backend.write_event("cam", &object_event(12_000, 30)).await;
 
         assert_eq!(outcome, WriteOutcome::Failed);
-        assert!(backend.find_event("cam", 12_000).is_none());
+        assert!(backend.find_event("cam", url_key(12_000, 1000)).is_none());
         // Both objects are still there, so the next scan adopts the phantom
         // video as the object event it is — not as a movement event on a
         // two-day retention.
         stub.clear_faults();
         let scanned = backend_for(&url, "secret", 0);
         scanned.scan().await;
-        let e = scanned.find_event("cam", 12_000).unwrap();
+        let e = scanned.find_event("cam", url_key(12_000, 1000)).unwrap();
         assert_eq!(e.event_type, EventType::Object);
         assert_eq!(e.object_classes, vec!["car".to_string()]);
     }
@@ -2658,7 +2785,7 @@ mod tests {
         stub.clear_faults();
         let scanned = backend_for(&url, "secret", 0);
         scanned.scan().await;
-        assert!(scanned.find_event("cam", 17_000).is_none());
+        assert!(scanned.find_event("cam", url_key(17_000, 1000)).is_none());
         assert!(!stub.has("cam/17000_1000.json"), "orphan sidecar kept");
     }
 
@@ -2688,7 +2815,10 @@ mod tests {
         assert!(!stub.has("cam/20000_1000.json"));
         // The live event keeps every one of its objects.
         assert_eq!(
-            scanned.find_event("cam", 19_000).unwrap().filmstrip_frames,
+            scanned
+                .find_event("cam", url_key(19_000, 1000))
+                .unwrap()
+                .filmstrip_frames,
             2
         );
         assert!(stub.has("cam/19000_1000.json"));
@@ -2753,7 +2883,10 @@ mod tests {
         let scanned = backend_for(&url, "secret", 0);
         scanned.scan().await;
         assert_eq!(
-            scanned.find_event("cam", 22_000).unwrap().event_type,
+            scanned
+                .find_event("cam", url_key(22_000, 1000))
+                .unwrap()
+                .event_type,
             EventType::Object
         );
     }
@@ -2812,14 +2945,14 @@ mod tests {
         let outcome = backend.write_event("cam", &object_event(13_000, 30)).await;
 
         assert_eq!(outcome, WriteOutcome::Written);
-        let entry = backend.find_event("cam", 13_000).unwrap();
+        let entry = backend.find_event("cam", url_key(13_000, 1000)).unwrap();
         assert_eq!(entry.event_type, EventType::Object);
         assert_eq!(entry.filmstrip_frames, 0);
 
         // ...and the index a restart rebuilds agrees with the one in RAM.
         let scanned = backend_for(&url, "secret", 0);
         scanned.scan().await;
-        let e = scanned.find_event("cam", 13_000).unwrap();
+        let e = scanned.find_event("cam", url_key(13_000, 1000)).unwrap();
         assert_eq!(e.event_type, EventType::Object);
         assert_eq!(e.filmstrip_frames, 0);
         assert!(backend.read_thumbnail("cam", &entry).await.is_err());
@@ -2846,17 +2979,17 @@ mod tests {
 
         // Indexed and visible (losing the footage from the UI would be its own
         // bug), but not deleted by the sweep its placeholder type invites.
-        assert!(scanned.find_event("cam", OLD_PTS).is_some());
+        assert!(scanned.find_event("cam", url_key(OLD_PTS, 1000)).is_some());
         scanned
             .prune(1, u64::MAX, u64::MAX, &AtomicBool::new(false))
             .await;
-        assert!(scanned.find_event("cam", OLD_PTS).is_some());
+        assert!(scanned.find_event("cam", url_key(OLD_PTS, 1000)).is_some());
         assert!(stub.has("cam/1000000000_1000.ts"));
 
         // The hold is a longer retention, not an immortal one: once every
         // configured age has passed, an event nobody can type still goes.
         scanned.prune(1, 1, 1, &AtomicBool::new(false)).await;
-        assert!(scanned.find_event("cam", OLD_PTS).is_none());
+        assert!(scanned.find_event("cam", url_key(OLD_PTS, 1000)).is_none());
         assert!(!stub.has("cam/1000000000_1000.ts"));
     }
 
@@ -2879,17 +3012,17 @@ mod tests {
             .prune(1, u64::MAX, u64::MAX, &AtomicBool::new(false))
             .await;
 
-        let entry = backend.find_event("cam", OLD_PTS).unwrap();
+        let entry = backend.find_event("cam", url_key(OLD_PTS, 1000)).unwrap();
         assert_eq!(entry.event_type, EventType::Object);
         assert_eq!(entry.object_classes, vec!["car".to_string()]);
         assert!(!backend.has_unknown_type("cam", (OLD_PTS, 1000)));
 
         // Typed again, it prunes on its own retention: kept as an object...
         backend.prune(1, u64::MAX, 1, &AtomicBool::new(false)).await;
-        assert!(backend.find_event("cam", OLD_PTS).is_some());
+        assert!(backend.find_event("cam", url_key(OLD_PTS, 1000)).is_some());
         // ...and gone once the object retention itself expires.
         backend.prune(1, 1, 1, &AtomicBool::new(false)).await;
-        assert!(backend.find_event("cam", OLD_PTS).is_none());
+        assert!(backend.find_event("cam", url_key(OLD_PTS, 1000)).is_none());
     }
 
     /// Valid JSON that names no type is not a movement event either — and
@@ -2915,7 +3048,7 @@ mod tests {
             .prune(1, u64::MAX, u64::MAX, &AtomicBool::new(false))
             .await;
         // A re-read says the same thing, so the hold survives the sweep.
-        assert!(backend.find_event("cam", OLD_PTS).is_some());
+        assert!(backend.find_event("cam", url_key(OLD_PTS, 1000)).is_some());
         assert!(backend.has_unknown_type("cam", (OLD_PTS, 1000)));
     }
 
@@ -2941,7 +3074,7 @@ mod tests {
         backend
             .prune(1, u64::MAX, u64::MAX, &AtomicBool::new(false))
             .await;
-        assert!(backend.find_event("cam", OLD_PTS).is_some());
+        assert!(backend.find_event("cam", url_key(OLD_PTS, 1000)).is_some());
     }
 
     /// Eviction order is the other decision that reads the event type. A held
@@ -2963,8 +3096,8 @@ mod tests {
         // ...so the budget must still evict the genuine movement event first,
         // even though the held one is older and labelled movement too.
         backend.guard_free_space("cam", 0).await;
-        assert!(backend.find_event("cam", 2_000).is_none());
-        assert!(backend.find_event("cam", 1_000).is_some());
+        assert!(backend.find_event("cam", url_key(2_000, 1000)).is_none());
+        assert!(backend.find_event("cam", url_key(1_000, 1000)).is_some());
     }
 
     /// A thumbnail gap stops the uploads: the scan counts frames contiguously
@@ -2981,7 +3114,10 @@ mod tests {
         backend.write_event("cam", &event).await;
 
         assert_eq!(
-            backend.find_event("cam", 18_000).unwrap().filmstrip_frames,
+            backend
+                .find_event("cam", url_key(18_000, 1000))
+                .unwrap()
+                .filmstrip_frames,
             1
         );
         assert!(stub.has("cam/18000_1000_thumb_0.jpg"));
@@ -3006,7 +3142,7 @@ mod tests {
         let backend = backend_for(&url, "secret", 0);
         let event = continuous_event(7_000, 30); // no filmstrip frames
         backend.write_event("cam", &event).await;
-        let entry = backend.find_event("cam", 7_000).unwrap();
+        let entry = backend.find_event("cam", url_key(7_000, 1000)).unwrap();
         assert!(backend.read_thumbnail("cam", &entry).await.is_err());
     }
 
@@ -3018,7 +3154,7 @@ mod tests {
         let backend = backend_for(&url, "secret", 0);
         // A 40-byte movement event (body is 40 × 0xab).
         backend.write_event("cam", &movement_event(8_000, 40)).await;
-        let entry = backend.find_event("cam", 8_000).unwrap();
+        let entry = backend.find_event("cam", url_key(8_000, 1000)).unwrap();
 
         // bytes=10-19 → a 206 with a 10-byte body and the right Content-Range.
         let vs = backend
@@ -3050,7 +3186,7 @@ mod tests {
         let (url, _stub) = spawn_stub("secret").await;
         let backend = backend_for(&url, "secret", 0);
         backend.write_event("cam", &movement_event(9_000, 40)).await;
-        let entry = backend.find_event("cam", 9_000).unwrap();
+        let entry = backend.find_event("cam", url_key(9_000, 1000)).unwrap();
 
         // start past EOF → the stub answers 416; we surface Unsatisfiable + size.
         let vs = backend
@@ -3078,7 +3214,7 @@ mod tests {
         backend
             .write_event("cam", &movement_event(10_000, 40))
             .await;
-        let entry = backend.find_event("cam", 10_000).unwrap();
+        let entry = backend.find_event("cam", url_key(10_000, 1000)).unwrap();
 
         // A range was requested, but the full body comes back as a 200.
         let vs = backend

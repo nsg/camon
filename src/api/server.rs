@@ -21,8 +21,8 @@ use crate::analytics::{MotionSettingsStore, SettingsUpdate, UpdateError};
 use crate::buffer::HotBuffer;
 use crate::locks::LockExt;
 use crate::storage::{
-    DetectionDebugStore, DetectionStore, MapKind, MotionStore, RangeRequest, ServedRange,
-    ThumbnailError, VideoStream, WarmStorageBackend,
+    DetectionDebugStore, DetectionStore, EventRef, MapKind, MotionStore, RangeRequest, ServedRange,
+    ThumbnailError, VideoStream, WarmEventEntry, WarmStorageBackend,
 };
 
 use super::hls;
@@ -220,19 +220,19 @@ fn api_routes() -> Router<AppState> {
         .route("/api/cameras/{id}/hot-events", get(hot_events_handler))
         .route("/api/cameras/{id}/events", get(warm_events_handler))
         .route(
-            "/api/cameras/{id}/events/{start_pts}/playlist.m3u8",
+            "/api/cameras/{id}/events/{event}/playlist.m3u8",
             get(warm_playlist_handler),
         )
         .route(
-            "/api/cameras/{id}/events/{start_pts}/segment",
+            "/api/cameras/{id}/events/{event}/segment",
             get(warm_segment_handler),
         )
         .route(
-            "/api/cameras/{id}/events/{start_pts}/thumbnail",
+            "/api/cameras/{id}/events/{event}/thumbnail",
             get(warm_thumbnail_handler),
         )
         .route(
-            "/api/cameras/{id}/events/{start_pts}/filmstrip/{index}",
+            "/api/cameras/{id}/events/{event}/filmstrip/{index}",
             get(warm_filmstrip_handler),
         )
         .route(
@@ -682,11 +682,10 @@ async fn warm_events_handler(
         .map(|e| WarmEventResponse {
             start_pts_ns: e.start_pts_ns.to_string(),
             duration_ms: e.duration_ms,
-            event_type: match e.event_type {
-                crate::storage::EventType::Movement => "movement".to_string(),
-                crate::storage::EventType::Object => "object".to_string(),
-                crate::storage::EventType::Continuous => "continuous".to_string(),
-            },
+            // The one spelling of a type: the same `as_str` an event key in a
+            // URL is built from, so a listing and the keys made from it cannot
+            // disagree about what a type is called.
+            event_type: e.event_type.as_str().to_string(),
             object_classes: e.object_classes.clone(),
             backend: e.backend.clone(),
             model: e.model.clone(),
@@ -707,23 +706,39 @@ async fn warm_events_handler(
     axum::Json(response).into_response()
 }
 
+/// Resolve an `{event}` path segment to the one stored event it names.
+///
+/// The segment is a whole [`EventRef`] — `{start_pts_ns}_{duration_ms}_{type}` —
+/// because a start PTS alone identifies nothing: events sharing one are two
+/// recordings, and these routes used to serve whichever of them a search on the
+/// start returned. So a segment that is not a key is a `400`, exactly as an
+/// unparseable start PTS was, and only a key with an event behind it reads
+/// anything.
+///
+/// `Err` carries the status and message to answer with.
+fn resolve_event(
+    backend: &Arc<dyn WarmStorageBackend>,
+    camera_id: &str,
+    segment: &str,
+) -> Result<WarmEventEntry, (StatusCode, &'static str)> {
+    let key = EventRef::parse(segment).ok_or((StatusCode::BAD_REQUEST, "invalid event key"))?;
+    backend
+        .find_event(camera_id, key)
+        .ok_or((StatusCode::NOT_FOUND, "event not found"))
+}
+
 async fn warm_playlist_handler(
     State(state): State<AppState>,
-    Path((id, start_pts_str)): Path<(String, String)>,
+    Path((id, event)): Path<(String, String)>,
 ) -> Response {
     let backend = match &state.storage {
         Some(b) => b,
         None => return (StatusCode::NOT_FOUND, "warm storage not enabled").into_response(),
     };
 
-    let start_pts: u64 = match start_pts_str.parse() {
-        Ok(v) => v,
-        Err(_) => return (StatusCode::BAD_REQUEST, "invalid start_pts").into_response(),
-    };
-
-    let entry = match backend.find_event(&id, start_pts) {
-        Some(e) => e,
-        None => return (StatusCode::NOT_FOUND, "event not found").into_response(),
+    let entry = match resolve_event(backend, &id, &event) {
+        Ok(e) => e,
+        Err(response) => return response.into_response(),
     };
 
     let duration_secs = entry.duration_ms as f64 / 1000.0;
@@ -783,7 +798,7 @@ fn parse_range_header(value: &str) -> Option<RangeRequest> {
 
 async fn warm_segment_handler(
     State(state): State<AppState>,
-    Path((id, start_pts_str)): Path<(String, String)>,
+    Path((id, event)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> Response {
     let backend = match &state.storage {
@@ -791,14 +806,9 @@ async fn warm_segment_handler(
         None => return (StatusCode::NOT_FOUND, "warm storage not enabled").into_response(),
     };
 
-    let start_pts: u64 = match start_pts_str.parse() {
-        Ok(v) => v,
-        Err(_) => return (StatusCode::BAD_REQUEST, "invalid start_pts").into_response(),
-    };
-
-    let entry = match backend.find_event(&id, start_pts) {
-        Some(e) => e,
-        None => return (StatusCode::NOT_FOUND, "event not found").into_response(),
+    let entry = match resolve_event(backend, &id, &event) {
+        Ok(e) => e,
+        Err(response) => return response.into_response(),
     };
 
     let range = headers
@@ -867,21 +877,16 @@ fn jpeg_response(data: Vec<u8>) -> Response {
 
 async fn warm_thumbnail_handler(
     State(state): State<AppState>,
-    Path((id, start_pts_str)): Path<(String, String)>,
+    Path((id, event)): Path<(String, String)>,
 ) -> Response {
     let backend = match &state.storage {
         Some(b) => b,
         None => return (StatusCode::NOT_FOUND, "warm storage not enabled").into_response(),
     };
 
-    let start_pts: u64 = match start_pts_str.parse() {
-        Ok(v) => v,
-        Err(_) => return (StatusCode::BAD_REQUEST, "invalid start_pts").into_response(),
-    };
-
-    let entry = match backend.find_event(&id, start_pts) {
-        Some(e) => e,
-        None => return (StatusCode::NOT_FOUND, "event not found").into_response(),
+    let entry = match resolve_event(backend, &id, &event) {
+        Ok(e) => e,
+        Err(response) => return response.into_response(),
     };
 
     // The backend acquires the poster frame (LocalDisk lazily renders + caches
@@ -971,7 +976,7 @@ async fn detection_debug_full_frame_handler(
 
 async fn warm_filmstrip_handler(
     State(state): State<AppState>,
-    Path((id, start_pts_str, index)): Path<(String, String, u8)>,
+    Path((id, event, index)): Path<(String, String, u8)>,
 ) -> Response {
     let backend = match &state.storage {
         Some(b) => b,
@@ -986,14 +991,9 @@ async fn warm_filmstrip_handler(
         return (StatusCode::BAD_REQUEST, "index must be 0-3").into_response();
     }
 
-    let start_pts_ns: u64 = match start_pts_str.parse() {
-        Ok(v) => v,
-        Err(_) => return (StatusCode::BAD_REQUEST, "invalid start_pts").into_response(),
-    };
-
-    let entry = match backend.find_event(&id, start_pts_ns) {
-        Some(e) => e,
-        None => return (StatusCode::NOT_FOUND, "event not found").into_response(),
+    let entry = match resolve_event(backend, &id, &event) {
+        Ok(e) => e,
+        Err(response) => return response.into_response(),
     };
 
     match backend.read_filmstrip(&id, &entry, index).await {
@@ -1012,6 +1012,7 @@ async fn warm_filmstrip_handler(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::EventType;
 
     const TOKEN: &str = "s3cr3t token";
 
@@ -1095,6 +1096,141 @@ mod tests {
         ] {
             let status = reqwest::get(&url).await.unwrap().status();
             assert_eq!(status, reqwest::StatusCode::NOT_FOUND, "{url}");
+        }
+    }
+
+    /// Like [`serve_with_storage`], but holding two events that start on the
+    /// same keyframe: a 2-second movement event with one filmstrip frame, and
+    /// the 4-second continuous chunk covering it. Returns the base URL, the temp
+    /// dir (which must outlive the server) and the two indexed entries.
+    async fn serve_with_same_start_events() -> (String, tempfile::TempDir, Vec<WarmEventEntry>) {
+        use crate::buffer::warm::{assemble_continuous_chunk, assemble_event};
+        use crate::buffer::GopSegment;
+
+        let dir = tempfile::tempdir().unwrap();
+        let ids = vec!["cam".to_string()];
+        let source = HotBuffer::new("cam".to_string(), 3600);
+        {
+            let mut buf = source.write_recover();
+            for seq in 0..10u64 {
+                buf.push(GopSegment {
+                    start_pts: seq * 1_000_000_000,
+                    duration_ns: 1_000_000_000,
+                    data: Arc::new(vec![seq as u8; 4]),
+                    frame_count: 1,
+                });
+            }
+        }
+        let (mut movement, chunk) = {
+            let buf = source.read_recover();
+            (
+                assemble_event(&buf, None, "cam", 5, 6, 5, 0, false, None).unwrap(),
+                assemble_continuous_chunk(&buf, "cam", 5, 8, false).unwrap(),
+            )
+        };
+        movement.filmstrip_frames = Some(Arc::new(vec![vec![0xaa]]));
+
+        let storage = Arc::new(crate::storage::LocalDiskBackend::new(
+            dir.path().to_path_buf(),
+            &ids,
+        ));
+        storage.write_event("cam", &movement).await;
+        storage.write_event("cam", &chunk).await;
+        let events = storage.query("cam", 0, u64::MAX);
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].start_pts_ns, events[1].start_pts_ns);
+
+        let buffers = HashMap::from([("cam".to_string(), HotBuffer::new("cam".to_string(), 60))]);
+        let state = AppState::new(
+            buffers,
+            MotionStore::new(&ids),
+            DetectionStore::new(&ids),
+            DetectionDebugStore::new(&ids),
+            Some(storage),
+            None,
+        );
+        let app = build_router(state, None);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{addr}"), dir, events)
+    }
+
+    /// Two recordings begin on the same keyframe — a motion event and the
+    /// continuous chunk covering it — and each of these routes has to answer
+    /// with the one its URL names.
+    ///
+    /// The URL carries the whole key, because it used to carry the start PTS
+    /// alone and that names both events: the lookup binary-searched it and
+    /// answered every one of these requests with whichever of the two it landed
+    /// on. A viewer asking for the movement got the continuous chunk's video,
+    /// under the movement's duration in the manifest, with its filmstrip
+    /// missing — and nothing in the exchange said so.
+    #[tokio::test]
+    async fn each_same_start_event_is_served_under_its_own_key() {
+        let (base, _dir, events) = serve_with_same_start_events().await;
+        let start = events[0].start_pts_ns;
+
+        for (event_type, duration_ms, bytes) in [
+            (EventType::Movement, 2000u32, 8usize),
+            (EventType::Continuous, 4000, 16),
+        ] {
+            let key = EventRef::new(start, duration_ms, event_type);
+            let events = format!("{base}/api/cameras/cam/events/{key}");
+
+            let playlist = reqwest::get(format!("{events}/playlist.m3u8"))
+                .await
+                .unwrap()
+                .text()
+                .await
+                .unwrap();
+            let secs = duration_ms as f64 / 1000.0;
+            assert!(
+                playlist.contains(&format!("#EXTINF:{secs:.3},")),
+                "{key} was served another event's playlist: {playlist}"
+            );
+
+            let segment = reqwest::get(format!("{events}/segment")).await.unwrap();
+            assert_eq!(segment.status(), reqwest::StatusCode::OK, "{key}");
+            let body = segment.bytes().await.unwrap();
+            assert_eq!(body.len(), bytes, "{key} was served another event's video");
+
+            // Only the movement event has a filmstrip; the continuous chunk's
+            // frame 0 does not exist, and must not resolve to the movement's.
+            let frame = reqwest::get(format!("{events}/filmstrip/0")).await.unwrap();
+            match event_type {
+                EventType::Movement => {
+                    assert_eq!(frame.status(), reqwest::StatusCode::OK, "{key}");
+                    assert_eq!(frame.bytes().await.unwrap().as_ref(), [0xaa]);
+                }
+                _ => assert_eq!(frame.status(), reqwest::StatusCode::NOT_FOUND, "{key}"),
+            }
+        }
+
+        // A key nothing is stored under is a 404 — including the third type at
+        // a start two other events do hold.
+        let missing = EventRef::new(start, 2000, EventType::Object);
+        let status = reqwest::get(format!(
+            "{base}/api/cameras/cam/events/{missing}/playlist.m3u8"
+        ))
+        .await
+        .unwrap()
+        .status();
+        assert_eq!(status, reqwest::StatusCode::NOT_FOUND);
+
+        // A segment that is not a key at all is a 400, as an unparseable start
+        // PTS was — the bare start PTS these routes used to take included.
+        for bad in [
+            start.to_string(),
+            format!("{start}_2000"),
+            format!("{start}_2000_movements"),
+            "nonsense".to_string(),
+        ] {
+            let status = reqwest::get(format!("{base}/api/cameras/cam/events/{bad}/playlist.m3u8"))
+                .await
+                .unwrap()
+                .status();
+            assert_eq!(status, reqwest::StatusCode::BAD_REQUEST, "{bad}");
         }
     }
 

@@ -386,10 +386,10 @@ url = "rtsp://admin:password@192.168.1.100:554/stream1"
 | `GET` | `/api/cameras/{id}/detections/{id}/frame` | JPEG frame of detection |
 | `GET` | `/api/cameras/{id}/hot-events` | Hot buffer motion events |
 | `GET` | `/api/cameras/{id}/events` | Warm events overlapping a time range (`from`, `to`) |
-| `GET` | `/api/cameras/{id}/events/{pts}/playlist.m3u8` | Warm event HLS playlist |
-| `GET` | `/api/cameras/{id}/events/{pts}/segment` | Warm event HLS segment |
-| `GET` | `/api/cameras/{id}/events/{pts}/thumbnail` | Warm event thumbnail JPEG |
-| `GET` | `/api/cameras/{id}/events/{pts}/filmstrip/{index}` | Filmstrip frame JPEG |
+| `GET` | `/api/cameras/{id}/events/{event}/playlist.m3u8` | Warm event HLS playlist |
+| `GET` | `/api/cameras/{id}/events/{event}/segment` | Warm event HLS segment |
+| `GET` | `/api/cameras/{id}/events/{event}/thumbnail` | Warm event thumbnail JPEG |
+| `GET` | `/api/cameras/{id}/events/{event}/filmstrip/{index}` | Filmstrip frame JPEG |
 | `GET` | `/api/cameras/{id}/detection-debug` | Detection debug entries |
 | `GET` | `/api/cameras/{id}/detection-debug/{id}/frame/{index}` | Detection debug frame JPEG |
 | `GET` | `/api/cameras/{id}/detection-debug/{id}/full-frame` | Detection debug full frame JPEG |
@@ -397,6 +397,8 @@ url = "rtsp://admin:password@192.168.1.100:554/stream1"
 Every route above sits behind `[http] token` when one is set: a request without it answers `401` with `WWW-Authenticate: Bearer`. Only `/api` is covered — the UI shell (`/`) and its assets stay open so the token prompt can load. A GET may carry the token as `?token=` instead of the header; a `PUT` may not.
 
 `{stage}` on the motion-map route names one of the detector's pipeline stages: `stability` (the final motion mask, after component filtering), `raw` (the raw MOG2 foreground mask), `no-shadow` (an alias of the raw mask, kept from when a shadow stage existed), `morph` (after morphological opening) and `background` (the learned background model). A stage that has not been published yet, or a name that is not one of these, answers `404`. Each stage costs a JPEG encode per camera on every analysis pass, so they are only produced while they are being asked for: a stage that has not been requested for half a minute stops being encoded, and the view left behind expires with it rather than being served as if it were live. The first request after such a pause therefore answers `404`, and is also what starts production again — polling, which the debug UI does every five seconds, fills the view in on the next pass.
+
+`{event}` on the four warm-event routes is one event's key: `{start_pts_ns}_{duration_ms}_{event_type}`, e.g. `81234000000_5200_movement`, with the three fields spelled exactly as the event listing sends them. All three are needed because a start PTS on its own names more than one recording — a motion event and the continuous chunk covering it begin on the same keyframe — and picking one of them for the caller would serve the wrong footage under the right link. A segment that is not a key answers `400`; a key nothing is stored under answers `404`. The local-disk backend matches all three fields; the remote (stathost) backend matches the start and duration and ignores the type, because there an event keeps its objects when it is reclassified, so a link taken before an upgrade still plays afterwards.
 
 `from` and `to` on the event query are wall-clock nanoseconds, and either may be left out (an omitted `from` reaches back to the start of the archive, an omitted `to` runs to the end). The range is matched by **overlap**, so an event that started before `from` and is still running inside it is returned; that is how a long continuous chunk shows up in a window it merely spans. A range with `from` greater than `to` answers `400` rather than guessing at what was meant.
 

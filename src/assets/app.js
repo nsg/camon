@@ -140,7 +140,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     let isAtLiveEdge = true;
 
     // Warm events (shared between views 2 & 3). `eventChains` maps an event's
-    // start_pts_ns to its place in a chain of `continues` chunks; see
+    // key (see eventKey) to its place in a chain of `continues` chunks; see
     // buildEventChains.
     let warmEvents = [];
     let eventChains = new Map();
@@ -148,7 +148,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     let eventsScrollDay = null;
 
     // Playback state
-    let currentPlaybackPts = null;
+    let currentPlaybackKey = null;
     let playbackAnimationId = null;
     let isScrubbing = false;
 
@@ -290,16 +290,19 @@ document.addEventListener('DOMContentLoaded', async () => {
     function router() {
         const hash = window.location.hash || '#/';
 
-        // #/camera/{id}/events/{pts}
-        const playbackMatch = hash.match(/^#\/camera\/(.+)\/events\/(\d+)$/);
+        // #/camera/{id}/events/{key}, where {key} is an event key (see eventKey).
+        // The type part is matched loosely, the way the event list already
+        // tolerates a type it has no label for: a newer server's spelling should
+        // still route to playback and let the server answer.
+        const playbackMatch = hash.match(/^#\/camera\/(.+)\/events\/(\d+_\d+_[a-z0-9-]+)$/);
         if (playbackMatch) {
             const cameraId = decodeURIComponent(playbackMatch[1]);
-            const pts = playbackMatch[2];
+            const key = playbackMatch[2];
             if (cameras.includes(cameraId)) {
-                const targetView = `playback:${cameraId}:${pts}`;
+                const targetView = `playback:${cameraId}:${key}`;
                 if (currentView !== targetView) {
                     const isBack = currentView && currentView.startsWith('playback:');
-                    withViewTransition(() => showPlaybackView(cameraId, pts), isBack);
+                    withViewTransition(() => showPlaybackView(cameraId, key), isBack);
                     currentView = targetView;
                 }
                 return;
@@ -602,16 +605,16 @@ document.addEventListener('DOMContentLoaded', async () => {
     });
 
     prevEventBtn.addEventListener('click', () => {
-        const nav = getAdjacentEvents(currentPlaybackPts);
+        const nav = getAdjacentEvents(currentPlaybackKey);
         if (nav.prev) {
-            window.location.hash = `/camera/${encodeURIComponent(currentDetailCameraId)}/events/${nav.prev.start_pts_ns}`;
+            window.location.hash = `/camera/${encodeURIComponent(currentDetailCameraId)}/events/${nav.prev.key}`;
         }
     });
 
     nextEventBtn.addEventListener('click', () => {
-        const nav = getAdjacentEvents(currentPlaybackPts);
+        const nav = getAdjacentEvents(currentPlaybackKey);
         if (nav.next) {
-            window.location.hash = `/camera/${encodeURIComponent(currentDetailCameraId)}/events/${nav.next.start_pts_ns}`;
+            window.location.hash = `/camera/${encodeURIComponent(currentDetailCameraId)}/events/${nav.next.key}`;
         }
     });
 
@@ -712,7 +715,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         renderEventList();
     }
 
-    function showPlaybackView(cameraId, pts) {
+    function showPlaybackView(cameraId, key) {
         cleanupDebugView();
 
         // Ensure warm events are available
@@ -726,10 +729,10 @@ document.addEventListener('DOMContentLoaded', async () => {
 
         hideAllViews();
         playbackView.hidden = false;
-        currentPlaybackPts = pts;
+        currentPlaybackKey = key;
 
         // Find the event
-        const ev = warmEvents.find(e => e.start_pts_ns === pts);
+        const ev = warmEvents.find(e => e.key === key);
         if (ev) {
             const evDate = new Date(ev.start_ms);
             const timeStr = evDate.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
@@ -738,7 +741,7 @@ document.addEventListener('DOMContentLoaded', async () => {
             playbackEventInfo.textContent = 'Event';
         }
 
-        loadPlaybackVideo(cameraId, pts);
+        loadPlaybackVideo(cameraId, key);
         updatePlaybackNav();
     }
 
@@ -810,7 +813,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         }
         if (playbackHls) { playbackHls.destroy(); playbackHls = null; }
         playbackVideo.src = '';
-        currentPlaybackPts = null;
+        currentPlaybackKey = null;
         isScrubbing = false;
         playbackScrubber.value = 0;
         playbackProgressFill.style.width = '0%';
@@ -921,8 +924,8 @@ document.addEventListener('DOMContentLoaded', async () => {
         }
     }
 
-    function loadPlaybackVideo(cameraId, pts) {
-        const src = `api/cameras/${encodeURIComponent(cameraId)}/events/${pts}/playlist.m3u8`;
+    function loadPlaybackVideo(cameraId, key) {
+        const src = `api/cameras/${encodeURIComponent(cameraId)}/events/${key}/playlist.m3u8`;
 
         if (playbackHls) { playbackHls.destroy(); playbackHls = null; }
         playbackLoading.hidden = false;
@@ -1431,6 +1434,23 @@ document.addEventListener('DOMContentLoaded', async () => {
         });
     }
 
+    // The key that identifies one stored event, everywhere: in the playback
+    // route, in the chain map, and in every event URL the server answers.
+    //
+    // A start PTS alone identifies nothing — two recordings can begin on the
+    // same keyframe (a motion event and the continuous chunk covering it), and
+    // asking for one of them by start used to serve whichever the server found
+    // first. So the key carries the duration and the type as well, in the
+    // spelling the API uses: `{start_pts_ns}_{duration_ms}_{event_type}`.
+    //
+    // Built by string concatenation, never by arithmetic: `start_pts_ns` arrives
+    // as a JSON string because nanoseconds since the epoch are past the range
+    // Number holds exactly, and a key that had been through Number would name an
+    // event the server does not have.
+    function eventKey(ev) {
+        return `${ev.start_pts_ns}_${ev.duration_ms}_${ev.event_type}`;
+    }
+
     function fetchWarmEvents(cameraId) {
         if (warmEventPoller) warmEventPoller.stop();
         warmEventPoller = startPoller('warm events', 15000, async (signal) => {
@@ -1439,6 +1459,7 @@ document.addEventListener('DOMContentLoaded', async () => {
             const raw = await response.json();
             warmEvents = raw.map(ev => ({
                 ...ev,
+                key: eventKey(ev),
                 start_ms: Number(BigInt(ev.start_pts_ns) / 1_000_000n),
             }));
             eventChains = buildEventChains(warmEvents);
@@ -1677,7 +1698,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     const CHUNK_GAP_TOLERANCE_MS = 2000;
 
     function buildEventChains(events) {
-        // start_pts_ns -> { part, headKnown }
+        // event key -> { part, headKnown }
         const chains = new Map();
         const ascending = [...events].sort((a, b) => a.start_ms - b.start_ms);
         let run = [];
@@ -1688,7 +1709,7 @@ document.addEventListener('DOMContentLoaded', async () => {
             // that they carry one on. A run with its head intact can be counted
             // forward, but never totalled: the recording may still be growing.
             const headKnown = run.length > 0 && !run[0].continues;
-            run.forEach((ev, i) => chains.set(ev.start_pts_ns, {
+            run.forEach((ev, i) => chains.set(ev.key, {
                 part: i + 1,
                 length: run.length,
                 headKnown,
@@ -1711,7 +1732,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     // surviving chunk would claim a position in the recording that it does not
     // have, and would change on every retention sweep.
     function chainPartLabel(ev) {
-        const chain = eventChains.get(ev.start_pts_ns);
+        const chain = eventChains.get(ev.key);
         if (!chain) return '';
         if (!chain.headKnown) return ' · continued';
         return chain.length > 1 ? ` · part ${chain.part}` : '';
@@ -1721,7 +1742,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     // of that recording is on screen, or because it continues one that has been
     // pruned away.
     function isChunkOfRun(ev) {
-        const chain = eventChains.get(ev.start_pts_ns);
+        const chain = eventChains.get(ev.key);
         return !!chain && (chain.length > 1 || !chain.headKnown);
     }
 
@@ -1779,7 +1800,7 @@ document.addEventListener('DOMContentLoaded', async () => {
                 // continues the one below it.
                 if (isChunkOfRun(ev)) item.classList.add('chain-part');
 
-                const thumbSrc = authUrl(`api/cameras/${encodeURIComponent(currentDetailCameraId)}/events/${ev.start_pts_ns}/thumbnail`);
+                const thumbSrc = authUrl(`api/cameras/${encodeURIComponent(currentDetailCameraId)}/events/${ev.key}/thumbnail`);
                 const evDate = new Date(ev.start_ms);
                 const timeStr = evDate.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
                 const durSec = (ev.duration_ms / 1000).toFixed(1);
@@ -1801,7 +1822,7 @@ document.addEventListener('DOMContentLoaded', async () => {
                 if (ev.filmstrip_frames > 0) {
                     const cid = encodeURIComponent(currentDetailCameraId);
                     thumbHtml = `<div class="event-filmstrip">` +
-                        Array.from({ length: ev.filmstrip_frames }, (_, i) => `<img class="filmstrip-frame" src="${esc(authUrl(`api/cameras/${cid}/events/${ev.start_pts_ns}/filmstrip/${i}`))}" loading="lazy" alt="" onerror="this.style.display='none'">`).join('') +
+                        Array.from({ length: ev.filmstrip_frames }, (_, i) => `<img class="filmstrip-frame" src="${esc(authUrl(`api/cameras/${cid}/events/${ev.key}/filmstrip/${i}`))}" loading="lazy" alt="" onerror="this.style.display='none'">`).join('') +
                         `</div>`;
                 } else {
                     thumbHtml = `<img class="event-list-thumb" src="${esc(thumbSrc)}" loading="lazy" alt="">`;
@@ -1828,7 +1849,7 @@ document.addEventListener('DOMContentLoaded', async () => {
                 `;
 
                 item.addEventListener('click', () => {
-                    window.location.hash = `/camera/${encodeURIComponent(currentDetailCameraId)}/events/${ev.start_pts_ns}`;
+                    window.location.hash = `/camera/${encodeURIComponent(currentDetailCameraId)}/events/${ev.key}`;
                 });
 
                 groupEl.appendChild(item);
@@ -1866,10 +1887,10 @@ document.addEventListener('DOMContentLoaded', async () => {
         update();
     }
 
-    function getAdjacentEvents(pts) {
+    function getAdjacentEvents(key) {
         // Sort events by time descending (newest first) to match event list order
         const sorted = [...warmEvents].sort((a, b) => b.start_ms - a.start_ms);
-        const idx = sorted.findIndex(e => e.start_pts_ns === pts);
+        const idx = sorted.findIndex(e => e.key === key);
         return {
             prev: idx > 0 ? sorted[idx - 1] : null,
             next: idx >= 0 && idx < sorted.length - 1 ? sorted[idx + 1] : null,
@@ -1877,13 +1898,13 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
 
     function updatePlaybackNav() {
-        const nav = getAdjacentEvents(currentPlaybackPts);
+        const nav = getAdjacentEvents(currentPlaybackKey);
 
         if (nav.prev) {
             prevEventBtn.hidden = false;
             const prevDate = new Date(nav.prev.start_ms);
             prevEventText.textContent = prevDate.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-            prevEventThumb.src = authUrl(`api/cameras/${encodeURIComponent(currentDetailCameraId)}/events/${nav.prev.start_pts_ns}/thumbnail`);
+            prevEventThumb.src = authUrl(`api/cameras/${encodeURIComponent(currentDetailCameraId)}/events/${nav.prev.key}/thumbnail`);
         } else {
             prevEventBtn.hidden = true;
         }
@@ -1892,7 +1913,7 @@ document.addEventListener('DOMContentLoaded', async () => {
             nextEventBtn.hidden = false;
             const nextDate = new Date(nav.next.start_ms);
             nextEventText.textContent = nextDate.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-            nextEventThumb.src = authUrl(`api/cameras/${encodeURIComponent(currentDetailCameraId)}/events/${nav.next.start_pts_ns}/thumbnail`);
+            nextEventThumb.src = authUrl(`api/cameras/${encodeURIComponent(currentDetailCameraId)}/events/${nav.next.key}/thumbnail`);
         } else {
             nextEventBtn.hidden = true;
         }

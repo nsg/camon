@@ -7,7 +7,7 @@ use std::path::PathBuf;
 
 use crate::storage::event_index::{
     deduplicate_detections, evict_tiers, sweep_expired, DetectionDetail, EmergencyOutcome,
-    EventIndex, EventType, EvictionPolicy, Removal, WarmEventEntry,
+    EventIndex, EventRef, EventType, EvictionPolicy, Removal, WarmEventEntry,
 };
 
 /// Local disk's event identity: `{data_dir}/{camera}/{event_type}/{start_pts_ns}_{duration_ms}.ts`
@@ -15,6 +15,12 @@ use crate::storage::event_index::{
 /// [`EventIdentity`](crate::storage::event_index::EventIdentity) for why the
 /// remote backend spells this differently.
 type EventKey = (u64, EventType, u32);
+
+/// What an API request ([`EventRef`]) names here: all three fields, because all
+/// three are in the path of the file it asks for.
+fn event_key(event: EventRef) -> EventKey {
+    (event.start_pts_ns, event.event_type, event.duration_ms)
+}
 
 pub struct WarmEventIndex {
     events: EventIndex<EventKey>,
@@ -279,8 +285,8 @@ impl WarmEventIndex {
         self.events.newest_event_end_ns(camera_id)
     }
 
-    pub fn find_event(&self, camera_id: &str, start_pts_ns: u64) -> Option<WarmEventEntry> {
-        self.events.find(camera_id, start_pts_ns)
+    pub fn find_event(&self, camera_id: &str, event: EventRef) -> Option<WarmEventEntry> {
+        self.events.find(camera_id, event_key(event))
     }
 
     /// Apply the post-hoc movement→object upgrade to the indexed entry.
@@ -513,7 +519,6 @@ pub(crate) fn wall_clock_ns() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::event_index::EventIdentity;
 
     fn write_event_files(dir: &std::path::Path, subdir: &str, stem: &str, sidecar: Option<&str>) {
         let d = dir.join("cam").join(subdir);
@@ -657,17 +662,23 @@ mod tests {
         let events = entries(&index);
         assert_eq!(events.len(), 3);
 
-        let movement_chunk = index.find_event("cam", 1000).unwrap();
+        let movement_chunk = index
+            .find_event("cam", EventRef::new(1000, 5000, EventType::Movement))
+            .unwrap();
         // Type comes from the directory, not the sidecar presence.
         assert_eq!(movement_chunk.event_type, EventType::Movement);
         assert!(movement_chunk.continues);
         assert!(movement_chunk.object_classes.is_empty());
 
-        let plain = index.find_event("cam", 2000).unwrap();
+        let plain = index
+            .find_event("cam", EventRef::new(2000, 5000, EventType::Movement))
+            .unwrap();
         assert_eq!(plain.event_type, EventType::Movement);
         assert!(!plain.continues);
 
-        let object_chunk = index.find_event("cam", 3000).unwrap();
+        let object_chunk = index
+            .find_event("cam", EventRef::new(3000, 5000, EventType::Object))
+            .unwrap();
         assert_eq!(object_chunk.event_type, EventType::Object);
         assert!(object_chunk.continues);
         assert_eq!(object_chunk.detections.len(), 1);
@@ -689,10 +700,14 @@ mod tests {
         let index = WarmEventIndex::new(&["cam".to_string()], dir.path().to_path_buf());
         index.scan();
 
-        let first = index.find_event("cam", 1000).unwrap();
+        let first = index
+            .find_event("cam", EventRef::new(1000, 5000, EventType::Continuous))
+            .unwrap();
         assert_eq!(first.event_type, EventType::Continuous);
         assert!(!first.continues);
-        let follow = index.find_event("cam", 2000).unwrap();
+        let follow = index
+            .find_event("cam", EventRef::new(2000, 5000, EventType::Continuous))
+            .unwrap();
         assert_eq!(follow.event_type, EventType::Continuous);
         assert!(follow.continues);
         // Continuous chunks resolve back into continuous/.
@@ -745,7 +760,12 @@ mod tests {
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].event_type, EventType::Movement);
         // The continuous file and its in-memory entry are both gone.
-        assert!(index.find_event("cam", continuous_pts).is_none());
+        assert!(index
+            .find_event(
+                "cam",
+                EventRef::new(continuous_pts, 5000, EventType::Continuous)
+            )
+            .is_none());
         assert!(!dir
             .path()
             .join("cam")
@@ -1133,15 +1153,18 @@ mod tests {
                 delete_failed: false,
             },
         );
-        let snapshot_key = EventKey::of(&index.find_event("cam", 1000).unwrap());
+        let snapshot = EventRef::new(1000, 5000, EventType::Movement);
+        assert!(index.find_event("cam", snapshot).is_some());
 
         index.update_event("cam", 1000, 5000, |e| e.event_type = EventType::Object);
 
-        let after = EventKey::of(&index.find_event("cam", 1000).unwrap());
-        assert_ne!(
-            snapshot_key, after,
+        assert!(
+            index.find_event("cam", snapshot).is_none(),
             "an upgraded event would be unindexed by the sweep it raced"
         );
+        assert!(index
+            .find_event("cam", EventRef::new(1000, 5000, EventType::Object))
+            .is_some());
     }
 
     #[tokio::test]
@@ -1369,7 +1392,9 @@ mod tests {
         );
         let index = WarmEventIndex::new(&["cam".to_string()], dir.path().to_path_buf());
         index.scan();
-        let e = index.find_event("cam", 1000).unwrap();
+        let e = index
+            .find_event("cam", EventRef::new(1000, 5000, EventType::Object))
+            .unwrap();
         assert!(!e.continues);
         assert_eq!(e.object_classes, vec!["car".to_string()]);
     }
