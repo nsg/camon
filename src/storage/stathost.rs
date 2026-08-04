@@ -69,16 +69,33 @@
 //!   the type is a directory, has to match all three.
 //! * **Metadata whose video never landed is collected at startup.** Nothing
 //!   else can: the index walks `.ts` objects, and an event's siblings are only
-//!   deleted with it. See [`StathostBackend::sweep_orphaned_metadata`].
+//!   deleted with it. See [`StathostBackend::sweep_orphaned_metadata`], and
+//!   [`ScanKind`] for why only the *startup* scan may do this.
 //! * **An unreadable sidecar is not a movement event.** The scan applies the
 //!   movement default only to a *confirmed* 404; anything else — a transport
 //!   failure, unparsable bytes, valid JSON naming no type — leaves the type
 //!   unknown. Such an event is still indexed and served, but every decision
 //!   that would need its type errs toward keeping it: age-based pruning
 //!   measures it against the longest configured retention, and budget eviction
-//!   tiers it with the objects. The prune tick re-reads its sidecar, which is
-//!   the only in-process retry there is — [`scan`](StathostBackend::scan) runs
-//!   once at startup.
+//!   tiers it with the objects. The prune tick re-reads its sidecar, one of the
+//!   two things it retries; the other is the scan itself.
+//! * **An index that has never been rebuilt is not an empty archive.** In RAM
+//!   the two are the same object and to retention they are opposite
+//!   instructions: on an empty archive there is nothing to prune, no bytes
+//!   against the budget and no orphan to collect, while on an unknown one every
+//!   such conclusion is a guess made against footage that is still there and
+//!   still growing. A listing that fails at startup — a boot-time network race
+//!   is enough, the unit only orders after `network.target` — must therefore not
+//!   read as "the store is empty". So the scan is retried ([`SCAN_RETRY`]) on a
+//!   deadline ([`SCAN_LISTING_BUDGET`], because startup is time nothing is
+//!   recording), and until one of those attempts walks a listing to the end the
+//!   backend is *un-scanned*: retention, the byte budget and the orphan sweep
+//!   refuse to run and say so, writes and reads carry on, and the retention tick
+//!   keeps retrying the scan until it heals. Success is sticky — the state means
+//!   "never rebuilt", not "the last request failed" — see
+//!   [`StathostBackend::scanned_events`]. A healing scan is the one scan that is
+//!   not the only writer of the index, so it yields to what the live write path
+//!   has already put there ([`ScanKind::Heal`]).
 //! * **The startup scan fans out.** It blocks startup by design — the index,
 //!   the byte budget and the orphan sweep's safety all depend on it finishing
 //!   before the first camera writes — and it needs one sidecar GET per stored
@@ -105,7 +122,8 @@ use serde::Deserialize;
 use crate::buffer::warm::{EventUpgrade, FinishedEvent};
 use crate::buffer::GopSegment;
 use crate::config::StathostConfig;
-use crate::locks::LockExt;
+use crate::locks::{LockExt, MutexExt};
+use crate::retry::{jittered, RetrySchedule, Streak};
 use crate::storage::backend::{
     RangeRequest, ServedRange, ThumbnailError, VideoStream, WarmStorageBackend, WriteOutcome,
 };
@@ -155,16 +173,19 @@ const UPLOAD_TIMEOUT: Duration = Duration::from_secs(300);
 /// harmless here because a ranged GET carries no request body.
 const STREAM_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// How many requests [`StathostBackend::scan`] keeps in flight — its sidecar
-/// reads, and the orphan sweep's probes and deletes.
+/// How many requests a [`scan`](StathostBackend::scan) keeps in flight — its
+/// sidecar reads, and the orphan sweep's probes and deletes.
 ///
-/// The scan is awaited by `init_storage` *before* the first camera is spawned,
-/// so every round trip it makes is time nothing is recording. Its work is one
-/// small GET per stored event, and those are latency-bound rather than
+/// The startup scan is awaited by `init_storage` *before* the first camera is
+/// spawned, so every round trip it makes is time nothing is recording. Its work
+/// is one small GET per stored event, and those are latency-bound rather than
 /// bandwidth-bound — a sidecar is a few hundred bytes — so awaiting them one at
 /// a time makes startup a function of the archive's size: a bucket holding a
 /// few thousand events costs that many round trips, minutes of them on any link
 /// that is not a LAN. The per-request timeouts bound each one, not the total.
+/// (A heal costs no recording time — it runs on the retention task while the
+/// cameras are up — but it does compete with their uploads for the one host,
+/// which the same width suits.)
 ///
 /// 16 is sized against what the far end is. stathost is a small single-process
 /// static file host, typically the same box camon runs on or next to, and each
@@ -181,6 +202,133 @@ const STREAM_READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// under parallel load; serving static files has no such property.
 const SCAN_CONCURRENCY: usize = 16;
 
+/// How long a scan waits before asking the store again, and how far that wait
+/// grows: 2s, 4s, 8s, 16s — the four waits [`SCAN_ATTEMPTS`] leaves room for,
+/// the last of them the cap.
+///
+/// Jittered like every other retry here. Only one scan runs at a time in one
+/// process, so nothing of camon's own retries in lockstep with it; a rack of
+/// cameras coming back from one power cut is a fleet of camons listing one host
+/// at the same second, which is the same pile-up seen from the server's side.
+#[cfg(not(test))]
+const SCAN_RETRY: RetrySchedule = RetrySchedule {
+    start: Duration::from_secs(2),
+    max: Duration::from_secs(16),
+};
+/// Milliseconds under test: the tests here pin *how many* attempts are made and
+/// what state the failures leave behind, and neither needs the wall clock. The
+/// clock cannot be paused instead — these tests drive a real HTTP stub, and a
+/// paused runtime advances time while a request is in flight, which fires the
+/// request timeouts.
+#[cfg(test)]
+const SCAN_RETRY: RetrySchedule = RetrySchedule {
+    start: Duration::from_millis(1),
+    max: Duration::from_millis(4),
+};
+
+/// Listings one scan is worth before it gives up and leaves the backend
+/// un-scanned. Giving up is not the end of it: the retention tick starts the
+/// series again until one succeeds.
+const SCAN_ATTEMPTS: u32 = 5;
+
+/// Wall clock a *startup* scan may spend failing: listings that never arrived
+/// and the waits between them. Whichever runs out first — this or
+/// [`SCAN_ATTEMPTS`] — ends the series.
+///
+/// The attempt count alone bounds nothing worth bounding. A refused connection
+/// fails in a millisecond, so five of those cost the waits and nothing else; a
+/// host that accepts the connection and then says nothing — half-open link,
+/// wedged server, a firewall dropping instead of rejecting — costs a full
+/// [`REQUEST_TIMEOUT`] every time, and five of those is five minutes. Startup
+/// awaits this series *before any camera is spawned*, so five minutes of it is
+/// five minutes of a camera system recording nothing. That is worse than
+/// starting un-scanned, which costs retention until a tick heals it.
+///
+/// So it is a deadline: each attempt's listing gets what is left of it, and the
+/// series stops once it is spent. Startup is therefore dark for this long at
+/// worst, whatever the host does.
+///
+/// A heal has no deadline at all. Nothing is off the air while it runs — it is
+/// a background task, and shutdown stops it between requests — so its listings
+/// get the ordinary [`REQUEST_TIMEOUT`] each. That is also what keeps this
+/// deadline from becoming a trap: a bucket whose listing genuinely needs longer
+/// than startup was willing to wait is scanned by the first heal instead, a
+/// minute later. Truncating that one too would turn "slow store" into an
+/// un-scanned backend no restart could clear — the shape of fault this whole
+/// state machine exists to end.
+///
+/// The band between the two is a real gap, stated rather than papered over: an
+/// installation whose listing reliably takes between this and
+/// [`REQUEST_TIMEOUT`] never completes a *startup* scan, on any boot. Its index
+/// and its retention are healed a minute in and are no worse for it, but the
+/// orphan sweep is startup's alone — for the reason [`ScanKind`] gives — so
+/// that one installation never collects the metadata of uploads whose video
+/// failed, and accumulates it. Widening this constant to cover such a store
+/// would buy that back for the price of the same delay before every camera on
+/// every boot, which is the trade this number is.
+///
+/// Neither ceiling touches the indexing pass. Once a listing arrives it is
+/// walked to the end however long that takes: a half-built index is not a
+/// rebuilt one, so cutting it short would leave the backend un-scanned every
+/// time and never heal either.
+#[cfg(not(test))]
+const SCAN_LISTING_BUDGET: Duration = Duration::from_secs(45);
+/// Long enough under test that a series of fast refusals never runs into it
+/// (five of those cost about 15ms of waits), short enough that the test which
+/// pins the deadline against a listing that never answers finishes in it.
+#[cfg(test)]
+const SCAN_LISTING_BUDGET: Duration = Duration::from_millis(500);
+
+/// Which scan this is, and so whether it may collect orphaned metadata.
+///
+/// The orphan sweep asks "is there a `.ts` for this sidecar?" and deletes the
+/// metadata when the answer is no. That question only has an honest answer
+/// while nothing of this process's is mid-upload: the sidecar goes up *before*
+/// the video, so a camera uploading a large event looks exactly like an orphan
+/// for as long as the upload takes — up to [`UPLOAD_TIMEOUT`], not the one
+/// round trip the module header calls the residual race.
+#[derive(Clone, Copy, PartialEq)]
+enum ScanKind {
+    /// The scan `init_storage` awaits before the first camera is spawned.
+    /// Nothing of this process's can be in flight, so the sweep runs.
+    Startup,
+    /// A later attempt, from the retention tick, healing an un-scanned index
+    /// while cameras record. It rebuilds the index — which is what retention
+    /// was waiting for — and leaves orphaned metadata for the next startup,
+    /// which can tell an orphan from an upload in progress.
+    Heal,
+}
+
+/// Whether a scan pass got through everything its listing named.
+#[derive(Clone, Copy, PartialEq)]
+enum ScanPass {
+    /// The index now describes the store.
+    Complete,
+    /// Shutdown arrived part-way through the sidecar reads. The entries already
+    /// inserted are true — they came from the listing — but the archive was not
+    /// walked to the end, so the pass says nothing about what else is there.
+    Interrupted,
+}
+
+/// How often a wait between scan attempts looks up to see whether shutdown has
+/// been asked for. camon's shutdown is a raised `AtomicBool` and nothing else,
+/// so a long wait either polls it or ignores it; the retention task this can
+/// run on is joined rather than aborted, and every wait it sits through is the
+/// drain waiting too.
+const SHUTDOWN_POLL: Duration = Duration::from_millis(250);
+
+/// Sleep out `delay`, returning early if shutdown is asked for meanwhile.
+async fn sleep_unless_stopped(delay: Duration, stop: &impl Fn() -> bool) {
+    let deadline = tokio::time::Instant::now() + delay;
+    loop {
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if left.is_zero() || stop() {
+            return;
+        }
+        tokio::time::sleep(left.min(SHUTDOWN_POLL)).await;
+    }
+}
+
 /// The remote warm store: an HTTP client over the shared in-RAM index.
 pub struct StathostBackend {
     http: Http,
@@ -189,6 +337,18 @@ pub struct StathostBackend {
     /// it holds — the two cannot drift.
     max_stored_bytes: u64,
     events: EventIndex<EventKey>,
+    /// Whether [`Self::events`] has ever been rebuilt from what the store
+    /// actually holds. Set by the first scan that walks a listing to the end
+    /// and never cleared; read only through [`Self::scanned_events`], which
+    /// hands out the index itself so that a caller who must not act on an
+    /// un-scanned one cannot reach it without answering the question.
+    scanned: std::sync::atomic::AtomicBool,
+    /// How many times budget enforcement has refused to run because of that,
+    /// across every camera — the index it refuses on is one index, and so is
+    /// the budget. Enforcement is asked before every write, so the refusal is
+    /// reported on the widening schedule [`Streak`] exists for rather than once
+    /// per event.
+    budget_refusals: std::sync::Mutex<Streak>,
     /// Events whose sidecar the scan could not read, per camera. Their
     /// [`WarmEventEntry::event_type`] is a placeholder, not a fact — see
     /// [`Self::mark_unknown_type`]. This has no local-disk counterpart: there
@@ -219,6 +379,8 @@ impl StathostBackend {
             },
             max_stored_bytes: config.max_stored_bytes,
             events: EventIndex::new(camera_ids),
+            scanned: std::sync::atomic::AtomicBool::new(false),
+            budget_refusals: std::sync::Mutex::new(Streak::new()),
             unknown_type: camera_ids
                 .iter()
                 .map(|id| (id.clone(), RwLock::new(HashSet::new())))
@@ -228,6 +390,33 @@ impl StathostBackend {
 
     fn used(&self) -> u64 {
         self.events.used_bytes()
+    }
+
+    /// The index as retention may see it: `None` until a scan has rebuilt it
+    /// from the store.
+    ///
+    /// The gate hands back the index rather than answering a question about it,
+    /// so that the two paths which must not act on an un-scanned index —
+    /// [`WarmStorageBackend::prune`] and [`Self::enforce_budget`] — cannot
+    /// reach the events they would delete without going through it. The third
+    /// deleter, the orphan sweep, needs no gate here: it lives inside
+    /// [`Self::scan_once`] and runs only on the listing that pass just got,
+    /// which is a stronger guarantee than this one. Everything else (writes,
+    /// reads,
+    /// the API's queries) is correct either way and uses [`Self::events`]
+    /// directly: an event this process wrote is in there whether or not a scan
+    /// ever ran, and a query that can only offer this session's events is a
+    /// thin answer, not a wrong one. Deleting on that same index *is* wrong.
+    fn scanned_events(&self) -> Option<&EventIndex<EventKey>> {
+        self.scanned.load(Ordering::Acquire).then_some(&self.events)
+    }
+
+    /// Record that the index now describes the store. Sticky by design: a
+    /// transient failure of anything afterwards leaves this set, because the
+    /// question it answers is "has the archive ever been read", and the answer
+    /// to that cannot become no again.
+    fn mark_scanned(&self) {
+        self.scanned.store(true, Ordering::Release);
     }
 
     /// Record that this event's type could not be established. `event_type` on
@@ -249,10 +438,11 @@ impl StathostBackend {
             .is_some_and(|lock| lock.read_recover().contains(&key))
     }
 
-    /// Drop the marker once the type is settled. Only [`Self::scan`] ever sets
-    /// one, and it runs once per process, so in practice this fires where a
-    /// type becomes a fact — `write_event` and `upgrade_event`, neither of which
-    /// may leave a "type unknown" marker on an event it just proved.
+    /// Drop the marker once the type is settled. Only a scan ever sets one, and
+    /// scans are rare — one at startup, and one per retention tick for as long
+    /// as the startup one never got a listing — so in practice this fires where
+    /// a type becomes a fact: `write_event` and `upgrade_event`, neither of
+    /// which may leave a "type unknown" marker on an event it just proved.
     ///
     /// A marker for an event that has *left* the index is collected by
     /// [`Self::resolve_unknown_types`] on the next prune tick instead: removal
@@ -550,11 +740,11 @@ impl StathostBackend {
     /// Re-read the sidecars of events whose type an earlier scan could not
     /// establish, and index what they say.
     ///
-    /// [`WarmStorageBackend::scan`] runs exactly once per process, so without
-    /// this a hold would last until a restart however quickly the store
-    /// recovered. The scheduled sweep is the only place in-process where a
-    /// retry can happen at all; it costs one GET per held event, and a store
-    /// with nothing held issues none.
+    /// A scan re-reads every sidecar, but a scan only runs at startup and, for
+    /// as long as none of those has succeeded, once per retention tick — so on
+    /// a store whose index was built normally a hold would last until a restart
+    /// however quickly the store recovered. This is the retry, and it costs one
+    /// GET per held event: a store with nothing held issues none.
     async fn resolve_unknown_types(&self, camera_id: &str, cancel: &std::sync::atomic::AtomicBool) {
         let held: Vec<EventKey> = match self.unknown_type.get(camera_id) {
             Some(lock) => lock.read_recover().iter().copied().collect(),
@@ -587,6 +777,400 @@ impl StathostBackend {
         }
     }
 
+    /// Rebuild the index from the store, retrying a host that is not answering
+    /// yet.
+    ///
+    /// One failed listing used to be the whole story: the index stayed empty,
+    /// an empty index is exactly what an empty archive looks like, and so
+    /// retention found nothing to prune, the budget saw no bytes used and the
+    /// orphan sweep never ran — for the life of the process, cleared only by a
+    /// restart. The listing is a single request made at the one moment camon is
+    /// most likely to find the network still coming up, which is what these
+    /// attempts are for.
+    ///
+    /// Failing all of them is not fatal and does not stop startup: cameras
+    /// still record and still upload. What it costs is retention, and the
+    /// caller says so.
+    ///
+    /// Two things end the series short of success: for a startup scan
+    /// [`SCAN_LISTING_BUDGET`], which is what keeps a wedged host from holding
+    /// the cameras off the air, and for either kind `stop` — the shutdown flag
+    /// as the caller has it. Shutdown is checked before each attempt, during
+    /// each wait, and inside the indexing pass, so the drain waits for at most
+    /// the request already in flight rather than for the schedule or for an
+    /// archive's worth of round trips. What it does not do is interrupt a
+    /// request mid-flight: nothing here deletes, so an abandoned scan costs
+    /// requests and no consistency.
+    async fn scan_with_retries(
+        &self,
+        kind: ScanKind,
+        stop: impl Fn() -> bool,
+    ) -> std::io::Result<()> {
+        // Only startup is spending footage on this; a heal is a background task
+        // and takes the ordinary per-request ceiling instead.
+        let deadline = match kind {
+            ScanKind::Startup => Some(tokio::time::Instant::now() + SCAN_LISTING_BUDGET),
+            ScanKind::Heal => None,
+        };
+        let left = || {
+            deadline.map(|d: tokio::time::Instant| {
+                d.saturating_duration_since(tokio::time::Instant::now())
+            })
+        };
+        let mut delay = SCAN_RETRY.start;
+        let mut attempt = 1u32;
+        loop {
+            if stop() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "shutdown",
+                ));
+            }
+            // What is left of the budget is what this attempt's listing gets,
+            // so the series cannot outlast it by a whole request timeout. Never
+            // more than one request is worth either way: a listing is a large
+            // response and [`REQUEST_TIMEOUT`] is what one is allowed.
+            let listing_timeout = left().unwrap_or(REQUEST_TIMEOUT).min(REQUEST_TIMEOUT);
+            match self.scan_once(kind, &stop, listing_timeout).await {
+                Ok(ScanPass::Complete) => return Ok(()),
+                // Shutdown, part-way through indexing. Whatever was inserted
+                // stays — it came from the store and is true — but the index is
+                // not marked as describing it, so nothing prunes on a half of
+                // one and the next start scans again from scratch.
+                Ok(ScanPass::Interrupted) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Interrupted,
+                        "shutdown",
+                    ))
+                }
+                Err(e) => {
+                    // Decided before the wait rather than after it: a budget
+                    // with no room left for both the wait and the request it
+                    // leads to is spent, and issuing a listing on the remainder
+                    // only replaces this error with a timeout.
+                    let wait = jittered(delay);
+                    let spent = left().is_some_and(|left| wait >= left);
+                    if attempt >= SCAN_ATTEMPTS || spent || stop() {
+                        // No promise of a later scan on the way out at
+                        // shutdown: there is no later tick to make it.
+                        if stop() {
+                            tracing::info!(error = %e, attempts = attempt,
+                                "abandoning the stathost warm index scan for shutdown");
+                        } else {
+                            tracing::warn!(
+                                error = %e,
+                                attempts = attempt,
+                                gave_up_on_the_clock = spent,
+                                "could not list stathost: the warm index does not describe \
+                                 the store, so retention, the byte budget and the orphan \
+                                 sweep stay paused until a later scan succeeds"
+                            );
+                        }
+                        return Err(reqwest_io(e));
+                    }
+                    tracing::info!(
+                        error = %e,
+                        attempt,
+                        delay_ms = delay.as_millis() as u64,
+                        "stathost listing failed; retrying the warm index scan"
+                    );
+                    sleep_unless_stopped(wait, &stop).await;
+                    delay = SCAN_RETRY.next(delay);
+                    attempt += 1;
+                }
+            }
+        }
+    }
+
+    /// Raise an entry the heal yielded to from movement to object, when the
+    /// sidecar on the store says object and the index still says movement.
+    ///
+    /// This repairs a state only the store can report: an upgrade whose sidecar
+    /// `PUT` reported failure and committed anyway. `upgrade_event` gives up
+    /// before its own index update when the `PUT` errs — it cannot know the
+    /// origin took the bytes — so the store says object while RAM says
+    /// movement, and nothing in the process ever revisits it. Left alone, that
+    /// event expires on movement retention twelve days early, and budget
+    /// eviction, which evicts movements before objects, reaches for it first.
+    ///
+    /// Safe in both directions of the race [`insert_absent`] exists for, and
+    /// for the same reason: the type only ever moves one way. Object is
+    /// terminal — no same-identity re-write exists (each `FinishedEvent` is
+    /// written once, and the one write retry is on an outcome this backend
+    /// never returns) and `resolve_unknown_types` can never hold an object
+    /// entry (the marker is set only where the entry was just made a movement,
+    /// and every path that types the entry clears it). Anything that ever
+    /// re-writes an already-written stem as a movement breaks this and hands
+    /// the guard a stale classification to re-apply. So a sidecar reading
+    /// object is authoritative whichever process wrote it, while a sidecar
+    /// reading movement says nothing about an entry that may have been upgraded
+    /// since the read. The guard runs inside the index's write lock, so a live
+    /// upgrade is wholly before this or wholly after it: an entry already
+    /// upgraded in RAM keeps its own detections, which are the fresher ones.
+    ///
+    /// Only the type and what travels with it. Size and filmstrip count are
+    /// left exactly as [`insert_absent`] left them: a sidecar rewrite does not
+    /// touch the `.ts` or its thumbnails, so the listing has nothing newer to
+    /// say about either.
+    fn join_object_type(&self, camera_id: &str, key: EventKey, sidecar: &SidecarData) -> bool {
+        let joined = self
+            .events
+            .update(camera_id, key, |entry| {
+                if entry.event_type != EventType::Movement {
+                    return false;
+                }
+                // Mirrors `upgrade_event`'s index half, from the sidecar that
+                // upgrade wrote rather than from the upgrade it no longer has.
+                entry.event_type = EventType::Object;
+                entry.object_classes = sidecar.classes.clone();
+                entry.detections = sidecar.detections.clone();
+                entry.backend = sidecar.backend.clone();
+                entry.model = sidecar.model.clone();
+                entry.continues = sidecar.continues;
+                true
+            })
+            // `None` if the entry left the index between the yield and here.
+            .unwrap_or(false);
+        if joined {
+            // The type is a fact again, so no hold may outlive it — an earlier
+            // interrupted pass can have indexed this event with an unreadable
+            // sidecar and marked it.
+            self.clear_unknown_type(camera_id, key);
+        }
+        joined
+    }
+
+    /// One pass: list the bucket, index every `.ts` belonging to a camera this
+    /// process owns, and — at startup only, see [`ScanKind`] — collect metadata
+    /// whose video never landed.
+    ///
+    /// The listing failure is returned rather than logged and dropped. It is
+    /// the one error here that changes what the index *means*: everything below
+    /// it degrades one event (a sidecar that will not read leaves one type
+    /// unknown), while a listing that does not arrive leaves every event in the
+    /// archive unaccounted for, and only the caller can decide how long to keep
+    /// asking.
+    ///
+    /// `listing_timeout` is what the caller's schedule leaves this attempt (see
+    /// [`SCAN_LISTING_BUDGET`]); `stop` ends the pass between sidecar reads,
+    /// which on a large archive is the difference between a drain of seconds
+    /// and one of minutes.
+    async fn scan_once(
+        &self,
+        kind: ScanKind,
+        stop: &impl Fn() -> bool,
+        listing_timeout: Duration,
+    ) -> Result<ScanPass, reqwest::Error> {
+        let start = std::time::Instant::now();
+        let items = self.http.list(listing_timeout).await?;
+
+        // Full path set, so filmstrip frames can be counted without extra GETs.
+        let all_paths: HashSet<&str> = items.iter().map(|i| i.path.as_str()).collect();
+
+        // Everything the listing alone settles, in listing order. Only the
+        // sidecar reads below need the network.
+        let mut pending: Vec<ScannedEvent> = Vec::new();
+        for item in &items {
+            let Some((camera_id, stem)) = split_ts_key(&item.path) else {
+                continue;
+            };
+            if !self.events.owns_camera(camera_id) {
+                continue;
+            }
+            let Some((start_pts_ns, duration_ms)) = parse_event_filename(stem) else {
+                tracing::warn!(path = %item.path, "skipping stathost object with unparsable name");
+                continue;
+            };
+            if item.size == 0 {
+                tracing::warn!(path = %item.path,
+                    "zero-byte .ts on stathost (interrupted upload?)");
+            }
+            let mut filmstrip_frames = 0usize;
+            while all_paths
+                .contains(format!("{camera_id}/{stem}_thumb_{filmstrip_frames}.jpg").as_str())
+            {
+                filmstrip_frames += 1;
+            }
+            pending.push(ScannedEvent {
+                camera_id: camera_id.to_string(),
+                stem: stem.to_string(),
+                start_pts_ns,
+                duration_ms,
+                file_size: item.size,
+                filmstrip_frames,
+            });
+        }
+
+        let total = pending.len();
+        let mut unknown_type = 0usize;
+        let mut typeless = 0usize;
+
+        // `buffered`, not `buffer_unordered`: the reads overlap, but their
+        // results are handed back in listing order, so the index is built by
+        // exactly the sequence of insertions a serial scan made and the
+        // warnings below keep a stable order. Every insertion this pass makes
+        // happens here, on one task — the fan-out covers the request, not the
+        // index. Under [`ScanKind::Heal`] it is not the only writer, though:
+        // see the insert below.
+        let mut reads = futures_util::stream::iter(pending)
+            .map(|event| self.read_sidecar_for(event))
+            .buffered(SCAN_CONCURRENCY);
+
+        // Events this pass put in the index, events it found the live write
+        // path had already indexed better than a listing can, and — of those —
+        // the ones the store could still tell something about (heal only).
+        let mut indexed = 0usize;
+        let mut yielded = 0usize;
+        let mut joined = 0usize;
+
+        while let Some((event, read)) = reads.next().await {
+            // One archive's worth of round trips is a long time to hold a
+            // shutdown drain that is measured in one event's deletes, and an
+            // index nobody is going to use is not worth finishing.
+            if stop() {
+                tracing::info!(
+                    indexed,
+                    of = total,
+                    "stathost warm index scan stopped by shutdown; the index is not marked \
+                     as describing the store and the next start scans again"
+                );
+                return Ok(ScanPass::Interrupted);
+            }
+            // Only a confirmed absence means "movement" — that is the one event
+            // written without a sidecar. Concurrency does not touch this: the
+            // 404 that says "absent" and the error that says "could not find
+            // out" are both decided inside the one request they belong to.
+            let (sidecar, type_known) = match read {
+                SidecarRead::Parsed(s) => (Some(s), true),
+                SidecarRead::Absent => (None, true),
+                SidecarRead::Unreadable => (None, false),
+                SidecarRead::Typeless(s) => {
+                    // Deterministic, so no later scan will clear this by
+                    // itself: name the object so it can actually be fixed.
+                    tracing::warn!(path = %format_args!("{}/{}.ts", event.camera_id, event.stem),
+                        "stathost sidecar names no event type; retention falls back to the \
+                         longest configured age until the sidecar is repaired");
+                    typeless += 1;
+                    (Some(s), false)
+                }
+            };
+
+            let mut entry = WarmEventEntry {
+                start_pts_ns: event.start_pts_ns,
+                duration_ms: event.duration_ms,
+                event_type: EventType::Movement,
+                file_size: event.file_size,
+                object_classes: Vec::new(),
+                backend: None,
+                model: None,
+                detections: Vec::new(),
+                filmstrip_frames: event.filmstrip_frames,
+                continues: false,
+                recovered: false,
+                delete_failed: false,
+            };
+            apply_sidecar(&mut entry, sidecar.as_ref());
+            // A heal runs while the write path is live, and what the index
+            // already holds under this identity came from that path: an event
+            // this process uploaded, with a type an upgrade may have settled
+            // since, a size a rewrite may have changed, and thumbnails that may
+            // have landed after the listing was taken. All of that is fresher
+            // than a listing taken seconds ago and a sidecar read after it, so
+            // the rebuild yields to it — it is here for the events the index
+            // does *not* have. Overwriting instead put a stale movement entry
+            // over an upgraded one, which expires real object footage twelve
+            // days early with no unknown-type marker to repair it by, and
+            // reset filmstrip counts so the extra frames leaked on delete.
+            // The startup scan has no such rival — it is awaited before the
+            // first camera is spawned — and must overwrite, because the index
+            // it inherits from `write_event`'s own bookkeeping is nothing.
+            //
+            // Yielding leaves the rest of what the listing said about an event
+            // this process wrote unreconciled, deliberately: a size or a
+            // filmstrip count the index and the store disagree on is a
+            // disagreement the store cannot win, since the entry is newer than
+            // the listing. So is an event in neither the listing nor the index
+            // — a `.ts` whose upload reported failure and committed after the
+            // snapshot — which no pass of this scan can see at all. Both are
+            // the next startup's to settle, where the index starts empty and
+            // the listing is the only account there is.
+            let key = (event.start_pts_ns, event.duration_ms);
+            let landed = match kind {
+                ScanKind::Startup => {
+                    self.events.insert(&event.camera_id, entry);
+                    true
+                }
+                ScanKind::Heal => self.events.insert_absent(&event.camera_id, entry),
+            };
+            if !landed {
+                yielded += 1;
+                // The one thing a yielded entry can be behind on: see
+                // [`Self::join_object_type`].
+                if let Some(s) = sidecar
+                    .as_ref()
+                    .filter(|s| s.event_type == Some(EventType::Object))
+                {
+                    if self.join_object_type(&event.camera_id, key, s) {
+                        joined += 1;
+                    }
+                }
+                continue;
+            }
+            indexed += 1;
+            if !type_known {
+                self.mark_unknown_type(&event.camera_id, (event.start_pts_ns, event.duration_ms));
+                unknown_type += 1;
+            }
+        }
+
+        // Every event the listing named has been accounted for, so the index
+        // now describes the archive rather than merely this session's writes —
+        // the whole of what retention was waiting for. Only reached by a pass
+        // that ran to the end: an interrupted one returns above, before this.
+        self.mark_scanned();
+
+        if kind == ScanKind::Startup {
+            self.sweep_orphaned_metadata(&items, &all_paths).await;
+        }
+
+        if unknown_type > 0 {
+            tracing::warn!(
+                unknown_type,
+                typeless,
+                "events indexed without a known type: shown as movement but pruned on the \
+                 longest configured retention. `typeless` of them need their sidecar fixed; \
+                 the rest may resolve on a later start"
+            );
+        }
+        if joined > 0 {
+            tracing::warn!(
+                joined,
+                "stathost sidecars typed events this process still had as movements: an \
+                 upgrade's sidecar upload reported failure and had landed after all. Their \
+                 retention class is corrected; the failed upload was reported when it happened"
+            );
+        }
+        tracing::info!(
+            total_events = total,
+            // Both zero outside a heal: only there is anything else writing.
+            already_indexed = yielded,
+            retyped_from_store = joined,
+            elapsed_ms = start.elapsed().as_millis() as u64,
+            "stathost warm index scan complete"
+        );
+        if kind == ScanKind::Heal {
+            // At warn, like the refusals it ends: an operator who was shown the
+            // pause in a production log must be shown the recovery in the same
+            // one, or a fault that fixed itself reads as a fault that lasted.
+            tracing::warn!(
+                "stathost warm index rebuilt after an earlier scan failed; retention and the \
+                 byte budget resume. Metadata whose video never landed is left for the next \
+                 startup, when no upload of this process's can be mistaken for an orphan"
+            );
+        }
+        Ok(ScanPass::Complete)
+    }
+
     /// Enforce the client-side storage budget: while tracked usage exceeds
     /// `max_stored_bytes`, delete the oldest events cheapest-tier-first. No-op
     /// when the budget is unlimited.
@@ -594,12 +1178,40 @@ impl StathostBackend {
     /// This is the local low-space guard's counterpart, sharing its skeleton and
     /// differing only in [`EvictionPolicy`] — which is where the argument for
     /// stopping on a failure and demoting rather than excluding is written down.
+    ///
+    /// Both of its answers need an index that has seen the store. "Under
+    /// budget" measured against this session's writes alone is a fiction that
+    /// grows with the archive, and evicting on it would delete the newest
+    /// footage — the only footage the index knows — while everything older sits
+    /// there uncounted. So an un-scanned index refuses instead, and does not
+    /// try to heal itself: this runs ahead of every write, on the camera's own
+    /// writer task, and a retry schedule there would stall recording. The
+    /// retention tick does the healing.
     async fn enforce_budget(&self, camera_id: &str) {
-        if self.max_stored_bytes == 0 || self.used() <= self.max_stored_bytes {
+        // Nothing to enforce, and so nothing to refuse: an unlimited budget
+        // never evicts on any index.
+        if self.max_stored_bytes == 0 {
+            return;
+        }
+        let Some(events) = self.scanned_events() else {
+            // Counted and reported for the store, not for the camera that
+            // happened to ask: one index, one budget, one fault.
+            if let Some(refusals) = self.budget_refusals.lock_recover().record() {
+                tracing::warn!(
+                    refusals,
+                    max_stored_bytes = self.max_stored_bytes,
+                    "not enforcing the stathost byte budget: the warm index has never been \
+                     rebuilt from the store, so what is stored there is unknown and uploads \
+                     are running unbounded. Retention resumes when a scan succeeds"
+                );
+            }
+            return;
+        };
+        if self.used() <= self.max_stored_bytes {
             return;
         }
         let outcome = evict_tiers(
-            &self.events,
+            events,
             EvictionPolicy {
                 skip_failed: false,
                 stop_on_failure: true,
@@ -863,7 +1475,33 @@ impl WarmStorageBackend for StathostBackend {
         // able to sit on a request timeout, so shutdown gets checked between
         // events and between cameras — never part-way through an event.
         let stop = || cancel.load(Ordering::Relaxed);
-        for camera_id in self.events.camera_ids() {
+
+        // This tick is also what heals an index no scan has ever filled: the
+        // startup attempts are bounded, so without a retry here a store that
+        // came back a minute after boot would stay unpruned until the next
+        // restart. It runs before the sweep so a scan that succeeds is pruned
+        // in the same tick, and only while un-scanned — once the index
+        // describes the store, re-listing it every hour would be one large
+        // request an hour for nothing.
+        if self.scanned_events().is_none() && !stop() {
+            // Its own failure is already reported; here it only decides whether
+            // this tick has an index to sweep.
+            let _ = self.scan_with_retries(ScanKind::Heal, stop).await;
+        }
+        let Some(events) = self.scanned_events() else {
+            // Silent when it is shutdown that cut the scan short: there is no
+            // next tick to promise, and the next start says all of this again.
+            if !stop() {
+                tracing::warn!(
+                    "not pruning stathost: the warm index has never been rebuilt from the \
+                     store, so an empty index would be read as an empty archive and expired \
+                     footage is accumulating unseen. The next tick retries the scan"
+                );
+            }
+            return;
+        };
+
+        for camera_id in events.camera_ids() {
             if stop() {
                 break;
             }
@@ -873,7 +1511,7 @@ impl WarmStorageBackend for StathostBackend {
             // does not clear them, and nothing between here and there reads one.
             self.resolve_unknown_types(camera_id, cancel).await;
 
-            let expired = self.events.expired_for_sweep(camera_id, now_ns, |e| {
+            let expired = events.expired_for_sweep(camera_id, now_ns, |e| {
                 if self.has_unknown_type(camera_id, event_key(e)) {
                     unknown_max_age
                 } else {
@@ -884,11 +1522,10 @@ impl WarmStorageBackend for StathostBackend {
                 continue;
             }
 
-            let outcome =
-                sweep_expired(&self.events, camera_id, expired, stop, |entry| async move {
-                    self.delete_event_objects(camera_id, &entry).await
-                })
-                .await;
+            let outcome = sweep_expired(events, camera_id, expired, stop, |entry| async move {
+                self.delete_event_objects(camera_id, &entry).await
+            })
+            .await;
 
             if outcome.deleted > 0 {
                 tracing::info!(
@@ -928,124 +1565,14 @@ impl WarmStorageBackend for StathostBackend {
         }
     }
 
-    async fn scan(&self) {
-        let start = std::time::Instant::now();
-        let items = match self.http.list().await {
-            Ok(items) => items,
-            Err(e) => {
-                tracing::error!(error = %e, "stathost list failed; warm index left empty");
-                return;
-            }
-        };
-
-        // Full path set, so filmstrip frames can be counted without extra GETs.
-        let all_paths: HashSet<&str> = items.iter().map(|i| i.path.as_str()).collect();
-
-        // Everything the listing alone settles, in listing order. Only the
-        // sidecar reads below need the network.
-        let mut pending: Vec<ScannedEvent> = Vec::new();
-        for item in &items {
-            let Some((camera_id, stem)) = split_ts_key(&item.path) else {
-                continue;
-            };
-            if !self.events.owns_camera(camera_id) {
-                continue;
-            }
-            let Some((start_pts_ns, duration_ms)) = parse_event_filename(stem) else {
-                tracing::warn!(path = %item.path, "skipping stathost object with unparsable name");
-                continue;
-            };
-            if item.size == 0 {
-                tracing::warn!(path = %item.path,
-                    "zero-byte .ts on stathost (interrupted upload?)");
-            }
-            let mut filmstrip_frames = 0usize;
-            while all_paths
-                .contains(format!("{camera_id}/{stem}_thumb_{filmstrip_frames}.jpg").as_str())
-            {
-                filmstrip_frames += 1;
-            }
-            pending.push(ScannedEvent {
-                camera_id: camera_id.to_string(),
-                stem: stem.to_string(),
-                start_pts_ns,
-                duration_ms,
-                file_size: item.size,
-                filmstrip_frames,
-            });
-        }
-
-        let total = pending.len();
-        let mut unknown_type = 0usize;
-        let mut typeless = 0usize;
-
-        // `buffered`, not `buffer_unordered`: the reads overlap, but their
-        // results are handed back in listing order, so the index is built by
-        // exactly the sequence of insertions a serial scan made and the
-        // warnings below keep a stable order. Every insertion still happens
-        // here, on one task — the fan-out covers the request, not the index.
-        let mut reads = futures_util::stream::iter(pending)
-            .map(|event| self.read_sidecar_for(event))
-            .buffered(SCAN_CONCURRENCY);
-
-        while let Some((event, read)) = reads.next().await {
-            // Only a confirmed absence means "movement" — that is the one event
-            // written without a sidecar. Concurrency does not touch this: the
-            // 404 that says "absent" and the error that says "could not find
-            // out" are both decided inside the one request they belong to.
-            let (sidecar, type_known) = match read {
-                SidecarRead::Parsed(s) => (Some(s), true),
-                SidecarRead::Absent => (None, true),
-                SidecarRead::Unreadable => (None, false),
-                SidecarRead::Typeless(s) => {
-                    // Deterministic, so no later scan will clear this by
-                    // itself: name the object so it can actually be fixed.
-                    tracing::warn!(path = %format_args!("{}/{}.ts", event.camera_id, event.stem),
-                        "stathost sidecar names no event type; retention falls back to the \
-                         longest configured age until the sidecar is repaired");
-                    typeless += 1;
-                    (Some(s), false)
-                }
-            };
-
-            let mut entry = WarmEventEntry {
-                start_pts_ns: event.start_pts_ns,
-                duration_ms: event.duration_ms,
-                event_type: EventType::Movement,
-                file_size: event.file_size,
-                object_classes: Vec::new(),
-                backend: None,
-                model: None,
-                detections: Vec::new(),
-                filmstrip_frames: event.filmstrip_frames,
-                continues: false,
-                recovered: false,
-                delete_failed: false,
-            };
-            apply_sidecar(&mut entry, sidecar.as_ref());
-            self.events.insert(&event.camera_id, entry);
-            if !type_known {
-                self.mark_unknown_type(&event.camera_id, (event.start_pts_ns, event.duration_ms));
-                unknown_type += 1;
-            }
-        }
-
-        self.sweep_orphaned_metadata(&items, &all_paths).await;
-
-        if unknown_type > 0 {
-            tracing::warn!(
-                unknown_type,
-                typeless,
-                "events indexed without a known type: shown as movement but pruned on the \
-                 longest configured retention. `typeless` of them need their sidecar fixed; \
-                 the rest may resolve on a later start"
-            );
-        }
-        tracing::info!(
-            total_events = total,
-            elapsed_ms = start.elapsed().as_millis() as u64,
-            "stathost warm index scan complete"
-        );
+    async fn scan(&self) -> std::io::Result<()> {
+        // Nothing of this process's is recording yet, so this is the one scan
+        // that may also collect orphans — and the one whose failures are paid
+        // for in footage nobody records, which is what bounds the series by the
+        // clock. Nothing to consult about shutdown this early either: the
+        // signal handlers are registered once startup is done, so until this
+        // returns a SIGTERM is the default action and there is no drain.
+        self.scan_with_retries(ScanKind::Startup, || false).await
     }
 
     fn recover_orphans(&self) {
@@ -1340,11 +1867,16 @@ impl Http {
     /// List every object in the bucket via the detailed listing
     /// (stathost >= 0.2.0). No fallback: an unexpected response shape is an
     /// error, surfaced by the caller.
-    async fn list(&self) -> Result<Vec<ListEntry>, reqwest::Error> {
+    ///
+    /// The one request here whose ceiling is the caller's rather than
+    /// [`REQUEST_TIMEOUT`]: the scan retries this call, and what has to be
+    /// bounded is the series rather than any one attempt in it. See
+    /// [`SCAN_LISTING_BUDGET`].
+    async fn list(&self, timeout: Duration) -> Result<Vec<ListEntry>, reqwest::Error> {
         self.client
             .get(format!("{}/_meta/list?detail=true", self.base))
             .bearer_auth(&self.token)
-            .timeout(REQUEST_TIMEOUT)
+            .timeout(timeout)
             .send()
             .await?
             .error_for_status()?
@@ -1503,6 +2035,17 @@ mod tests {
         /// Paths that appear the instant after a listing is served: an upload
         /// committing while a scan walks the snapshot it took.
         commit_after_list: Arc<Mutex<Vec<String>>>,
+        /// Listings still to be refused with a `500` before the store starts
+        /// answering — a host that is not up yet.
+        list_failures: Arc<AtomicUsize>,
+        /// Latency added to every listing. A value larger than any timeout is a
+        /// host that accepted the connection and then said nothing, which is
+        /// the failure that costs a whole request timeout rather than a
+        /// millisecond.
+        list_delay_ms: Arc<AtomicU64>,
+        /// Listings asked for, refusals included: how many times the client
+        /// came back.
+        lists: Arc<AtomicUsize>,
         /// Every GET path served, in arrival order — what a caller asked for,
         /// and how many times.
         gets: Arc<Mutex<Vec<String>>>,
@@ -1540,6 +2083,31 @@ mod tests {
         fn clear_faults(&self) {
             *self.put_fault.lock().unwrap() = None;
             *self.fail_get_suffix.lock().unwrap() = None;
+        }
+
+        /// Refuse the next `n` listings. A whole scan's worth of them is the
+        /// boot-time race the un-scanned state exists for: the store is not
+        /// answering yet, and everything else the client does still works.
+        fn fail_next_lists(&self, n: usize) {
+            self.list_failures.store(n, Ordering::SeqCst);
+        }
+
+        /// The store comes back.
+        fn serve_lists_again(&self) {
+            self.list_failures.store(0, Ordering::SeqCst);
+        }
+
+        /// Answer listings this slowly. With a delay longer than any timeout
+        /// the client is willing to wait, this is the host that accepts a
+        /// connection and then goes quiet — the failure that costs a whole
+        /// request timeout instead of a millisecond.
+        fn hang_lists(&self, delay: Duration) {
+            self.list_delay_ms
+                .store(delay.as_millis() as u64, Ordering::SeqCst);
+        }
+
+        fn lists(&self) -> usize {
+            self.lists.load(Ordering::SeqCst)
         }
 
         fn has(&self, path: &str) -> bool {
@@ -1622,6 +2190,15 @@ mod tests {
             if !authorized(&headers, &stub.token) {
                 return StatusCode::UNAUTHORIZED.into_response();
             }
+            stub.lists.fetch_add(1, Ordering::SeqCst);
+            let delay = stub.list_delay_ms.load(Ordering::Relaxed);
+            if delay > 0 {
+                tokio::time::sleep(Duration::from_millis(delay)).await;
+            }
+            if stub.list_failures.load(Ordering::SeqCst) > 0 {
+                stub.list_failures.fetch_sub(1, Ordering::SeqCst);
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
             // Mirrors stathost >= 0.2.0: plain array without ?detail=true,
             // [{"path","size","mtime"}] with it.
             let detail = query.as_deref() == Some("detail=true");
@@ -1681,11 +2258,15 @@ mod tests {
                 stub.gets.lock().unwrap().push(path.clone());
                 let now = stub.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
                 stub.peak_gets.fetch_max(now, Ordering::SeqCst);
+                // Read first, then take the latency: a slow response carries
+                // what the object was when the request arrived. That is what a
+                // real one does, and it is the only way a test can put a write
+                // *inside* the window of a read that is already under way.
+                let resp = get_response(&stub, &path, &headers);
                 let delay = stub.get_delay_ms.load(Ordering::Relaxed);
                 if delay > 0 {
                     tokio::time::sleep(Duration::from_millis(delay)).await;
                 }
-                let resp = get_response(&stub, &path, &headers);
                 stub.in_flight.fetch_sub(1, Ordering::SeqCst);
                 resp
             }
@@ -1750,6 +2331,9 @@ mod tests {
             fail_delete_paths: Arc::new(Mutex::new(HashSet::new())),
             ignore_range: Arc::new(AtomicBool::new(false)),
             commit_after_list: Arc::new(Mutex::new(Vec::new())),
+            list_failures: Arc::new(AtomicUsize::new(0)),
+            list_delay_ms: Arc::new(AtomicU64::new(0)),
+            lists: Arc::new(AtomicUsize::new(0)),
             gets: Arc::new(Mutex::new(Vec::new())),
             in_flight: Arc::new(AtomicUsize::new(0)),
             peak_gets: Arc::new(AtomicUsize::new(0)),
@@ -1775,6 +2359,30 @@ mod tests {
             enabled: true,
         };
         StathostBackend::new(&config, &["cam".to_string()])
+    }
+
+    /// Wait for something the stub is about to be told, polling because what is
+    /// being waited for is a real request arriving at a real socket. Panics
+    /// rather than hanging the suite if it never happens.
+    async fn wait_until(mut condition: impl FnMut() -> bool) {
+        for _ in 0..5_000 {
+            if condition() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        panic!("the stub never reached the state this test needs");
+    }
+
+    /// A backend that has already been through a startup scan, which is the
+    /// only state `init_storage` ever hands on: retention and budget eviction
+    /// refuse to act on an index no scan has filled, so a test that prunes or
+    /// evicts has to start from one. The store is empty at this point, so the
+    /// scan costs one listing and indexes nothing.
+    async fn scanned_backend_for(url: &str, token: &str, max_stored_bytes: u64) -> StathostBackend {
+        let backend = backend_for(url, token, max_stored_bytes);
+        backend.scan().await.unwrap();
+        backend
     }
 
     // ---- event fixtures ---------------------------------------------------
@@ -1905,7 +2513,7 @@ mod tests {
         // A fresh backend rebuilding from the same host recovers the event,
         // its type, size (detailed list), and filmstrip count.
         let scanned = backend_for(&url, "secret", 0);
-        scanned.scan().await;
+        scanned.scan().await.unwrap();
         let e = scanned.find_event("cam", url_key(1_000, 1000)).unwrap();
         assert_eq!(e.event_type, EventType::Movement);
         assert_eq!(e.file_size, 40);
@@ -1969,7 +2577,7 @@ mod tests {
 
         // What a restart rebuilds agrees with the index in RAM.
         let scanned = backend_for(&url, "secret", 0);
-        scanned.scan().await;
+        scanned.scan().await.unwrap();
         assert_eq!(
             scanned
                 .find_event("cam", url_key(2_000, 1000))
@@ -1986,7 +2594,7 @@ mod tests {
     #[tokio::test]
     async fn siblings_sharing_a_start_pts_are_upgraded_and_removed_by_stem() {
         let (url, stub) = spawn_stub("secret").await;
-        let backend = backend_for(&url, "secret", 0);
+        let backend = scanned_backend_for(&url, "secret", 0).await;
         backend
             .write_event("cam", &movement_event(OLD_PTS, 40))
             .await;
@@ -2121,7 +2729,7 @@ mod tests {
         // Only the longer sibling's sidecar is unreadable on the next start.
         stub.fail_gets("_2000.json");
         let backend = backend_for(&url, "secret", 0);
-        backend.scan().await;
+        backend.scan().await.unwrap();
         assert!(backend.has_unknown_type("cam", (OLD_PTS, 2000)));
         assert!(!backend.has_unknown_type("cam", (OLD_PTS, 1000)));
 
@@ -2153,7 +2761,7 @@ mod tests {
         backend.write_event("cam", &object_event(4_000, 20)).await;
 
         let scanned = backend_for(&url, "secret", 0);
-        scanned.scan().await;
+        scanned.scan().await.unwrap();
         let e = scanned.find_event("cam", url_key(4_000, 1000)).unwrap();
         assert_eq!(e.event_type, EventType::Object);
         assert_eq!(e.object_classes, vec!["car".to_string()]);
@@ -2204,7 +2812,7 @@ mod tests {
     #[tokio::test]
     async fn delete_via_prune_removes_all_objects() {
         let (url, stub) = spawn_stub("secret").await;
-        let backend = backend_for(&url, "secret", 0);
+        let backend = scanned_backend_for(&url, "secret", 0).await;
         // A movement event far enough in the past to expire.
         let old_pts = 1_000_000_000; // 1s after epoch
         backend
@@ -2228,7 +2836,7 @@ mod tests {
     #[tokio::test]
     async fn prune_caps_how_much_one_sweep_deletes() {
         let (url, _stub) = spawn_stub("secret").await;
-        let backend = backend_for(&url, "secret", 0);
+        let backend = scanned_backend_for(&url, "secret", 0).await;
         for i in 0..40u64 {
             backend
                 .write_event("cam", &movement_event(1_000_000_000 + i * 1_000_000, 10))
@@ -2253,7 +2861,7 @@ mod tests {
     #[tokio::test]
     async fn an_undeletable_event_does_not_block_the_sweep_forever() {
         let (url, stub) = spawn_stub("secret").await;
-        let backend = backend_for(&url, "secret", 0);
+        let backend = scanned_backend_for(&url, "secret", 0).await;
         for i in 0..12u64 {
             backend
                 .write_event("cam", &movement_event(1_000_000_000 + i * 1_000_000, 10))
@@ -2289,7 +2897,7 @@ mod tests {
     #[tokio::test]
     async fn a_cancelled_prune_deletes_nothing() {
         let (url, stub) = spawn_stub("secret").await;
-        let backend = backend_for(&url, "secret", 0);
+        let backend = scanned_backend_for(&url, "secret", 0).await;
         let old_pts = 1_000_000_000;
         backend
             .write_event("cam", &movement_event(old_pts, 30))
@@ -2304,11 +2912,484 @@ mod tests {
         assert_eq!(stub.files.lock().unwrap().len(), before);
     }
 
+    // ---- the un-scanned state ---------------------------------------------
+
+    /// The listing is one request, made at the moment the network is least
+    /// likely to be up. When every attempt at it fails the index holds only
+    /// what this process has written since, which is indistinguishable from a
+    /// store that is nearly empty — and pruning on that reads a full archive as
+    /// nothing to do, forever, until someone restarts camon.
+    #[tokio::test]
+    async fn a_scan_that_never_listed_the_store_refuses_to_prune() {
+        let (url, stub) = spawn_stub("secret").await;
+        stub.fail_next_lists(usize::MAX);
+        let backend = backend_for(&url, "secret", 0);
+
+        assert!(backend.scan().await.is_err(), "an unlisted store scanned");
+        assert_eq!(
+            stub.lists(),
+            SCAN_ATTEMPTS as usize,
+            "the startup scan did not make its attempts"
+        );
+
+        // Recording is unaffected by any of this — that is the point of not
+        // failing startup — so events pile up in an index of this session only.
+        backend
+            .write_event("cam", &movement_event(1_000_000_000, 30))
+            .await;
+        let stored = stub.files.lock().unwrap().len();
+
+        // Long expired, and pruned anyway if the empty index is believed.
+        backend
+            .prune(1, u64::MAX, u64::MAX, &AtomicBool::new(false))
+            .await;
+
+        assert!(
+            backend
+                .find_event("cam", url_key(1_000_000_000, 1000))
+                .is_some(),
+            "pruned against an index that has never seen the store"
+        );
+        assert_eq!(stub.files.lock().unwrap().len(), stored, "deleted objects");
+        assert_eq!(
+            stub.lists(),
+            2 * SCAN_ATTEMPTS as usize,
+            "the tick did not retry the scan it is the only retry for"
+        );
+    }
+
+    /// The budget's two answers both need an index that has seen the store:
+    /// "under budget" is measured against a sum of what is indexed, and the
+    /// eviction that follows deletes what is indexed. Un-scanned, that is this
+    /// session's writes — the newest footage there is — while everything older
+    /// sits on the host uncounted and unevicted.
+    #[tokio::test]
+    async fn a_scan_that_never_listed_the_store_refuses_to_enforce_the_budget() {
+        let (url, stub) = spawn_stub("secret").await;
+        stub.fail_next_lists(usize::MAX);
+        // 60 bytes of budget against 120 written: enough to evict twice.
+        let backend = backend_for(&url, "secret", 60);
+        assert!(backend.scan().await.is_err());
+
+        for pts in [1_000u64, 2_000, 3_000] {
+            backend.write_event("cam", &movement_event(pts, 40)).await;
+        }
+        let stored = stub.files.lock().unwrap().len();
+        let listed = stub.lists();
+
+        backend.guard_free_space("cam", 0).await;
+
+        assert_eq!(
+            backend.query("cam", 0, u64::MAX).len(),
+            3,
+            "evicted the only events it could see"
+        );
+        assert_eq!(stub.files.lock().unwrap().len(), stored);
+        assert_eq!(
+            stub.lists(),
+            listed,
+            "the write path waited on a scan; that stalls the camera it guards"
+        );
+    }
+
+    /// The failure this exists for is a race with the network coming up, so the
+    /// attempt that succeeds is usually the second or the third.
+    #[tokio::test]
+    async fn a_listing_that_comes_back_before_the_attempts_run_out_scans_normally() {
+        let (url, stub) = spawn_stub("secret").await;
+        seed_events(&stub, 1_000, 3, 1000, "object");
+        stub.fail_next_lists(SCAN_ATTEMPTS as usize - 1);
+
+        let backend = backend_for(&url, "secret", 0);
+        backend.scan().await.unwrap();
+
+        assert_eq!(stub.lists(), SCAN_ATTEMPTS as usize);
+        assert_eq!(backend.query("cam", 0, u64::MAX).len(), 3);
+        // Retention runs on it like any other scanned index.
+        backend
+            .prune(u64::MAX, 1, u64::MAX, &AtomicBool::new(false))
+            .await;
+        assert!(backend.query("cam", 0, u64::MAX).is_empty());
+    }
+
+    /// The startup attempts are bounded, so a store that comes back a minute
+    /// after boot would otherwise leave retention off until the next restart.
+    /// The retention tick retries the scan while — and only while — the index
+    /// has never been built.
+    #[tokio::test]
+    async fn the_retention_tick_heals_an_index_the_startup_scan_never_built() {
+        let (url, stub) = spawn_stub("secret").await;
+        // Footage from before this process started: only a listing reveals it,
+        // and it is long expired.
+        seed_events(&stub, 1_000_000_000, 2, 1000, "movement");
+        stub.fail_next_lists(usize::MAX);
+        let backend = backend_for(&url, "secret", 0);
+        assert!(backend.scan().await.is_err());
+        assert!(backend.query("cam", 0, u64::MAX).is_empty());
+
+        stub.serve_lists_again();
+
+        backend
+            .prune(1, u64::MAX, u64::MAX, &AtomicBool::new(false))
+            .await;
+
+        assert!(
+            backend.query("cam", 0, u64::MAX).is_empty() && stub.files.lock().unwrap().is_empty(),
+            "the tick did not rebuild the index and prune what it found"
+        );
+
+        // And having healed, it stops asking: re-listing a whole bucket every
+        // hour is the request the scan exists to make once.
+        let listed = stub.lists();
+        backend
+            .prune(1, u64::MAX, u64::MAX, &AtomicBool::new(false))
+            .await;
+        assert_eq!(stub.lists(), listed, "kept re-scanning a scanned index");
+    }
+
+    /// The state means "never rebuilt", not "the last request failed". A store
+    /// that goes away after a good scan must not throw the index back to
+    /// refusing: what it learned is still the best account of the archive there
+    /// is, and retention is exactly what an unreachable store needs to keep.
+    #[tokio::test]
+    async fn a_scan_that_succeeded_stays_scanned_when_a_later_one_fails() {
+        let (url, stub) = spawn_stub("secret").await;
+        let backend = scanned_backend_for(&url, "secret", 0).await;
+        backend
+            .write_event("cam", &movement_event(1_000_000_000, 30))
+            .await;
+
+        stub.fail_next_lists(usize::MAX);
+        assert!(backend.scan().await.is_err());
+
+        backend
+            .prune(1, u64::MAX, u64::MAX, &AtomicBool::new(false))
+            .await;
+        assert!(
+            backend
+                .find_event("cam", url_key(1_000_000_000, 1000))
+                .is_none(),
+            "a failed listing un-scanned an index that had been built"
+        );
+        assert!(stub.files.lock().unwrap().is_empty());
+    }
+
+    /// A healing scan runs while cameras record, and an upload in progress has
+    /// its sidecar on the host before its video — for as long as the video
+    /// takes. The sweep cannot tell that from an orphan, so it does not run
+    /// here at all; the next startup, where nothing of this process's can be in
+    /// flight, collects what accumulated. See [`ScanKind`].
+    #[tokio::test]
+    async fn a_healing_rescan_leaves_orphaned_metadata_for_the_next_startup() {
+        let (url, stub) = spawn_stub("secret").await;
+        // An expired event, which is how this test knows the heal happened at
+        // all, and a sidecar whose video is not there.
+        seed_events(&stub, 1_000_000_000, 1, 1000, "movement");
+        stub.files.lock().unwrap().insert(
+            "cam/5000_1000.json".to_string(),
+            br#"{"event_type":"object"}"#.to_vec(),
+        );
+        stub.fail_next_lists(usize::MAX);
+        let backend = backend_for(&url, "secret", 0);
+        assert!(backend.scan().await.is_err());
+
+        stub.serve_lists_again();
+        backend
+            .prune(1, u64::MAX, u64::MAX, &AtomicBool::new(false))
+            .await;
+
+        assert!(
+            !stub.has("cam/1000000000_1000.ts") && backend.query("cam", 0, u64::MAX).is_empty(),
+            "the heal did not rebuild the index and prune what it found"
+        );
+        assert!(
+            stub.has("cam/5000_1000.json"),
+            "a heal swept metadata a camera may have been uploading"
+        );
+        // The next startup is the one that may, and does.
+        let restarted = backend_for(&url, "secret", 0);
+        restarted.scan().await.unwrap();
+        assert!(!stub.has("cam/5000_1000.json"), "orphan sidecar kept");
+    }
+
+    /// Five attempts is a bound on a host that refuses connections in a
+    /// millisecond. A host that accepts and then says nothing costs a whole
+    /// request timeout each time, and startup awaits this series before any
+    /// camera is spawned: five of those is five minutes of a camera system
+    /// recording nothing, which is worse than starting un-scanned.
+    #[tokio::test]
+    async fn a_listing_that_never_answers_gives_up_on_the_clock_not_the_attempt_count() {
+        let (url, stub) = spawn_stub("secret").await;
+        // Far longer than the budget, and longer than `REQUEST_TIMEOUT` would
+        // allow too: without a deadline of its own the series waits for this.
+        stub.hang_lists(Duration::from_secs(30));
+        let backend = backend_for(&url, "secret", 0);
+
+        let started = std::time::Instant::now();
+        assert!(backend.scan().await.is_err());
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < SCAN_LISTING_BUDGET * 4,
+            "the startup scan held the cameras for {elapsed:?}"
+        );
+        assert!(
+            stub.lists() < SCAN_ATTEMPTS as usize,
+            "spent the attempt count on a host that answers nothing"
+        );
+    }
+
+    /// The retention task is joined by the shutdown drain on a bound of one
+    /// event's deletes. A heal on that task must respect the same flag: its
+    /// waits between attempts are the drain's waits.
+    #[tokio::test]
+    async fn a_shutdown_stops_the_scan_from_retrying() {
+        let (url, stub) = spawn_stub("secret").await;
+        stub.fail_next_lists(usize::MAX);
+        // Long enough to raise the flag while the first attempt is in flight.
+        stub.hang_lists(Duration::from_millis(30));
+        let backend = Arc::new(backend_for(&url, "secret", 0));
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let healing = tokio::spawn({
+            let (backend, cancel) = (Arc::clone(&backend), Arc::clone(&cancel));
+            async move { backend.prune(1, u64::MAX, u64::MAX, &cancel).await }
+        });
+
+        wait_until(|| stub.lists() >= 1).await;
+        cancel.store(true, Ordering::SeqCst);
+        healing.await.unwrap();
+
+        assert_eq!(
+            stub.lists(),
+            1,
+            "kept retrying the scan after shutdown was asked for"
+        );
+    }
+
+    /// The wait between attempts is the drain's wait too, and the flag it must
+    /// notice is raised while it is already sleeping — so the wait polls rather
+    /// than sleeping through the whole delay it was given.
+    #[tokio::test]
+    async fn a_wait_between_scan_attempts_ends_when_shutdown_arrives_during_it() {
+        let flag = Arc::new(AtomicBool::new(false));
+        let raiser = {
+            let flag = Arc::clone(&flag);
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                flag.store(true, Ordering::SeqCst);
+            })
+        };
+
+        let started = std::time::Instant::now();
+        // A backoff far longer than any drain is allowed to take.
+        sleep_unless_stopped(Duration::from_secs(30), &|| flag.load(Ordering::SeqCst)).await;
+        let elapsed = started.elapsed();
+        raiser.await.unwrap();
+
+        assert!(
+            elapsed < SHUTDOWN_POLL * 4,
+            "the wait sat through {elapsed:?} of a shutdown"
+        );
+        assert!(elapsed >= Duration::from_millis(20), "did not wait at all");
+    }
+
+    /// And the pass itself stops, rather than walking an archive's worth of
+    /// sidecars inside a drain measured in one event's deletes. What it leaves
+    /// is not a rebuilt index: it never reached the end of the listing, so it
+    /// knows nothing about what it did not read.
+    #[tokio::test]
+    async fn a_shutdown_part_way_through_a_scan_leaves_it_unscanned() {
+        let (url, stub) = spawn_stub("secret").await;
+        seed_events(&stub, 1_000_000_000, 4, 1000, "movement");
+        stub.fail_next_lists(usize::MAX);
+        let backend = Arc::new(backend_for(&url, "secret", 0));
+        assert!(backend.scan().await.is_err());
+
+        stub.serve_lists_again();
+        // Every sidecar read is slow enough to raise the flag inside one.
+        stub.get_delay_ms.store(100, Ordering::Relaxed);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let healing = tokio::spawn({
+            let (backend, cancel) = (Arc::clone(&backend), Arc::clone(&cancel));
+            async move { backend.prune(1, u64::MAX, u64::MAX, &cancel).await }
+        });
+
+        wait_until(|| !stub.gets.lock().unwrap().is_empty()).await;
+        cancel.store(true, Ordering::SeqCst);
+        healing.await.unwrap();
+
+        // Nothing was pruned on what it did manage to read...
+        assert!(stub.has("cam/1000000000_1000.ts"));
+        // ...and the next tick still finds an index that must be rebuilt,
+        // which it would not if an interrupted pass counted as a rebuild.
+        stub.get_delay_ms.store(0, Ordering::Relaxed);
+        let listed = stub.lists();
+        backend
+            .prune(1, u64::MAX, u64::MAX, &AtomicBool::new(false))
+            .await;
+        assert!(
+            stub.lists() > listed,
+            "an interrupted pass was taken for a rebuilt index"
+        );
+        assert!(
+            backend.query("cam", 0, u64::MAX).is_empty(),
+            "the completed heal did not prune what it found"
+        );
+    }
+
+    /// The one scan that is not the only writer of the index. A heal reads a
+    /// sidecar over the network and inserts what it says some round trips
+    /// later, and in between the live write path can settle the same event's
+    /// type, size or filmstrip — all of which the listing predates. Writing the
+    /// listing's version over that would expire object footage on movement
+    /// retention twelve days early, with no unknown-type marker to repair it
+    /// by, so the heal yields to whatever the index already holds.
+    #[tokio::test]
+    async fn a_heal_yields_to_an_upgrade_that_landed_while_it_was_reading() {
+        const LIVE_PTS: u64 = 5_000_000_000;
+        let (url, stub) = spawn_stub("secret").await;
+        // Footage from before this process: only a listing reveals it.
+        seed_events(&stub, 1_000_000_000, 2, 1000, "movement");
+        stub.fail_next_lists(usize::MAX);
+        let backend = Arc::new(backend_for(&url, "secret", 0));
+        assert!(backend.scan().await.is_err());
+
+        // A live event of this session: uploaded and indexed as a movement,
+        // which is what its sidecar on the host says too.
+        backend
+            .write_event("cam", &movement_event(LIVE_PTS, 40))
+            .await;
+
+        stub.serve_lists_again();
+        // A sidecar read that takes long enough for a detection to come back
+        // while it is in flight.
+        stub.get_delay_ms.store(100, Ordering::Relaxed);
+        let healing = tokio::spawn({
+            let backend = Arc::clone(&backend);
+            // Retention long enough that this sweep only heals.
+            async move {
+                backend
+                    .prune(u64::MAX, u64::MAX, u64::MAX, &AtomicBool::new(false))
+                    .await
+            }
+        });
+
+        let sidecar = format!("cam/{LIVE_PTS}_1000.json");
+        wait_until(|| stub.get_count(&sidecar) >= 1).await;
+        // The heal is holding a movement sidecar it has already read.
+        backend.upgrade_event("cam", &upgrade_for(LIVE_PTS)).await;
+        healing.await.unwrap();
+
+        let entry = backend.find_event("cam", url_key(LIVE_PTS, 1000)).unwrap();
+        assert_eq!(
+            entry.event_type,
+            EventType::Object,
+            "the heal wrote a stale movement over an upgraded event"
+        );
+        assert_eq!(entry.object_classes, vec!["person".to_string()]);
+        // And it still did what it was for: the archive it could not see.
+        assert_eq!(backend.query("cam", 0, u64::MAX).len(), 3);
+    }
+
+    /// The other half of that yield. An upgrade whose sidecar `PUT` reported
+    /// failure may have committed anyway — the client cannot tell — and
+    /// `upgrade_event` gives up before its index update when it does, leaving
+    /// the store saying object and RAM saying movement with nothing in the
+    /// process that ever looks again. The event then expires twelve days early,
+    /// and budget eviction, which takes movements before objects, reaches it
+    /// first. A heal reads that sidecar, so it can put the type right; it is
+    /// the only pass that ever will before a restart.
+    #[tokio::test]
+    async fn a_heal_types_an_upgrade_whose_sidecar_landed_despite_reporting_failure() {
+        const LIVE_PTS: u64 = 5_000_000_000;
+        let (url, stub) = spawn_stub("secret").await;
+        stub.fail_next_lists(usize::MAX);
+        let backend = backend_for(&url, "secret", 0);
+        assert!(backend.scan().await.is_err());
+
+        backend
+            .write_event("cam", &movement_event(LIVE_PTS, 40))
+            .await;
+        // The upgraded sidecar lands at the origin and the client is told it
+        // did not, which is a timeout or a proxy error over a committed body.
+        stub.fail_puts(".json", true);
+        backend.upgrade_event("cam", &upgrade_for(LIVE_PTS)).await;
+        stub.clear_faults();
+
+        let stale = backend.find_event("cam", url_key(LIVE_PTS, 1000)).unwrap();
+        assert_eq!(
+            stale.event_type,
+            EventType::Movement,
+            "not the state to fix"
+        );
+
+        stub.serve_lists_again();
+        backend
+            .prune(u64::MAX, u64::MAX, u64::MAX, &AtomicBool::new(false))
+            .await;
+
+        let entry = backend.find_event("cam", url_key(LIVE_PTS, 1000)).unwrap();
+        assert_eq!(
+            entry.event_type,
+            EventType::Object,
+            "the heal read an object sidecar and left the index on movement"
+        );
+        assert_eq!(entry.object_classes, vec!["person".to_string()]);
+        assert_eq!(entry.detections.len(), 1);
+        assert_eq!(entry.backend.as_deref(), Some("ollama"));
+        // What the sidecar says nothing newer about is untouched: the video and
+        // its thumbnails are the ones the index already had.
+        assert_eq!(entry.file_size, 40);
+        assert_eq!(entry.filmstrip_frames, 2);
+    }
+
+    /// The join only ever moves an entry forward. An event the index already
+    /// holds as an object is the *later* account of it — the join exists for an
+    /// index that is behind the store, not for one that is ahead of it — so a
+    /// sidecar naming different detections leaves them alone. That is what
+    /// makes the join safe against a live upgrade landing while the heal reads:
+    /// whichever order they fall in, the detections that survive are the ones
+    /// the write path put there.
+    #[tokio::test]
+    async fn a_heal_leaves_the_detections_of_an_entry_it_already_has_as_an_object() {
+        const LIVE_PTS: u64 = 6_000_000_000;
+        let (url, stub) = spawn_stub("secret").await;
+        stub.fail_next_lists(usize::MAX);
+        let backend = backend_for(&url, "secret", 0);
+        assert!(backend.scan().await.is_err());
+
+        backend
+            .write_event("cam", &movement_event(LIVE_PTS, 40))
+            .await;
+        backend.upgrade_event("cam", &upgrade_for(LIVE_PTS)).await;
+
+        // An object sidecar on the store that says something else — a second
+        // writer, or an upgrade this one has already superseded.
+        stub.files.lock().unwrap().insert(
+            format!("cam/{LIVE_PTS}_1000.json"),
+            br#"{"event_type":"object","detections":[{"class":"car","confidence":0.5}]}"#.to_vec(),
+        );
+
+        stub.serve_lists_again();
+        backend
+            .prune(u64::MAX, u64::MAX, u64::MAX, &AtomicBool::new(false))
+            .await;
+
+        let entry = backend.find_event("cam", url_key(LIVE_PTS, 1000)).unwrap();
+        assert_eq!(entry.event_type, EventType::Object);
+        assert_eq!(
+            entry.object_classes,
+            vec!["person".to_string()],
+            "the heal wrote the store's detections over the write path's"
+        );
+    }
+
     #[tokio::test]
     async fn budget_prune_evicts_cheapest_and_oldest_first() {
         let (url, _stub) = spawn_stub("secret").await;
         // Budget of 60 bytes; three 40-byte events (120 total) overflow it.
-        let backend = backend_for(&url, "secret", 60);
+        let backend = scanned_backend_for(&url, "secret", 60).await;
 
         // Oldest first: a continuous chunk, then a movement, then an object.
         backend
@@ -2343,7 +3424,7 @@ mod tests {
     #[tokio::test]
     async fn budget_eviction_skips_an_event_it_already_failed_to_delete() {
         let (url, stub) = spawn_stub("secret").await;
-        let backend = backend_for(&url, "secret", 60);
+        let backend = scanned_backend_for(&url, "secret", 60).await;
         for pts in [1_000u64, 2_000, 3_000] {
             backend.write_event("cam", &movement_event(pts, 40)).await;
         }
@@ -2376,7 +3457,7 @@ mod tests {
     #[tokio::test]
     async fn budget_eviction_unindexes_an_object_that_is_already_gone() {
         let (url, stub) = spawn_stub("secret").await;
-        let backend = backend_for(&url, "secret", 60);
+        let backend = scanned_backend_for(&url, "secret", 60).await;
         backend.write_event("cam", &movement_event(1_000, 40)).await;
         backend.write_event("cam", &movement_event(2_000, 40)).await;
         backend.write_event("cam", &movement_event(3_000, 40)).await;
@@ -2399,7 +3480,7 @@ mod tests {
     #[tokio::test]
     async fn budget_eviction_recovers_after_an_outage_flagged_every_candidate() {
         let (url, stub) = spawn_stub("secret").await;
-        let backend = backend_for(&url, "secret", 60);
+        let backend = scanned_backend_for(&url, "secret", 60).await;
         for pts in [1_000u64, 2_000, 3_000, 4_000] {
             backend.write_event("cam", &movement_event(pts, 40)).await;
         }
@@ -2437,7 +3518,7 @@ mod tests {
     #[tokio::test]
     async fn a_video_that_refuses_to_delete_keeps_its_sidecar_and_its_type() {
         let (url, stub) = spawn_stub("secret").await;
-        let backend = backend_for(&url, "secret", 0);
+        let backend = scanned_backend_for(&url, "secret", 0).await;
         let mut event = continuous_event(OLD_PTS, 30);
         event.filmstrip_frames = Some(Arc::new(vec![vec![0x01]]));
         backend.write_event("cam", &event).await;
@@ -2461,7 +3542,7 @@ mod tests {
         // A restart still knows what it is, so the retry measures it against
         // the retention it actually belongs to.
         let scanned = backend_for(&url, "secret", 0);
-        scanned.scan().await;
+        scanned.scan().await.unwrap();
         assert_eq!(
             scanned
                 .find_event("cam", url_key(OLD_PTS, 1000))
@@ -2512,7 +3593,7 @@ mod tests {
 
         // The scan counts the same thing, and the event's delete takes it all.
         let scanned = backend_for(&url, "secret", 0);
-        scanned.scan().await;
+        scanned.scan().await.unwrap();
         assert_eq!(
             scanned
                 .find_event("cam", url_key(24_000, 1000))
@@ -2538,7 +3619,7 @@ mod tests {
             .insert("cam/9000_1000.ts".to_string(), vec![0u8; 10]);
 
         let backend = backend_for(&url, "secret", 0);
-        backend.scan().await;
+        backend.scan().await.unwrap();
         let e = backend.find_event("cam", url_key(9_000, 1000)).unwrap();
         // A confirmed-absent sidecar is what a plain movement event is written
         // with, so the default is a fact about the write path, not a fallback.
@@ -2575,7 +3656,7 @@ mod tests {
 
         let backend = backend_for(&url, "secret", 0);
         let started = std::time::Instant::now();
-        backend.scan().await;
+        backend.scan().await.unwrap();
         let elapsed = started.elapsed();
 
         assert_eq!(backend.query("cam", 0, u64::MAX).len(), 64);
@@ -2613,7 +3694,7 @@ mod tests {
         stub.get_delay_ms.store(5, Ordering::Relaxed);
 
         let backend = backend_for(&url, "secret", 0);
-        backend.scan().await;
+        backend.scan().await.unwrap();
 
         let entries = backend.query("cam", 0, u64::MAX);
         assert_eq!(entries.len(), 40, "an event was dropped or duplicated");
@@ -2645,7 +3726,7 @@ mod tests {
         stub.fail_gets("_2000.json");
 
         let backend = backend_for(&url, "secret", 0);
-        backend.scan().await;
+        backend.scan().await.unwrap();
 
         let entries = backend.query("cam", 0, u64::MAX);
         assert_eq!(entries.len(), 40);
@@ -2697,7 +3778,7 @@ mod tests {
         // scan to call a movement event.
         assert!(!stub.has("cam/11000_1000.ts"));
         let scanned = backend_for(&url, "secret", 0);
-        scanned.scan().await;
+        scanned.scan().await.unwrap();
         assert!(scanned.find_event("cam", url_key(11_000, 1000)).is_none());
     }
 
@@ -2733,7 +3814,7 @@ mod tests {
 
         stub.files.lock().unwrap().remove("cam/16000_1000.json");
         let scanned = backend_for(&url, "secret", 0);
-        scanned.scan().await;
+        scanned.scan().await.unwrap();
 
         assert_eq!(
             scanned.find_event("cam", url_key(16_000, 1000)).unwrap(),
@@ -2760,7 +3841,7 @@ mod tests {
         // two-day retention.
         stub.clear_faults();
         let scanned = backend_for(&url, "secret", 0);
-        scanned.scan().await;
+        scanned.scan().await.unwrap();
         let e = scanned.find_event("cam", url_key(12_000, 1000)).unwrap();
         assert_eq!(e.event_type, EventType::Object);
         assert_eq!(e.object_classes, vec!["car".to_string()]);
@@ -2784,7 +3865,7 @@ mod tests {
         assert!(stub.has("cam/17000_1000.json"));
         stub.clear_faults();
         let scanned = backend_for(&url, "secret", 0);
-        scanned.scan().await;
+        scanned.scan().await.unwrap();
         assert!(scanned.find_event("cam", url_key(17_000, 1000)).is_none());
         assert!(!stub.has("cam/17000_1000.json"), "orphan sidecar kept");
     }
@@ -2809,7 +3890,7 @@ mod tests {
             .insert("cam/20000_1000.json".to_string(), b"{}".to_vec());
 
         let scanned = backend_for(&url, "secret", 0);
-        scanned.scan().await;
+        scanned.scan().await.unwrap();
 
         assert!(!stub.has("cam/20000_1000_thumb_0.jpg"));
         assert!(!stub.has("cam/20000_1000.json"));
@@ -2840,7 +3921,7 @@ mod tests {
         }
 
         let backend = backend_for(&url, "secret", 0);
-        backend.scan().await;
+        backend.scan().await.unwrap();
 
         assert_eq!(
             stub.get_count("cam/24000_1000.ts"),
@@ -2874,14 +3955,14 @@ mod tests {
             .push("cam/22000_1000.ts".to_string());
 
         let backend = backend_for(&url, "secret", 0);
-        backend.scan().await;
+        backend.scan().await.unwrap();
 
         assert!(stub.has("cam/22000_1000.json"), "live sidecar collected");
         assert!(stub.has("cam/22000_1000.ts"));
         // Not indexed — it was not in the listing — but the next start reads it
         // back as the object event its surviving sidecar says it is.
         let scanned = backend_for(&url, "secret", 0);
-        scanned.scan().await;
+        scanned.scan().await.unwrap();
         assert_eq!(
             scanned
                 .find_event("cam", url_key(22_000, 1000))
@@ -2903,7 +3984,7 @@ mod tests {
         stub.fail_gets(".ts");
 
         let backend = backend_for(&url, "secret", 0);
-        backend.scan().await;
+        backend.scan().await.unwrap();
 
         assert!(stub.has("cam/23000_1000.json"));
     }
@@ -2926,7 +4007,7 @@ mod tests {
         }
 
         let backend = backend_for(&url, "secret", 0);
-        backend.scan().await;
+        backend.scan().await.unwrap();
 
         assert!(stub.has("other/21000_1000.json"));
         assert!(stub.has("cam/notes.txt"));
@@ -2951,7 +4032,7 @@ mod tests {
 
         // ...and the index a restart rebuilds agrees with the one in RAM.
         let scanned = backend_for(&url, "secret", 0);
-        scanned.scan().await;
+        scanned.scan().await.unwrap();
         let e = scanned.find_event("cam", url_key(13_000, 1000)).unwrap();
         assert_eq!(e.event_type, EventType::Object);
         assert_eq!(e.filmstrip_frames, 0);
@@ -2975,7 +4056,7 @@ mod tests {
         // A restart that cannot read the sidecar: 500, not 404.
         stub.fail_gets(".json");
         let scanned = backend_for(&url, "secret", 0);
-        scanned.scan().await;
+        scanned.scan().await.unwrap();
 
         // Indexed and visible (losing the footage from the UI would be its own
         // bug), but not deleted by the sweep its placeholder type invites.
@@ -2993,8 +4074,8 @@ mod tests {
         assert!(!stub.has("cam/1000000000_1000.ts"));
     }
 
-    /// `scan` runs once per process, so the sweep is the only place a held
-    /// event can ever be typed without a restart.
+    /// A scan that succeeded is not run again, so the sweep is the only place a
+    /// held event can ever be typed without a restart.
     #[tokio::test]
     async fn a_prune_tick_resolves_a_held_event() {
         let (url, stub) = spawn_stub("secret").await;
@@ -3003,7 +4084,7 @@ mod tests {
             .await;
         stub.fail_gets(".json");
         let backend = backend_for(&url, "secret", 0);
-        backend.scan().await;
+        backend.scan().await.unwrap();
         assert!(backend.has_unknown_type("cam", (OLD_PTS, 1000)));
 
         // The store recovers; the next sweep reads the sidecar it could not.
@@ -3041,7 +4122,7 @@ mod tests {
             .insert("cam/1000000000_1000.json".to_string(), b"{}".to_vec());
 
         let backend = backend_for(&url, "secret", 0);
-        backend.scan().await;
+        backend.scan().await.unwrap();
         assert!(backend.has_unknown_type("cam", (OLD_PTS, 1000)));
 
         backend
@@ -3068,7 +4149,7 @@ mod tests {
             .insert("cam/1000000000_1000.json".to_string(), b"not json".to_vec());
 
         let backend = backend_for(&url, "secret", 0);
-        backend.scan().await;
+        backend.scan().await.unwrap();
         assert!(backend.has_unknown_type("cam", (OLD_PTS, 1000)));
 
         backend
@@ -3090,7 +4171,7 @@ mod tests {
         // The object event's sidecar is unreadable on the next start...
         stub.fail_gets("1000_1000.json");
         let backend = backend_for(&url, "secret", 60);
-        backend.scan().await;
+        backend.scan().await.unwrap();
         assert!(backend.has_unknown_type("cam", (1_000, 1000)));
 
         // ...so the budget must still evict the genuine movement event first,

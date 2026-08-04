@@ -393,6 +393,32 @@ impl<K: EventIdentity> EventIndex<K> {
         replaced
     }
 
+    /// Index one event only if nothing holds its identity yet, reporting
+    /// whether it landed.
+    ///
+    /// For a rebuild that runs while the write path is live: there, what is
+    /// already indexed was put there by this process from what it just uploaded
+    /// and is newer than anything a listing taken seconds ago can say, so the
+    /// rebuild must yield to it rather than overwrite it. The test and the
+    /// insertion are one locked step because the two racing writers are exactly
+    /// what this is for — a `contains` followed by an `insert` can be overtaken
+    /// between them, and the entry that loses is the fresh one.
+    pub(crate) fn insert_absent(&self, camera_id: &str, entry: WarmEventEntry) -> bool {
+        let Some(lock) = self.cameras.get(camera_id) else {
+            return false;
+        };
+        let added = entry.file_size;
+        {
+            let mut entries = lock.write_recover();
+            if position(&entries, K::of(&entry)).is_some() {
+                return false;
+            }
+            Self::insert_locked(&mut entries, entry);
+        }
+        self.charge(added, 0);
+        true
+    }
+
     /// [`insert`](Self::insert)'s list surgery, without the byte accounting, so
     /// [`reidentify`](Self::reidentify) can re-place an entry under the write
     /// lock it is already holding.
@@ -1061,6 +1087,32 @@ mod tests {
         assert_eq!(entries[0].file_size, 300);
         assert_eq!(entries[0].event_type, EventType::Object);
         assert_eq!(index.used_bytes(), 300);
+    }
+
+    /// `insert_absent` yields to whatever holds the identity — bytes included,
+    /// since an insert that did not happen must not be charged — and behaves
+    /// like `insert` when nothing does.
+    #[test]
+    fn insert_absent_yields_to_the_entry_already_holding_the_identity() {
+        let index = index_with_cam();
+        assert!(index.insert_absent("cam", sized(entry(1000, EventType::Movement, 500), 300)));
+        assert_eq!(index.used_bytes(), 300);
+
+        assert!(!index.insert_absent("cam", sized(entry(1000, EventType::Movement, 500), 70)));
+        let entries = index.query("cam", 0, u64::MAX);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].file_size, 300, "overwrote the indexed entry");
+        assert_eq!(
+            index.used_bytes(),
+            300,
+            "charged an insert that did not happen"
+        );
+
+        // A different identity is not the same event, whatever it shares.
+        assert!(index.insert_absent("cam", sized(entry(1000, EventType::Object, 500), 70)));
+        assert_eq!(index.query("cam", 0, u64::MAX).len(), 2);
+        assert_eq!(index.used_bytes(), 370);
+        assert!(!index.insert_absent("other", sized(entry(1000, EventType::Movement, 500), 5)));
     }
 
     /// Nothing to displace, and a closure that changes nothing: the entry and

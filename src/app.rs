@@ -251,12 +251,24 @@ fn log_object_detection_config(config: &Config) -> bool {
     true
 }
 
-async fn init_storage(
-    config: &Config,
-    camera_ids: &[String],
-) -> Option<Arc<dyn WarmStorageBackend>> {
+/// The warm backend and whether its index describes the store.
+///
+/// The second half exists for the retention task: a backend whose scan failed
+/// is refusing to prune or enforce its budget until a sweep rebuilds the index,
+/// and the sweep it is waiting for is the one this schedules — so that first
+/// sweep comes early instead of an hour later. `true` when there is no warm
+/// storage at all, which has nothing to heal.
+struct Storage {
+    backend: Option<Arc<dyn WarmStorageBackend>>,
+    scanned: bool,
+}
+
+async fn init_storage(config: &Config, camera_ids: &[String]) -> Storage {
     if !config.storage.enabled {
-        return None;
+        return Storage {
+            backend: None,
+            scanned: true,
+        };
     }
 
     // A configured (and enabled) [storage.stathost] section switches the warm
@@ -269,8 +281,29 @@ async fn init_storage(
         );
         let backend = StathostBackend::new(stathost, camera_ids);
         backend.recover_orphans();
-        backend.scan().await;
-        return Some(Arc::new(backend));
+        // A store that cannot be listed does not stop camon: the cameras record
+        // and upload either way, and holding startup for a host that may be
+        // down for hours would cost footage that nothing else would have
+        // recorded. What it does cost is retention, and that is worth a line of
+        // its own — the backend refuses to prune or evict until a later scan
+        // succeeds, saying so on every retention sweep and, for the budget it
+        // is asked about before every write, on a widening schedule.
+        let scanned = match backend.scan().await {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "starting on a warm index that was never rebuilt from stathost: retention, \
+                     the storage budget and the orphan sweep stay paused, and uploads are \
+                     unbounded, until a retention sweep lists the store"
+                );
+                false
+            }
+        };
+        return Storage {
+            backend: Some(Arc::new(backend)),
+            scanned,
+        };
     }
 
     let data_dir = std::path::PathBuf::from(&config.storage.data_dir);
@@ -278,8 +311,18 @@ async fn init_storage(
     // Salvage any event files orphaned mid-write by a crash or power cut
     // BEFORE the scan, so recovered events are indexed like any other.
     backend.recover_orphans();
-    backend.scan().await;
-    Some(Arc::new(backend))
+    // Infallible for local disk — see its `scan` — but handled rather than
+    // discarded, so that a backend which grows a failure mode here is not able
+    // to acquire a silent one. Nothing here gates on the scan the way the
+    // remote backend does: a directory that could not be read is one directory,
+    // and retention sweeps what it did read.
+    if let Err(e) = backend.scan().await {
+        tracing::warn!(error = %e, "warm index scan failed; some events may not be indexed");
+    }
+    Storage {
+        backend: Some(Arc::new(backend)),
+        scanned: true,
+    }
 }
 
 fn init_motion_settings(
@@ -639,7 +682,10 @@ async fn graceful_shutdown(
     // only looks at .ts files — would never see them again. That is the exact
     // silent leak this drain is not allowed to create, so the sweep is asked
     // to stop instead: it polls the shutdown flag between events, and the wait
-    // is bounded by one event's deletes. Waiting here first costs nothing —
+    // is bounded by one event's deletes — or, on a remote backend still
+    // retrying the index scan its startup could not do, by the one listing or
+    // sidecar read already in flight, since that retry polls the same flag
+    // between attempts and between reads. Waiting here first costs nothing —
     // the flag was raised before the drain began, so every writer, analyzer
     // and recorder is already winding down concurrently with this await.
     if let Some(handle) = retention_handle {
@@ -763,7 +809,10 @@ where
     let detection_store = DetectionStore::new(&camera_ids);
     let debug_store = DetectionDebugStore::new(&camera_ids);
     let object_detection_ready = log_object_detection_config(&config);
-    let storage = init_storage(&config, &camera_ids).await;
+    let Storage {
+        backend: storage,
+        scanned: warm_index_scanned,
+    } = init_storage(&config, &camera_ids).await;
     // The recording-silence watchdog cannot see the storage volume being
     // unmounted: writes to the bare mountpoint succeed and keep resetting it.
     // So the volume is watched directly — by the backends that have one to
@@ -834,14 +883,19 @@ where
     // Retention is a property of the store, not of a camera: one task sweeps
     // every camera on a schedule, however many writers there are.
     let retention_handle = storage.as_ref().map(|backend| {
-        tokio::spawn(
-            RetentionTask::new(
-                Arc::clone(backend),
-                &config.storage,
-                Arc::clone(&shutdown.flag),
-            )
-            .run(),
-        )
+        let task = RetentionTask::new(
+            Arc::clone(backend),
+            &config.storage,
+            Arc::clone(&shutdown.flag),
+        );
+        // A backend that never got its index is waiting for a sweep to retry
+        // the scan, so it does not wait the usual hour for one.
+        let task = if warm_index_scanned {
+            task
+        } else {
+            task.after_a_failed_scan()
+        };
+        tokio::spawn(task.run())
     });
 
     let detect_worker_handle = match (ollama_client, detect_rx) {

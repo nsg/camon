@@ -412,6 +412,16 @@ impl WarmWriter {
 /// How much footage ages out between two scheduled sweeps.
 const PRUNE_INTERVAL: Duration = Duration::from_secs(3600);
 
+/// How soon the first sweep comes when startup could not build the warm index.
+///
+/// The usual full interval rests on startup having scanned the store, and in
+/// this one case it did not: the backend is refusing to prune or enforce its
+/// byte budget until a sweep rebuilds the index, so the wait is not a quiet
+/// hour, it is an hour of retention not happening on a store that may be full.
+/// A minute is long enough for a link that was still coming up at boot to have
+/// finished doing so, which is the failure this exists for.
+const PRUNE_AFTER_FAILED_SCAN: Duration = Duration::from_secs(60);
+
 /// How often the retention task wakes to compare the clock against its next
 /// deadline. Cheap enough not to matter, fine enough that a shutdown between
 /// sweeps is not noticeable.
@@ -434,6 +444,7 @@ pub struct RetentionTask {
     movement_retention_ns: u64,
     object_retention_ns: u64,
     continuous_retention_ns: u64,
+    first_sweep: Duration,
     shutdown: Arc<AtomicBool>,
 }
 
@@ -452,13 +463,25 @@ impl RetentionTask {
             movement_retention_ns: retention_ns(warm_config.movement_retention_days),
             object_retention_ns: retention_ns(warm_config.object_retention_days),
             continuous_retention_ns: retention_ns(warm_config.continuous_retention_days),
+            first_sweep: PRUNE_INTERVAL,
             shutdown,
         }
     }
 
-    /// The first sweep is one full interval in, as it was when the writers
-    /// owned the tick: startup already scanned the store, and an operator
-    /// restarting camon is rarely asking for deletions.
+    /// Bring the first sweep forward because startup's scan failed. A sweep is
+    /// also where a backend that could not read its store retries doing so, and
+    /// nothing it owns works until that succeeds — see
+    /// [`PRUNE_AFTER_FAILED_SCAN`]. The cadence afterwards is the usual one.
+    pub fn after_a_failed_scan(mut self) -> Self {
+        self.first_sweep = PRUNE_AFTER_FAILED_SCAN;
+        self
+    }
+
+    /// The first sweep is one full interval in: startup has just scanned the
+    /// store, as it was when the writers owned the tick, and an operator
+    /// restarting camon is rarely asking for deletions. The exception is a
+    /// startup whose scan failed — [`Self::after_a_failed_scan`] — where the
+    /// sweep is also the retry.
     ///
     /// Deadlines advance by whole intervals from the previous deadline, so the
     /// cadence is fixed-rate: a sweep that takes 20 minutes does not push the
@@ -471,7 +494,7 @@ impl RetentionTask {
         // The poll exists to notice a deadline, not to catch up on missed
         // wakeups: replaying them after a long sweep would achieve nothing.
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        let mut next_prune = tokio::time::Instant::now() + PRUNE_INTERVAL;
+        let mut next_prune = tokio::time::Instant::now() + self.first_sweep;
         tracing::debug!("retention task started");
 
         while !self.shutdown.load(Ordering::Relaxed) {
@@ -774,7 +797,9 @@ mod tests {
             Ok(u64::MAX)
         }
 
-        async fn scan(&self) {}
+        async fn scan(&self) -> std::io::Result<()> {
+            Ok(())
+        }
 
         fn recover_orphans(&self) {}
 
@@ -993,6 +1018,45 @@ mod tests {
             "cadence drifted with the sweep duration"
         );
         assert_eq!(backend.prunes_finished.load(Ordering::Relaxed), 2);
+
+        shutdown.store(true, Ordering::Relaxed);
+        tokio::time::timeout(PRUNE_INTERVAL, handle)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    /// A backend whose startup scan failed is refusing to prune or enforce its
+    /// budget until a sweep rebuilds its index, and the sweep is the only thing
+    /// that retries the scan — so an hour of the usual quiet is an hour of no
+    /// retention on a store that may be full.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_startup_scan_brings_the_first_sweep_forward() {
+        let backend = Arc::new(RecordingBackend::default());
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let handle = tokio::spawn(
+            RetentionTask::new(
+                backend.clone(),
+                &WarmConfig::default(),
+                Arc::clone(&shutdown),
+            )
+            .after_a_failed_scan()
+            .run(),
+        );
+
+        tokio::time::sleep(PRUNE_AFTER_FAILED_SCAN + RETENTION_POLL_INTERVAL).await;
+        assert_eq!(
+            backend.prunes.load(Ordering::Relaxed),
+            1,
+            "the retry waited out the ordinary interval"
+        );
+
+        // Then the ordinary cadence: the next one is an interval later, not
+        // another minute.
+        tokio::time::sleep(PRUNE_AFTER_FAILED_SCAN * 2).await;
+        assert_eq!(backend.prunes.load(Ordering::Relaxed), 1);
+        tokio::time::sleep(PRUNE_INTERVAL).await;
+        assert_eq!(backend.prunes.load(Ordering::Relaxed), 2);
 
         shutdown.store(true, Ordering::Relaxed);
         tokio::time::timeout(PRUNE_INTERVAL, handle)

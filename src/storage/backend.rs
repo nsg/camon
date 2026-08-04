@@ -216,7 +216,16 @@ pub trait WarmStorageBackend: Send + Sync {
     /// Rebuild the in-RAM index from durable storage. Async because a remote
     /// backend rebuilds its index over HTTP (list + sidecar fetches);
     /// LocalDisk's body is synchronous filesystem work.
-    async fn scan(&self);
+    ///
+    /// `Err` means the index does not describe the store — not that some events
+    /// were skipped, which both backends report as they go, but that the
+    /// backend never found out what is there. It is a `Result` rather than a
+    /// log line because an index that was never built and an index of an empty
+    /// store are the same object in RAM and the opposite instruction to
+    /// retention, and only a caller holding the error can tell them apart. It
+    /// is not fatal: startup continues, because a camera that cannot list its
+    /// archive can still record into it.
+    async fn scan(&self) -> std::io::Result<()>;
 
     /// Salvage writes interrupted by a crash or power cut, before the scan.
     fn recover_orphans(&self);
@@ -460,8 +469,13 @@ impl WarmStorageBackend for LocalDiskBackend {
         free_space_bytes(&self.data_dir)
     }
 
-    async fn scan(&self) {
+    async fn scan(&self) -> std::io::Result<()> {
+        // Always `Ok`: this walk reports the directories and files it could not
+        // read one by one and indexes the rest, and a data dir that is not there
+        // at all is an empty store rather than an unknown one — nothing else
+        // could have written to it either.
         self.index.scan();
+        Ok(())
     }
 
     fn recover_orphans(&self) {
