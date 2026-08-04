@@ -18,10 +18,15 @@
 //! Verdicts are handled in two ways:
 //! - always written to the [`DetectionStore`], where the event-assembly path
 //!   and the API read them exactly as before;
-//! - if the covering event already reached disk as a movement event (looked
-//!   up in the [`EventRegistry`]), an upgrade message is sent to that
-//!   camera's warm writer, which owns all file mutations. See
-//!   `storage::event_registry` for the race analysis with event assembly.
+//! - delivered to the [`EventRegistry`], which decides what the covering
+//!   events still need. One whose write is already queued gets an upgrade
+//!   message on its camera's warm writer channel, which owns all file
+//!   mutations; one the analyzer is still assembling parks the verdict and
+//!   sends that message itself. See `storage::event_registry`.
+//!
+//! Every job is reported back to the registry when the worker is done with
+//! it, verdict or no verdict, because a record covering its sequences is
+//! being kept alive until it is — see [`EventRegistry::verdict_settled`].
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -32,7 +37,9 @@ use tokio::sync::{mpsc, Notify};
 use crate::buffer::warm::{EventUpgrade, WriterMessage};
 use crate::mqtt::{send_event, MqttEvent, Sighting};
 use crate::storage::event_index::DetectionDetail;
-use crate::storage::{DetectionDebugStore, DetectionEntry, DetectionStore, EventRegistry};
+use crate::storage::{
+    DetectionDebugStore, DetectionEntry, DetectionStore, EventRegistry, Verdict, VerdictId,
+};
 
 use super::ollama::{Detection, OllamaClient};
 
@@ -60,6 +67,11 @@ pub struct DetectionJob {
     pub motion_rects: Vec<(f32, f32, f32, f32)>,
     /// The union crop region the frames were cropped to, normalized.
     pub run_crop: Option<(f32, f32, f32, f32)>,
+    /// The registry's handle on this job, stamped by [`DetectQueueSender::send`]
+    /// as the job is accepted and handed back when the job leaves the system —
+    /// answered here, or dropped at the queue cap. `None` when there is no
+    /// registry to hold records for (warm storage disabled).
+    pub verdict_id: Option<VerdictId>,
 }
 
 pub struct DetectionWorker {
@@ -108,7 +120,21 @@ impl DetectionWorker {
         tracing::info!("detection worker stopped");
     }
 
+    /// Classify one job and then tell the registry the question is answered,
+    /// on every path out of the classification — a job that timed out, one the
+    /// model saw nothing in, one whose camera has no registry at all. The
+    /// records it was holding open are only released by this call, so it
+    /// wraps the work rather than living inside it.
     async fn process_job(&self, job: DetectionJob) {
+        let camera_id = job.camera_id.clone();
+        let verdict_id = job.verdict_id;
+        self.classify_job(job).await;
+        if let Some(ref registry) = self.event_registry {
+            registry.verdict_settled(&camera_id, verdict_id);
+        }
+    }
+
+    async fn classify_job(&self, job: DetectionJob) {
         // Kept per frame rather than flattened so each detection stays
         // attributable to the crop it came from: entry `i` holds the verdict
         // for `job.crop_jpegs[i]`, including for frames the model failed on.
@@ -208,8 +234,16 @@ impl DetectionWorker {
         }
     }
 
-    /// If any covering event already reached disk movement-classified,
-    /// request its post-hoc upgrade from the owning warm writer.
+    /// Hand this run's verdict to the registry and send the upgrades it asks
+    /// for.
+    ///
+    /// The registry answers for every event the run covers, so the ones that
+    /// come back are exactly those already in the writer's queue — an upgrade
+    /// for them is guaranteed to arrive behind the write it refers to. An
+    /// event the analyzer is still assembling comes back from nowhere: the
+    /// verdict parks on its record, and the analyzer sends it once the write
+    /// is queued, because a message this worker sent now would reach the
+    /// writer first and find no file.
     async fn upgrade_covering_events(
         &self,
         job: &DetectionJob,
@@ -220,32 +254,28 @@ impl DetectionWorker {
         let Some(ref registry) = self.event_registry else {
             return;
         };
-        let records = registry.claim_movement_events(&job.camera_id, &job.seqs);
-        if records.is_empty() {
+        let verdict = Verdict {
+            object_classes: classes.to_vec(),
+            detections: detections
+                .iter()
+                .map(|d| DetectionDetail {
+                    class: d.class_name.clone(),
+                    confidence: d.confidence,
+                })
+                .collect(),
+            backend: "ollama".to_string(),
+            model: model.to_string(),
+        };
+        let targets = registry.deliver_verdict(&job.camera_id, &job.seqs, &verdict);
+        if targets.is_empty() {
             return;
         }
         let Some(tx) = self.event_senders.get(&job.camera_id) else {
             return;
         };
 
-        let details: Vec<DetectionDetail> = detections
-            .iter()
-            .map(|d| DetectionDetail {
-                class: d.class_name.clone(),
-                confidence: d.confidence,
-            })
-            .collect();
-
-        for record in records {
-            let upgrade = EventUpgrade {
-                start_pts_ns: record.start_pts_ns,
-                duration_ms: record.duration_ms,
-                object_classes: classes.to_vec(),
-                detections: details.clone(),
-                backend: "ollama".to_string(),
-                model: model.to_string(),
-                continues: record.continues,
-            };
+        for target in targets {
+            let upgrade = EventUpgrade::for_event(target, verdict.clone());
             if tx.send(WriterMessage::Upgrade(upgrade)).await.is_err() {
                 tracing::warn!(camera = %job.camera_id, "warm writer gone, upgrade lost");
             }
@@ -359,11 +389,19 @@ fn build_sightings(
 /// Create the crop-job queue: a sender for the analyzers (clone one per
 /// camera) and the shared queue for the worker. The queue closes when the
 /// last sender is dropped, mirroring channel semantics.
-pub fn detect_queue() -> (DetectQueueSender, Arc<DetectQueue>) {
+///
+/// The registry is held here because this is the one place that sees a job's
+/// whole life on the queue: accepted (a verdict is now expected, and records
+/// covering the job's sequences are kept until it comes) and, for the jobs
+/// that never reach the worker, dropped at the cap.
+pub fn detect_queue(
+    event_registry: Option<EventRegistry>,
+) -> (DetectQueueSender, Arc<DetectQueue>) {
     let queue = Arc::new(DetectQueue {
         state: Mutex::new(QueueState::default()),
         notify: Notify::new(),
         senders: AtomicUsize::new(1),
+        event_registry,
     });
     (
         DetectQueueSender {
@@ -379,6 +417,7 @@ pub struct DetectQueue {
     state: Mutex<QueueState>,
     notify: Notify,
     senders: AtomicUsize,
+    event_registry: Option<EventRegistry>,
 }
 
 #[derive(Default)]
@@ -441,7 +480,15 @@ impl DetectQueueSender {
     /// always accepted; a camera past its cap loses its OLDEST queued job
     /// instead — the motion event still persists, only that object upgrade
     /// is lost.
-    pub fn send(&self, job: DetectionJob) {
+    ///
+    /// The registry is told before the job is queued and after one is dropped,
+    /// in that order, so a record covering these sequences is never held open
+    /// by a job that has already left and never forgotten while one is still
+    /// on the queue.
+    pub fn send(&self, mut job: DetectionJob) {
+        if let Some(ref registry) = self.queue.event_registry {
+            job.verdict_id = registry.expect_verdict(&job.camera_id, &job.seqs);
+        }
         let dropped = {
             let mut state = self.queue.lock_state();
             if !state.jobs.contains_key(&job.camera_id) {
@@ -456,6 +503,9 @@ impl DetectQueueSender {
             }
         };
         if let Some(old) = dropped {
+            if let Some(ref registry) = self.queue.event_registry {
+                registry.verdict_settled(&old.camera_id, old.verdict_id);
+            }
             tracing::warn!(
                 camera = %old.camera_id,
                 first_seq = old.seqs.first().copied().unwrap_or_default(),
@@ -496,12 +546,13 @@ mod tests {
             full_frame_jpeg: None,
             motion_rects: Vec::new(),
             run_crop: None,
+            verdict_id: None,
         }
     }
 
     #[tokio::test]
     async fn queue_serves_cameras_round_robin_newest_first() {
-        let (tx, queue) = detect_queue();
+        let (tx, queue) = detect_queue(None);
         tx.send(job("spammy", vec![1]));
         tx.send(job("spammy", vec![2]));
         tx.send(job("spammy", vec![3]));
@@ -523,7 +574,7 @@ mod tests {
 
     #[tokio::test]
     async fn overflowing_camera_loses_its_oldest_job() {
-        let (tx, queue) = detect_queue();
+        let (tx, queue) = detect_queue(None);
         for seq in 0..=DETECT_QUEUE_PER_CAMERA_CAP as u64 {
             tx.send(job("cam", vec![seq]));
         }
@@ -538,9 +589,108 @@ mod tests {
         assert_eq!(seqs, expected);
     }
 
+    /// A job sitting on the queue is a verdict still to come, and the record
+    /// it will land on has to survive until then. The queue is what says so,
+    /// as it accepts the job — without that, the very next event to close
+    /// forgets the record, and a verdict arriving minutes later against a slow
+    /// model finds nothing to upgrade.
+    #[tokio::test]
+    async fn a_queued_job_keeps_alive_the_record_its_verdict_will_land_on() {
+        let registry = EventRegistry::new(&["cam".to_string()]);
+        let (tx, _queue) = detect_queue(Some(registry.clone()));
+
+        tx.send(job("cam", vec![0, 1]));
+        registry.open("cam", 0, 1, false).commit(1000, 5000, false);
+
+        // A later event closing is when settled records are forgotten. This
+        // one is not settled: its job has not even been served yet.
+        registry
+            .open("cam", 100, 100, false)
+            .commit(2000, 5000, false);
+        assert_eq!(
+            registry.held("cam"),
+            2,
+            "the record was forgotten while its crop job was still on the queue"
+        );
+    }
+
+    /// The registry keeps an event's record alive until every crop job that
+    /// could still classify it has come back. A job dropped at the cap never
+    /// will, so the drop has to report it — otherwise the camera least able to
+    /// afford it, the one at its queue cap, accumulates a record per dropped
+    /// job for the life of the process.
+    #[tokio::test]
+    async fn a_job_dropped_at_the_cap_releases_the_records_it_was_holding() {
+        let registry = EventRegistry::new(&["cam".to_string()]);
+        let (tx, _queue) = detect_queue(Some(registry.clone()));
+
+        tx.send(job("cam", vec![0]));
+        registry.open("cam", 0, 0, false).commit(1000, 5000, false);
+        assert_eq!(registry.held("cam"), 1);
+
+        // Fill the camera's stack past its cap: the oldest job — the only one
+        // that covered seq 0 — falls off.
+        for seq in 1..=DETECT_QUEUE_PER_CAMERA_CAP as u64 + 1 {
+            tx.send(job("cam", vec![seq]));
+        }
+
+        // Nothing can classify that first event any more, so the next event to
+        // arrive forgets it instead of holding it forever.
+        registry
+            .open("cam", 100, 100, false)
+            .commit(2000, 5000, false);
+        assert_eq!(
+            registry.held("cam"),
+            1,
+            "a job that was dropped unprocessed went on pinning its records"
+        );
+    }
+
+    /// The same obligation on the worker's side, on the path with nothing to
+    /// report: a job whose frames all failed, or that the model saw nothing
+    /// in, leaves through the early return in `classify_job` — and still has
+    /// to release what it was holding.
+    #[tokio::test]
+    async fn a_job_the_model_answered_nothing_for_is_still_reported_back() {
+        let registry = EventRegistry::new(&["cam".to_string()]);
+        // Nothing is listening on this port, so every frame of the job fails
+        // and it reaches the end of processing with no verdict at all.
+        let client = OllamaClient::new(
+            "http://127.0.0.1:1",
+            "test-model",
+            1,
+            0.5,
+            vec!["person".to_string()],
+            None,
+        )
+        .expect("client");
+        let worker = DetectionWorker::new(
+            client,
+            DetectionStore::new(&["cam".to_string()]),
+            None,
+            Some(registry.clone()),
+            HashMap::new(),
+            None,
+        );
+
+        let mut job = job("cam", vec![0]);
+        job.verdict_id = registry.expect_verdict("cam", &[0]);
+        registry.open("cam", 0, 0, false).commit(1000, 5000, false);
+        worker.process_job(job).await;
+
+        registry
+            .open("cam", 100, 100, false)
+            .commit(2000, 5000, false);
+        assert_eq!(
+            registry.held("cam"),
+            1,
+            "a job that produced no verdict never released the record it was holding"
+        );
+    }
+
     #[tokio::test]
     async fn queue_closes_when_last_sender_drops() {
-        let (tx, queue) = detect_queue();
+        let (tx, queue) = detect_queue(None);
         let tx2 = tx.clone();
         tx.send(job("cam", vec![1]));
         drop(tx);

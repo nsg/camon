@@ -11,7 +11,7 @@ use crate::locks::LockExt;
 use crate::shutdown::{shortfall, who_stalled, DrainGate, DrainStep, Stalled, TAIL_DRAIN_BOUND};
 use crate::storage::backend::{WarmStorageBackend, WriteOutcome};
 use crate::storage::event_index::DetectionDetail;
-use crate::storage::{DetectionStore, EventType, RecordingWatchdog};
+use crate::storage::{DetectionStore, EventType, RecordingWatchdog, UpgradeTarget, Verdict};
 
 const NANOS_PER_MS: u64 = 1_000_000;
 
@@ -88,6 +88,27 @@ pub struct EventUpgrade {
     /// Preserved from the original event so the chain-stitching flag
     /// survives the sidecar rewrite.
     pub continues: bool,
+}
+
+impl EventUpgrade {
+    /// The upgrade one verdict asks for on one written event.
+    ///
+    /// Both halves of the reconciliation build it here — the detection worker
+    /// for a verdict that arrived after the write was enqueued, the analyzer
+    /// for one that parked before it — so the two paths cannot drift into
+    /// writing different sidecars for the same situation. See
+    /// [`crate::storage::event_registry`].
+    pub fn for_event(target: UpgradeTarget, verdict: Verdict) -> Self {
+        Self {
+            start_pts_ns: target.start_pts_ns,
+            duration_ms: target.duration_ms,
+            object_classes: verdict.object_classes,
+            detections: verdict.detections,
+            backend: verdict.backend,
+            model: verdict.model,
+            continues: target.continues,
+        }
+    }
 }
 
 /// Assemble a finished event from the hot buffer and detection store.

@@ -8,7 +8,7 @@ use crate::analytics::motion_settings::{
     MotionSettingsStore, DEFAULT_MIN_CONTOUR_AREA, DEFAULT_VAR_THRESHOLD, MASK_CELLS, MASK_COLS,
     MASK_ROWS,
 };
-use crate::buffer::warm::{assemble_event, WriterMessage};
+use crate::buffer::warm::{assemble_event, EventUpgrade, WriterMessage};
 use crate::buffer::HotBuffer;
 use crate::config::AnalyticsConfig;
 use crate::locks::LockExt;
@@ -16,7 +16,7 @@ use crate::mqtt::{send_event, MqttEvent};
 use crate::retry::{jittered, RetrySchedule, Streak};
 use crate::shutdown::{shortfall, who_stalled, DrainGate, DrainStep, Stalled, TAIL_DRAIN_BOUND};
 use crate::storage::{
-    DetectionStore, EventRecord, EventRegistry, MapKind, MotionEntry, MotionStore,
+    DetectionStore, EventRegistry, MapKind, MotionEntry, MotionStore, UpgradeTarget,
 };
 
 use super::decoder::{
@@ -836,6 +836,16 @@ impl MotionAnalyzer {
 
         // Emit after detection so runs that close in the same batch as their
         // motion segments still get object metadata.
+        //
+        // The registry's memory bound rests on this order too, and less
+        // visibly. `process_motion_runs` dispatches the crop jobs for this
+        // batch, and dispatching is what registers the verdicts they owe; a
+        // record opened below is then guaranteed that every job which can ever
+        // cover its sequences already exists. Emit first and a record can be
+        // opened while a job for its own sequences is still to be dispatched —
+        // the record looks resolved, the next event to close forgets it, and
+        // the verdict arrives to find nothing. See
+        // [`crate::storage::event_registry`].
         for (run, filmstrip) in closed_runs {
             self.emit_event(run, filmstrip);
         }
@@ -1014,11 +1024,32 @@ impl MotionAnalyzer {
     /// Assemble and hand off a finished event the moment its run closes.
     /// All segments in range are still hot and the metadata stores have not
     /// been cleaned up for them yet, so everything is read fresh here.
+    ///
+    /// The registry record is opened BEFORE the detection store is read and
+    /// committed only once the write is in the writer's queue, so there is no
+    /// instant in between — and the blocking send in the middle of it can last
+    /// minutes — at which a verdict for this run arrives to find nothing to
+    /// land on. See [`crate::storage::event_registry`] for the whole
+    /// reconciliation; what this function owns is the one case the detection
+    /// worker cannot handle itself, a verdict that landed before the write was
+    /// queued and so has to be sent from here, behind it.
     fn emit_event(&self, run: ClosedRun, filmstrip: Option<Filmstrip>) {
         let tx = match self.event_tx {
             Some(ref tx) => tx,
             None => return,
         };
+
+        // Every path below that returns without committing drops this, and
+        // dropping it abandons the record — which is right, because those are
+        // the paths where no file ever appears under this identity.
+        let pending = self.event_registry.as_ref().map(|registry| {
+            registry.open(
+                &self.camera_id,
+                run.first_motion_seq,
+                run.last_seq,
+                run.continues,
+            )
+        });
 
         let event = {
             let buffer = self.buffer.read_recover();
@@ -1057,21 +1088,32 @@ impl MotionAnalyzer {
             return;
         }
 
-        // Record the event AFTER enqueuing the write, so any upgrade the
-        // detection worker derives from this record is guaranteed to reach
-        // the writer behind the write itself (same channel, FIFO). See
-        // `storage::event_registry` for the full race analysis.
-        if let Some(ref registry) = self.event_registry {
-            registry.record(
-                &self.camera_id,
-                EventRecord {
-                    start_pts_ns,
-                    duration_ms,
-                    first_motion_seq: run.first_motion_seq,
-                    last_seq: run.last_seq,
-                    has_objects,
-                    continues: run.continues,
-                },
+        // The write is in the channel, so from here the detection worker can
+        // derive upgrades from this record itself: they go down the same
+        // channel and so arrive behind the write (FIFO). What comes back is a
+        // verdict that landed before that was true — while this thread was
+        // assembling, or blocked on the send above — and it is this thread's
+        // to send, because only a message queued after the write can find the
+        // file the write creates.
+        let Some(verdict) =
+            pending.and_then(|pending| pending.commit(start_pts_ns, duration_ms, has_objects))
+        else {
+            return;
+        };
+        let upgrade = EventUpgrade::for_event(
+            UpgradeTarget {
+                start_pts_ns,
+                duration_ms,
+                continues: run.continues,
+            },
+            verdict,
+        );
+        // Losing this costs the event twelve days of retention, so it gets the
+        // same blocking send the write itself did.
+        if tx.blocking_send(WriterMessage::Upgrade(upgrade)).is_err() {
+            tracing::error!(
+                camera = %self.camera_id,
+                "warm writer gone, object upgrade lost: the event keeps movement retention"
             );
         }
     }
@@ -1346,6 +1388,8 @@ impl MotionAnalyzer {
                 full_frame_jpeg,
                 motion_rects: all_motion_rects,
                 run_crop: run_crop.map(|c| (c.x, c.y, c.w, c.h)),
+                // Stamped by the queue as it accepts the job.
+                verdict_id: None,
             });
         }
 
@@ -2200,6 +2244,327 @@ mod tests {
             6,
             "the flush left behind footage that was already in the buffer"
         );
+    }
+
+    // ---- Event assembly against a verdict arriving at the worst moment ----
+
+    /// An analyzer with a live event registry, an open run over everything
+    /// analyzed so far, and a writer channel of exactly `slots`. The spare
+    /// sender is handed back so a test can occupy those slots and hold the
+    /// analyzer's handoff open where a slow store holds it in production.
+    fn analyzer_with_a_registry(
+        dir: &std::path::Path,
+        analyzed_through: u64,
+        slots: usize,
+    ) -> (
+        MotionAnalyzer,
+        EventRegistry,
+        Arc<RwLock<HotBuffer>>,
+        tokio::sync::mpsc::Sender<WriterMessage>,
+        tokio::sync::mpsc::Receiver<WriterMessage>,
+    ) {
+        let (tx, rx) = tokio::sync::mpsc::channel(slots);
+        let registry = EventRegistry::new(&["cam".to_string()]);
+        let mut ctx = test_context("cam", dir);
+        ctx.event_tx = Some(tx.clone());
+        ctx.event_registry = Some(registry.clone());
+        // A real store, empty: `assemble_event` reads it, finds nothing, and
+        // classifies the event as movement — so an upgrade afterwards is the
+        // only way it can become an object event.
+        ctx.detection_store = Some(DetectionStore::new(&["cam".to_string()]));
+        let buffer = Arc::clone(&ctx.buffer);
+        {
+            let mut buf = buffer.write_recover();
+            for seq in 0..=analyzed_through {
+                buf.push(gop(seq));
+            }
+        }
+
+        let mut analyzer = MotionAnalyzer::with_decoder(ctx, FrameDecoder::dead());
+        let now = Instant::now();
+        for seq in 0..=analyzed_through {
+            analyzer.run_tracker.observe(seq, true, now);
+        }
+        analyzer.last_processed = analyzed_through + 1;
+        analyzer.observed_sequences = true;
+        (analyzer, registry, buffer, tx, rx)
+    }
+
+    fn person() -> crate::storage::Verdict {
+        crate::storage::Verdict {
+            object_classes: vec!["person".to_string()],
+            detections: vec![crate::storage::event_index::DetectionDetail {
+                class: "person".to_string(),
+                confidence: 0.9,
+            }],
+            backend: "ollama".to_string(),
+            model: "test-model".to_string(),
+        }
+    }
+
+    /// Long enough that a machine under load is not the reason a test fails,
+    /// short enough that a message which is never coming is reported as one
+    /// rather than hanging the suite.
+    const PATIENCE: Duration = Duration::from_secs(10);
+
+    /// Spin until the analyzer thread has got somewhere observable, failing
+    /// with `what_went_wrong` rather than hanging if it never does.
+    fn wait_for(mut reached: impl FnMut() -> bool, what_went_wrong: &str) {
+        let waited = Instant::now();
+        while !reached() {
+            assert!(waited.elapsed() < PATIENCE, "{what_went_wrong}");
+            std::thread::yield_now();
+        }
+    }
+
+    async fn next_message(
+        rx: &mut tokio::sync::mpsc::Receiver<WriterMessage>,
+        expected: &str,
+    ) -> WriterMessage {
+        match tokio::time::timeout(PATIENCE, rx.recv()).await {
+            Ok(Some(message)) => message,
+            Ok(None) => panic!("the writer channel closed before {expected}"),
+            Err(_) => panic!("{expected} never arrived"),
+        }
+    }
+
+    fn filler() -> WriterMessage {
+        WriterMessage::Upgrade(EventUpgrade::for_event(
+            UpgradeTarget {
+                start_pts_ns: u64::MAX,
+                duration_ms: 0,
+                continues: false,
+            },
+            person(),
+        ))
+    }
+
+    /// The race the whole registry exists for, and both of its windows.
+    ///
+    /// The analyzer reads the detection store, assembles the event, and then
+    /// blocks handing it to a writer that is one slow remote store away —
+    /// minutes, in production. A verdict landing anywhere from the store read
+    /// to the end of that handoff used to hit nothing on either path: the read
+    /// had already happened, and there was no entry to claim until after the
+    /// handoff returned. The event stayed movement-classified and its footage
+    /// was deleted twelve days early.
+    ///
+    /// Both windows are held open here rather than waited for, so neither
+    /// assertion rests on a timing:
+    ///
+    /// * the hot buffer's write lock is held, and `assemble_event` takes a
+    ///   read lock on it before it touches the detection store — so a record
+    ///   appearing while the lock is held proves the record was opened
+    ///   *before* the store was read;
+    /// * the writer channel's only slot is taken, so the analyzer provably
+    ///   cannot have got its write away when the verdict lands.
+    ///
+    /// The store is real and empty, so the event is assembled as a movement
+    /// event: the upgrade that follows is the only thing that can save its
+    /// footage.
+    #[tokio::test]
+    async fn a_verdict_landing_while_the_analyzer_holds_the_write_still_upgrades_the_event() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut analyzer, registry, buffer, spare, mut rx) =
+            analyzer_with_a_registry(dir.path(), 2, 1);
+        spare.try_send(filler()).expect("the channel starts empty");
+
+        let run = analyzer
+            .run_tracker
+            .flush(Some(2))
+            .expect("the analyzer carries an open run");
+        // Nothing can be read out of the hot buffer until this is dropped, so
+        // the analyzer cannot have reached the detection store read inside
+        // `assemble_event`.
+        let before_the_store_read = buffer.write_recover();
+        let flushing = std::thread::spawn(move || analyzer.emit_event(run, None));
+
+        wait_for(
+            || registry.held("cam") > 0,
+            "no record was open while the analyzer was still short of the detection store: a \
+             verdict landing between the read and the handoff would have nothing to land on",
+        );
+
+        // Window one: the record exists, nothing has been read out of the
+        // store yet.
+        let targets = registry.deliver_verdict("cam", &[0, 1, 2], &person());
+        assert!(
+            targets.is_empty(),
+            "an upgrade was sent for an event whose write is not in the channel yet: it would \
+             reach the writer first and find no file"
+        );
+        drop(before_the_store_read);
+
+        // Window two: assembly is done and the handoff is blocked on a full
+        // channel, which is where a slow store holds it in production.
+        assert!(
+            !flushing.is_finished(),
+            "the analyzer got its write away before the verdict landed; the window this test \
+             needs was never open"
+        );
+
+        // Let go of the slot: the write goes in, and the upgrade the verdict
+        // earned follows it down the same channel.
+        next_message(&mut rx, "the filler message").await;
+        let event = match next_message(&mut rx, "the event").await {
+            WriterMessage::Event(event) => event,
+            WriterMessage::Upgrade(_) => panic!("the upgrade overtook the write it belongs to"),
+        };
+        assert!(
+            !event.has_objects,
+            "the assembly saw detections the test never stored; the upgrade below would prove \
+             nothing"
+        );
+        match next_message(&mut rx, "the upgrade the verdict earned").await {
+            WriterMessage::Upgrade(upgrade) => {
+                assert_eq!(upgrade.start_pts_ns, event.first_pts);
+                assert_eq!(upgrade.duration_ms, event.duration_ms() as u32);
+                assert_eq!(upgrade.object_classes, vec!["person".to_string()]);
+            }
+            WriterMessage::Event(_) => panic!("a second event was written"),
+        }
+        flushing.join().expect("the analyzer panicked");
+    }
+
+    /// The same verdict on the other side of the handoff. Once the write is in
+    /// the channel the record carries the identity the file will have, so the
+    /// detection worker upgrades it itself — and the identity it gets has to
+    /// be the one the write is about to create.
+    #[test]
+    fn a_verdict_landing_after_the_write_is_queued_upgrades_the_event_it_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut analyzer, registry, _buffer, _spare, mut rx) =
+            analyzer_with_a_registry(dir.path(), 2, 4);
+
+        analyzer.flush_open_run();
+        let event = flushed_event(&mut rx);
+
+        assert_eq!(
+            registry.deliver_verdict("cam", &[0, 1, 2], &person()),
+            [UpgradeTarget {
+                start_pts_ns: event.first_pts,
+                duration_ms: event.duration_ms() as u32,
+                continues: false,
+            }]
+        );
+    }
+
+    /// A write that never left the analyzer — the writer was already gone —
+    /// creates no file, so its record goes with it and a verdict that arrives
+    /// afterwards has nothing to rewrite. The detections are still in the
+    /// detection store and the API, as they always were.
+    #[test]
+    fn an_event_whose_write_never_left_leaves_no_record_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut analyzer, registry, _buffer, spare, rx) =
+            analyzer_with_a_registry(dir.path(), 2, 4);
+        drop(rx);
+        drop(spare);
+
+        analyzer.flush_open_run();
+
+        assert_eq!(
+            registry.held("cam"),
+            0,
+            "a record outlived the event whose write was lost"
+        );
+        assert!(registry
+            .deliver_verdict("cam", &[0, 1, 2], &person())
+            .is_empty());
+    }
+
+    /// Phase 2 of the stop flushes open runs while crop jobs for them are
+    /// still queued behind a model that answers one request at a time. The
+    /// detection worker is not aborted until the analyzers have been joined,
+    /// so those verdicts are not *yet* impossible — they are simply not
+    /// coming in time, and the abort that follows the join ends them for good.
+    /// The registry must not make the drain wait for one, and must not lose
+    /// the half that did happen: the write is at the writer's door and the
+    /// record stays, unresolved and harmless, until the process goes away
+    /// with it.
+    #[test]
+    fn a_flush_at_shutdown_neither_waits_for_a_verdict_nor_drops_the_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut analyzer, registry, _buffer, _spare, mut rx) =
+            analyzer_with_a_registry(dir.path(), 2, 4);
+        // A crop job queued behind a model that will be aborted still holding it.
+        let _never_answered = registry.expect_verdict("cam", &[0, 1, 2]);
+
+        let started = Instant::now();
+        analyzer.flush_open_run();
+
+        assert!(
+            started.elapsed() < TAIL_DRAIN_BOUND,
+            "the flush waited on a verdict instead of getting the recording away"
+        );
+        assert_eq!(
+            flushed_event(&mut rx).segments.len(),
+            3,
+            "the event the drain exists to save never reached the writer"
+        );
+        assert_eq!(
+            registry.held("cam"),
+            1,
+            "the record was dropped while its verdict was still outstanding"
+        );
+    }
+
+    /// The other end of that stop: a verdict that *did* park during the
+    /// handoff, and a writer that is gone by the time the analyzer comes to
+    /// send the upgrade it earned. Phase 3 drains the writers after the
+    /// analyzers, so this is narrow — but it is reachable, and the one thing
+    /// it must not do is wedge a drain that is already on a bound.
+    ///
+    /// What it costs is the upgrade, with an error line saying so: the event
+    /// keeps movement retention. What it must not cost is the write, which is
+    /// the footage, and which is already through.
+    ///
+    /// Both halves are deterministic. The event lands in the channel's only
+    /// slot, so the upgrade behind it cannot have been sent; closing the
+    /// receiver from there fails that send whether the analyzer has reached it
+    /// yet or not.
+    #[tokio::test]
+    async fn an_upgrade_with_no_writer_left_to_take_it_is_dropped_not_waited_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut analyzer, registry, _buffer, spare, mut rx) =
+            analyzer_with_a_registry(dir.path(), 2, 1);
+        spare.try_send(filler()).expect("the channel starts empty");
+
+        let flushing = std::thread::spawn(move || analyzer.flush_open_run());
+        wait_for(
+            || registry.held("cam") > 0,
+            "no record was opened for the event",
+        );
+        assert!(
+            registry
+                .deliver_verdict("cam", &[0, 1, 2], &person())
+                .is_empty(),
+            "an upgrade was sent for an event whose write is not in the channel yet"
+        );
+
+        // Let the write through and no further: with the event in the only
+        // slot, the upgrade has not been sent and cannot be.
+        next_message(&mut rx, "the filler message").await;
+        wait_for(|| rx.len() == 1, "the write never reached the writer");
+
+        // The writer goes away with the event in its queue and the upgrade
+        // still in the analyzer's hand.
+        rx.close();
+        wait_for(
+            || flushing.is_finished(),
+            "the analyzer wedged on an upgrade no writer was left to take",
+        );
+        flushing.join().expect("the analyzer panicked");
+
+        match rx
+            .recv()
+            .await
+            .expect("the write was lost with the upgrade")
+        {
+            WriterMessage::Event(event) => assert_eq!(event.segments.len(), 3),
+            WriterMessage::Upgrade(_) => panic!("the upgrade was queued after all"),
+        }
+        assert!(rx.recv().await.is_none());
     }
 
     /// The real spawn path, not just the retry helper it is built from: a task

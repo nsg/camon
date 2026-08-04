@@ -1000,7 +1000,7 @@ where
     };
     let (detect_tx, detect_rx) = match ollama_client {
         Some(_) => {
-            let (tx, queue) = detect_queue();
+            let (tx, queue) = detect_queue(event_registry.clone());
             (Some(tx), Some(queue))
         }
         None => (None, None),
