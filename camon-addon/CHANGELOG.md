@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- **Stopping the add-on no longer cuts recordings off after ten seconds.**
+  The Supervisor's default stop timeout is 10 seconds, but camon's shutdown
+  finishes what it is doing first — the motion run in progress, any pending
+  continuous chunk and every queued upload — which can take minutes against
+  a slow storage host. The add-on now asks for the same 360-second stop
+  budget the systemd install has always used, so stops, updates and host
+  shutdowns wait for the drain instead of killing it.
 - **An all-digit MQTT password no longer stops the add-on from starting.**
   The Supervisor's generated credentials are handed to camon with
   `--set`, and a value that looked like a number used to be read as one —

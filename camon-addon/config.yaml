@@ -20,6 +20,12 @@ boot: auto
 # We build from a plain Debian runtime (no s6-overlay), so let Docker's own
 # init stay out of the way and run our CMD as PID 1 for direct SIGTERM.
 init: false
+# How long the Supervisor waits after SIGTERM before killing the container.
+# The default is 10 seconds, which lands in the middle of camon's shutdown
+# drain: in-progress recordings are flushed and queued events uploaded, and a
+# single stathost upload can legitimately take minutes. 360 is the same stop
+# budget the systemd install sets (src/install.rs), for the same reason.
+timeout: 360
 
 # --- Ingress: embed the Camon web UI in the Home Assistant sidebar ----------
 # Home Assistant proxies the ingress path to this internal port and strips the
