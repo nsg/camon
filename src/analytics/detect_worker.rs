@@ -43,11 +43,12 @@ use crate::storage::{
 
 use super::ollama::{Detection, OllamaClient};
 
-/// Jobs held per camera before the oldest is evicted. A job is roughly 1 MB
-/// (up to four crop JPEGs plus a full 1080p frame), so even every camera at
-/// its cap stays around 100–200 MB — fine on the production box. The cap
-/// exists to bound staleness, not memory: under sustained motion the oldest
-/// jobs are the ones that stopped mattering.
+/// Jobs held per camera before the oldest is evicted. A job is up to four crop
+/// JPEGs, plus the full 1080p frame the debug view adds while somebody is
+/// watching one — roughly 1 MB with that frame and most of it without, so even
+/// every camera at its cap stays around 100–200 MB, fine on the production box.
+/// The cap exists to bound staleness, not memory: under sustained motion the
+/// oldest jobs are the ones that stopped mattering.
 pub const DETECT_QUEUE_PER_CAMERA_CAP: usize = 32;
 
 /// At most this many frames of a run are sent to the model.
@@ -59,10 +60,16 @@ pub struct DetectionJob {
     pub camera_id: String,
     /// Segment sequences of the motion run this job covers (ascending).
     pub seqs: Vec<u64>,
-    /// Cropped frames, JPEG-encoded, at most 4 are used.
-    pub crop_jpegs: Vec<Vec<u8>>,
-    /// A full (uncropped) frame for the debug overlay.
-    pub full_frame_jpeg: Option<Vec<u8>>,
+    /// Cropped frames, JPEG-encoded, at most 4 are used. Held by handle
+    /// because the debug store outlives the job: it takes a share of these
+    /// bytes rather than a second copy of them.
+    pub crop_jpegs: Vec<Arc<Vec<u8>>>,
+    /// A full (uncropped) frame for the debug overlay, which is what reads it
+    /// — so the analyzer encodes one only while somebody is watching that
+    /// view, and this is `None` the rest of the time. The MQTT bridge names it
+    /// as a fallback picture, for a run that carried no crops at all; a run
+    /// that produced a verdict always has the crop that verdict was seen in.
+    pub full_frame_jpeg: Option<Arc<Vec<u8>>>,
     /// Individual motion boxes in normalized full-frame coords.
     pub motion_rects: Vec<(f32, f32, f32, f32)>,
     /// The union crop region the frames were cropped to, normalized.
@@ -186,7 +193,7 @@ impl DetectionWorker {
                         &classes,
                         &per_frame,
                         &job.crop_jpegs,
-                        job.full_frame_jpeg.as_deref(),
+                        job.full_frame_jpeg.as_ref().map(|f| f.as_slice()),
                     ),
                 },
             );
@@ -208,13 +215,12 @@ impl DetectionWorker {
         // Thumbnail: the second frame when there is one (an inner frame of
         // the run reads better than the leading edge).
         let best_idx = if job.crop_jpegs.len() > 1 { 1 } else { 0 };
-        let frame_jpeg = Arc::new(
-            job.crop_jpegs
-                .get(best_idx)
-                .or_else(|| job.crop_jpegs.first())
-                .cloned()
-                .unwrap_or_default(),
-        );
+        let frame_jpeg = job
+            .crop_jpegs
+            .get(best_idx)
+            .or_else(|| job.crop_jpegs.first())
+            .map(Arc::clone)
+            .unwrap_or_default();
 
         for &seq in &job.seqs {
             for (class, &confidence) in classes.iter().zip(confidences) {
@@ -282,6 +288,15 @@ impl DetectionWorker {
         }
     }
 
+    /// Publish this run to the detector's debug view — but only while somebody
+    /// has that view open.
+    ///
+    /// An entry is the run's full frame plus its crops, about a megabyte, and
+    /// fifty of them are retained per camera; kept for a page nobody opened
+    /// that is the largest thing the process holds. So the store is asked
+    /// first, exactly as the analyzer asks before encoding a stage overlay,
+    /// and both pictures below reach it as handles on the job's own bytes
+    /// rather than as copies of them.
     fn store_debug_entry(
         &self,
         job: &DetectionJob,
@@ -292,6 +307,9 @@ impl DetectionWorker {
         let Some(ref debug_store) = self.debug_store else {
             return;
         };
+        if !debug_store.wanted(&job.camera_id) {
+            return;
+        }
         if job.crop_jpegs.is_empty() {
             return;
         }
@@ -312,11 +330,12 @@ impl DetectionWorker {
             .collect();
         debug_store.insert(
             &job.camera_id,
-            job.crop_jpegs.iter().cloned().map(Arc::new).collect(),
+            // Both of these clone `Arc` handles, not JPEGs.
+            job.crop_jpegs.clone(),
             raw_responses,
             model.to_string(),
             detections.len(),
-            job.full_frame_jpeg.clone().map(Arc::new),
+            job.full_frame_jpeg.clone(),
             job.motion_rects.clone(),
             job.run_crop,
             ollama_rects,
@@ -368,7 +387,7 @@ fn best_frame_per_class(per_frame: &[Vec<Detection>]) -> HashMap<&str, usize> {
 fn build_sightings(
     classes: &[String],
     per_frame: &[Vec<Detection>],
-    crop_jpegs: &[Vec<u8>],
+    crop_jpegs: &[Arc<Vec<u8>>],
     full_frame_jpeg: Option<&[u8]>,
 ) -> Vec<Sighting> {
     let best = best_frame_per_class(per_frame);
@@ -379,7 +398,7 @@ fn build_sightings(
             frame_jpeg: best
                 .get(class.as_str())
                 .and_then(|&idx| crop_jpegs.get(idx))
-                .map(Vec::as_slice)
+                .map(|jpeg| jpeg.as_slice())
                 .or(full_frame_jpeg)
                 .map(<[u8]>::to_vec),
         })
@@ -542,7 +561,7 @@ mod tests {
         DetectionJob {
             camera_id: camera_id.to_string(),
             seqs,
-            crop_jpegs: vec![vec![0xff]],
+            crop_jpegs: vec![Arc::new(vec![0xff])],
             full_frame_jpeg: None,
             motion_rects: Vec::new(),
             run_crop: None,
@@ -688,6 +707,90 @@ mod tests {
         );
     }
 
+    /// A worker whose only job in these tests is to publish debug entries; the
+    /// Ollama end is never reached.
+    fn worker_with(debug_store: &DetectionDebugStore) -> DetectionWorker {
+        let client = OllamaClient::new(
+            "http://127.0.0.1:1",
+            "test-model",
+            1,
+            0.5,
+            vec!["person".to_string()],
+            None,
+        )
+        .expect("client");
+        DetectionWorker::new(
+            client,
+            DetectionStore::new(&["cam".to_string()]),
+            Some(debug_store.clone()),
+            None,
+            HashMap::new(),
+            None,
+        )
+    }
+
+    /// A job carrying both of the pictures the debug view shows: the crops the
+    /// model saw and the full frame the overlay is drawn on.
+    fn job_with_pictures(crop: &Arc<Vec<u8>>, full: &Arc<Vec<u8>>) -> DetectionJob {
+        let mut job = job("cam", vec![0]);
+        job.crop_jpegs = vec![Arc::clone(crop)];
+        job.full_frame_jpeg = Some(Arc::clone(full));
+        job
+    }
+
+    /// The store keeps fifty entries of about a megabyte per camera, and
+    /// detection runs all night. Neither picture may be kept for a view nobody
+    /// has open — and both have to come back the moment somebody does.
+    #[test]
+    fn neither_debug_picture_is_kept_until_somebody_is_watching() {
+        let debug_store = DetectionDebugStore::new(&["cam".to_string()]);
+        let worker = worker_with(&debug_store);
+        let (crop, full) = (Arc::new(vec![0xaa]), Arc::new(vec![0xbb]));
+
+        worker.store_debug_entry(&job_with_pictures(&crop, &full), &[], Vec::new(), "m");
+        assert_eq!(
+            debug_store.stored("cam"),
+            0,
+            "kept a run's frames for a debug view nobody has open"
+        );
+
+        debug_store.list("cam");
+        worker.store_debug_entry(&job_with_pictures(&crop, &full), &[], Vec::new(), "m");
+        assert_eq!(debug_store.stored("cam"), 1);
+        let id = debug_store.list("cam")[0].id;
+        assert!(
+            debug_store.get_frame_jpeg("cam", id, 0).is_some(),
+            "the crops never reached the open view"
+        );
+        assert!(
+            debug_store.get_full_frame_jpeg("cam", id).is_some(),
+            "the full frame never reached the open view"
+        );
+    }
+
+    /// The job owns these bytes and the store outlives the job, so the store
+    /// takes a share of them. Copying instead would double the megabyte per
+    /// entry — the very memory this gate exists to give back.
+    #[test]
+    fn the_debug_entry_shares_the_jobs_frames_rather_than_copying_them() {
+        let debug_store = DetectionDebugStore::new(&["cam".to_string()]);
+        let worker = worker_with(&debug_store);
+        let (crop, full) = (Arc::new(vec![0xaa]), Arc::new(vec![0xbb]));
+
+        debug_store.list("cam");
+        worker.store_debug_entry(&job_with_pictures(&crop, &full), &[], Vec::new(), "m");
+
+        let id = debug_store.list("cam")[0].id;
+        assert!(
+            Arc::ptr_eq(&debug_store.get_frame_jpeg("cam", id, 0).unwrap(), &crop),
+            "the crop was copied into the store instead of shared"
+        );
+        assert!(
+            Arc::ptr_eq(&debug_store.get_full_frame_jpeg("cam", id).unwrap(), &full),
+            "the full frame was copied into the store instead of shared"
+        );
+    }
+
     #[tokio::test]
     async fn queue_closes_when_last_sender_drops() {
         let (tx, queue) = detect_queue(None);
@@ -756,7 +859,7 @@ mod tests {
             vec![detection("person", 0.6), detection("cat", 0.9)],
             vec![detection("person", 0.8)],
         ];
-        let crops = vec![vec![0xaa], vec![0xbb]];
+        let crops = vec![Arc::new(vec![0xaa]), Arc::new(vec![0xbb])];
         let sightings = build_sightings(
             &["person".to_string(), "cat".to_string()],
             &per_frame,

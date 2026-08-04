@@ -208,7 +208,7 @@ impl MotionStore {
     #[cfg(test)]
     pub(crate) fn mark_map_requested_ago(&self, camera_id: &str, kind: MapKind, ago: Duration) {
         if let Some(maps) = self.maps.get(camera_id) {
-            *maps[kind as usize].last_request.write_recover() = Some(back_date(ago));
+            *maps[kind as usize].last_request.write_recover() = Some(super::back_date(ago));
         }
     }
 
@@ -218,7 +218,7 @@ impl MotionStore {
     pub(crate) fn mark_map_published_ago(&self, camera_id: &str, kind: MapKind, ago: Duration) {
         if let Some(maps) = self.maps.get(camera_id) {
             if let Some(map) = maps[kind as usize].published.write_recover().as_mut() {
-                map.at = back_date(ago);
+                map.at = super::back_date(ago);
             }
         }
     }
@@ -230,17 +230,6 @@ impl MotionStore {
             .back()
             .map(|e| e.segment_sequence)
     }
-}
-
-/// An `Instant` `ago` in the past, saturating at the present when the monotonic
-/// clock does not reach back that far (it starts at boot). Saturating this way
-/// round keeps a failed back-date reading as "just now" rather than "long ago",
-/// so a test that expects a stage to have gone quiet fails loudly instead of
-/// passing because the timestamp went missing.
-#[cfg(test)]
-fn back_date(ago: Duration) -> Instant {
-    let now = Instant::now();
-    now.checked_sub(ago).unwrap_or(now)
 }
 
 pub struct MotionSnapshot {

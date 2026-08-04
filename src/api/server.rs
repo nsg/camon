@@ -930,6 +930,11 @@ struct DebugEntryResponse {
     ollama_rects: Vec<(String, f32, f32, f32, f32)>,
 }
 
+/// The debug view's poll — and, by being it, the one thing that tells the
+/// detector somebody is watching. The store opens a demand window on this
+/// request; the analyzer and the detection worker produce and keep frames only
+/// while it is open, so a route that stops reaching the store here leaves the
+/// view permanently empty. See [`DetectionDebugStore::wanted`].
 async fn detection_debug_handler(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -1069,6 +1074,107 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         (format!("http://{addr}"), motion_store)
+    }
+
+    /// Like [`serve`], but hands back the detection debug store, whose demand
+    /// window this API is the only opener of.
+    async fn serve_with_debug_store() -> (String, DetectionDebugStore) {
+        let ids = vec!["cam".to_string()];
+        let buffers = HashMap::from([("cam".to_string(), HotBuffer::new("cam".to_string(), 60))]);
+        let debug_store = DetectionDebugStore::new(&ids);
+        let state = AppState::new(
+            buffers,
+            MotionStore::new(&ids),
+            DetectionStore::new(&ids),
+            debug_store.clone(),
+            None,
+            None,
+        );
+        let app = build_router(state, None);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{addr}"), debug_store)
+    }
+
+    /// The detector's debug frames are a megabyte a run and are kept only while
+    /// somebody is watching. This route is what says somebody is: the analyzer
+    /// and the detection worker both ask the store, and nothing else ever
+    /// answers yes. If the entry list stops registering the request, the view
+    /// goes permanently blank.
+    #[tokio::test]
+    async fn asking_for_the_debug_entries_is_what_says_somebody_is_watching() {
+        let (base, debug_store) = serve_with_debug_store().await;
+        assert!(
+            !debug_store.wanted("cam"),
+            "frames were being kept before anyone opened the view"
+        );
+
+        let response = reqwest::get(format!("{base}/api/cameras/cam/detection-debug"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert!(
+            debug_store.wanted("cam"),
+            "the view was polled and the detector was still told nobody wants its frames"
+        );
+
+        // And with the window open, what the worker stores is what the view
+        // serves — all the way to the JPEG bytes.
+        debug_store.insert(
+            "cam",
+            vec![Arc::new(vec![0xaa])],
+            vec!["{}".to_string()],
+            "test-model".to_string(),
+            0,
+            Some(Arc::new(vec![0xbb])),
+            Vec::new(),
+            None,
+            Vec::new(),
+        );
+        let entries = reqwest::get(format!("{base}/api/cameras/cam/detection-debug"))
+            .await
+            .unwrap()
+            .json::<Vec<serde_json::Value>>()
+            .await
+            .unwrap();
+        assert_eq!(entries.len(), 1);
+        let id = entries[0]["id"].as_u64().unwrap();
+
+        let frame = reqwest::get(format!(
+            "{base}/api/cameras/cam/detection-debug/{id}/frame/0"
+        ))
+        .await
+        .unwrap();
+        assert_eq!(frame.status(), reqwest::StatusCode::OK);
+        assert_eq!(frame.bytes().await.unwrap().as_ref(), [0xaa]);
+
+        let full = reqwest::get(format!(
+            "{base}/api/cameras/cam/detection-debug/{id}/full-frame"
+        ))
+        .await
+        .unwrap();
+        assert_eq!(full.status(), reqwest::StatusCode::OK);
+        assert_eq!(full.bytes().await.unwrap().as_ref(), [0xbb]);
+
+        // The images are the seam: they are fetched as a consequence of a list
+        // the viewer already has, so they must not be able to hold the window
+        // open by themselves. A cached page, or a URL somebody bookmarked,
+        // would otherwise keep the detector encoding frames for nobody.
+        debug_store.mark_requested_ago("cam", std::time::Duration::from_secs(600));
+        for url in [
+            format!("{base}/api/cameras/cam/detection-debug/{id}/frame/0"),
+            format!("{base}/api/cameras/cam/detection-debug/{id}/full-frame"),
+        ] {
+            assert_eq!(
+                reqwest::get(&url).await.unwrap().status(),
+                reqwest::StatusCode::OK
+            );
+            assert!(
+                !debug_store.wanted("cam"),
+                "{url} re-armed the window on its own"
+            );
+        }
     }
 
     /// Every stage the UI asks for has to resolve to its own map — one route

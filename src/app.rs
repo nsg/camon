@@ -470,6 +470,9 @@ struct SpawnContext<'a> {
     config: &'a Config,
     motion_store: &'a MotionStore,
     detection_store: &'a DetectionStore,
+    /// The detector's debug view, for the analyzers to ask whether anybody is
+    /// watching one before encoding frames for it.
+    debug_store: &'a DetectionDebugStore,
     storage: &'a Option<Arc<dyn WarmStorageBackend>>,
     motion_settings: &'a Option<analytics::MotionSettingsStore>,
     /// Crop-job queue into the global detection worker; `None` when object
@@ -647,6 +650,7 @@ fn spawn_cameras(ctx: &SpawnContext, cameras: Vec<config::CameraConfig>) -> Came
                     buffer,
                     motion_store: ctx.motion_store.clone(),
                     detection_store: Some(ctx.detection_store.clone()),
+                    debug_store: Some(ctx.debug_store.clone()),
                     detect_tx: ctx.detect_tx.clone(),
                     event_registry: ctx.event_registry.clone(),
                     config: ctx.config.analytics.clone(),
@@ -1188,6 +1192,7 @@ where
         config: &config,
         motion_store: &motion_store,
         detection_store: &detection_store,
+        debug_store: &debug_store,
         storage: &storage,
         motion_settings: &motion_settings,
         detect_tx: &detect_tx,

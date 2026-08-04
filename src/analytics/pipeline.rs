@@ -16,7 +16,8 @@ use crate::mqtt::{send_event, MqttEvent};
 use crate::retry::{jittered, RetrySchedule, Streak};
 use crate::shutdown::{shortfall, who_stalled, DrainGate, DrainStep, Stalled, TAIL_DRAIN_BOUND};
 use crate::storage::{
-    DetectionStore, EventRegistry, MapKind, MotionEntry, MotionStore, UpgradeTarget,
+    DetectionDebugStore, DetectionStore, EventRegistry, MapKind, MotionEntry, MotionStore,
+    UpgradeTarget,
 };
 
 use super::decoder::{
@@ -526,6 +527,11 @@ pub struct AnalyzerContext {
     pub buffer: Arc<RwLock<HotBuffer>>,
     pub motion_store: MotionStore,
     pub detection_store: Option<DetectionStore>,
+    /// The detector's debug view. Held here for its demand window, not to
+    /// write to it: the analyzer asks whether anybody is watching before
+    /// encoding a full frame for it, and frees what an ended session left
+    /// behind. `None` when there is no debug view to feed (the tests).
+    pub debug_store: Option<DetectionDebugStore>,
     /// Crop jobs for the global (serial) detection worker. `None` when
     /// object detection is disabled. Sends never block — motion detection
     /// never stalls on the vision model.
@@ -558,6 +564,7 @@ pub struct MotionAnalyzer {
     buffer: Arc<RwLock<HotBuffer>>,
     motion_store: MotionStore,
     detection_store: Option<DetectionStore>,
+    debug_store: Option<DetectionDebugStore>,
     config: AnalyticsConfig,
     detector: MotionDetector,
     decoder: FrameDecoder,
@@ -633,6 +640,7 @@ impl MotionAnalyzer {
             buffer: ctx.buffer,
             motion_store: ctx.motion_store,
             detection_store: ctx.detection_store,
+            debug_store: ctx.debug_store,
             config: ctx.config,
             detector,
             decoder,
@@ -660,19 +668,9 @@ impl MotionAnalyzer {
         tracing::info!(camera = %self.camera_id, "motion analyzer started");
 
         while !shutdown.load(Ordering::Relaxed) {
-            if !self.ensure_decoder_alive(&shutdown) {
-                continue;
+            if self.tick(&shutdown) {
+                thread::sleep(POLL_INTERVAL);
             }
-
-            if let Err(e) = self.process_new_segments() {
-                tracing::error!(
-                    camera = %self.camera_id,
-                    error = %e,
-                    "motion analysis error"
-                );
-            }
-
-            thread::sleep(POLL_INTERVAL);
         }
 
         // The stop flag alone means only that a stop has *begun*: the camera
@@ -682,6 +680,39 @@ impl MotionAnalyzer {
         self.drain_tail(DrainGate::starting_at(Instant::now(), TAIL_DRAIN_BOUND));
         self.flush_open_run();
         tracing::info!(camera = %self.camera_id, "motion analyzer stopped");
+    }
+
+    /// One pass of the analyzer. Returns whether the caller should wait out the
+    /// poll interval — a pass that gave up on the decoder has already waited
+    /// its own respawn backoff.
+    ///
+    /// The debug view's frames are freed first, above everything a decoder
+    /// could stop: a camera looping on a respawn that keeps failing analyzes
+    /// nothing, and that is precisely the state where the box is short enough
+    /// of memory for a fork to fail. Leaving the expiry below the decoder check
+    /// would pin the debug view's tens of megabytes exactly when they are least
+    /// affordable. Nothing else in a pass is like that — everything else here
+    /// needs frames to do anything at all.
+    fn tick(&mut self, shutdown: &AtomicBool) -> bool {
+        if let Some(ref debug_store) = self.debug_store {
+            debug_store.expire_unwatched(&self.camera_id);
+        }
+
+        // The stop can be requested while a pass is running, and a decoder
+        // forked for a pass that will not happen is the fork the drain path
+        // already refuses to make.
+        if shutdown.load(Ordering::Relaxed) || !self.ensure_decoder_alive(shutdown) {
+            return false;
+        }
+
+        if let Err(e) = self.process_new_segments() {
+            tracing::error!(
+                camera = %self.camera_id,
+                error = %e,
+                "motion analysis error"
+            );
+        }
+        true
     }
 
     /// Phase 2 of the stop: keep analyzing until the camera's terminal
@@ -799,6 +830,15 @@ impl MotionAnalyzer {
                 false
             }
         }
+    }
+
+    /// Whether anybody is looking at this camera's detection debug view. The
+    /// answer comes from the last time the API was asked for it, exactly as
+    /// [`MotionStore::map_wanted`] answers for a stage overlay.
+    fn debug_view_wanted(&self) -> bool {
+        self.debug_store
+            .as_ref()
+            .is_some_and(|store| store.wanted(&self.camera_id))
     }
 
     /// Pull the latest deterministic settings from the shared store and apply
@@ -1301,6 +1341,35 @@ impl MotionAnalyzer {
         )
     }
 
+    /// The full (uncropped) frame the detection debug view draws its overlay
+    /// on: the first frame of the run that has a crop, i.e. that had motion.
+    /// The detection mask is blacked out here too, so the view shows exactly
+    /// what the model could not see.
+    ///
+    /// Nothing but that view ever reads this frame, so it is encoded only while
+    /// somebody has the view open — the same bargain the stage overlays strike
+    /// in [`publish_debug_maps`]. Unconditionally it is a 1080p encode per
+    /// motion run all night, a megabyte carried through the detection queue and
+    /// then pinned in the debug store, for a page nobody opened. With detection
+    /// off there is no job to carry it at all.
+    fn debug_overlay_frame(
+        &self,
+        tagged_frames: &[(RgbFrame, Option<NormalizedRect>)],
+    ) -> Option<Arc<Vec<u8>>> {
+        if self.detect_tx.is_none() || !self.debug_view_wanted() {
+            return None;
+        }
+        tagged_frames
+            .iter()
+            .find(|(_, crop)| crop.is_some())
+            .and_then(|(frame, _)| {
+                let mut f = frame.clone();
+                apply_detection_mask(&mut f, FULL_FRAME, &self.detection_mask);
+                rgb_jpeg(&f)
+            })
+            .map(Arc::new)
+    }
+
     /// Extract, crop and JPEG-encode the color frames of one contiguous motion
     /// run. They become the filmstrip of the event the run belongs to, and —
     /// when object detection is on — a crop job for the global detection
@@ -1317,6 +1386,18 @@ impl MotionAnalyzer {
             return;
         }
 
+        self.process_run_frames(run, tagged_frames);
+    }
+
+    /// Everything the run's frames are turned into, once they have been
+    /// extracted. Split from the extraction above so what the strip, the job
+    /// and the debug overlay are built out of can be driven from a test
+    /// without an ffmpeg to decode with.
+    fn process_run_frames(
+        &mut self,
+        run: Vec<MotionSegment>,
+        tagged_frames: Vec<(RgbFrame, Option<NormalizedRect>)>,
+    ) {
         // Collect motion rects and crop before consuming them
         let mut all_motion_rects: Vec<(f32, f32, f32, f32)> = Vec::new();
         let mut run_crop: Option<NormalizedRect> = None;
@@ -1334,21 +1415,7 @@ impl MotionAnalyzer {
             }
         }
 
-        // Encode a full (uncropped) frame for debug overlay. Pick the first
-        // tagged frame that has a crop (i.e. had motion). The detection mask
-        // is blacked out here too so the debug UI shows exactly what the model
-        // could not see. Only the detection debug UI reads it, so it is not
-        // encoded at all without object detection.
-        let full_frame_jpeg = self.detect_tx.as_ref().and_then(|_| {
-            tagged_frames
-                .iter()
-                .find(|(_, crop)| crop.is_some())
-                .and_then(|(frame, _)| {
-                    let mut f = frame.clone();
-                    apply_detection_mask(&mut f, FULL_FRAME, &self.detection_mask);
-                    rgb_jpeg(&f)
-                })
-        });
+        let full_frame_jpeg = self.debug_overlay_frame(&tagged_frames);
 
         // Apply per-frame crops, then black out any painted detection-mask
         // cells so masked pixels reach neither the model nor a stored
@@ -1384,7 +1451,12 @@ impl MotionAnalyzer {
             tx.send(DetectionJob {
                 camera_id: self.camera_id.clone(),
                 seqs: run.iter().map(|seg| seg.seq).collect(),
-                crop_jpegs: filmstrip_jpegs.clone(),
+                // The strip has two independent owners — this event and the
+                // detection job — so it is copied once, here. Past this point
+                // the job's copy is shared by handle: what the model reads, the
+                // thumbnail keeps and the debug store holds are all these
+                // bytes, never another copy of them.
+                crop_jpegs: filmstrip_jpegs.iter().cloned().map(Arc::new).collect(),
                 full_frame_jpeg,
                 motion_rects: all_motion_rects,
                 run_crop: run_crop.map(|c| (c.x, c.y, c.w, c.h)),
@@ -2036,6 +2108,119 @@ mod tests {
         assert_eq!(attempts.load(Ordering::Relaxed), 0);
     }
 
+    /// The overlay's full frame is a 1080p encode per motion run, and up to a
+    /// third of what the debug store then pins per entry. It follows the view
+    /// being open — not detection being enabled, which is how it was decided
+    /// before and is true all night on a box nobody is looking at.
+    ///
+    /// Driven through the run-processing path rather than the helper it calls,
+    /// so that what is pinned is the decision the job is actually built with:
+    /// a caller that went back to encoding unconditionally would still pass a
+    /// test of the helper alone.
+    #[tokio::test]
+    async fn the_debug_overlay_frame_is_encoded_only_while_the_view_is_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let debug_store = DetectionDebugStore::new(&["cam".to_string()]);
+        let (detect_tx, queue) = crate::analytics::detect_worker::detect_queue(None);
+        let mut ctx = test_context("cam", dir.path());
+        ctx.debug_store = Some(debug_store.clone());
+        ctx.detect_tx = Some(detect_tx);
+        let mut analyzer = MotionAnalyzer::with_decoder(ctx, FrameDecoder::dead());
+
+        let frames = || {
+            vec![(
+                RgbFrame {
+                    data: vec![0u8; 4 * 4 * 3],
+                    width: 4,
+                    height: 4,
+                },
+                Some(FULL_FRAME),
+            )]
+        };
+        let segment = |seq| MotionSegment {
+            seq,
+            data: Arc::new(Vec::new()),
+            duration_ns: 1,
+        };
+
+        analyzer.process_run_frames(vec![segment(0)], frames());
+        let job = queue.recv().await.expect("a crop job per run");
+        assert!(
+            job.full_frame_jpeg.is_none(),
+            "encoded a debug overlay for a view nobody has open"
+        );
+        // The crops the model needs are unaffected by the gate, and reach the
+        // job as handles.
+        assert_eq!(job.crop_jpegs.len(), 1);
+
+        debug_store.list("cam");
+        analyzer.process_run_frames(vec![segment(1)], frames());
+        let job = queue.recv().await.expect("a crop job per run");
+        assert!(
+            job.full_frame_jpeg.is_some(),
+            "the view is open and its overlay has no frame to draw on"
+        );
+
+        debug_store.mark_requested_ago("cam", Duration::from_secs(600));
+        analyzer.process_run_frames(vec![segment(2)], frames());
+        let job = queue.recv().await.expect("a crop job per run");
+        assert!(
+            job.full_frame_jpeg.is_none(),
+            "kept encoding after the viewer left"
+        );
+    }
+
+    /// Nothing else can give the memory back. Both producers stop the instant
+    /// the window closes, so no insert ever comes to notice that it has —
+    /// without this tick the last session's tens of megabytes per camera stay
+    /// resident until the next detection, which on a quiet night is never.
+    ///
+    /// The pass is driven with a dead decoder and the stop already requested,
+    /// which is what pins the *position* of the expiry rather than only its
+    /// existence: this pass analyzes nothing and forks nothing, so an expiry
+    /// anywhere below the decoder check — where it used to be — never runs at
+    /// all. That is the state the position is for: a camera whose decoder will
+    /// not respawn, on a box short enough of memory that a fork fails.
+    #[test]
+    fn the_analyzer_tick_gives_back_what_an_ended_session_was_holding() {
+        let dir = tempfile::tempdir().unwrap();
+        let debug_store = DetectionDebugStore::new(&["cam".to_string()]);
+        let mut ctx = test_context("cam", dir.path());
+        ctx.debug_store = Some(debug_store.clone());
+        let mut analyzer = MotionAnalyzer::with_decoder(ctx, FrameDecoder::dead());
+        let stopping = AtomicBool::new(true);
+
+        debug_store.list("cam");
+        debug_store.insert(
+            "cam",
+            vec![Arc::new(vec![0xaa])],
+            Vec::new(),
+            "test-model".to_string(),
+            0,
+            Some(Arc::new(vec![0xbb])),
+            Vec::new(),
+            None,
+            Vec::new(),
+        );
+        assert_eq!(debug_store.stored("cam"), 1);
+
+        // A pass while somebody is still watching keeps them.
+        analyzer.tick(&stopping);
+        assert_eq!(
+            debug_store.stored("cam"),
+            1,
+            "took the frames away from a viewer who is still there"
+        );
+
+        debug_store.mark_requested_ago("cam", Duration::from_secs(600));
+        analyzer.tick(&stopping);
+        assert_eq!(
+            debug_store.stored("cam"),
+            0,
+            "the viewer left and the frames stayed resident"
+        );
+    }
+
     fn test_context(camera_id: &str, data_dir: &std::path::Path) -> AnalyzerContext {
         let ids = [camera_id.to_string()];
         AnalyzerContext {
@@ -2043,6 +2228,7 @@ mod tests {
             buffer: HotBuffer::new(camera_id.to_string(), 30),
             motion_store: MotionStore::new(&ids),
             detection_store: None,
+            debug_store: None,
             detect_tx: None,
             event_registry: None,
             config: AnalyticsConfig::default(),
