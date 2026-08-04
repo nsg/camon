@@ -973,6 +973,29 @@ pub fn spawn_bridge(
     tokio::spawn(run_bridge(ctx, rx))
 }
 
+/// Whether the bridge's loop has nothing left to serve. Both halves are
+/// required, and the second is the one that is easy to leave out.
+///
+/// The stop flag says a stop has *begun*. It does not say the analyzers have
+/// finished: phase 2 of the drain (see [`crate::shutdown`]) lets each of them
+/// keep working for up to `TAIL_DRAIN_BOUND` past the flag, and the last thing
+/// one does before it exits is flush its open motion run and send the
+/// `MotionEnd` that clears Home Assistant's motion sensor. A bridge that
+/// stopped receiving on the flag alone stopped one tick in and dropped that
+/// transition on the floor, leaving Home Assistant holding movement until camon
+/// came back. The producers dropping their senders is what actually says there
+/// is nothing more coming, and by the time the drain joins this task they
+/// always have.
+///
+/// If they somehow have not — an analyzer abandoned at its own bound still
+/// holds an `mqtt_tx` clone — this loop keeps running and the drain's
+/// `MQTT_SHUTDOWN_TIMEOUT` aborts it, which costs the retained `offline` marker
+/// and lets the LWT publish it instead. That is the same fallback an
+/// unreachable broker already gets.
+fn bridge_is_done(producers_gone: bool, shutdown: &AtomicBool) -> bool {
+    producers_gone && shutdown.load(Ordering::Relaxed)
+}
+
 async fn run_bridge(ctx: BridgeContext, mut rx: tokio::sync::mpsc::Receiver<MqttEvent>) {
     let topics = Topics::new(&ctx.config);
     // Before the client: its queue has to be sized for the clears too.
@@ -1055,6 +1078,7 @@ async fn run_bridge(ctx: BridgeContext, mut rx: tokio::sync::mpsc::Receiver<Mqtt
                     &ctx,
                     &mut snapshot_tasks,
                     &mut link,
+                    ctx.shutdown.load(Ordering::Relaxed),
                 ),
                 // Every producer is gone: the analyzers and detection worker
                 // have exited, so shutdown is already under way. Keep serving
@@ -1062,13 +1086,13 @@ async fn run_bridge(ctx: BridgeContext, mut rx: tokio::sync::mpsc::Receiver<Mqtt
                 // with the availability marker still reading `online`.
                 None => {
                     producers_gone = true;
-                    if ctx.shutdown.load(Ordering::Relaxed) {
+                    if bridge_is_done(producers_gone, &ctx.shutdown) {
                         break;
                     }
                 }
             },
             _ = tick.tick() => {
-                if ctx.shutdown.load(Ordering::Relaxed) {
+                if bridge_is_done(producers_gone, &ctx.shutdown) {
                     break;
                 }
                 on_tick(
@@ -1079,6 +1103,7 @@ async fn run_bridge(ctx: BridgeContext, mut rx: tokio::sync::mpsc::Receiver<Mqtt
                     &mut snapshot_tasks,
                     &mut link,
                     &mut memory,
+                    ctx.shutdown.load(Ordering::Relaxed),
                 );
             }
         }
@@ -1095,6 +1120,19 @@ async fn run_bridge(ctx: BridgeContext, mut rx: tokio::sync::mpsc::Receiver<Mqtt
     .await;
 }
 
+/// `stopping` is the shutdown flag, and it means here what it means in
+/// [`on_tick`]: the state transitions still go out — they are publishes onto a
+/// queue that is still being drained, and the `MotionEnd` below is the one that
+/// clears Home Assistant's motion sensor — but no new snapshot is started,
+/// because each one forks an ffmpeg to decode a GOP and a drain is the one time
+/// this process is trying to get every child it already has to exit.
+///
+/// Both spawn sites are guarded, not just the tick's. The `MotionEnd` that
+/// arrives during phase 2 is precisely an analyzer flushing its open run on the
+/// way out, so leaving this one unguarded would fork a decode per camera at the
+/// worst possible moment — a snapshot of the very last GOP, which is also the
+/// least interesting frame anybody will ever not look at.
+#[allow(clippy::too_many_arguments)]
 fn handle_event(
     event: MqttEvent,
     client: &AsyncClient,
@@ -1103,6 +1141,7 @@ fn handle_event(
     ctx: &BridgeContext,
     snapshot_tasks: &mut HashMap<String, tokio::task::JoinHandle<()>>,
     link: &mut Link,
+    stopping: bool,
 ) {
     match event {
         MqttEvent::MotionStart { camera_id } => {
@@ -1113,8 +1152,10 @@ fn handle_event(
             link.note(publish_state(client, &topics.motion(&camera_id), "ON"));
             // The frame that opened the run is the interesting one: take it now
             // rather than waiting up to a full interval for the tick.
-            state.mark_snapshot(&camera_id, Instant::now());
-            spawn_snapshot(client, topics, ctx, &camera_id, snapshot_tasks, link);
+            if !stopping {
+                state.mark_snapshot(&camera_id, Instant::now());
+                spawn_snapshot(client, topics, ctx, &camera_id, snapshot_tasks, link);
+            }
         }
         MqttEvent::MotionEnd { camera_id } => {
             if !state.motion_end(&camera_id) {
@@ -1124,7 +1165,9 @@ fn handle_event(
             link.note(publish_state(client, &topics.motion(&camera_id), "OFF"));
             // One last frame so the camera tile shows the end of the event
             // instead of freezing wherever the cadence happened to land.
-            spawn_snapshot(client, topics, ctx, &camera_id, snapshot_tasks, link);
+            if !stopping {
+                spawn_snapshot(client, topics, ctx, &camera_id, snapshot_tasks, link);
+            }
         }
         MqttEvent::Detections {
             camera_id,
@@ -1165,6 +1208,13 @@ fn handle_event(
     }
 }
 
+/// `stopping` is the shutdown flag: the loop goes on serving ticks through the
+/// drain (see [`bridge_is_done`]), but a stopping camon does not start new
+/// snapshots. Each one forks an ffmpeg to decode a GOP, and a drain is the one
+/// time this process is trying to get every child it already has to exit —
+/// publishing is still welcome, forking is not. Everything else here is a
+/// publish onto a queue that is still being drained.
+#[allow(clippy::too_many_arguments)]
 fn on_tick(
     client: &AsyncClient,
     topics: &Topics,
@@ -1173,6 +1223,7 @@ fn on_tick(
     snapshot_tasks: &mut HashMap<String, tokio::task::JoinHandle<()>>,
     link: &mut Link,
     memory: &mut EntityMemory,
+    stopping: bool,
 ) {
     let now = Instant::now();
 
@@ -1183,8 +1234,10 @@ fn on_tick(
         link.republish_pending = republish(client, topics, state, memory);
     }
 
-    for camera_id in state.due_snapshots(now) {
-        spawn_snapshot(client, topics, ctx, &camera_id, snapshot_tasks, link);
+    if !stopping {
+        for camera_id in state.due_snapshots(now) {
+            spawn_snapshot(client, topics, ctx, &camera_id, snapshot_tasks, link);
+        }
     }
 
     for (camera_id, class) in state.expire_occupancy(now) {
@@ -2320,6 +2373,7 @@ mod tests {
             &mut tasks,
             &mut link,
             &mut memory,
+            false,
         );
         assert!(link.republish_pending);
         assert_eq!(load_record(&path).unwrap().cameras, ["yard", "gate"]);
@@ -2335,6 +2389,7 @@ mod tests {
             &mut tasks,
             &mut link,
             &mut memory,
+            false,
         );
         assert!(!link.republish_pending);
         let written = load_record(&path).unwrap();
@@ -2423,6 +2478,7 @@ mod tests {
             &mut tasks,
             &mut link,
             &mut no_memory(&ctx),
+            false,
         );
 
         // The OFF had nowhere to go. Nothing else would ever re-assert it, so
@@ -2492,6 +2548,7 @@ mod tests {
             &mut tasks,
             &mut link,
             &mut no_memory(&ctx),
+            false,
         );
         // Still owed to the broker: the flag is what brings the next tick back
         // here, instead of leaving `online` unsent on a healthy connection.
@@ -2506,6 +2563,7 @@ mod tests {
             &mut tasks,
             &mut link,
             &mut no_memory(&ctx),
+            false,
         );
         assert!(!link.republish_pending);
 
@@ -2523,6 +2581,7 @@ mod tests {
             &mut tasks,
             &mut link,
             &mut no_memory(&ctx),
+            false,
         );
         assert!(link.republish_pending);
     }
@@ -2692,6 +2751,137 @@ mod tests {
             "the reconnect delay outlived the stop signal"
         );
         accepts.abort();
+    }
+
+    /// The flag says a stop has begun; the producers dropping their senders is
+    /// what says there is nothing left to receive. Both arms of the bridge's
+    /// loop ask this one question, so neither can drift into answering it on
+    /// its own.
+    #[test]
+    fn the_bridge_stops_only_once_its_producers_have_gone() {
+        let stopping = AtomicBool::new(true);
+        assert!(
+            !bridge_is_done(false, &stopping),
+            "the bridge stopped while its analyzers were still draining"
+        );
+        assert!(bridge_is_done(true, &stopping));
+        // Producers gone without a stop is the channel closing under a running
+        // camon, which the availability marker must not be torn down for.
+        assert!(!bridge_is_done(true, &AtomicBool::new(false)));
+    }
+
+    /// A `MotionEnd` arriving during the drain is an analyzer flushing its open
+    /// run on the way out, and the bridge now stays to receive it. What it must
+    /// not do is answer it by forking a decode: every snapshot spawns an ffmpeg,
+    /// and a stop is the one time this process is trying to get every child it
+    /// already has to exit. The state transition still goes out — that is the
+    /// message that clears Home Assistant's motion sensor, and losing it is the
+    /// whole reason the bridge stayed.
+    #[tokio::test]
+    async fn a_transition_during_the_drain_is_published_but_forks_no_snapshot() {
+        use crate::buffer::{GopSegment, HotBuffer};
+
+        let buffer = HotBuffer::new("yard".to_string(), 30);
+        buffer.write_recover().push(GopSegment {
+            start_pts: 0,
+            duration_ns: 1_000_000_000,
+            data: Arc::new(vec![0x47; 188]),
+            frame_count: 1,
+        });
+        let mut ctx = bridge_context(&["yard"], &[]);
+        ctx.buffers = Arc::new(HashMap::from([("yard".to_string(), buffer)]));
+
+        let topics = Topics::new(&ctx.config);
+        let (client, _loop) = unpolled_client(capacity_for(&ctx));
+        let mut state = state();
+        let mut link = Link {
+            connected: true,
+            republish_pending: false,
+        };
+        let mut tasks = HashMap::new();
+
+        // Both spawn sites, because guarding one of two is the bug this fixes.
+        let mut deliver = |event, state: &mut SensorState, tasks: &mut HashMap<_, _>| {
+            handle_event(
+                event, &client, &topics, state, &ctx, tasks, &mut link, true, // stopping
+            );
+        };
+
+        deliver(
+            MqttEvent::MotionStart {
+                camera_id: "yard".to_string(),
+            },
+            &mut state,
+            &mut tasks,
+        );
+        assert!(
+            state.has_motion("yard"),
+            "the ON transition was not applied"
+        );
+        assert!(tasks.is_empty(), "a MotionStart forked a snapshot decode");
+
+        deliver(
+            MqttEvent::MotionEnd {
+                camera_id: "yard".to_string(),
+            },
+            &mut state,
+            &mut tasks,
+        );
+        // Everything a live camon would publish for these transitions still
+        // went out; only the forks were skipped.
+        assert!(
+            !state.has_motion("yard"),
+            "the OFF transition was not applied"
+        );
+        assert!(
+            tasks.is_empty(),
+            "the drain's last MotionEnd forked a snapshot decode"
+        );
+    }
+
+    /// The regression the phased stop nearly introduced. Phase 2 lets an
+    /// analyzer keep working for up to `TAIL_DRAIN_BOUND` past the flag, and
+    /// the last thing it does before exiting is flush its open run and send the
+    /// `MotionEnd` that clears Home Assistant's motion sensor. A bridge that
+    /// stopped receiving on the flag alone stopped one tick in, and that
+    /// transition went nowhere — Home Assistant would hold movement until camon
+    /// came back.
+    ///
+    /// Real time, not paused: the bridge shares a runtime with an event loop
+    /// reconnecting to a broker that is not there, and a virtual clock in the
+    /// middle of that never settles enough to advance.
+    #[tokio::test]
+    async fn the_bridge_keeps_receiving_while_the_analyzers_are_still_draining() {
+        let ctx = bridge_context(&["yard"], &[]);
+        ctx.shutdown.store(true, Ordering::Relaxed); // a stop signal, just now
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let bridge = tokio::spawn(run_bridge(ctx, rx));
+
+        // Past the tick the bridge used to stop on, and well short of the
+        // bound a real analyzer has.
+        tokio::time::sleep(Duration::from_millis(1_500)).await;
+        let motion_end = MqttEvent::MotionEnd {
+            camera_id: "yard".to_string(),
+        };
+        tx.send(motion_end.clone())
+            .await
+            .expect("the bridge dropped the channel while its analyzers were still draining");
+
+        // Received, not merely queued behind a loop that has stopped reading.
+        // The channel holds one, so this second send can only complete once
+        // the bridge has taken the first — a loop that has broken out leaves
+        // it here until the receiver is dropped, and then fails it.
+        tokio::time::timeout(Duration::from_secs(5), tx.send(motion_end))
+            .await
+            .expect("the bridge stopped consuming while its analyzers were still draining")
+            .expect("the bridge dropped the channel while its analyzers were still draining");
+
+        // The analyzers exit; now the bridge has nothing left to serve.
+        drop(tx);
+        tokio::time::timeout(Duration::from_secs(10), bridge)
+            .await
+            .expect("the bridge did not stop once its producers were gone")
+            .expect("bridge task panicked");
     }
 
     #[tokio::test]

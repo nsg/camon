@@ -147,8 +147,25 @@ impl RunTracker {
         self.open.is_some()
     }
 
-    /// Close an open run immediately (shutdown flush — no post-padding wait).
-    pub fn flush(&mut self) -> Option<ClosedRun> {
+    /// Close an open run immediately (shutdown flush — no post-padding wait),
+    /// extending it through `through` when that reaches past the last segment
+    /// the analyzer scored.
+    ///
+    /// The extension is what keeps a recording whole when analysis stops before
+    /// the footage does — a decoder that died during the drain, a drain that
+    /// hit its bound with segments still unscored. Those segments are ordinary
+    /// GOPs sitting in the hot buffer and the event is assembled from a
+    /// sequence range, so including them costs nothing and keeps the recording
+    /// as long as the camera was recording. What ends early is the analysis:
+    /// there are no motion scores or detections over the extension, which is
+    /// the honest outcome — nothing looked at it.
+    ///
+    /// `None` extends nothing, which is every caller that is not the shutdown
+    /// flush.
+    pub fn flush(&mut self, through: Option<u64>) -> Option<ClosedRun> {
+        if let (Some(through), Some(run)) = (through, self.open.as_mut()) {
+            run.last_seq = run.last_seq.max(through);
+        }
         self.close()
     }
 
@@ -212,7 +229,7 @@ mod tests {
         for seq in 0..5 {
             assert_eq!(t.observe(seq, false, t0 + Duration::from_secs(seq)), None);
         }
-        assert_eq!(t.flush(), None);
+        assert_eq!(t.flush(None), None);
     }
 
     #[test]
@@ -242,7 +259,7 @@ mod tests {
                 continues: false,
             }
         );
-        assert_eq!(t.flush(), None);
+        assert_eq!(t.flush(None), None);
     }
 
     #[test]
@@ -276,7 +293,7 @@ mod tests {
         let t0 = base();
         t.observe(5, true, t0);
         t.observe(6, false, t0 + Duration::from_secs(1));
-        let closed = t.flush().unwrap();
+        let closed = t.flush(None).unwrap();
         assert_eq!(
             closed,
             ClosedRun {
@@ -286,7 +303,53 @@ mod tests {
                 continues: false,
             }
         );
-        assert_eq!(t.flush(), None);
+        assert_eq!(t.flush(None), None);
+    }
+
+    /// Analysis can stop before the footage does: a decoder that died during
+    /// the shutdown drain, a drain that ran out its bound with segments still
+    /// unscored. The run closes through the footage all the same — those
+    /// segments are ordinary GOPs and an event is a sequence range, so the
+    /// recording stays as long as the camera was recording and only the
+    /// scoring ends early. A run cut at the last *analyzed* segment would be a
+    /// recording truncated at exactly the moment the drain exists to protect.
+    #[test]
+    fn the_shutdown_flush_closes_through_footage_nobody_scored() {
+        let mut t = RunTracker::new(POST, CAP);
+        let t0 = base();
+        t.observe(5, true, t0);
+        t.observe(6, false, t0 + Duration::from_secs(1));
+        let closed = t.flush(Some(11)).unwrap();
+        assert_eq!(
+            closed,
+            ClosedRun {
+                first_motion_seq: 5,
+                last_seq: 11,
+                min_start_seq: 0,
+                continues: false,
+            }
+        );
+    }
+
+    /// The extension only ever reaches forward. A `through` behind what was
+    /// analyzed — an eviction race, a buffer read a moment stale — would drop
+    /// scored footage back out of the event it was already part of.
+    #[test]
+    fn the_shutdown_flush_never_shortens_a_run() {
+        let mut t = RunTracker::new(POST, CAP);
+        let t0 = base();
+        t.observe(5, true, t0);
+        t.observe(6, true, t0 + Duration::from_secs(1));
+        assert_eq!(t.flush(Some(2)).unwrap().last_seq, 6);
+    }
+
+    /// Nothing open is nothing to extend: an extension must not conjure an
+    /// event out of quiet footage that never had a motion run.
+    #[test]
+    fn the_shutdown_flush_extends_nothing_when_no_run_is_open() {
+        let mut t = RunTracker::new(POST, CAP);
+        t.observe(5, false, base());
+        assert_eq!(t.flush(Some(11)), None);
     }
 
     #[test]
@@ -300,7 +363,7 @@ mod tests {
         assert_eq!(first.last_seq, 0);
         // Second run: pre-padding may reach back only to seq 1.
         t.observe(2, true, t0 + POST + Duration::from_secs(2));
-        let second = t.flush().unwrap();
+        let second = t.flush(None).unwrap();
         assert_eq!(second.min_start_seq, 1);
         assert_eq!(second.first_motion_seq, 2);
     }
@@ -326,7 +389,7 @@ mod tests {
         );
         // The follow-on starts at seq 2, gets no pre-padding (barrier == 2),
         // and is flagged continues when it later closes.
-        let follow = t.flush().unwrap();
+        let follow = t.flush(None).unwrap();
         assert_eq!(follow.first_motion_seq, 2);
         assert_eq!(follow.min_start_seq, 2);
         assert!(follow.continues);
@@ -386,7 +449,7 @@ mod tests {
         assert_eq!(t.observe(0, true, t0), None);
         // Far past any sane cap — must not chunk.
         assert_eq!(t.observe(1, true, t0 + Duration::from_secs(3600)), None);
-        let closed = t.flush().unwrap();
+        let closed = t.flush(None).unwrap();
         assert_eq!(closed.first_motion_seq, 0);
         assert_eq!(closed.last_seq, 1);
         assert!(!closed.continues);

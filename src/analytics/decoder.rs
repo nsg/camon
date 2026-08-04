@@ -365,6 +365,28 @@ impl FrameDecoder {
         DecodeOutcome::Frames(frames)
     }
 
+    /// A decoder whose child is already gone, built without forking one first.
+    ///
+    /// For the shutdown-drain tests. The path where the decoder dies before the
+    /// drain begins is the path where a recording most easily loses its tail,
+    /// and it has to be reachable from a test that does not depend on ffmpeg
+    /// being installed — every test here that forks one is `#[ignore]`d, which
+    /// would leave that path unpinned in the suite that actually gates commits.
+    #[cfg(test)]
+    pub(crate) fn dead() -> Self {
+        let (_frame_tx, frame_rx) = std::sync::mpsc::channel();
+        Self {
+            pipe: FfmpegPipe {
+                segment_tx: None,
+                frame_rx,
+                child: None,
+                _writer_handle: std::thread::spawn(|| {}),
+                _reader_handle: std::thread::spawn(|| {}),
+            },
+            unclaimed_frames: 0,
+        }
+    }
+
     /// Kill the ffmpeg child so the caller's liveness check respawns it. Used
     /// when the pipe is wedged or the decoder has gone blind — neither of which
     /// the child recovers from on its own.

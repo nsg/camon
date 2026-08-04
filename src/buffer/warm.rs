@@ -8,6 +8,7 @@ use super::GopSegment;
 use crate::buffer::HotBuffer;
 use crate::config::WarmConfig;
 use crate::locks::LockExt;
+use crate::shutdown::{shortfall, who_stalled, DrainGate, DrainStep, Stalled, TAIL_DRAIN_BOUND};
 use crate::storage::backend::{WarmStorageBackend, WriteOutcome};
 use crate::storage::event_index::DetectionDetail;
 use crate::storage::{DetectionStore, EventType, RecordingWatchdog};
@@ -221,7 +222,8 @@ const CONTINUOUS_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 /// `last_sequence()` (one past the newest resident segment);
 /// `pending_duration_ns` is the summed duration of `[next_seq, last_sequence)`.
 /// A chunk rolls once the pending footage reaches `cap_ns`, or immediately when
-/// `force` is set (shutdown flush of whatever remains). A zero cap only rolls on
+/// `force` is set — the recorder's final flush, on the tick where it has
+/// established that no more footage is coming. A zero cap only rolls on
 /// `force`. Returns the inclusive `(start, last)` range, or `None`.
 fn plan_continuous_roll(
     next_seq: u64,
@@ -241,11 +243,19 @@ fn plan_continuous_roll(
 ///
 /// With no analyzer to close motion runs, this task owns the roll loop: it
 /// tracks the first not-yet-written sequence and, on each tick, rolls a chunk
-/// once `max_event_duration` of footage has accumulated in the hot buffer (or
-/// flushes whatever remains at shutdown). Chunks are assembled as `Arc` clones
-/// and handed to the same per-camera [`WarmWriter`] over the existing channel;
-/// `send().await` never drops a chunk. Successive chunks are flagged
-/// `continues` (all but the first after startup) so a UI can stitch the chain.
+/// once `max_event_duration` of footage has accumulated in the hot buffer.
+/// Chunks are assembled as `Arc` clones and handed to the same per-camera
+/// [`WarmWriter`] over the existing channel; `send().await` never drops a
+/// chunk. Successive chunks are flagged `continues` (all but the first after
+/// startup) so a UI can stitch the chain.
+///
+/// At shutdown it does not flush and leave. The stop flag says a stop has
+/// begun, not that the camera has finished — it is being joined at that moment
+/// and the GOP in its hand is still coming — so the recorder holds its final
+/// chunk open until the camera publishes its terminal watermark
+/// ([`HotBuffer::seal`]) and the chunk can take in everything up to it. See
+/// [`crate::shutdown`] for the phases and their bounds; the last of every
+/// recording used to be lost to exactly this.
 ///
 /// Chunk-boundary timing is lifecycle, so tick-based monotonic timing is used;
 /// segment content and PTS are untouched.
@@ -260,11 +270,33 @@ pub async fn run_continuous_recorder(
     let mut next_seq: u64 = 0;
     let mut first_chunk = true;
     let mut interval = tokio::time::interval(CONTINUOUS_CHECK_INTERVAL);
+    let mut gate: Option<DrainGate> = None;
     tracing::info!(camera = %camera_id, "continuous recorder started");
 
     loop {
         interval.tick().await;
-        let force = shutdown.load(Ordering::Relaxed);
+        // The tokio clock, not the system one, so a paused test can move a
+        // drain bound without waiting it out.
+        let now = tokio::time::Instant::now().into_std();
+        let stopping = shutdown.load(Ordering::Relaxed);
+        if stopping && gate.is_none() {
+            gate = Some(DrainGate::starting_at(now, TAIL_DRAIN_BOUND));
+        }
+
+        let terminal = stopping
+            .then(|| buffer.read_recover().terminal_watermark())
+            .flatten();
+        let expired = gate.as_ref().is_some_and(|gate| gate.expired(now));
+        // The final flush happens on the tick that knows it is the last one:
+        // once the camera has stopped and said where it stopped, or once the
+        // drain bound has run out of patience with a camera that has not.
+        // Forcing a roll on every stopping tick instead would slice the tail
+        // into one-second chunks while phase 1 was still joining the camera.
+        //
+        // A provisional watermark does not qualify — its camera is still
+        // pushing, and rolling on it would start that slicing again for the one
+        // camera least able to afford it. That chunk waits for the bound.
+        let force = stopping && (terminal.is_some_and(|terminal| !terminal.provisional) || expired);
 
         // Plan + assemble under the read lock; release it before awaiting send.
         let planned = {
@@ -300,8 +332,36 @@ pub async fn run_continuous_recorder(
             first_chunk = false;
         }
 
-        if force {
-            break;
+        if let Some(ref gate) = gate {
+            match gate.step(terminal, next_seq, now) {
+                DrainStep::Drained => break,
+                DrainStep::Abandoned => {
+                    // Whose bound this was. A final watermark means the camera
+                    // stopped and said so, and what ran out was this recorder's
+                    // ability to get the chunk away — a writer queue it is
+                    // blocking on. Anything else is a camera that never
+                    // finished stopping.
+                    let ran_out_of = match who_stalled(terminal) {
+                        Stalled::Consumer => {
+                            "the recorder could not write out the camera's last segments before \
+                             the shutdown drain bound; the tail of this recording is missing"
+                        }
+                        Stalled::Camera => {
+                            "gave up waiting for a camera that never finished stopping; whatever \
+                             it records past this point is not in the recording"
+                        }
+                    };
+                    tracing::warn!(
+                        camera = %camera_id,
+                        bound_secs = TAIL_DRAIN_BOUND.as_secs(),
+                        next_seq,
+                        segments_abandoned = shortfall(terminal, next_seq),
+                        "{ran_out_of}"
+                    );
+                    break;
+                }
+                DrainStep::Continue => {}
+            }
         }
     }
 
@@ -312,9 +372,16 @@ pub async fn run_continuous_recorder(
 ///
 /// Receives complete events (and post-hoc upgrade requests from the
 /// detection worker) over a bounded channel and handles each one inline — no
-/// detached spawns — so awaiting the writer task at shutdown guarantees every
-/// accepted event reached disk. The writer owns ALL file mutations under its
-/// camera's warm-storage directory.
+/// detached spawns — so a writer task that has returned is a queue that reached
+/// disk. The writer owns ALL file mutations under its camera's warm-storage
+/// directory.
+///
+/// Phase 3 of the stop is the drain awaiting these tasks (see
+/// [`crate::shutdown`]). It gets whatever the earlier phases left of the stop
+/// budget, which in a healthy stop is nearly all of it; a writer still working
+/// when that runs out is abandoned with a line saying so, because the
+/// alternative to abandoning it is a service manager's SIGKILL landing in the
+/// middle of the same write.
 ///
 /// Retention is NOT its business: pruning sweeps the whole store, not one
 /// camera, so it belongs to the single [`RetentionTask`]. What stays here is
@@ -710,6 +777,150 @@ mod tests {
     fn plan_roll_zero_cap_only_rolls_on_force() {
         assert_eq!(plan_continuous_roll(0, 4, 4 * SEC, 0, false), None);
         assert_eq!(plan_continuous_roll(0, 4, 4 * SEC, 0, true), Some((0, 3)));
+    }
+
+    // ---- The continuous recorder's phase-2 drain ----
+
+    /// A recorder wired to a hot buffer nothing else is writing to, with a cap
+    /// far beyond anything the test pushes, so the only chunk it ever rolls is
+    /// its final one. Paused time throughout: the bounds under test are tens of
+    /// seconds long and a test has no business waiting them out.
+    fn stopping_recorder(
+        buffer: &Arc<RwLock<HotBuffer>>,
+        shutdown: &Arc<AtomicBool>,
+    ) -> (mpsc::Receiver<WriterMessage>, tokio::task::JoinHandle<()>) {
+        let (tx, rx) = mpsc::channel(8);
+        let handle = tokio::spawn(run_continuous_recorder(
+            "cam".to_string(),
+            Arc::clone(buffer),
+            tx,
+            Duration::from_secs(3600),
+            Arc::clone(shutdown),
+        ));
+        (rx, handle)
+    }
+
+    fn chunk_range(message: WriterMessage) -> (u64, u64) {
+        match message {
+            WriterMessage::Event(event) => (
+                event.first_pts / SEC,
+                event.first_pts / SEC + event.segments.len() as u64 - 1,
+            ),
+            WriterMessage::Upgrade(_) => panic!("a recorder never sends an upgrade"),
+        }
+    }
+
+    /// The bug this whole phase exists for. The stop flag means a stop has
+    /// begun, not that the camera has finished: it is being joined at that
+    /// moment and the GOP in its hand is still coming. A recorder that flushed
+    /// on the flag wrote seconds 0-1 and left; it must wait for the watermark
+    /// and write 0-2.
+    #[tokio::test(start_paused = true)]
+    async fn the_tail_pushed_after_the_stop_flag_is_in_the_final_chunk() {
+        use crate::locks::LockExt;
+        let buffer = populated_buffer(2);
+        let shutdown = Arc::new(AtomicBool::new(true));
+        let (mut rx, handle) = stopping_recorder(&buffer, &shutdown);
+
+        // Long enough that a recorder which flushed on the flag has been gone
+        // for several ticks by the time the camera's last GOP lands.
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        buffer.write_recover().push(segment(2 * SEC, SEC, 2));
+        buffer.write_recover().seal();
+
+        tokio::time::timeout(TAIL_DRAIN_BOUND, handle)
+            .await
+            .expect("the recorder never stopped")
+            .expect("recorder task panicked");
+        assert_eq!(
+            chunk_range(rx.recv().await.expect("no chunk was written at all")),
+            (0, 2),
+            "the recorder rolled its last chunk before the camera had finished"
+        );
+        assert!(
+            rx.recv().await.is_none(),
+            "the tail was split across chunks"
+        );
+    }
+
+    /// Between the flag and the watermark the recorder is waiting, not
+    /// flushing: one chunk per tick there would slice a camera's last seconds
+    /// into one-second files while phase 1 was still joining it.
+    #[tokio::test(start_paused = true)]
+    async fn a_recorder_rolls_nothing_while_it_is_still_waiting_for_the_camera() {
+        let buffer = populated_buffer(2);
+        let shutdown = Arc::new(AtomicBool::new(true));
+        let (mut rx, handle) = stopping_recorder(&buffer, &shutdown);
+
+        tokio::time::sleep(CONTINUOUS_CHECK_INTERVAL * 5).await;
+        assert!(
+            rx.try_recv().is_err(),
+            "the recorder flushed before the camera published its watermark"
+        );
+        handle.abort();
+    }
+
+    /// A camera that missed its join bound is still recording, and the
+    /// watermark published on its behalf says so. Rolling the last chunk on it
+    /// and leaving would drop whatever that camera pushes next — the same loss
+    /// the phases exist to prevent, reached by a different route — so the
+    /// recorder treats it as a floor and keeps going to its own bound.
+    #[tokio::test(start_paused = true)]
+    async fn a_provisional_watermark_does_not_end_the_recorders_drain() {
+        use crate::locks::LockExt;
+        let buffer = populated_buffer(2);
+        let shutdown = Arc::new(AtomicBool::new(true));
+        let (mut rx, handle) = stopping_recorder(&buffer, &shutdown);
+
+        // Phase 1 gives up on the camera and publishes what it has so far.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        buffer.write_recover().seal_provisionally();
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert!(
+            rx.try_recv().is_err(),
+            "the recorder rolled its last chunk on a watermark that can still move"
+        );
+
+        // The camera nobody could wait for is, of course, still recording.
+        buffer.write_recover().push(segment(2 * SEC, SEC, 2));
+
+        tokio::time::timeout(TAIL_DRAIN_BOUND * 4, handle)
+            .await
+            .expect("the recorder never stopped")
+            .expect("recorder task panicked");
+        assert_eq!(
+            chunk_range(rx.recv().await.expect("nothing was written at all")),
+            (0, 2),
+            "footage that arrived past the provisional watermark was left out"
+        );
+    }
+
+    /// The second time this goes wrong: a camera whose thread never comes back
+    /// publishes no watermark of its own, and the drain publishes only a
+    /// provisional one after its own bound. A recorder that waited for it
+    /// unconditionally would be the reason an NVR never restarts, so its wait
+    /// is bounded — and it still writes what it has on the way out.
+    #[tokio::test(start_paused = true)]
+    async fn a_recorder_whose_camera_never_finishes_stops_at_its_bound() {
+        let buffer = populated_buffer(2);
+        let shutdown = Arc::new(AtomicBool::new(true));
+        let (mut rx, handle) = stopping_recorder(&buffer, &shutdown);
+
+        let started = tokio::time::Instant::now();
+        tokio::time::timeout(TAIL_DRAIN_BOUND * 4, handle)
+            .await
+            .expect("a watermark that never arrived held the recorder open")
+            .expect("recorder task panicked");
+
+        assert!(
+            started.elapsed() >= TAIL_DRAIN_BOUND,
+            "the recorder gave up before its bound"
+        );
+        assert_eq!(
+            chunk_range(rx.recv().await.expect("nothing was written at all")),
+            (0, 1),
+            "the recorder abandoned footage it already had"
+        );
     }
 
     // ---- Who prunes: the retention task, never a writer ----

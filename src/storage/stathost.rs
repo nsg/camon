@@ -166,7 +166,12 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 /// not one event — `write_event` uploads a sidecar and a video, each retried
 /// once, then thumbnails up to the first failure, so a half-broken link can
 /// hold the warm writer for a multiple of this.
-const UPLOAD_TIMEOUT: Duration = Duration::from_secs(300);
+///
+/// Visible to the crate because the shutdown drain's budget is divided around
+/// it: phase 3 is sized so that one upload can always use its whole timeout,
+/// and [`crate::shutdown`] pins that against this constant rather than against
+/// a copy of the number.
+pub(crate) const UPLOAD_TIMEOUT: Duration = Duration::from_secs(300);
 /// Idle budget for the streaming client only. reqwest arms it flat until the
 /// response headers arrive, then per response frame with a reset on each — the
 /// right shape for a body a player drains at its own pace. The flat phase is

@@ -14,6 +14,7 @@ use crate::config::AnalyticsConfig;
 use crate::locks::LockExt;
 use crate::mqtt::{send_event, MqttEvent};
 use crate::retry::{jittered, RetrySchedule, Streak};
+use crate::shutdown::{shortfall, who_stalled, DrainGate, DrainStep, Stalled, TAIL_DRAIN_BOUND};
 use crate::storage::{
     DetectionStore, EventRecord, EventRegistry, MapKind, MotionEntry, MotionStore,
 };
@@ -592,6 +593,14 @@ pub struct MotionAnalyzer {
 
 impl MotionAnalyzer {
     fn new(ctx: AnalyzerContext) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let decoder = FrameDecoder::new()?;
+        Ok(Self::with_decoder(ctx, decoder))
+    }
+
+    /// Everything but the fork. Split out so the shutdown tests can build an
+    /// analyzer around a decoder that is already dead — see
+    /// [`FrameDecoder::dead`] — without an ffmpeg on the box.
+    fn with_decoder(ctx: AnalyzerContext, decoder: FrameDecoder) -> Self {
         // Seed the detector from the persisted (or default) per-camera settings;
         // subsequent live edits are picked up each tick in `sync_settings`.
         let settings = ctx.motion_settings.get(&ctx.camera_id);
@@ -607,7 +616,6 @@ impl MotionAnalyzer {
             .as_ref()
             .map(|s| s.detection_mask.clone())
             .unwrap_or_else(|| vec![false; MASK_CELLS]);
-        let decoder = FrameDecoder::new()?;
         let frame_use = FrameUse::of(ctx.event_tx.is_some(), ctx.detect_tx.is_some());
 
         // An estimate, not a record of what was analyzed: the motion store only
@@ -620,7 +628,7 @@ impl MotionAnalyzer {
             .map(|s| s + 1)
             .unwrap_or(0);
 
-        Ok(Self {
+        Self {
             camera_id: ctx.camera_id,
             buffer: ctx.buffer,
             motion_store: ctx.motion_store,
@@ -645,7 +653,7 @@ impl MotionAnalyzer {
             event_tx: ctx.event_tx,
             mqtt_tx: ctx.mqtt_tx,
             pre_padding_ns: ctx.pre_padding_ns,
-        })
+        }
     }
 
     fn run(mut self, shutdown: Arc<AtomicBool>) {
@@ -667,8 +675,102 @@ impl MotionAnalyzer {
             thread::sleep(POLL_INTERVAL);
         }
 
+        // The stop flag alone means only that a stop has *begun*: the camera
+        // feeding this buffer is being joined right now and the GOP it has in
+        // hand is still on its way. Flushing here — which is all this used to
+        // do — is what dropped the last seconds of every recording in progress.
+        self.drain_tail(DrainGate::starting_at(Instant::now(), TAIL_DRAIN_BOUND));
         self.flush_open_run();
         tracing::info!(camera = %self.camera_id, "motion analyzer stopped");
+    }
+
+    /// Phase 2 of the stop: keep analyzing until the camera's terminal
+    /// watermark has been consumed, so the tail it pushed on its way out is
+    /// part of the event that is about to be flushed rather than footage that
+    /// arrived one poll too late.
+    ///
+    /// Bounded because a consumer that cannot finish must not be the reason an
+    /// NVR never restarts. `gate` carries that bound — [`TAIL_DRAIN_BOUND`] at
+    /// the one call site — and it covers the wait for phase 1 as well as the
+    /// drain itself, so a camera that never comes back, and therefore never
+    /// gets a final watermark, costs this analyzer the bound and no more. It is
+    /// a parameter so a test can trip that bound without waiting out half a
+    /// minute of it.
+    fn drain_tail(&mut self, gate: DrainGate) {
+        let mut said_the_decoder_was_gone = false;
+        loop {
+            // A decoder that died is not respawned here: forking ffmpeg during
+            // a drain is the one thing the analyzer's construction path already
+            // refuses to do, and without one no further segment can be scored.
+            //
+            // What it does not do is leave. The camera is still finishing, and
+            // the sequence `flush_open_run` extends the open run through is only
+            // the end of the footage once the camera has said where it stopped
+            // — returning here would sample it a GOP early and close the
+            // recording exactly short of the tail this phase exists to keep. So
+            // the wait is the same wait, held without decoding.
+            let decoding = self.decoder.is_alive();
+            if decoding {
+                if let Err(e) = self.process_new_segments() {
+                    tracing::error!(
+                        camera = %self.camera_id,
+                        error = %e,
+                        "motion analysis error while draining"
+                    );
+                }
+            } else if !said_the_decoder_was_gone {
+                said_the_decoder_was_gone = true;
+                tracing::warn!(
+                    camera = %self.camera_id,
+                    last_analyzed = self.last_processed.saturating_sub(1),
+                    "decoder gone at shutdown; waiting out the camera so the recording keeps its \
+                     tail, but nothing past this sequence is scored for motion or objects"
+                );
+            }
+
+            // Without a decoder nothing more will ever be consumed, so this
+            // analyzer is as caught up as it is ever going to be: all it is
+            // waiting for is the camera to say where it stopped.
+            let position = if decoding {
+                self.last_processed
+            } else {
+                u64::MAX
+            };
+            let terminal = self.buffer.read_recover().terminal_watermark();
+            match gate.step(terminal, position, Instant::now()) {
+                DrainStep::Drained => return,
+                DrainStep::Abandoned => {
+                    // Whose bound this was, said plainly. A camera that stopped
+                    // and published a final watermark did its part, and what ran
+                    // out was this analyzer's ability to keep up with it —
+                    // usually a writer queue it is blocking on. Anything else is
+                    // a camera that never finished stopping.
+                    let ran_out_of = match who_stalled(terminal) {
+                        Stalled::Consumer => {
+                            "the analyzer could not catch up with the camera's last segment before \
+                             the shutdown drain bound; the tail of this event is missing"
+                        }
+                        Stalled::Camera => {
+                            "gave up waiting for a camera that never finished stopping; whatever \
+                             it records past this point is not in the event"
+                        }
+                    };
+                    tracing::warn!(
+                        camera = %self.camera_id,
+                        last_processed = self.last_processed,
+                        // From where scoring actually stopped, never from the
+                        // position handed to the gate: a dead decoder reports
+                        // itself finished to end the wait, and measuring from
+                        // that would say it kept up with a camera it had
+                        // stopped following.
+                        segments_abandoned = shortfall(terminal, self.last_processed),
+                        "{ran_out_of}"
+                    );
+                    return;
+                }
+                DrainStep::Continue => thread::sleep(POLL_INTERVAL),
+            }
+        }
     }
 
     fn ensure_decoder_alive(&mut self, shutdown: &AtomicBool) -> bool {
@@ -983,8 +1085,21 @@ impl MotionAnalyzer {
         }
     }
 
+    /// Close whatever run is still open as a complete event, without waiting
+    /// out its post-padding.
+    ///
+    /// Reached after [`MotionAnalyzer::drain_tail`], and closed through the last
+    /// segment the camera actually produced rather than through the last one
+    /// this analyzer managed to score. On the drain's normal path those are the
+    /// same sequence. On the paths where they are not — a decoder that died
+    /// mid-drain, a drain that ran out its bound — the difference is footage
+    /// that is sitting in the hot buffer with nothing wrong with it except that
+    /// nobody looked at it, and an event that stopped short of it would be a
+    /// recording cut off at exactly the moment this whole drain exists to
+    /// protect. The analysis ends early; the recording does not.
     fn flush_open_run(&mut self) {
-        if let Some(run) = self.run_tracker.flush() {
+        let through = self.buffer.read_recover().last_sequence().checked_sub(1);
+        if let Some(run) = self.run_tracker.flush(through) {
             tracing::info!(
                 camera = %self.camera_id,
                 first_motion_seq = run.first_motion_seq,
@@ -1890,6 +2005,203 @@ mod tests {
         }
     }
 
+    /// Collects the `segments_abandoned` field off whatever the body logs.
+    ///
+    /// The figure the operator reads is the whole point of the abandonment
+    /// line, and the way to get it wrong is to report from the position the
+    /// gate was handed rather than from where scoring actually stopped — which
+    /// no assertion on the analyzer's own state can catch, because both numbers
+    /// are right about different questions. So the log itself is the assertion.
+    /// (`camera::rtsp`'s tests carry a capture layer of their own; sharing one
+    /// would mean a crate-level test-support module, which is more than this
+    /// needs.)
+    #[derive(Clone, Default)]
+    struct AbandonedCounts(Arc<std::sync::Mutex<Vec<Option<u64>>>>);
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for AbandonedCounts {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            struct Field(Option<Option<u64>>);
+            impl tracing::field::Visit for Field {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    if field.name() == "segments_abandoned" {
+                        // Logged as a `Option<u64>`, so `None` arrives as the
+                        // literal "None" and anything else as the number.
+                        let rendered = format!("{value:?}");
+                        self.0 = Some(rendered.parse().ok());
+                    }
+                }
+                fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+                    if field.name() == "segments_abandoned" {
+                        self.0 = Some(Some(value));
+                    }
+                }
+            }
+            let mut field = Field(None);
+            event.record(&mut field);
+            if let Some(count) = field.0 {
+                self.0.lock().expect("capture poisoned").push(count);
+            }
+        }
+    }
+
+    fn abandonments(body: impl FnOnce()) -> Vec<Option<u64>> {
+        use tracing_subscriber::layer::SubscriberExt;
+        let counts = AbandonedCounts::default();
+        let subscriber = tracing_subscriber::registry().with(counts.clone());
+        tracing::subscriber::with_default(subscriber, body);
+        let captured = counts.0.lock().expect("capture poisoned").clone();
+        captured
+    }
+
+    const SEC: u64 = 1_000_000_000;
+
+    fn gop(index: u64) -> crate::buffer::GopSegment {
+        crate::buffer::GopSegment {
+            start_pts: index * SEC,
+            duration_ns: SEC,
+            data: Arc::new(vec![0x47; 188]),
+            frame_count: 1,
+        }
+    }
+
+    /// An analyzer whose decoder is already gone, wired to a writer channel and
+    /// carrying an open motion run over everything analyzed so far — the state
+    /// a real one is in when its ffmpeg dies just as the stop begins.
+    ///
+    /// Built without forking anything, so the drain's most fragile path is
+    /// pinned by a test that runs in the suite that gates commits rather than
+    /// behind `--ignored`.
+    fn analyzer_with_a_dead_decoder(
+        dir: &std::path::Path,
+        analyzed_through: u64,
+    ) -> (
+        MotionAnalyzer,
+        Arc<RwLock<HotBuffer>>,
+        tokio::sync::mpsc::Receiver<WriterMessage>,
+    ) {
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        let mut ctx = test_context("cam", dir);
+        ctx.event_tx = Some(tx);
+        let buffer = Arc::clone(&ctx.buffer);
+        {
+            let mut buf = buffer.write_recover();
+            for seq in 0..=analyzed_through {
+                buf.push(gop(seq));
+            }
+        }
+
+        let mut analyzer = MotionAnalyzer::with_decoder(ctx, FrameDecoder::dead());
+        let now = Instant::now();
+        for seq in 0..=analyzed_through {
+            analyzer.run_tracker.observe(seq, true, now);
+        }
+        analyzer.last_processed = analyzed_through + 1;
+        analyzer.observed_sequences = true;
+        (analyzer, buffer, rx)
+    }
+
+    fn flushed_event(
+        rx: &mut tokio::sync::mpsc::Receiver<WriterMessage>,
+    ) -> crate::buffer::warm::FinishedEvent {
+        match rx.try_recv().expect("no event was flushed at all") {
+            WriterMessage::Event(event) => event,
+            WriterMessage::Upgrade(_) => panic!("the flush sent an upgrade"),
+        }
+    }
+
+    /// A decoder that dies as the stop begins used to end the drain on the
+    /// spot, and the run was then closed through whatever the buffer held at
+    /// that instant — which is before the camera, still being joined, pushes
+    /// the GOP in its hand. The recording lost its last second in exactly the
+    /// scenario this whole phase exists for, and the log said it had kept it.
+    ///
+    /// Nothing scores that GOP, and nothing can: the analysis ends where the
+    /// decoder did. The recording does not.
+    #[test]
+    fn a_dead_decoder_waits_out_the_camera_and_keeps_the_tail_it_cannot_score() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut analyzer, buffer, mut rx) = analyzer_with_a_dead_decoder(dir.path(), 1);
+
+        // The camera is still stopping; its last GOP lands after the drain has
+        // begun, and its watermark only once phase 1 has joined it.
+        let camera = Arc::clone(&buffer);
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            camera.write_recover().push(gop(2));
+            camera.write_recover().seal();
+        });
+
+        let started = Instant::now();
+        analyzer.drain_tail(DrainGate::starting_at(started, TAIL_DRAIN_BOUND));
+        analyzer.flush_open_run();
+
+        assert!(
+            started.elapsed() < TAIL_DRAIN_BOUND,
+            "the analyzer sat out its whole bound instead of following the watermark"
+        );
+        assert_eq!(
+            flushed_event(&mut rx).segments.len(),
+            3,
+            "the event stopped short of the GOP the camera pushed on its way out"
+        );
+    }
+
+    /// The same wait, bounded. A camera that never finishes stopping must not
+    /// hold a decoder-less analyzer any longer than it holds any other stalled
+    /// consumer — and what is in the buffer when the bound trips still has to
+    /// reach the recording.
+    ///
+    /// Also what the abandonment claims it cost. To end the wait, an analyzer
+    /// with no decoder tells the gate it is finished consuming; reporting from
+    /// that same position would print a shortfall of zero here and read as "the
+    /// analyzer kept up", when in fact scoring stopped three segments back.
+    #[test]
+    fn a_dead_decoder_still_stops_at_its_drain_bound_and_says_what_went_unscored() {
+        const BOUND: Duration = Duration::from_millis(300);
+
+        let dir = tempfile::tempdir().unwrap();
+        let (mut analyzer, buffer, mut rx) = analyzer_with_a_dead_decoder(dir.path(), 1);
+        // Phase 1 gave up on this camera: a watermark that can still move, and
+        // a camera that goes on recording past it and never says it stopped.
+        buffer.write_recover().push(gop(2));
+        buffer.write_recover().push(gop(3));
+        buffer.write_recover().push(gop(4));
+        buffer.write_recover().seal_provisionally();
+        buffer.write_recover().push(gop(5));
+
+        let started = Instant::now();
+        let reported = abandonments(|| {
+            analyzer.drain_tail(DrainGate::starting_at(started, BOUND));
+        });
+        analyzer.flush_open_run();
+
+        assert!(started.elapsed() >= BOUND, "the wait was not the bound's");
+        assert!(
+            started.elapsed() < BOUND * 10,
+            "a camera that never finished held the analyzer past its bound"
+        );
+        // Scored through seq 1, watermark at 5: seqs 2, 3 and 4 went unscored.
+        assert_eq!(
+            reported,
+            vec![Some(3)],
+            "the abandonment reported from the position that ended the wait, not from where \
+             scoring stopped"
+        );
+        assert_eq!(
+            flushed_event(&mut rx).segments.len(),
+            6,
+            "the flush left behind footage that was already in the buffer"
+        );
+    }
+
     /// The real spawn path, not just the retry helper it is built from: a task
     /// spawned into a drain must not construct anything and must not sit out a
     /// backoff before noticing.
@@ -1913,15 +2225,53 @@ mod tests {
     async fn spawn_analyzer_builds_a_real_analyzer_and_stops_on_shutdown() {
         let dir = tempfile::tempdir().unwrap();
         let shutdown = Arc::new(AtomicBool::new(false));
-        let handle = spawn_analyzer(test_context("cam", dir.path()), Arc::clone(&shutdown));
+        let ctx = test_context("cam", dir.path());
+        let buffer = Arc::clone(&ctx.buffer);
+        let handle = spawn_analyzer(ctx, Arc::clone(&shutdown));
 
         tokio::time::sleep(Duration::from_millis(500)).await;
         assert!(!handle.is_finished(), "analyzer stopped on its own");
 
+        // Both halves of a real stop: the flag, then the watermark phase 1
+        // publishes once the camera has been joined. Without the second the
+        // analyzer keeps draining, which is the point of the test below.
         shutdown.store(true, Ordering::Relaxed);
+        buffer.write_recover().seal();
         tokio::time::timeout(Duration::from_secs(5), handle)
             .await
             .expect("analyzer did not stop")
+            .expect("analyzer task panicked");
+    }
+
+    /// The analyzer half of the lost tail: the stop flag is the start of a
+    /// stop, not the end of the camera, and an analyzer that flushed its open
+    /// run on the flag alone wrote an event ending several seconds before the
+    /// footage did. It now keeps analyzing until the camera's watermark says
+    /// there is nothing left to analyze.
+    ///
+    /// Needs a real decoder, so it is ignored by default like every other test
+    /// here that forks ffmpeg.
+    #[tokio::test]
+    #[ignore]
+    async fn an_analyzer_keeps_going_until_the_camera_publishes_its_watermark() {
+        let dir = tempfile::tempdir().unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let ctx = test_context("cam", dir.path());
+        let buffer = Arc::clone(&ctx.buffer);
+        let handle = spawn_analyzer(ctx, Arc::clone(&shutdown));
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        shutdown.store(true, Ordering::Relaxed);
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert!(
+            !handle.is_finished(),
+            "the analyzer exited on the flag alone, before the camera had finished"
+        );
+
+        buffer.write_recover().seal();
+        tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("the analyzer ignored the watermark and sat out its whole drain bound")
             .expect("analyzer task panicked");
     }
 
@@ -2692,7 +3042,7 @@ mod tests {
             .filter_map(|(seg, &at)| tracker.observe(seg.seq, true, at))
             .collect();
         assert!(closed.is_empty(), "unanalyzed footage ended the event");
-        let run = tracker.flush().unwrap();
+        let run = tracker.flush(None).unwrap();
         assert_eq!(run.first_motion_seq, 0);
         assert_eq!(run.last_seq, 16);
 
@@ -2707,7 +3057,7 @@ mod tests {
             .collect();
         assert_eq!(closed.len(), 1);
         assert_eq!(closed[0].last_seq, 10);
-        assert_eq!(as_quiet.flush().unwrap().first_motion_seq, 16);
+        assert_eq!(as_quiet.flush(None).unwrap().first_motion_seq, 16);
     }
 
     fn pending(seq: u64, duration_ns: u64) -> PendingSegment {

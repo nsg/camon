@@ -42,7 +42,8 @@ fn resolve_working_dir() -> PathBuf {
 /// the footage the graceful shutdown exists to save, and unlike the
 /// update-initiated drain — which has [`camon::app::RESTART_DRAIN_DEADLINE`] as its
 /// own backstop — nothing else bounds this one. Same budget as that deadline,
-/// deliberately.
+/// deliberately, and the same budget the drain's own phases are sized against:
+/// [`camon::shutdown`] has the arithmetic that divides it up.
 const STOP_TIMEOUT_SECS: u64 = camon::app::RESTART_DRAIN_DEADLINE.as_secs();
 
 /// Camon exits cleanly of its own accord after installing an update, so the

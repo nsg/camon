@@ -1,6 +1,10 @@
 //! Process orchestration: startup, the camera/analyzer/writer task graph, and
 //! the graceful drain both shutdown paths end in.
 //!
+//! The drain is phased — producers, then consumers, then writers — and
+//! [`crate::shutdown`] is where that contract and its bounds are written down.
+//! What lives here is the sequencing itself.
+//!
 //! Lives in the library rather than in `main.rs` so it is compiled and tested
 //! once. The binary is the shim around it, and keeps what only a binary has:
 //! argument dispatch and the self-updater.
@@ -388,12 +392,20 @@ fn create_ollama_client(config: &Config) -> Option<OllamaClient> {
 const EVENT_CHANNEL_CAPACITY: usize = 8;
 
 struct CameraHandles {
+    /// The producers, with the buffer each one fills. Phase 1 of the drain
+    /// joins these first and then publishes each buffer's watermark, which is
+    /// why the buffer travels with the handle rather than only in
+    /// `buffers_map`.
     pipeline_handles: Vec<(String, tokio::task::JoinHandle<()>, Arc<RwLock<HotBuffer>>)>,
-    analyzer_handles: Vec<tokio::task::JoinHandle<()>>,
+    /// Every worker below is per-camera and keeps its camera's id beside it, so
+    /// that a drain which has to abandon one can say which recording to
+    /// distrust rather than only which kind of task stopped answering.
+    analyzer_handles: Vec<(String, tokio::task::JoinHandle<()>)>,
     /// Per-camera continuous-recording drivers (storage on + analytics off).
-    /// Empty in event mode. Flushed at shutdown before the writers' senders drop.
-    continuous_handles: Vec<tokio::task::JoinHandle<()>>,
-    warm_handles: Vec<tokio::task::JoinHandle<()>>,
+    /// Empty in event mode. Drained in phase 2, before the writers' senders
+    /// drop, so their final chunk is still accepted.
+    continuous_handles: Vec<(String, tokio::task::JoinHandle<()>)>,
+    warm_handles: Vec<(String, tokio::task::JoinHandle<()>)>,
     /// Kept alive so the writer channels stay open for as long as the process
     /// runs; dropped during shutdown to let the writers drain and exit.
     event_senders: Vec<tokio::sync::mpsc::Sender<WriterMessage>>,
@@ -522,7 +534,9 @@ fn spawn_cameras(ctx: &SpawnContext, cameras: Vec<config::CameraConfig>) -> Came
                 backend,
                 Arc::clone(ctx.recording_watchdog),
             );
-            handles.warm_handles.push(tokio::spawn(writer.run()));
+            handles
+                .warm_handles
+                .push((camera_id.clone(), tokio::spawn(writer.run())));
             handles.event_senders.push(tx.clone());
             handles
                 .event_sender_map
@@ -559,14 +573,16 @@ fn spawn_cameras(ctx: &SpawnContext, cameras: Vec<config::CameraConfig>) -> Came
                     chunk,
                     Arc::clone(&ctx.shutdown.flag),
                 );
-                handles.continuous_handles.push(tokio::spawn(recorder));
+                handles
+                    .continuous_handles
+                    .push((camera_id.clone(), tokio::spawn(recorder)));
             }
         }
 
         if ctx.config.analytics.enabled {
             let analyzer_handle = analytics::spawn_analyzer(
                 AnalyzerContext {
-                    camera_id,
+                    camera_id: camera_id.clone(),
                     buffer,
                     motion_store: ctx.motion_store.clone(),
                     detection_store: Some(ctx.detection_store.clone()),
@@ -589,7 +605,7 @@ fn spawn_cameras(ctx: &SpawnContext, cameras: Vec<config::CameraConfig>) -> Came
                 },
                 Arc::clone(&ctx.shutdown.flag),
             );
-            handles.analyzer_handles.push(analyzer_handle);
+            handles.analyzer_handles.push((camera_id, analyzer_handle));
         }
     }
 
@@ -634,6 +650,12 @@ async fn wait_for_shutdown(shutdown: &ShutdownSignal) -> ShutdownReason {
 /// writer queue can hold several events. So this can abandon a drain that is
 /// still making progress, losing the remainder. That is the accepted trade:
 /// the alternative is an NVR that silently never restarts.
+///
+/// It is also the budget the drain's own phases are sized against, and
+/// [`graceful_shutdown`] measures phase 3's deadline from it, so the drain
+/// finishes and says what it lost a moment before this thread would have taken
+/// the process out from under it without saying anything. See
+/// [`crate::shutdown`] for the arithmetic.
 pub const RESTART_DRAIN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(360);
 
 /// How often the watchdog looks for an installed update while the drain runs.
@@ -669,41 +691,119 @@ fn spawn_restart_watchdog(update_installed: Arc<AtomicBool>) {
 
 /// How long shutdown waits for the MQTT bridge to publish its retained
 /// `offline` marker and disconnect before giving up on it.
-const MQTT_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+pub const MQTT_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// Join a set of per-camera tasks under one shared deadline, so a rack of
+/// cameras cannot multiply a per-task bound into a stop that outlives its
+/// budget. See [`crate::shutdown`] for why every phase of the drain is bounded.
+///
+/// What is abandoned is named — the task and the camera it belongs to — because
+/// an operator reading this line afterwards is trying to work out which
+/// camera's recording to distrust, and "a motion analyzer" does not answer
+/// that. The consumer's own bound has usually already logged how much it left
+/// behind; this says which one stopped answering at all.
+async fn join_all_before(
+    handles: Vec<(String, tokio::task::JoinHandle<()>)>,
+    deadline: tokio::time::Instant,
+    what: &str,
+) {
+    for (camera_id, handle) in handles {
+        if tokio::time::timeout_at(deadline, handle).await.is_err() {
+            tracing::warn!(
+                camera = %camera_id,
+                "{what} did not stop within the shutdown drain bound, abandoning it where it stands"
+            );
+        }
+    }
+}
+
+/// The drain both stop paths end in, in the three phases [`crate::shutdown`]
+/// describes: the producers stop and publish their watermarks, the consumers
+/// drain through them, and the writers write out what they were handed.
 async fn graceful_shutdown(
     handles: CameraHandles,
     retention_handle: Option<tokio::task::JoinHandle<()>>,
     detect_worker_handle: Option<tokio::task::JoinHandle<()>>,
     mqtt_handle: Option<tokio::task::JoinHandle<()>>,
 ) {
-    // Joined, not aborted: an abort mid-delete could strip an event's .ts and
-    // leave its sidecar and thumbnails behind, where the startup scan — which
-    // only looks at .ts files — would never see them again. That is the exact
-    // silent leak this drain is not allowed to create, so the sweep is asked
-    // to stop instead: it polls the shutdown flag between events, and the wait
-    // is bounded by one event's deletes — or, on a remote backend still
-    // retrying the index scan its startup could not do, by the one listing or
-    // sidecar read already in flight, since that retry polls the same flag
-    // between attempts and between reads. Waiting here first costs nothing —
-    // the flag was raised before the drain began, so every writer, analyzer
-    // and recorder is already winding down concurrently with this await.
-    if let Some(handle) = retention_handle {
-        let _ = handle.await;
+    // Phase 3's deadline, taken here rather than when phase 3 begins: the
+    // budget is one budget, and a phase that overran has to come out of the
+    // writers' share and not out of the service manager's patience.
+    let budget_ends =
+        tokio::time::Instant::now() + RESTART_DRAIN_DEADLINE - crate::shutdown::TEARDOWN_MARGIN;
+
+    // PHASE 1 — the producers stop, completely, before anything downstream is
+    // asked to finish. Each camera thread is at most one 500ms poll from
+    // noticing the flag, after which it flushes the GOP it was filling, kills
+    // its ffmpeg and returns. A camera that does not come back inside the
+    // shared bound is left running: a provisional watermark is published from
+    // wherever its buffer had reached, and everything behind it carries on.
+    // Waiting for it instead would mean a stuck network read could stop the
+    // process from ever restarting.
+    //
+    // This is the first thing the drain does. It used to be the second, behind
+    // the retention join below, and that cost nothing back when every worker
+    // exited on the flag — but a consumer's phase-2 bound runs from the flag,
+    // so a remote sweep parked on a request timeout would spend the consumers'
+    // whole gate before the cameras were even joined, and every one of them
+    // would then report a lost tail it never actually had a chance to drain.
+    let mut buffers_with_ids = Vec::new();
+    let cameras_joined_by = tokio::time::Instant::now() + crate::shutdown::CAMERA_JOIN_BOUND;
+    for (camera_id, handle, buffer) in handles.pipeline_handles {
+        let stopped = tokio::time::timeout_at(cameras_joined_by, handle)
+            .await
+            .is_ok();
+        if !stopped {
+            tracing::warn!(
+                camera = %camera_id,
+                bound_secs = crate::shutdown::CAMERA_JOIN_BOUND.as_secs(),
+                "camera pipeline did not stop in time; its watermark goes out provisional and its \
+                 consumers drain to their own bound instead"
+            );
+        } else {
+            tracing::info!(camera = %camera_id, "camera pipeline stopped");
+        }
+        // PHASE 2 opens here: the watermark is published by the drain, after
+        // the join, so that no push can land behind it. Unconditional — a
+        // consumer waiting on a watermark that is never published is a
+        // consumer waiting out its whole bound for nothing.
+        let watermark = {
+            let mut buf = buffer.write_recover();
+            if stopped {
+                buf.seal()
+            } else {
+                buf.seal_provisionally()
+            }
+        };
+        tracing::debug!(
+            camera = %camera_id,
+            terminal_sequence = watermark.sequence,
+            provisional = watermark.provisional,
+            "camera watermark published"
+        );
+        buffers_with_ids.push((camera_id, buffer));
     }
 
-    // Analyzers poll the shutdown flag every ~200ms and flush any open motion
-    // run as a complete event before exiting — join them, never abort.
-    for handle in handles.analyzer_handles {
-        let _ = handle.await;
-    }
-
-    // Continuous recorders watch the same shutdown flag; each flushes its
-    // partial chunk to the writer and exits. Awaited here — before the senders
-    // are dropped below — so the final chunk is guaranteed accepted.
-    for handle in handles.continuous_handles {
-        let _ = handle.await;
-    }
+    // PHASE 2 — analyzers and continuous recorders keep consuming until they
+    // have drained through their camera's watermark, so the tail the camera
+    // pushed on its way out is part of the event or chunk they flush rather
+    // than footage that arrived one poll too late. Each bounds its own drain;
+    // this bound is only for the tick it is in when that one trips. Recorders
+    // are joined before the senders are dropped below, so their final chunk is
+    // guaranteed accepted.
+    let consumers_joined_by = tokio::time::Instant::now() + crate::shutdown::CONSUMER_JOIN_BOUND;
+    join_all_before(
+        handles.analyzer_handles,
+        consumers_joined_by,
+        "motion analyzer",
+    )
+    .await;
+    join_all_before(
+        handles.continuous_handles,
+        consumers_joined_by,
+        "continuous recorder",
+    )
+    .await;
 
     // The detection worker is aborted, not drained: queued jobs and even an
     // in-flight Ollama request (up to 90s) are droppable by design — losing
@@ -715,9 +815,14 @@ async fn graceful_shutdown(
     }
 
     // Joined here — after the analyzers flushed their final MotionEnd, before
-    // the buffers and writers go away — so the bridge can still reflect that
-    // last transition and publish the retained `offline` marker. A broker that
-    // has become unreachable must not hold shutdown up, hence the timeout.
+    // the buffers and writers go away. What preserves that last transition is
+    // not the position of this join but how long the bridge goes on receiving:
+    // it stops only once the producers have dropped their senders (see
+    // `mqtt::bridge_is_done`), which for a phase-2 analyzer can be half a
+    // minute after the stop flag. Joining here is what gives it somewhere to
+    // publish the transition to, and the retained `offline` marker after it. A
+    // broker that has become unreachable must not hold shutdown up, hence the
+    // timeout.
     if let Some(handle) = mqtt_handle {
         let abort = handle.abort_handle();
         if tokio::time::timeout(MQTT_SHUTDOWN_TIMEOUT, handle)
@@ -729,21 +834,76 @@ async fn graceful_shutdown(
         }
     }
 
-    let mut buffers_with_ids = Vec::new();
-    for (camera_id, handle, buffer) in handles.pipeline_handles {
-        let _ = handle.await;
-        tracing::info!(camera = %camera_id, "camera pipeline stopped");
-        buffers_with_ids.push((camera_id, buffer));
-    }
-
-    // With all senders gone the warm writers drain their queues and exit;
-    // awaiting them guarantees every accepted event reached disk. BOTH sender
-    // holders must drop — the map's clones alone keep the channels open, which
-    // deadlocked shutdown here until 2026-07-24.
+    // PHASE 3 — with all senders gone the warm writers drain their queues and
+    // exit; awaiting them is what puts every accepted event on disk. BOTH
+    // sender holders must drop — the map's clones alone keep the channels open,
+    // which deadlocked shutdown here until 2026-07-24. Bounded by what the
+    // earlier phases left of the budget, which is nearly all of it in a healthy
+    // stop: a consumer abandoned in phase 2 still holds a sender, so the
+    // channel it holds open would otherwise make this wait for ever.
     drop(handles.event_senders);
     drop(handles.event_sender_map);
-    for handle in handles.warm_handles {
-        let _ = handle.await;
+    join_all_before(handles.warm_handles, budget_ends, "warm writer").await;
+
+    // The retention sweep, joined last and inside phase 3's deadline. Waited
+    // for rather than aborted, because a sweep that is allowed to reach the end
+    // of the event it is deleting leaves no work behind, and asking it to stop
+    // is how that is arranged: it polls the shutdown flag between events, so it
+    // ends by itself within one event's deletes — or, on a remote backend still
+    // retrying the index scan its startup could not do, within the one listing
+    // or sidecar read already in flight, since that retry polls the same flag
+    // between attempts and between reads.
+    //
+    // What waiting does NOT buy is protection from being cut mid-delete. If the
+    // bound below trips, this drain returns, the runtime is torn down and the
+    // sweep's future is dropped wherever it was awaiting — and on the updater's
+    // path the process `_exit`s under it. Detaching a task is not letting it
+    // finish. The store survives that for the same reason it survives the
+    // service manager's SIGKILL, which no arrangement here has ever been able
+    // to prevent: one event's delete is recoverable wherever it is interrupted.
+    // How, and by whom, differs by backend, because the two delete in different
+    // orders and for good reasons of their own:
+    //
+    // * Local disk (`warm_index::remove_event_files`) unlinks the sidecar and
+    //   thumbnails first and the `.ts` last, so the survivor is a bare `.ts` —
+    //   which is what the startup scan indexes and what any later retention
+    //   sweep expires again, finishing the job. Pinned by
+    //   `a_delete_that_cannot_finish_leaves_the_video_rather_than_its_metadata`
+    //   (the interrupted state is the recoverable one),
+    //   `prune_keeps_events_it_could_not_delete_and_retries_them` (a later
+    //   sweep retries it) and `prune_unindexes_events_whose_files_already_
+    //   vanished` (an interruption past the last unlink leaves no phantom
+    //   entry).
+    // * Stathost (`delete_event_objects`) goes thumbnails, video, sidecar —
+    //   deliberately the other way round, so that a refused video delete never
+    //   leaves a `.ts` whose type the next scan has to guess. Its survivor is
+    //   therefore an orphan `.json` (or an orphan thumbnail), which indexes
+    //   nothing, and its healer is `sweep_orphaned_metadata`. That runs on a
+    //   `ScanKind::Startup` pass ONLY — a healing rescan skips orphan
+    //   collection by design, pinned by
+    //   `a_healing_rescan_leaves_orphaned_metadata_for_the_next_startup` — so
+    //   this survivor waits for a restart rather than for the next sweep. It
+    //   costs a few hundred bytes until then and nothing else: nothing indexes
+    //   it, counts it against the budget or reads it. No test reaches that
+    //   state by interrupting a delete, but `an_orphan_sidecar_indexes_nothing_
+    //   and_is_collected` reaches the identical on-disk state from the other
+    //   direction — an upload whose video failed — and pins the collection.
+    //
+    // Moving the wait here from the head of the drain changes no interleaving:
+    // the sweep has been running concurrently with everything since the flag
+    // went up and still is, and it touches the store while the cameras touch
+    // their hot buffers — only the waiting moved. What it buys is that a sweep
+    // parked on a remote request timeout now spends the writers' remainder of
+    // the budget, which it shares with them, instead of spending phase 2's gate
+    // before phase 2 had begun.
+    if let Some(handle) = retention_handle {
+        if tokio::time::timeout_at(budget_ends, handle).await.is_err() {
+            tracing::warn!(
+                "retention sweep did not finish within the shutdown budget; it is abandoned where \
+                 it stands and may be cut part-way through deleting an event, which a later sweep \
+                 (local disk) or the next startup (stathost) finishes"
+            );
+        }
     }
 
     for (camera_id, buffer) in buffers_with_ids {
@@ -1248,9 +1408,9 @@ mod tests {
         assert_eq!(calls.load(Ordering::Relaxed), 0, "checked during shutdown");
     }
 
-    /// Both shutdown paths end in this same drain, and its contract is that an
-    /// event already accepted by a warm writer reaches disk before the process
-    /// goes away — the footage the update path used to lose.
+    /// Both shutdown paths end in this same drain, and phase 3's contract is
+    /// that an event already accepted by a warm writer reaches disk before the
+    /// process goes away — the footage the update path used to lose.
     #[tokio::test]
     async fn graceful_shutdown_drains_queued_events_to_disk() {
         use crate::buffer::warm::FinishedEvent;
@@ -1295,7 +1455,7 @@ mod tests {
             pipeline_handles: Vec::new(),
             analyzer_handles: Vec::new(),
             continuous_handles: Vec::new(),
-            warm_handles: vec![tokio::spawn(writer.run())],
+            warm_handles: vec![("cam".to_string(), tokio::spawn(writer.run()))],
             event_senders: vec![tx.clone()],
             event_sender_map: HashMap::from([("cam".to_string(), tx)]),
             buffers_map: HashMap::new(),
@@ -1312,6 +1472,397 @@ mod tests {
 
         let written = dir.path().join("cam").join("movements").join("0_1000.ts");
         assert!(written.exists(), "queued event was not flushed to disk");
+    }
+
+    // ---- The phased stop, end to end (see `crate::shutdown`) ----
+
+    const SEC: u64 = 1_000_000_000;
+
+    fn gop(index: u64) -> crate::buffer::GopSegment {
+        crate::buffer::GopSegment {
+            start_pts: index * SEC,
+            duration_ns: SEC,
+            data: Arc::new(vec![0x47; 188]),
+            frame_count: 1,
+        }
+    }
+
+    fn empty_handles() -> CameraHandles {
+        CameraHandles {
+            pipeline_handles: Vec::new(),
+            analyzer_handles: Vec::new(),
+            continuous_handles: Vec::new(),
+            warm_handles: Vec::new(),
+            event_senders: Vec::new(),
+            event_sender_map: HashMap::new(),
+            buffers_map: HashMap::new(),
+        }
+    }
+
+    /// One camera wired the way [`spawn_cameras`] wires a continuous-recording
+    /// one — hot buffer, continuous recorder, warm writer, local disk — with
+    /// `camera` standing in for the camera task and handed the buffer to push
+    /// into. The chunk cap is an hour, so the only chunk that ever rolls is the
+    /// final one and its name says exactly how much of the recording survived.
+    fn add_continuous_camera<F, Fut>(
+        handles: &mut CameraHandles,
+        dir: &std::path::Path,
+        camera_id: &str,
+        shutdown: &ShutdownSignal,
+        camera: F,
+    ) where
+        F: FnOnce(Arc<RwLock<HotBuffer>>) -> Fut,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let backend: Arc<dyn WarmStorageBackend> = Arc::new(LocalDiskBackend::new(
+            dir.to_path_buf(),
+            &[camera_id.to_string()],
+        ));
+        let (tx, rx) = tokio::sync::mpsc::channel(EVENT_CHANNEL_CAPACITY);
+        let writer = WarmWriter::new(
+            rx,
+            camera_id.to_string(),
+            &config::WarmConfig::default(),
+            backend,
+            Arc::new(RecordingWatchdog::new()),
+        );
+        let buffer = HotBuffer::new(camera_id.to_string(), 3600);
+
+        handles
+            .warm_handles
+            .push((camera_id.to_string(), tokio::spawn(writer.run())));
+        handles.continuous_handles.push((
+            camera_id.to_string(),
+            tokio::spawn(crate::buffer::warm::run_continuous_recorder(
+                camera_id.to_string(),
+                Arc::clone(&buffer),
+                tx.clone(),
+                Duration::from_secs(3600),
+                Arc::clone(&shutdown.flag),
+            )),
+        ));
+        handles.event_senders.push(tx.clone());
+        handles
+            .event_sender_map
+            .insert(camera_id.to_string(), tx.clone());
+        handles.pipeline_handles.push((
+            camera_id.to_string(),
+            tokio::spawn(camera(Arc::clone(&buffer))),
+            buffer,
+        ));
+    }
+
+    /// A camera that notices the stop flag one poll late and then flushes the
+    /// GOP it was still filling, which is what every real one does.
+    async fn records_two_seconds_then_a_tail(buffer: Arc<RwLock<HotBuffer>>) {
+        buffer.write_recover().push(gop(0));
+        buffer.write_recover().push(gop(1));
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        buffer.write_recover().push(gop(2));
+    }
+
+    fn continuous_file(dir: &std::path::Path, camera_id: &str, stem: &str) -> std::path::PathBuf {
+        dir.join(camera_id)
+            .join("continuous")
+            .join(format!("{stem}.ts"))
+    }
+
+    /// The bug the phases exist for, through the whole graph. One stop flag
+    /// used to halt the producer and its consumer at the same instant, so the
+    /// GOP a camera pushed on its way out was written by nobody — every stop,
+    /// every camera, every time.
+    ///
+    /// The filename is the proof: `{first_pts}_{duration_ms}.ts`, so a
+    /// three-second recording that lost its tail is not a subtly shorter file,
+    /// it is `0_2000.ts` where `0_3000.ts` should be. Paused time throughout —
+    /// the bounds involved are tens of seconds and none of them should be
+    /// reached.
+    #[tokio::test(start_paused = true)]
+    async fn the_tail_a_camera_pushes_on_its_way_out_reaches_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let shutdown = ShutdownSignal::new();
+        shutdown.request();
+        let mut handles = empty_handles();
+        add_continuous_camera(
+            &mut handles,
+            dir.path(),
+            "cam",
+            &shutdown,
+            records_two_seconds_then_a_tail,
+        );
+
+        let started = tokio::time::Instant::now();
+        tokio::time::timeout(
+            RESTART_DRAIN_DEADLINE,
+            graceful_shutdown(handles, None, None, None),
+        )
+        .await
+        .expect("the drain never finished");
+
+        assert!(
+            continuous_file(dir.path(), "cam", "0_3000").exists(),
+            "the recording is missing the tail the camera pushed while stopping"
+        );
+        // Following the watermark, not waiting out a bound: a drain that only
+        // finished because something timed out is not the fix.
+        assert!(
+            started.elapsed() < crate::shutdown::CAMERA_JOIN_BOUND,
+            "the drain waited out a bound instead of following the watermark"
+        );
+    }
+
+    /// The second time this goes wrong: a camera thread that never comes back —
+    /// an ffmpeg unkillable in D state, a read that returns to nobody — must
+    /// cost its own tail and not the restart. Its watermark is published on its
+    /// behalf so the consumers behind it are not left waiting for one.
+    #[tokio::test(start_paused = true)]
+    async fn a_camera_that_never_stops_is_abandoned_with_a_provisional_watermark() {
+        let buffer = HotBuffer::new("cam".to_string(), 3600);
+        buffer.write_recover().push(gop(0));
+        let mut handles = empty_handles();
+        handles.pipeline_handles.push((
+            "cam".to_string(),
+            tokio::spawn(std::future::pending::<()>()),
+            Arc::clone(&buffer),
+        ));
+
+        let started = tokio::time::Instant::now();
+        tokio::time::timeout(
+            RESTART_DRAIN_DEADLINE,
+            graceful_shutdown(handles, None, None, None),
+        )
+        .await
+        .expect("a wedged camera thread held the whole drain open");
+
+        assert_eq!(
+            started.elapsed(),
+            crate::shutdown::CAMERA_JOIN_BOUND,
+            "the camera join was not bounded"
+        );
+        // Published, so nothing downstream waits on a watermark that is never
+        // coming — and flagged provisional, because the thread it was published
+        // for is still running and its consumers must not read the sequence as
+        // the end of the recording.
+        assert_eq!(
+            buffer.read_recover().terminal_watermark(),
+            Some(crate::shutdown::Watermark {
+                sequence: 1,
+                provisional: true,
+            }),
+            "the camera that hung got no watermark, or one claiming it had stopped"
+        );
+    }
+
+    /// Watermarks are per camera, so one camera's failure is one camera's loss.
+    /// A shared one — a single "the cameras have stopped" flag, say — would let
+    /// the slowest camera in the rack decide how much of everyone else's
+    /// footage was kept.
+    #[tokio::test(start_paused = true)]
+    async fn a_camera_that_hangs_does_not_cost_its_neighbour_its_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let shutdown = ShutdownSignal::new();
+        shutdown.request();
+        let mut handles = empty_handles();
+        add_continuous_camera(
+            &mut handles,
+            dir.path(),
+            "clean",
+            &shutdown,
+            records_two_seconds_then_a_tail,
+        );
+        add_continuous_camera(
+            &mut handles,
+            dir.path(),
+            "wedged",
+            &shutdown,
+            |buffer| async move {
+                buffer.write_recover().push(gop(0));
+                buffer.write_recover().push(gop(1));
+                std::future::pending::<()>().await;
+            },
+        );
+
+        tokio::time::timeout(
+            RESTART_DRAIN_DEADLINE,
+            graceful_shutdown(handles, None, None, None),
+        )
+        .await
+        .expect("the drain never finished");
+
+        assert!(
+            continuous_file(dir.path(), "clean", "0_3000").exists(),
+            "the camera that stopped cleanly lost its tail to the one that hung"
+        );
+        assert!(
+            continuous_file(dir.path(), "wedged", "0_2000").exists(),
+            "the wedged camera's recorder wrote nothing at all"
+        );
+    }
+
+    /// The retention sweep is joined at the end of the drain, not the start.
+    ///
+    /// Waiting for it first cost nothing back when every worker exited on the
+    /// stop flag, but a phase-2 consumer's bound runs from that flag: a remote
+    /// sweep parked on a request timeout would spend the consumers' whole gate
+    /// before the cameras had even been joined, and every consumer would then
+    /// report a tail it was never given a chance to drain. So the assertion is
+    /// on the ordering itself — the sweep observes, from inside itself, that
+    /// the cameras were joined and their watermarks published long before it
+    /// finished.
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_retention_sweep_does_not_hold_up_the_camera_joins() {
+        let buffer = HotBuffer::new("cam".to_string(), 3600);
+        buffer.write_recover().push(gop(0));
+
+        let watermark_was_out = Arc::new(AtomicBool::new(false));
+        let probe = Arc::clone(&watermark_was_out);
+        let watched = Arc::clone(&buffer);
+        let retention = tokio::spawn(async move {
+            // Longer than every phase-2 bound there is, which is exactly the
+            // sweep this ordering exists for.
+            tokio::time::sleep(crate::shutdown::TAIL_DRAIN_BOUND * 2).await;
+            probe.store(
+                watched.read_recover().terminal_watermark().is_some(),
+                Ordering::Relaxed,
+            );
+        });
+
+        let mut handles = empty_handles();
+        handles.pipeline_handles.push((
+            "cam".to_string(),
+            tokio::spawn(std::future::ready(())),
+            Arc::clone(&buffer),
+        ));
+
+        tokio::time::timeout(
+            RESTART_DRAIN_DEADLINE,
+            graceful_shutdown(handles, Some(retention), None, None),
+        )
+        .await
+        .expect("the drain never finished");
+
+        assert!(
+            watermark_was_out.load(Ordering::Relaxed),
+            "the drain waited out the retention sweep before joining its cameras, spending every \
+             consumer's phase-2 gate before phase 2 had begun"
+        );
+    }
+
+    /// A consumer that stalls past its own bound is abandoned where it stands
+    /// and the phases behind it run anyway. It is still holding a warm-writer
+    /// sender when that happens, which is why phase 3 is bounded too: a channel
+    /// nobody will ever close is a writer that never returns, and a stop that
+    /// never ends is worse than the tail it was trying to save.
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_consumer_does_not_hold_the_stop_open() {
+        use crate::buffer::warm::FinishedEvent;
+
+        let dir = tempfile::tempdir().unwrap();
+        let backend: Arc<dyn WarmStorageBackend> = Arc::new(LocalDiskBackend::new(
+            dir.path().to_path_buf(),
+            &["cam".to_string()],
+        ));
+        let (tx, rx) = tokio::sync::mpsc::channel(EVENT_CHANNEL_CAPACITY);
+        let writer = WarmWriter::new(
+            rx,
+            "cam".to_string(),
+            &config::WarmConfig::default(),
+            backend,
+            Arc::new(RecordingWatchdog::new()),
+        );
+        tx.send(WriterMessage::Event(FinishedEvent {
+            segments: vec![gop(0)],
+            first_pts: 0,
+            total_bytes: 188,
+            has_objects: false,
+            object_classes: Vec::new(),
+            filmstrip_frames: None,
+            backend: None,
+            model: None,
+            detection_details: Vec::new(),
+            continues: false,
+            is_continuous: false,
+        }))
+        .await
+        .unwrap();
+
+        let mut handles = empty_handles();
+        handles
+            .warm_handles
+            .push(("cam".to_string(), tokio::spawn(writer.run())));
+        handles.event_senders.push(tx.clone());
+        let held = tx.clone();
+        handles.analyzer_handles.push((
+            "cam".to_string(),
+            tokio::spawn(async move {
+                let _sender_the_stall_keeps_open = held;
+                std::future::pending::<()>().await;
+            }),
+        ));
+        drop(tx);
+
+        let started = tokio::time::Instant::now();
+        tokio::time::timeout(
+            RESTART_DRAIN_DEADLINE,
+            graceful_shutdown(handles, None, None, None),
+        )
+        .await
+        .expect("a stalled analyzer held the stop open past its whole budget");
+
+        assert!(
+            started.elapsed() >= crate::shutdown::CONSUMER_JOIN_BOUND,
+            "the analyzer was abandoned before its bound"
+        );
+        assert!(
+            dir.path()
+                .join("cam")
+                .join("movements")
+                .join("0_1000.ts")
+                .exists(),
+            "the drain gave up on the events it could still write"
+        );
+    }
+
+    /// A stop can be asked for twice — a SIGTERM landing while an update check
+    /// already in flight installs a binary and asks for a restart, the ordering
+    /// [`spawn_restart_watchdog`] exists for. The second request finds a flag
+    /// that is already up and a drain already running, and must change nothing
+    /// about what reaches disk.
+    #[tokio::test(start_paused = true)]
+    async fn a_stop_asked_for_twice_still_lands_the_whole_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let shutdown = ShutdownSignal::new();
+        shutdown.request();
+        let mut handles = empty_handles();
+        add_continuous_camera(
+            &mut handles,
+            dir.path(),
+            "cam",
+            &shutdown,
+            records_two_seconds_then_a_tail,
+        );
+
+        let second = shutdown.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            second.request_restart();
+        });
+        tokio::time::timeout(
+            RESTART_DRAIN_DEADLINE,
+            graceful_shutdown(handles, None, None, None),
+        )
+        .await
+        .expect("the second request deadlocked the drain");
+
+        assert!(
+            continuous_file(dir.path(), "cam", "0_3000").exists(),
+            "a second stop request truncated the recording"
+        );
+        assert!(shutdown.requested(), "the second request cleared the flag");
+        assert!(
+            shutdown.update_installed.load(Ordering::Relaxed),
+            "the restart watchdog would never arm"
+        );
     }
 
     /// Set on the child process spawned by
