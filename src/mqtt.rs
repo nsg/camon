@@ -43,17 +43,28 @@
 //! notification or dashboard tile actually wants. A final snapshot is taken as
 //! the run closes so the tile does not freeze mid-event.
 //!
-//! # Never block the loop
+//! # Never block the loop, and never cancel it either
 //!
 //! The event loop must be polled continuously — rumqttc does all of its I/O,
-//! including draining the client's request queue, inside `poll()`. Two
+//! including draining the client's request queue, inside `poll()`. Three
 //! consequences shape this module:
 //!
+//! - `poll()` never appears as a `select!` arm, because it is not
+//!   cancellation-safe. It runs in a plain loop on a task of its own, which
+//!   does nothing else; see [`Eventloop`]. A QoS-1 publish is booked as
+//!   in-flight *before* its bytes are written, so a `poll()` dropped
+//!   mid-write leaks that slot — no PUBACK can ever retire it — and a hundred
+//!   leaked slots wedge the request path shut for good: a bridge that still
+//!   answers keepalives, still accepts publishes and still reports `online`
+//!   while nothing it queues ever reaches the broker. Cancelling a connect
+//!   attempt is the same bug in miniature, since the handshake then restarts
+//!   from the beginning every time and a broker slower than the cancelling
+//!   arm's cadence is never reached at all.
 //! - every publish uses `try_publish`, never the awaiting `publish`. While the
-//!   broker is unreachable the request queue backs up, and an awaiting publish
-//!   inside the `select!` body would stop the very `poll()` that drains it —
-//!   a self-inflicted deadlock. Rejected publishes are recovered by the
-//!   reconnect republish below.
+//!   broker is unreachable the request queue backs up and nothing drains it,
+//!   so an awaiting publish would park the bridge loop for the length of the
+//!   outage — no ticks, no events, and no reconnect burst to recover with.
+//!   Rejected publishes are recovered by the reconnect republish below.
 //! - snapshot decoding runs in a detached task holding a killable ffmpeg child,
 //!   with at most one in flight per camera, and is skipped entirely while
 //!   disconnected — the queue is not being drained, so a snapshot pushed into
@@ -194,6 +205,18 @@ const MAX_OUTGOING_PACKET_BYTES: usize = 4 * 1024 * 1024;
 /// own but does not pace itself, so without this a down broker becomes a busy
 /// loop.
 const RECONNECT_DELAY: Duration = Duration::from_secs(5);
+
+/// Depth of the eventloop task -> bridge notification channel. Its entries are
+/// connection edges, which [`RECONNECT_DELAY`] already paces to at most a
+/// couple per five seconds, so this is several outages' worth of headroom.
+const LINK_EVENT_CAPACITY: usize = 16;
+
+/// How long shutdown waits for the eventloop task to end once it has been told
+/// to stop. Usually far less: the broker closes the connection it was just told
+/// to disconnect from, `poll()` returns the error and the task falls out. A
+/// broker that leaves the socket open instead parks it in `poll()`, where no
+/// signal reaches, and this bound is what keeps shutdown from waiting on it.
+const EVENTLOOP_STOP_JOIN: Duration = Duration::from_millis(200);
 
 /// Snapshot output size. Fixed regardless of camera aspect ratio (letterboxed
 /// by the decode filter) so Home Assistant's camera tile never jumps around.
@@ -693,6 +716,112 @@ impl EntityMemory {
     }
 }
 
+/// What the eventloop task tells the bridge about the broker connection. Every
+/// other rumqttc event is the eventloop's own business and never gets here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LinkEvent {
+    /// A `ConnAck` arrived: the session is up. One per successful connect, and
+    /// the bridge's only cue to republish, so these must reach it whole —
+    /// neither dropped nor coalesced with a later one.
+    Connected,
+    /// The connection failed or dropped. The eventloop paces its own retry.
+    Disconnected,
+    /// The shutdown `Disconnect` reached the socket, which is also the proof
+    /// that everything queued before it did — see [`shutdown_bridge`].
+    DisconnectSent,
+}
+
+/// The bridge's half of the task that owns the rumqttc event loop.
+///
+/// The event loop lives on a task of its own for one reason: `poll()` is not
+/// cancellation-safe (see the module header), so it must never be raced against
+/// anything. Here it is polled in a plain loop that does nothing else, and the
+/// bridge learns about the connection through [`LinkEvent`]s instead.
+///
+/// The channel is small and the task sends into it with `send().await`, which
+/// looks like the very thing this module forbids — an await that could stop
+/// `poll()`. It cannot deadlock: the bridge loop never awaits anything but its
+/// own `select!`, so the channel is always drained within one turn of it, and
+/// the connection edges that flow here are rate-limited by [`RECONNECT_DELAY`]
+/// to a couple per five seconds against [`LINK_EVENT_CAPACITY`] slots. Waiting
+/// is chosen over dropping deliberately: a lost `Connected` is a lost republish
+/// burst, which leaves Home Assistant looking at `offline` on a live
+/// connection.
+struct Eventloop {
+    events: tokio::sync::mpsc::Receiver<LinkEvent>,
+    /// Cuts the retry delay short at shutdown. Nothing else can hurry the task
+    /// along — a `poll()` in progress is not interruptible.
+    stop: Arc<tokio::sync::Notify>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Eventloop {
+    /// Move `eventloop` onto its own task and start polling it.
+    fn spawn(eventloop: rumqttc::EventLoop) -> Self {
+        let (tx, events) = tokio::sync::mpsc::channel(LINK_EVENT_CAPACITY);
+        let stop = Arc::new(tokio::sync::Notify::new());
+        let task = tokio::spawn(run_eventloop(eventloop, tx, Arc::clone(&stop)));
+        Self { events, stop, task }
+    }
+
+    /// End the task: ask, wait briefly, abort. Only ever called once the
+    /// shutdown flush is over, so an aborted `poll()` costs nothing that
+    /// matters — the in-flight bookkeeping it could leak dies with the process,
+    /// and the session it belongs to has already been disconnected.
+    async fn stop(self) {
+        let Self {
+            events,
+            stop,
+            mut task,
+        } = self;
+        // Dropped first: nothing drains the channel any more, so a task parked
+        // on `send` has to be woken by the send failing rather than by a
+        // notification it is not listening for.
+        drop(events);
+        stop.notify_one();
+        if tokio::time::timeout(EVENTLOOP_STOP_JOIN, &mut task)
+            .await
+            .is_err()
+        {
+            task.abort();
+        }
+    }
+}
+
+/// Poll the event loop forever, reporting connection edges to the bridge.
+///
+/// The only awaits here are `poll()` itself and the paced retry, and the retry
+/// is the only one raced against anything: it is a sleep, so dropping it drops
+/// nothing rumqttc is keeping track of.
+async fn run_eventloop(
+    mut eventloop: rumqttc::EventLoop,
+    tx: tokio::sync::mpsc::Sender<LinkEvent>,
+    stop: Arc<tokio::sync::Notify>,
+) {
+    loop {
+        let event = match eventloop.poll().await {
+            Ok(Event::Incoming(Incoming::ConnAck(_))) => LinkEvent::Connected,
+            Ok(Event::Outgoing(rumqttc::Outgoing::Disconnect)) => LinkEvent::DisconnectSent,
+            Ok(_) => continue,
+            Err(e) => {
+                tracing::warn!(error = %e, "mqtt connection error, retrying");
+                LinkEvent::Disconnected
+            }
+        };
+        // The bridge is gone: there is no one left to publish, so there is
+        // nothing left to poll for either.
+        if tx.send(event).await.is_err() {
+            return;
+        }
+        if event == LinkEvent::Disconnected {
+            tokio::select! {
+                _ = tokio::time::sleep(RECONNECT_DELAY) => {}
+                _ = stop.notified() => return,
+            }
+        }
+    }
+}
+
 /// What the bridge believes about the broker connection.
 ///
 /// `republish_pending` is the whole recovery story for a dropped burst. The
@@ -863,7 +992,7 @@ async fn run_bridge(ctx: BridgeContext, mut rx: tokio::sync::mpsc::Receiver<Mqtt
         options.set_credentials(username, password);
     }
 
-    let (client, mut eventloop) = AsyncClient::new(
+    let (client, raw_eventloop) = AsyncClient::new(
         options,
         request_queue_capacity(
             memory.announced.cameras.len(),
@@ -871,6 +1000,9 @@ async fn run_bridge(ctx: BridgeContext, mut rx: tokio::sync::mpsc::Receiver<Mqtt
             memory.orphans.len(),
         ),
     );
+    // The client is a handle onto a request channel and stays usable from here;
+    // only the polling half moves away.
+    let mut eventloop = Eventloop::spawn(raw_eventloop);
     let mut state = SensorState::new(
         Duration::from_secs(ctx.config.snapshot_interval_secs),
         Duration::from_secs(ctx.config.occupancy_hold_secs),
@@ -891,20 +1023,27 @@ async fn run_bridge(ctx: BridgeContext, mut rx: tokio::sync::mpsc::Receiver<Mqtt
     // Once every producer's sender has dropped, `recv()` returns `None`
     // immediately and forever; the branch is disabled so it cannot spin.
     let mut producers_gone = false;
+    // Likewise for the eventloop task, which only ends when the bridge does.
+    let mut eventloop_gone = false;
 
     loop {
         tokio::select! {
-            event = eventloop.poll() => match event {
-                Ok(Event::Incoming(Incoming::ConnAck(_))) => {
+            event = eventloop.events.recv(), if !eventloop_gone => match event {
+                Some(LinkEvent::Connected) => {
                     tracing::info!(host = %ctx.config.host, "mqtt connected, publishing discovery");
                     link.connected = true;
                     link.republish_pending = republish(&client, &topics, &state, &mut memory);
                 }
-                Ok(_) => {}
-                Err(e) => {
-                    tracing::warn!(error = %e, "mqtt connection error, retrying");
+                Some(LinkEvent::Disconnected) => link.connected = false,
+                // Nothing asks for a disconnect before shutdown does, and by
+                // then this loop is over.
+                Some(LinkEvent::DisconnectSent) => {}
+                // Nothing is polling any more, so nothing can be published
+                // either: say so rather than leaving snapshots being queued
+                // into a queue that has stopped draining.
+                None => {
+                    eventloop_gone = true;
                     link.connected = false;
-                    tokio::time::sleep(RECONNECT_DELAY).await;
                 }
             },
             event = rx.recv(), if !producers_gone => match event {
@@ -948,7 +1087,7 @@ async fn run_bridge(ctx: BridgeContext, mut rx: tokio::sync::mpsc::Receiver<Mqtt
     shutdown_bridge(
         client,
         &topics,
-        &mut eventloop,
+        eventloop,
         snapshot_tasks,
         &mut memory,
         link.republish_pending,
@@ -1163,11 +1302,15 @@ fn reconnect_burst(
 
 /// Hand the burst to the request queue, reporting whether all of it fit.
 ///
-/// Nothing drains the queue between these publishes — `poll()` is not running
-/// while this returns — so a rejection means the queue is full and every
-/// publish after it fails too. That is the normal outcome of reconnecting after
-/// an outage, so it is one warn line for the burst rather than one per topic,
-/// and the caller retries rather than treating it as lost.
+/// The eventloop is draining the queue from its own task while this runs, so a
+/// rejection does not mean every publish after it is rejected too: a slot
+/// freeing up mid-burst would let a later message through and leave the tail
+/// published without its head — `online` standing on top of states that were
+/// dropped. It therefore stops at the first rejection and reports the burst as
+/// a whole, and the caller retries all of it from the live state rather than
+/// treating any of it as lost. One warn line for the burst rather than one per
+/// topic, because a rejection here is the normal outcome of reconnecting after
+/// an outage.
 fn publish_burst(client: &AsyncClient, burst: Vec<(String, Vec<u8>)>) -> bool {
     let total = burst.len();
     let mut published = 0;
@@ -1403,9 +1546,12 @@ fn encode_jpeg(rgb: &[u8], width: u32, height: u32) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// Publish the retained `offline` marker and disconnect cleanly, then keep
-/// polling briefly so both packets actually reach the socket — `try_publish`
-/// only queues them, `poll()` is what writes them.
+/// Publish the retained `offline` marker and, if the queue took that marker,
+/// disconnect cleanly, then wait briefly for both packets to actually reach the
+/// socket — `try_publish` only queues them, the eventloop task is what writes
+/// them. That task keeps polling
+/// throughout; all this does is watch its notifications for the
+/// [`LinkEvent::DisconnectSent`] that says the flush is over, and stop it after.
 ///
 /// The `Disconnect` this waits for is also the only evidence camon gets that
 /// the clears at the head of the reconnect burst were written rather than
@@ -1417,32 +1563,51 @@ fn encode_jpeg(rgb: &[u8], width: u32, height: u32) -> Option<Vec<u8>> {
 async fn shutdown_bridge(
     client: AsyncClient,
     topics: &Topics,
-    eventloop: &mut rumqttc::EventLoop,
+    mut eventloop: Eventloop,
     snapshot_tasks: HashMap<String, tokio::task::JoinHandle<()>>,
     memory: &mut EntityMemory,
     burst_owed: bool,
 ) {
     abort_snapshots(snapshot_tasks).await;
 
-    // Nothing left to retry with: if this is rejected the DISCONNECT below is
-    // too, so no clean disconnect goes out and the broker publishes the LWT.
-    let _ = publish_state(&client, &topics.availability(), "offline");
-    if let Err(e) = client.try_disconnect() {
-        tracing::debug!(error = %e, "mqtt disconnect request failed");
+    // Whatever is already queued was raised before the disconnect was even
+    // requested and says nothing about whether it reached the socket. Dropped
+    // rather than read, so that an edge left over from the loop — a connection
+    // error a moment ago, say — cannot be taken for this flush having failed.
+    while eventloop.events.try_recv().is_ok() {}
+
+    // Nothing left to retry with, and the two are not independent: a clean
+    // DISCONNECT tells the broker to *drop* the LWT, so sending one without the
+    // `offline` marker queued ahead of it leaves the retained availability
+    // reading `online` for as long as camon stays down. The queue can take the
+    // disconnect and not the publish — it is a request like any other, and the
+    // eventloop is draining slots the whole time — so the disconnect is only
+    // asked for once the marker is actually in the queue behind it. Rejected,
+    // the connection is left to die unclean instead, which is exactly what the
+    // LWT is for: the broker publishes `offline` on camon's behalf.
+    if publish_state(&client, &topics.availability(), "offline") == Published::Yes {
+        if let Err(e) = client.try_disconnect() {
+            tracing::debug!(error = %e, "mqtt disconnect request failed");
+        }
+    } else {
+        tracing::warn!("mqtt offline marker was not queued, leaving the LWT to publish it");
     }
 
     let flush = tokio::time::timeout(SHUTDOWN_FLUSH, async {
         loop {
-            match eventloop.poll().await {
-                Ok(Event::Outgoing(rumqttc::Outgoing::Disconnect)) => return true,
-                Ok(_) => {}
-                Err(_) => return false,
+            match eventloop.events.recv().await {
+                Some(LinkEvent::DisconnectSent) => return true,
+                // The socket went down with the disconnect still queued, or
+                // the task is gone: either way nothing was written.
+                Some(LinkEvent::Disconnected) | None => return false,
+                Some(LinkEvent::Connected) => {}
             }
         }
     });
     if flush.await == Ok(true) && !burst_owed {
         memory.note_clears_flushed();
     }
+    eventloop.stop().await;
     tracing::info!("mqtt bridge stopped");
 }
 
@@ -2481,6 +2646,52 @@ mod tests {
         let started = std::time::Instant::now();
         abort_snapshots(tasks).await;
         assert!(started.elapsed() < SNAPSHOT_ABORT_JOIN);
+    }
+
+    /// An event loop pointed at a socket that accepts every connection and
+    /// closes it immediately, so the CONNECT is met with an EOF and `poll()`
+    /// fails at once and keeps failing — the state the pacing delay exists for.
+    /// A listener rather than a port left free: a free port is only free until
+    /// something else takes it, and this test must not depend on what else is
+    /// running. Everything comes back so the caller can hold it for the length
+    /// of the test — dropping the client would end the event loop for a reason
+    /// unrelated to the connection, and dropping the accept task would put the
+    /// port back to being merely free.
+    async fn eventloop_against_a_closing_socket(
+    ) -> (AsyncClient, rumqttc::EventLoop, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accepts = tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                drop(stream);
+            }
+        });
+        let (client, eventloop) =
+            AsyncClient::new(MqttOptions::new("camon-test", "127.0.0.1", port), 1);
+        (client, eventloop, accepts)
+    }
+
+    #[tokio::test]
+    async fn a_connection_failure_reaches_the_bridge_and_paces_interruptibly() {
+        let (_client, eventloop, accepts) = eventloop_against_a_closing_socket().await;
+        let (tx, mut events) = tokio::sync::mpsc::channel(LINK_EVENT_CAPACITY);
+        let stop = Arc::new(tokio::sync::Notify::new());
+        let task = tokio::spawn(run_eventloop(eventloop, tx, Arc::clone(&stop)));
+
+        // The bridge hears about the failure rather than being left to infer
+        // it from a `poll()` it no longer performs.
+        assert_eq!(events.recv().await, Some(LinkEvent::Disconnected));
+
+        // The task is now inside RECONNECT_DELAY, which shutdown must not have
+        // to wait out. `Ok(Ok(()))` is the task having returned on the signal;
+        // a delay that ignored it would still be sleeping at the timeout.
+        stop.notify_one();
+        let ended = tokio::time::timeout(Duration::from_secs(1), task).await;
+        assert!(
+            matches!(ended, Ok(Ok(()))),
+            "the reconnect delay outlived the stop signal"
+        );
+        accepts.abort();
     }
 
     #[tokio::test]
