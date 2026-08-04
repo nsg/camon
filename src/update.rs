@@ -34,6 +34,11 @@ const PROBE_REAP_TIMEOUT: Duration = Duration::from_secs(5);
 /// while the probe runs and may be on a box with a history of OOM kills.
 const PROBE_STDOUT_LIMIT: u64 = 4096;
 const PROBE_STDERR_LIMIT: u64 = 4096;
+/// How often, and how many times, the probe re-attempts an exec that failed
+/// with `ETXTBSY` — see the comment at the spawn for why that error is a
+/// moment rather than a state. Half a second total, far past any fork window.
+const EXEC_RETRY_DELAY: Duration = Duration::from_millis(50);
+const EXEC_RETRIES: u32 = 10;
 
 /// How many times the same release version may be installed before camon stops
 /// installing it.
@@ -366,16 +371,33 @@ fn assess_staged(staged: &Version, tag: &Version, current: &Version) -> Result<(
 async fn probe_version(binary: &Path, timeout: Duration) -> Result<Version, String> {
     use tokio::io::AsyncReadExt as _;
 
-    let mut child = tokio::process::Command::new(binary)
-        .arg("version")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        // Its own group, so everything it spawns can be killed as one.
-        .process_group(0)
-        .kill_on_drop(true)
-        .spawn()
-        .map_err(|e| format!("it could not be run: {e}"))?;
+    // The exec can fail with ETXTBSY even though the download finished and its
+    // file was closed: any thread that forks in the window where the writing
+    // fd was open — and the camera pipelines fork ffmpeg all day — hands a
+    // copy of that fd to its child, and the file stays "open for writing"
+    // until the child execs or exits. That is a moment, not a state, so a
+    // short bounded retry outlives it; anything still busy after that is
+    // genuinely being written.
+    let mut retries = EXEC_RETRIES;
+    let mut child = loop {
+        match tokio::process::Command::new(binary)
+            .arg("version")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            // Its own group, so everything it spawns can be killed as one.
+            .process_group(0)
+            .kill_on_drop(true)
+            .spawn()
+        {
+            Ok(child) => break child,
+            Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) && retries > 0 => {
+                retries -= 1;
+                tokio::time::sleep(EXEC_RETRY_DELAY).await;
+            }
+            Err(e) => return Err(format!("it could not be run: {e}")),
+        }
+    };
 
     let group = child.id().ok_or("it exited before it could be probed")?;
     let mut stdout = child.stdout.take().expect("stdout is piped");
