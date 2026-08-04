@@ -183,17 +183,30 @@ pub fn build_router(state: AppState, token: Option<&str>) -> Router {
         .merge(api)
 }
 
-pub async fn start_server(
+/// Take the listening socket, and fail startup if it cannot be had.
+///
+/// Separate from [`serve`] because of *when* it has to happen. Binding inside
+/// the server task meant an address already in use, or a `[http] bind` this
+/// host does not have, was one `tracing::error!` line inside a detached task:
+/// camon went on recording with no UI, no ingress and no API, and — being
+/// alive — was never restarted by systemd or the Home Assistant Supervisor,
+/// which are the only things that could have fixed it. Bound here, before a
+/// single camera is spawned, the same failure ends startup with a nonzero exit
+/// and the operator gets the address in the message.
+pub async fn bind(addr: SocketAddr) -> Result<tokio::net::TcpListener, std::io::Error> {
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    tracing::info!("serving the API on http://{}", addr);
+    Ok(listener)
+}
+
+/// Serve the API on an already-bound listener until something goes wrong. The
+/// return is a failure however it reads: the process is meant to be serving.
+pub async fn serve(
+    listener: tokio::net::TcpListener,
     state: AppState,
-    addr: SocketAddr,
     token: Option<String>,
 ) -> Result<(), std::io::Error> {
-    let app = build_router(state, token.as_deref());
-
-    tracing::info!("starting HTTP server on http://{}", addr);
-
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app).await
+    axum::serve(listener, build_router(state, token.as_deref())).await
 }
 
 fn api_routes() -> Router<AppState> {

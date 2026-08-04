@@ -964,15 +964,6 @@ pub struct BridgeContext {
     pub shutdown: Arc<AtomicBool>,
 }
 
-/// Spawn the bridge. The returned handle is joined (with a timeout) during
-/// shutdown so the retained `offline` marker gets published.
-pub fn spawn_bridge(
-    ctx: BridgeContext,
-    rx: tokio::sync::mpsc::Receiver<MqttEvent>,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(run_bridge(ctx, rx))
-}
-
 /// Whether the bridge's loop has nothing left to serve. Both halves are
 /// required, and the second is the one that is easy to leave out.
 ///
@@ -996,7 +987,25 @@ fn bridge_is_done(producers_gone: bool, shutdown: &AtomicBool) -> bool {
     producers_gone && shutdown.load(Ordering::Relaxed)
 }
 
-async fn run_bridge(ctx: BridgeContext, mut rx: tokio::sync::mpsc::Receiver<MqttEvent>) {
+/// The bridge itself. Spawned under supervision by [`crate::app`] and joined
+/// (with a timeout) during shutdown, so the retained `offline` marker gets
+/// published.
+pub async fn run_bridge(ctx: BridgeContext, rx: tokio::sync::mpsc::Receiver<MqttEvent>) {
+    run_bridge_with(ctx, rx, Eventloop::spawn).await
+}
+
+/// [`run_bridge`], with the poller's construction handed in.
+///
+/// The seam exists for one test — the one that kills the poller to prove the
+/// bridge notices — because the eventloop task is created in here and a test
+/// otherwise has no way to reach it.
+async fn run_bridge_with<F>(
+    ctx: BridgeContext,
+    mut rx: tokio::sync::mpsc::Receiver<MqttEvent>,
+    poller: F,
+) where
+    F: FnOnce(rumqttc::EventLoop) -> Eventloop,
+{
     let topics = Topics::new(&ctx.config);
     // Before the client: its queue has to be sized for the clears too.
     let mut memory = EntityMemory::load(&topics, &ctx);
@@ -1025,7 +1034,7 @@ async fn run_bridge(ctx: BridgeContext, mut rx: tokio::sync::mpsc::Receiver<Mqtt
     );
     // The client is a handle onto a request channel and stays usable from here;
     // only the polling half moves away.
-    let mut eventloop = Eventloop::spawn(raw_eventloop);
+    let mut eventloop = poller(raw_eventloop);
     let mut state = SensorState::new(
         Duration::from_secs(ctx.config.snapshot_interval_secs),
         Duration::from_secs(ctx.config.occupancy_hold_secs),
@@ -1062,11 +1071,33 @@ async fn run_bridge(ctx: BridgeContext, mut rx: tokio::sync::mpsc::Receiver<Mqtt
                 // then this loop is over.
                 Some(LinkEvent::DisconnectSent) => {}
                 // Nothing is polling any more, so nothing can be published
-                // either: say so rather than leaving snapshots being queued
-                // into a queue that has stopped draining.
+                // either. The eventloop task only ends on purpose as part of
+                // this bridge's own shutdown, so reaching here with the stop
+                // flag still down means it died — panicked, or was aborted by
+                // something that had no business doing so.
+                //
+                // That is a task death and it is fatal, exactly as the policy
+                // table says for `mqtt-bridge`: a broker that has gone away is
+                // the *poller's* problem and it reconnects through those on its
+                // own, but the poller's absence cannot be recovered from in
+                // here, because the event loop moved out of this task
+                // deliberately (`poll()` is not cancellation-safe) and cannot
+                // be moved back. Carrying on would leave a bridge ticking for
+                // ever, publishing into a queue nobody drains, with Home
+                // Assistant holding whatever it last heard and camon looking
+                // perfectly healthy — the very failure supervision exists to
+                // end. So the bridge returns; its `FatalGuard` names it, the
+                // drain runs, and the restart brings up a poller that works.
                 None => {
                     eventloop_gone = true;
                     link.connected = false;
+                    if !ctx.shutdown.load(Ordering::Relaxed) {
+                        tracing::error!(
+                            "the mqtt event loop stopped polling while camon was running; \
+                             nothing can be published or received until camon restarts"
+                        );
+                        break;
+                    }
                 }
             },
             event = rx.recv(), if !producers_gone => match event {
@@ -2882,6 +2913,130 @@ mod tests {
             .await
             .expect("the bridge did not stop once its producers were gone")
             .expect("bridge task panicked");
+    }
+
+    /// A poller that dies is a task death, not a broker outage — and the
+    /// difference is the whole reason the bridge is a fatal-policy task.
+    ///
+    /// Outages are the eventloop task's own business: it retries, paced, for
+    /// ever, and the bridge just watches the connection edges go by. Its
+    /// *absence* is unrecoverable from in here, because `poll()` is not
+    /// cancellation-safe and was moved onto that task precisely so nothing
+    /// could race it — there is no way to poll it back from the bridge loop. A
+    /// bridge that carried on would tick for ever, publishing into a queue
+    /// nobody drains, with Home Assistant holding whatever it last heard and
+    /// camon looking perfectly healthy. So it ends, and the supervisor named it
+    /// mqtt-bridge on the way past.
+    ///
+    /// Real time, not paused: a rumqttc event loop reconnecting to a broker
+    /// that is not there never lets a virtual clock settle.
+    #[tokio::test]
+    async fn a_dead_event_loop_ends_the_bridge_so_the_process_can_restart() {
+        let ctx = bridge_context(&["yard"], &[]);
+        let stopping = Arc::clone(&ctx.shutdown); // down: camon is running
+        let stops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&stops);
+        let raise = Arc::clone(&stopping);
+        let supervisor = crate::supervise::Supervisor::new(
+            Arc::clone(&stopping),
+            Arc::new(tokio::sync::Notify::new()),
+            move || {
+                counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                raise.store(true, std::sync::atomic::Ordering::Relaxed);
+            },
+        );
+
+        let (_tx, rx) = tokio::sync::mpsc::channel(1);
+        let (probe_tx, probe_rx) = tokio::sync::oneshot::channel();
+        let bridge = supervisor.critical(
+            "mqtt-bridge",
+            run_bridge_with(ctx, rx, move |raw| {
+                let eventloop = Eventloop::spawn(raw);
+                let _ = probe_tx.send(eventloop.task.abort_handle());
+                eventloop
+            }),
+        );
+
+        // The poller dies the way a panic would leave it: gone, with the
+        // bridge's end of the channel still open.
+        probe_rx
+            .await
+            .expect("the bridge never built a poller")
+            .abort();
+
+        tokio::time::timeout(Duration::from_secs(10), bridge)
+            .await
+            .expect("the bridge ticked on for ever with nothing polling it")
+            .expect("bridge task panicked");
+
+        assert_eq!(
+            supervisor.deaths(),
+            vec!["mqtt-bridge (returned)".to_string()],
+            "a dead poller left the bridge looking healthy"
+        );
+        assert_eq!(
+            stops.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "nothing asked for the drain"
+        );
+    }
+
+    /// The same event during a stop is not that. The poller is *supposed* to go
+    /// away then — `Eventloop::stop` is how the bridge ends it — and the bridge
+    /// owes the drain its last transitions and the retained `offline` marker
+    /// before it leaves. So it keeps serving until its producers are gone, and
+    /// nothing is reported.
+    #[tokio::test]
+    async fn a_poller_that_ends_during_a_stop_is_not_a_death() {
+        let ctx = bridge_context(&["yard"], &[]);
+        ctx.shutdown
+            .store(true, std::sync::atomic::Ordering::Relaxed); // a SIGTERM, just now
+        let supervisor = crate::supervise::Supervisor::new(
+            Arc::clone(&ctx.shutdown),
+            Arc::new(tokio::sync::Notify::new()),
+            || panic!("a deliberate stop asked for another drain"),
+        );
+
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let (probe_tx, probe_rx) = tokio::sync::oneshot::channel();
+        let bridge = supervisor.critical(
+            "mqtt-bridge",
+            run_bridge_with(ctx, rx, move |raw| {
+                let eventloop = Eventloop::spawn(raw);
+                let _ = probe_tx.send(eventloop.task.abort_handle());
+                eventloop
+            }),
+        );
+        probe_rx
+            .await
+            .expect("the bridge never built a poller")
+            .abort();
+
+        // Still receiving: an analyzer draining through phase 2 has a MotionEnd
+        // to deliver, and a bridge that had left would drop it. Sent twice
+        // against a channel that holds one, because a send into the buffer of a
+        // receiver nobody is reading still succeeds — only the second can
+        // complete, and only once the bridge has taken the first.
+        let motion_end = MqttEvent::MotionEnd {
+            camera_id: "yard".to_string(),
+        };
+        for _ in 0..2 {
+            tokio::time::timeout(Duration::from_secs(5), tx.send(motion_end.clone()))
+                .await
+                .expect("the bridge stopped consuming when its poller went away")
+                .expect("the bridge dropped the channel when its poller went away");
+        }
+
+        drop(tx);
+        tokio::time::timeout(Duration::from_secs(10), bridge)
+            .await
+            .expect("the bridge did not stop once its producers were gone")
+            .expect("bridge task panicked");
+        assert!(
+            supervisor.deaths().is_empty(),
+            "a deliberate stop was reported as a failure: {:?}",
+            supervisor.deaths()
+        );
     }
 
     #[tokio::test]

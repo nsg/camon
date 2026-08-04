@@ -1701,8 +1701,19 @@ pub fn spawn_analyzer(
     ctx: AnalyzerContext,
     shutdown: Arc<AtomicBool>,
 ) -> tokio::task::JoinHandle<()> {
+    tokio::task::spawn_blocking(analyzer_body(ctx, shutdown))
+}
+
+/// The analyzer's whole life as a closure, for callers that spawn it
+/// themselves — [`crate::supervise::Supervisor::critical_blocking`] does, so
+/// that an analyzer which dies is noticed while camon is running rather than
+/// by whoever joins its handle at the stop.
+pub fn analyzer_body(
+    ctx: AnalyzerContext,
+    shutdown: Arc<AtomicBool>,
+) -> impl FnOnce() + Send + 'static {
     let camera_id = ctx.camera_id.clone();
-    tokio::task::spawn_blocking(move || {
+    move || {
         let analyzer = build_with_retry(
             &camera_id,
             "motion analyzer",
@@ -1719,7 +1730,7 @@ pub fn spawn_analyzer(
         if let Some(analyzer) = analyzer {
             analyzer.run(shutdown);
         }
-    })
+    }
 }
 
 #[cfg(test)]

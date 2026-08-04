@@ -61,7 +61,7 @@ Deleting it while camon is running is reported as the volume going away.
 /// How often the anchor is checked. The same cadence as the recording watchdog,
 /// against a fault that is a persistent state rather than an event: a volume
 /// does not unmount for the duration of one write and come back.
-const POLL_INTERVAL: Duration = Duration::from_secs(60);
+pub const POLL_INTERVAL: Duration = Duration::from_secs(60);
 
 /// How long between repeats of a fault that is still there. Long, because the
 /// message is unactionable more than once an hour and the log it lands in is

@@ -14,3 +14,4 @@ pub mod mqtt;
 pub mod retry;
 pub mod shutdown;
 pub mod storage;
+pub mod supervise;

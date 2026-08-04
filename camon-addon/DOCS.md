@@ -28,6 +28,11 @@ Assistant sidebar via **ingress**.
 4. Create the configuration file (see [Configuration](#configuration) below),
    then **Start**. With ingress enabled, **Camon** shows up in the sidebar —
    click it to open the web UI.
+5. Optional but recommended: turn on **Watchdog** on the add-on's page. Camon
+   exits when it loses a task it cannot run without — a dead recorder is meant
+   to become a restart rather than a process that looks healthy and records
+   nothing — and the Supervisor only restarts a stopped add-on when its
+   Watchdog is on. It is off by default.
 
 ## Repository layout
 

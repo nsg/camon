@@ -30,6 +30,32 @@ use crate::storage::{
     self, DetectionDebugStore, DetectionStore, EventRegistry, LocalDiskBackend, MotionStore,
     RecordingMode, RecordingWatchdog, StathostBackend, WarmStorageBackend,
 };
+use crate::supervise::{RestartLimit, Supervisor};
+
+/// Why camon stopped being able to run. Both are reported to the operator and
+/// both exit nonzero, which is what asks systemd (`Restart=always`) or the Home
+/// Assistant Supervisor to start the process again.
+#[derive(Debug, thiserror::Error)]
+pub enum RunError {
+    /// Startup could not take the API's listening socket. Almost always
+    /// another process on the port, or a `[http] bind` address this host does
+    /// not have.
+    #[error("cannot serve the API on {addr}: {source}")]
+    Bind {
+        addr: std::net::SocketAddr,
+        source: std::io::Error,
+    },
+    /// A supervised task the process cannot run without died. The drain has
+    /// already run by the time this is returned — see [`crate::supervise`].
+    ///
+    /// A list, because one fault reaches several guards and the first to arrive
+    /// is not reliably the origin: an analyzer panicking drops the sender its
+    /// detection worker is parked on, and the worker can report its own clean
+    /// exit while the analyzer is still unwinding. Naming only the first would
+    /// hand the operator the victim and keep the culprit to ourselves.
+    #[error("supervised tasks died and camon cannot run without them: {}", .tasks.join(", "))]
+    TaskDied { tasks: Vec<String> },
+}
 
 /// Parsed command-line arguments. Kept deliberately tiny (no clap): camon takes
 /// at most `--config <path>` and any number of `--set <dotted.path>=<value>`
@@ -138,12 +164,27 @@ impl ShutdownSignal {
         self.drain.notify_waiters();
     }
 
+    /// Ask for the drain from inside the process, where no signal is coming.
+    ///
     /// `notify_one` leaves a permit behind when nobody is waiting yet, so the
     /// wakeup cannot be lost to a race with the main task reaching it.
-    fn request_restart(&self) {
-        self.update_installed.store(true, Ordering::Relaxed);
+    fn request_now(&self) {
         self.request();
         self.wake.notify_one();
+    }
+
+    fn request_restart(&self) {
+        self.update_installed.store(true, Ordering::Relaxed);
+        self.request_now();
+    }
+
+    /// The supervisor that watches every long-lived task, wired so that a task
+    /// whose death is fatal asks for exactly the drain a signal would.
+    fn supervisor(&self) -> Supervisor {
+        let signal = self.clone();
+        Supervisor::new(Arc::clone(&self.flag), Arc::clone(&self.drain), move || {
+            signal.request_now()
+        })
     }
 
     /// Sleep for `duration`, cut short the moment shutdown is requested, so a
@@ -207,9 +248,13 @@ async fn run_update_check_loop_with<F, Fut, E>(
 /// The self-updater lives in the binary, so it reaches this as a plain
 /// argument: the library orchestrates the check (and what an installed update
 /// does to the running process) without depending on the updater itself.
-async fn check_for_updates<F, Fut, E>(config: &Config, shutdown: &ShutdownSignal, check: F)
-where
-    F: Fn() -> Fut + Send + 'static,
+async fn check_for_updates<F, Fut, E>(
+    config: &Config,
+    shutdown: &ShutdownSignal,
+    supervisor: &Supervisor,
+    check: F,
+) where
+    F: Fn() -> Fut + Send + Sync + 'static,
     Fut: std::future::Future<Output = Result<bool, E>> + Send + 'static,
     E: std::fmt::Display + 'static,
 {
@@ -228,11 +273,17 @@ where
             tracing::warn!(error = %e, "update check failed, continuing startup");
         }
     }
-    tokio::spawn(run_update_check_loop_with(
-        UPDATE_CHECK_INTERVAL,
-        shutdown.clone(),
-        check,
-    ));
+    // Restartable rather than fatal: an updater that dies leaves camon running
+    // an old binary, which is a lot less bad than a recording NVR taken down
+    // over a version check. The `Arc` is what lets the same checker be handed
+    // to a second attempt.
+    let check = Arc::new(check);
+    let shutdown = shutdown.clone();
+    let limit = RestartLimit::cycling_every(UPDATE_CHECK_INTERVAL);
+    supervisor.restartable("update-check", limit, move || {
+        let check = Arc::clone(&check);
+        run_update_check_loop_with(UPDATE_CHECK_INTERVAL, shutdown.clone(), move || check())
+    });
 }
 
 fn log_object_detection_config(config: &Config) -> bool {
@@ -431,6 +482,10 @@ struct SpawnContext<'a> {
     /// Notices a camera that is recording nothing, whatever the reason.
     recording_watchdog: &'a Arc<RecordingWatchdog>,
     shutdown: &'a ShutdownSignal,
+    /// Every task below is spawned through this, so that one dying is noticed
+    /// where it happens instead of at the stop. All of them are fatal — see
+    /// the policy table in [`run_with_config`].
+    supervisor: &'a Supervisor,
 }
 
 /// Say what this process is going to do with its footage, once, at startup.
@@ -534,9 +589,11 @@ fn spawn_cameras(ctx: &SpawnContext, cameras: Vec<config::CameraConfig>) -> Came
                 backend,
                 Arc::clone(ctx.recording_watchdog),
             );
-            handles
-                .warm_handles
-                .push((camera_id.clone(), tokio::spawn(writer.run())));
+            handles.warm_handles.push((
+                camera_id.clone(),
+                ctx.supervisor
+                    .critical(format!("warm-writer:{camera_id}"), writer.run()),
+            ));
             handles.event_senders.push(tx.clone());
             handles
                 .event_sender_map
@@ -552,9 +609,11 @@ fn spawn_cameras(ctx: &SpawnContext, cameras: Vec<config::CameraConfig>) -> Came
 
         let buffer_clone = Arc::clone(&buffer);
         let shutdown_clone = ctx.shutdown.clone();
-        let handle = tokio::spawn(async move {
-            run_camera(cam_config, buffer_clone, shutdown_clone).await;
-        });
+        let handle = ctx
+            .supervisor
+            .critical(format!("camera:{camera_id}"), async move {
+                run_camera(cam_config, buffer_clone, shutdown_clone).await;
+            });
         handles
             .pipeline_handles
             .push((camera_id.clone(), handle, Arc::clone(&buffer)));
@@ -573,14 +632,16 @@ fn spawn_cameras(ctx: &SpawnContext, cameras: Vec<config::CameraConfig>) -> Came
                     chunk,
                     Arc::clone(&ctx.shutdown.flag),
                 );
-                handles
-                    .continuous_handles
-                    .push((camera_id.clone(), tokio::spawn(recorder)));
+                handles.continuous_handles.push((
+                    camera_id.clone(),
+                    ctx.supervisor
+                        .critical(format!("continuous-recorder:{camera_id}"), recorder),
+                ));
             }
         }
 
         if ctx.config.analytics.enabled {
-            let analyzer_handle = analytics::spawn_analyzer(
+            let analyzer = analytics::analyzer_body(
                 AnalyzerContext {
                     camera_id: camera_id.clone(),
                     buffer,
@@ -605,6 +666,9 @@ fn spawn_cameras(ctx: &SpawnContext, cameras: Vec<config::CameraConfig>) -> Came
                 },
                 Arc::clone(&ctx.shutdown.flag),
             );
+            let analyzer_handle = ctx
+                .supervisor
+                .critical_blocking(format!("analyzer:{camera_id}"), analyzer);
             handles.analyzer_handles.push((camera_id, analyzer_handle));
         }
     }
@@ -612,9 +676,14 @@ fn spawn_cameras(ctx: &SpawnContext, cameras: Vec<config::CameraConfig>) -> Came
     handles
 }
 
+/// Which of the two kinds of stop this was, for what is said about it
+/// afterwards. `Internal` covers both things that ask for a drain from inside
+/// the process — an installed update and a supervised task's death — because
+/// the wakeup is the same one; which of them it was is [`Supervisor::first_failure`]'s
+/// answer, not this one's.
 enum ShutdownReason {
     Signal,
-    UpdateInstalled,
+    Internal,
 }
 
 async fn wait_for_shutdown(shutdown: &ShutdownSignal) -> ShutdownReason {
@@ -629,18 +698,19 @@ async fn wait_for_shutdown(shutdown: &ShutdownSignal) -> ShutdownReason {
             tracing::info!("SIGTERM received, shutting down");
             ShutdownReason::Signal
         }
-        _ = shutdown.wake.notified() => ShutdownReason::UpdateInstalled,
+        _ = shutdown.wake.notified() => ShutdownReason::Internal,
     };
     shutdown.request();
     reason
 }
 
-/// Last-resort liveness backstop for the drain that follows an installed
-/// update. The new binary is already on disk by then, so a drain that never
-/// finishes would leave the old process running the old code forever with
-/// nothing outside to notice: a signal shutdown is bounded by the service
-/// manager (`TimeoutStopSec` / OpenRC's `retry`, both set by the unit
-/// `camon install service` writes), an internally requested one is not.
+/// Last-resort liveness backstop for a drain nobody outside the process is
+/// bounding — the one that follows an installed update, and the one a
+/// supervised task's death asks for. A signal shutdown is bounded by the
+/// service manager (`TimeoutStopSec` / OpenRC's `retry`, both set by the unit
+/// `camon install service` writes); an internally requested one is not, so a
+/// drain that never finishes would leave the process up for ever: running the
+/// old code after an update, or running without whatever task just died.
 ///
 /// It guarantees the restart *eventually* happens; it does not guarantee that
 /// what it terminates was stuck. No honest value could: against a black-holing
@@ -658,14 +728,26 @@ async fn wait_for_shutdown(shutdown: &ShutdownSignal) -> ShutdownReason {
 /// [`crate::shutdown`] for the arithmetic.
 pub const RESTART_DRAIN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(360);
 
-/// How often the watchdog looks for an installed update while the drain runs.
+/// How often the watchdog looks for a reason to arm while the drain runs.
 const WATCHDOG_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
 
-/// Spawned at the start of the drain on *both* shutdown paths, then armed by
-/// the `update_installed` state rather than by whichever `select!` arm woke the
-/// wait: when a signal and an update land together the arm that wins is
-/// pseudo-random, and an in-flight check can install the binary after a signal
-/// drain has already begun. Either way the process must still end.
+/// Spawned at the start of the drain on *every* shutdown path, then armed by
+/// the state rather than by whichever `select!` arm woke the wait: when a
+/// signal and an update land together the arm that wins is pseudo-random, and
+/// an in-flight check can install the binary — or a supervised task can die —
+/// after a signal drain has already begun. Either way the process must still
+/// end.
+///
+/// The exit status is read when the deadline trips rather than when the thread
+/// arms, so an update that installs into a stop a task's death already started
+/// still exits nonzero — the failure outranks the update. What it does *not*
+/// do is turn a deliberate stop into a failure: a task that dies mid-drain is
+/// classified as asked-for by [`crate::supervise`] and never sets this flag, so
+/// a SIGTERM shutdown that loses a task on its way out still exits 0, by
+/// design. The one narrow exception is a task whose exit reads the stop flag in
+/// the instant before the signal handler stores it: that reads as a death and
+/// this exits nonzero, which is the honest answer for a race nobody can call
+/// either way.
 ///
 /// A wedged `spawn_blocking` thread and a blocked `sync_all` are both
 /// uncancellable from async code, so this is a plain thread. Everything the
@@ -673,19 +755,20 @@ const WATCHDOG_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_mi
 /// sleeps and terminates, because whatever wedged the drain could just as
 /// easily have wedged stderr. `_exit` runs no atexit handlers and no
 /// destructors — nothing that could block on the same wedge.
-fn spawn_restart_watchdog(update_installed: Arc<AtomicBool>) {
+fn spawn_restart_watchdog(update_installed: Arc<AtomicBool>, task_died: Arc<AtomicBool>) {
     std::thread::spawn(move || {
-        while !update_installed.load(Ordering::Relaxed) {
+        while !update_installed.load(Ordering::Relaxed) && !task_died.load(Ordering::Relaxed) {
             std::thread::sleep(WATCHDOG_POLL_INTERVAL);
         }
         tracing::warn!(
             deadline_secs = RESTART_DRAIN_DEADLINE.as_secs(),
-            "update installed: the process is terminated at this deadline whether or not the \
-             shutdown drain has finished, abandoning any recording still being flushed and \
-             every queued event, so the new binary can start"
+            "camon is restarting itself: the process is terminated at this deadline whether or not \
+             the shutdown drain has finished, abandoning any recording still being flushed and \
+             every queued event, so the replacement can start"
         );
         std::thread::sleep(RESTART_DRAIN_DEADLINE);
-        unsafe { libc::_exit(0) };
+        let code = i32::from(task_died.load(Ordering::Relaxed));
+        unsafe { libc::_exit(code) };
     });
 }
 
@@ -924,7 +1007,7 @@ async fn graceful_shutdown(
 /// every [`UPDATE_CHECK_INTERVAL`] until it installs something.
 pub async fn run<F, Fut, E>(check_update: F) -> Result<(), Box<dyn std::error::Error>>
 where
-    F: Fn() -> Fut + Send + 'static,
+    F: Fn() -> Fut + Send + Sync + 'static,
     Fut: std::future::Future<Output = Result<bool, E>> + Send + 'static,
     E: std::fmt::Display + 'static,
 {
@@ -957,10 +1040,85 @@ where
             std::process::exit(1);
         }
     };
+
+    // Same treatment for a startup that could not take its socket and for a
+    // run that lost a task it cannot do without: one line the operator can act
+    // on, and a nonzero status for the service manager. Exiting here rather
+    // than returning the error keeps `main` from printing the `Debug` form on
+    // top of it; by this point the drain, if there was one, is over.
+    if let Err(e) = run_with_config(config, check_update).await {
+        eprintln!("error: {e}");
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+/// Everything after the configuration has been read, which is everything that
+/// can be tested: the same startup, task graph and drain, minus the logging
+/// setup and argument parsing a process only does once.
+///
+/// # The supervision policy, task by task
+///
+/// Every long-lived task is spawned through the [`Supervisor`], which turns
+/// "the task stopped while camon was running" into either a restart or a
+/// process exit. Which one, and why:
+///
+/// | task | policy | why |
+/// |---|---|---|
+/// | `http-server` | fatal | The UI, the API and Home Assistant ingress are all it. A camon that cannot be reached is not doing its job, and nothing in-process can put a dead `axum::serve` back. Its socket is bound before any of this, so a death here is a real failure and not a busy port. |
+/// | `camera:<id>` | fatal | This task *is* the reconnect loop — it already survives ffmpeg dying, the stream going away and the box losing the network (see [`run_camera`]). Past that there is nothing left to retry, and its hot buffer feeds an analyzer and a recorder that would go on consuming from a buffer nobody fills. |
+/// | `analyzer:<id>` | fatal | Holds a live decoder, an open motion run and a warm-writer sender. A restart would resume with no baseline, mid-buffer, possibly duplicating an event it had already handed over. In event mode nothing else writes anything, so a camera whose analyzer is gone is a camera recording nothing. |
+/// | `continuous-recorder:<id>` | fatal | Same, for the analytics-off mode: it owns the chunk being rolled and the sender it rolls into. |
+/// | `warm-writer:<id>` | fatal | Owns the receiving end of its camera's event channel, which cannot be handed to a replacement — the producers already hold the senders. A dead writer silently stops that camera's recording and then blocks its analyzer on a channel nobody drains. |
+/// | `detection-worker` | fatal | Owns the crop queue's receiving end, for the same reason, and every job it accepts is a record the event registry keeps open until it is settled ([`crate::storage::event_registry`]). A worker that stops answering leaks those records for as long as the process lives. |
+/// | `mqtt-bridge` | fatal | Owns the receiving end of the event channel every analyzer publishes into, *and* the poller it cannot rebuild. Broker outages are the poller's own business and it reconnects through them; the poller dying is not that (see the `None` arm in [`crate::mqtt::run_bridge`]), and neither is this task dying, which leaves Home Assistant with stale entities and the analyzers filling a channel with no consumer. |
+/// | `retention` | restart | Periodic and stateless between sweeps: everything it needs is rebuilt from the config and the backend. A panic on one malformed event should not stop an NVR from recording. |
+/// | `recording-watchdog` | restart | Periodic, and its whole state is the registrations it keeps across a restart of its own loop. |
+/// | `storage-anchor` | restart | Periodic, and its baseline is in the `Arc` it polls, not in the task. |
+/// | `update-check` | restart | A dead updater means camon keeps running the version it has, which is not worth taking a recording process down for. |
+///
+/// Each restartable task is given [`RestartLimit::cycling_every`] of *its own*
+/// interval constant, so the streak that decides "restarting is not fixing
+/// this" is measured against the cadence that task actually works at — an hour
+/// for the sweep, a minute for the watchdog and the anchor, twelve hours for
+/// the updater. A permanently broken one escalates to the fatal policy four
+/// failures in, and the process restart that follows is the loudest and most
+/// thorough recovery camon has; [`crate::supervise`] states what that costs.
+///
+/// Everything spent under a supervised task belongs to that task and is not
+/// supervised separately: the camera's buffer-stats logger, the MQTT snapshot
+/// renders, the thumbnail renders behind an API request. They are bounded by
+/// the task that owns them and die with it. The MQTT poller is the exception
+/// that proves the rule — it is a child task whose death its parent cannot
+/// survive, so the parent watches for it explicitly and ends.
+async fn run_with_config<F, Fut, E>(config: Config, check_update: F) -> Result<(), RunError>
+where
+    F: Fn() -> Fut + Send + Sync + 'static,
+    Fut: std::future::Future<Output = Result<bool, E>> + Send + 'static,
+    E: std::fmt::Display + 'static,
+{
     // Created before the update check so the periodic checker can ask for the
     // same graceful shutdown a signal does.
     let shutdown = ShutdownSignal::new();
-    check_for_updates(&config, &shutdown, check_update).await;
+    let supervisor = shutdown.supervisor();
+
+    // The listening socket is taken here, synchronously, before anything is
+    // brought up behind it. See [`api::bind`] for what binding inside the
+    // server task used to cost.
+    let http_addr = std::net::SocketAddr::new(config.http.bind_addr(), config.http.port);
+    let listener = api::bind(http_addr)
+        .await
+        .map_err(|source| RunError::Bind {
+            addr: http_addr,
+            source,
+        })?;
+    api::warn_if_open(
+        http_addr.ip(),
+        config.http.token.as_deref(),
+        config.http.allow_open,
+    );
+
+    check_for_updates(&config, &shutdown, &supervisor, check_update).await;
 
     tracing::info!("loaded {} camera(s)", config.cameras.len());
 
@@ -1037,25 +1195,30 @@ where
         mqtt_tx: &mqtt_tx,
         recording_watchdog: &recording_watchdog,
         shutdown: &shutdown,
+        supervisor: &supervisor,
     };
     let camera_handles = spawn_cameras(&spawn_ctx, config.cameras.clone());
 
     // Retention is a property of the store, not of a camera: one task sweeps
     // every camera on a schedule, however many writers there are.
     let retention_handle = storage.as_ref().map(|backend| {
-        let task = RetentionTask::new(
-            Arc::clone(backend),
-            &config.storage,
-            Arc::clone(&shutdown.flag),
-        );
-        // A backend that never got its index is waiting for a sweep to retry
-        // the scan, so it does not wait the usual hour for one.
-        let task = if warm_index_scanned {
-            task
-        } else {
-            task.after_a_failed_scan()
-        };
-        tokio::spawn(task.run())
+        let backend = Arc::clone(backend);
+        let warm_config = config.storage.clone();
+        let flag = Arc::clone(&shutdown.flag);
+        let limit = RestartLimit::cycling_every(crate::buffer::warm::PRUNE_INTERVAL);
+        supervisor.restartable("retention", limit, move || {
+            let task = RetentionTask::new(Arc::clone(&backend), &warm_config, Arc::clone(&flag));
+            // A backend that never got its index is waiting for a sweep to
+            // retry the scan, so it does not wait the usual hour for one. A
+            // restarted sweep asks for the same head start: whatever killed the
+            // last one, the index is no fresher than it was.
+            let task = if warm_index_scanned {
+                task
+            } else {
+                task.after_a_failed_scan()
+            };
+            task.run()
+        })
     });
 
     let detect_worker_handle = match (ollama_client, detect_rx) {
@@ -1068,23 +1231,21 @@ where
                 camera_handles.event_sender_map.clone(),
                 mqtt_tx.clone(),
             );
-            Some(tokio::spawn(worker.run(rx)))
+            Some(supervisor.critical("detection-worker", worker.run(rx)))
         }
         _ => None,
     };
 
     let mqtt_handle = mqtt_rx.map(|rx| {
-        mqtt::spawn_bridge(
-            BridgeContext {
-                config: config.mqtt.clone(),
-                buffers: Arc::new(camera_handles.buffers_map.clone()),
-                camera_ids: camera_ids.clone(),
-                classes: object_classes,
-                entities_path: Some(mqtt_entities_path(&config)),
-                shutdown: Arc::clone(&shutdown.flag),
-            },
-            rx,
-        )
+        let ctx = BridgeContext {
+            config: config.mqtt.clone(),
+            buffers: Arc::new(camera_handles.buffers_map.clone()),
+            camera_ids: camera_ids.clone(),
+            classes: object_classes,
+            entities_path: Some(mqtt_entities_path(&config)),
+            shutdown: Arc::clone(&shutdown.flag),
+        };
+        supervisor.critical("mqtt-bridge", mqtt::run_bridge(ctx, rx))
     });
     // The analyzers and detection worker hold their own clones; dropping this
     // one lets the bridge see the channel close once they are gone.
@@ -1101,25 +1262,31 @@ where
         storage,
         motion_settings,
     );
-    let http_addr = std::net::SocketAddr::new(config.http.bind_addr(), config.http.port);
     let http_token = config.http.token.clone();
-    api::warn_if_open(
-        http_addr.ip(),
-        http_token.as_deref(),
-        config.http.allow_open,
-    );
-    let server_handle = tokio::spawn(async move {
-        if let Err(e) = api::start_server(app_state, http_addr, http_token).await {
-            tracing::error!("HTTP server error: {}", e);
+    // Serving on the socket startup already took. Any return is a failure —
+    // there is no version of "camon is running" that does not answer here — so
+    // the supervisor takes the process down and the service manager brings it
+    // back with a fresh listener.
+    let server_handle = supervisor.critical("http-server", async move {
+        if let Err(e) = api::serve(listener, app_state, http_token).await {
+            tracing::error!(error = %e, "the API server stopped serving");
         }
     });
 
     // No camera is registered when nothing is expected to record, and an empty
     // watchdog has nothing to poll.
-    let watchdog_handle =
-        recording_mode(&config).map(|_| tokio::spawn(Arc::clone(&recording_watchdog).run()));
+    let watchdog_handle = recording_mode(&config).map(|_| {
+        let watchdog = Arc::clone(&recording_watchdog);
+        let limit = RestartLimit::cycling_every(storage::watchdog::POLL_INTERVAL);
+        supervisor.restartable("recording-watchdog", limit, move || {
+            Arc::clone(&watchdog).run()
+        })
+    });
 
-    let anchor_handle = volume_anchor.map(|anchor| tokio::spawn(anchor.run()));
+    let anchor_handle = volume_anchor.map(|anchor| {
+        let limit = RestartLimit::cycling_every(storage::anchor::POLL_INTERVAL);
+        supervisor.restartable("storage-anchor", limit, move || Arc::clone(&anchor).run())
+    });
 
     let reason = wait_for_shutdown(&shutdown).await;
     server_handle.abort();
@@ -1132,7 +1299,7 @@ where
         handle.abort();
     }
 
-    spawn_restart_watchdog(Arc::clone(&shutdown.update_installed));
+    spawn_restart_watchdog(Arc::clone(&shutdown.update_installed), supervisor.died());
     graceful_shutdown(
         camera_handles,
         retention_handle,
@@ -1141,9 +1308,33 @@ where
     )
     .await;
 
+    stop_outcome(reason, supervisor.deaths(), supervisor.first_failure())
+}
+
+/// What the process leaves behind once the drain is over.
+///
+/// A supervised death outranks whatever woke the wait: the drain it asked for
+/// looks exactly like any other from the inside, and the only thing that tells
+/// an operator (or a service manager reading `$?`) that this restart was not
+/// asked for is the nonzero status and the tasks named in the message. Every
+/// death is named, in arrival order — `decided_by` says which of them started
+/// the stop, which is not the same claim as which one failed first.
+fn stop_outcome(
+    reason: ShutdownReason,
+    deaths: Vec<String>,
+    decided_by: Option<crate::supervise::Death>,
+) -> Result<(), RunError> {
+    if !deaths.is_empty() {
+        tracing::error!(
+            tasks = %deaths.join(", "),
+            decided_by = %decided_by.map(|d| d.task).unwrap_or_default(),
+            "drain complete after a supervised task died; exiting nonzero"
+        );
+        return Err(RunError::TaskDied { tasks: deaths });
+    }
     match reason {
         ShutdownReason::Signal => tracing::info!("shutdown complete"),
-        ShutdownReason::UpdateInstalled => {
+        ShutdownReason::Internal => {
             tracing::info!("shutdown complete, restarting into the updated binary")
         }
     }
@@ -1823,6 +2014,159 @@ mod tests {
         );
     }
 
+    // ---- Task supervision (see `crate::supervise`) ----
+
+    /// The socket is taken during startup readiness, so a port that is already
+    /// in use ends the process instead of being logged inside a detached task.
+    ///
+    /// Both assertions are about *ordering*, which is the whole point: a bind
+    /// that happens after the cameras are spawned leaves camon recording with
+    /// no UI and no ingress, alive, and therefore never restarted by anything.
+    /// Nothing that follows the bind may have run — not the update check, which
+    /// comes next, and not storage, whose first act is to write the volume
+    /// anchor's marker into the data directory.
+    #[tokio::test]
+    async fn a_bind_that_fails_ends_startup_before_anything_is_brought_up() {
+        let held = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let taken = held.local_addr().unwrap().port();
+        let data_dir = tempfile::tempdir().unwrap();
+        let config = config_from(&format!(
+            "[http]\nbind = \"127.0.0.1\"\nport = {taken}\n\n\
+             [update]\nenabled = true\n\n\
+             [storage]\nenabled = true\ndata_dir = {:?}\n{ONE_CAMERA}",
+            data_dir.path()
+        ));
+        // Enabled above precisely so that this would be called — it is the very
+        // next thing startup does — if the bind had not ended it first.
+        let (check, calls) = scripted_checker(vec![Ok(false)]);
+
+        let error = run_with_config(config, check)
+            .await
+            .expect_err("startup carried on without the socket it is there to serve");
+
+        assert!(
+            matches!(error, RunError::Bind { addr, .. } if addr.port() == taken),
+            "{error}"
+        );
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            0,
+            "startup got past the bind and ran the update check"
+        );
+        assert_eq!(
+            std::fs::read_dir(data_dir.path()).unwrap().count(),
+            0,
+            "storage was brought up behind a socket camon never took"
+        );
+    }
+
+    /// A task dying is a stop, not a shrug: it runs the same phased drain a
+    /// SIGTERM does — so the footage in flight still lands — and then exits
+    /// nonzero, which is the only thing that makes systemd or the Home
+    /// Assistant Supervisor start camon again.
+    ///
+    /// The recording is the assertion that matters. A death that killed the
+    /// process where it stood would leave `0_2000.ts`, or nothing at all.
+    #[tokio::test(start_paused = true)]
+    async fn a_supervised_death_drains_the_footage_and_exits_nonzero() {
+        let dir = tempfile::tempdir().unwrap();
+        let shutdown = ShutdownSignal::new();
+        let supervisor = shutdown.supervisor();
+        let mut handles = empty_handles();
+        add_continuous_camera(
+            &mut handles,
+            dir.path(),
+            "cam",
+            &shutdown,
+            records_two_seconds_then_a_tail,
+        );
+
+        supervisor.critical("warm-writer:cam", async { panic!("nothing to write with") });
+
+        // The main task is waiting for a signal that is never coming; the death
+        // is what wakes it.
+        let reason = tokio::time::timeout(RESTART_DRAIN_DEADLINE, wait_for_shutdown(&shutdown))
+            .await
+            .expect("a supervised death never woke the drain");
+        spawn_restart_watchdog(Arc::clone(&shutdown.update_installed), supervisor.died());
+        tokio::time::timeout(
+            RESTART_DRAIN_DEADLINE,
+            graceful_shutdown(handles, None, None, None),
+        )
+        .await
+        .expect("the drain never finished");
+
+        assert!(
+            continuous_file(dir.path(), "cam", "0_3000").exists(),
+            "a supervised death cost the recording its tail"
+        );
+        assert!(
+            supervisor.died().load(Ordering::Relaxed),
+            "nothing would have bounded a drain no service manager is watching"
+        );
+        let outcome = stop_outcome(reason, supervisor.deaths(), supervisor.first_failure());
+        assert!(
+            matches!(
+                outcome,
+                Err(RunError::TaskDied { ref tasks }) if tasks == &["warm-writer:cam (panicked)"]
+            ),
+            "a death exited as if camon had been asked to stop"
+        );
+    }
+
+    /// The other half of the same seam: a stop nobody had to be told about
+    /// exits zero, so an operator can tell `systemctl stop` from a camon that
+    /// fell over.
+    #[test]
+    fn a_stop_that_was_asked_for_exits_zero() {
+        assert!(stop_outcome(ShutdownReason::Signal, Vec::new(), None).is_ok());
+        assert!(stop_outcome(ShutdownReason::Internal, Vec::new(), None).is_ok());
+    }
+
+    /// Every restartable task is judged against its own cadence, and the
+    /// threshold has to be more than one of them: a task that dies on its first
+    /// tick every single time has an uptime of about one cadence, and a
+    /// threshold it could meet would let it clear its own streak and be
+    /// restarted for ever — which is exactly the shape the first design of this
+    /// could not escalate. Read off the same interval constants the tasks
+    /// themselves tick on, so a cadence that changes brings its limit with it.
+    #[test]
+    fn every_restartable_task_outlives_its_own_cadence_before_it_counts_as_healthy() {
+        for (task, cadence) in [
+            ("retention", crate::buffer::warm::PRUNE_INTERVAL),
+            ("recording-watchdog", storage::watchdog::POLL_INTERVAL),
+            ("storage-anchor", storage::anchor::POLL_INTERVAL),
+            ("update-check", UPDATE_CHECK_INTERVAL),
+        ] {
+            let limit = RestartLimit::cycling_every(cadence);
+            assert!(
+                limit.healthy_after > cadence,
+                "{task} can clear its streak by surviving a single {cadence:?} cycle"
+            );
+            assert_eq!(limit.max, crate::supervise::PERIODIC_RESTARTS);
+        }
+    }
+
+    /// One fault reaches two guards, and which of them gets there first is a
+    /// race the origin routinely loses — an analyzer panicking drops the queue
+    /// sender its detection worker is parked on, so the worker can report a
+    /// clean exit while the analyzer is still unwinding. The message the
+    /// operator is left with has to carry both, or it hands them the victim and
+    /// keeps the culprit back.
+    #[test]
+    fn the_exit_message_names_every_task_that_died() {
+        let deaths = vec![
+            "detection-worker (returned)".to_string(),
+            "analyzer:yard (panicked)".to_string(),
+        ];
+        let error = stop_outcome(ShutdownReason::Internal, deaths, None)
+            .expect_err("a cascade of deaths exited clean");
+
+        let message = error.to_string();
+        assert!(message.contains("analyzer:yard"), "{message}");
+        assert!(message.contains("detection-worker"), "{message}");
+    }
+
     /// A stop can be asked for twice — a SIGTERM landing while an update check
     /// already in flight installs a binary and asks for a restart, the ordering
     /// [`spawn_restart_watchdog`] exists for. The second request finds a flag
@@ -1881,18 +2225,42 @@ mod tests {
     fn applied_update_returns_instead_of_exiting() {
         if let Ok(marker) = std::env::var(UPDATE_LOOP_MARKER_ENV) {
             let shutdown = ShutdownSignal::new();
+            let supervisor = shutdown.supervisor();
             let (check, calls) = scripted_checker(vec![Ok(true)]);
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .unwrap();
-            runtime.block_on(run_update_check_loop_with(
-                Duration::from_millis(1),
-                shutdown.clone(),
-                check,
-            ));
+            // Run under supervision, the way startup does: the loop returning
+            // after an install is the one exit here that is *meant* to happen,
+            // and a supervisor that read it as a task death would turn every
+            // update into a failed process.
+            runtime.block_on(async {
+                let check = Arc::new(check);
+                let signal = shutdown.clone();
+                supervisor
+                    .restartable(
+                        "update-check",
+                        RestartLimit::cycling_every(Duration::from_millis(1)),
+                        move || {
+                            let check = Arc::clone(&check);
+                            run_update_check_loop_with(
+                                Duration::from_millis(1),
+                                signal.clone(),
+                                move || check(),
+                            )
+                        },
+                    )
+                    .await
+                    .expect("the supervised update loop panicked");
+            });
 
             assert_eq!(calls.load(Ordering::Relaxed), 1, "update installed twice");
+            assert_eq!(
+                supervisor.deaths(),
+                Vec::<String>::new(),
+                "an installed update looked like a supervised task death"
+            );
             assert!(shutdown.requested(), "drain flag not raised");
             assert!(
                 shutdown.update_installed.load(Ordering::Relaxed),

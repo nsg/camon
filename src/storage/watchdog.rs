@@ -63,7 +63,7 @@ const MIN_CONTINUOUS_SILENCE_LIMIT: Duration = Duration::from_secs(300);
 
 /// How often the watchdog compares each camera against its limit. Coarse
 /// against limits measured in tens of minutes and up.
-const POLL_INTERVAL: Duration = Duration::from_secs(60);
+pub const POLL_INTERVAL: Duration = Duration::from_secs(60);
 
 /// How long a camera had already been silent when camon started, from the end
 /// of its newest stored event.

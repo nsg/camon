@@ -498,7 +498,7 @@ impl WarmWriter {
 }
 
 /// How much footage ages out between two scheduled sweeps.
-const PRUNE_INTERVAL: Duration = Duration::from_secs(3600);
+pub const PRUNE_INTERVAL: Duration = Duration::from_secs(3600);
 
 /// How soon the first sweep comes when startup could not build the warm index.
 ///

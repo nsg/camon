@@ -16,4 +16,4 @@ pub use detect_worker::{detect_queue, DetectQueueSender, DetectionWorker};
 pub use motion::{MotionBox, MotionDetector};
 pub use motion_settings::{MotionSettingsStore, SettingsUpdate, UpdateError};
 pub use ollama::OllamaClient;
-pub use pipeline::{spawn_analyzer, AnalyzerContext};
+pub use pipeline::{analyzer_body, spawn_analyzer, AnalyzerContext};
