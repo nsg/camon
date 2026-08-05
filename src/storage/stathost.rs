@@ -120,7 +120,7 @@ use futures_util::{StreamExt, TryStreamExt};
 use serde::Deserialize;
 
 use crate::buffer::warm::{EventUpgrade, FinishedEvent};
-use crate::buffer::GopSegment;
+use crate::buffer::{wall_clock_ns, GopSegment};
 use crate::config::StathostConfig;
 use crate::locks::{LockExt, MutexExt};
 use crate::retry::{jittered, RetrySchedule, Streak};
@@ -132,7 +132,7 @@ use crate::storage::event_index::{
     Removal,
 };
 use crate::storage::warm_index::{
-    parse_event_filename, parse_sidecar_json, sidecar_json, wall_clock_ns, SidecarData,
+    parse_event_filename, parse_sidecar_json, sidecar_json, SidecarData,
 };
 use crate::storage::{EventRef, EventType, WarmEventEntry};
 
@@ -1254,10 +1254,17 @@ impl WarmStorageBackend for StathostBackend {
         // Checked, not cast: the index entry — and so [`event_key`], the
         // identity every object of this event is keyed by — holds a `u32`,
         // while the duration is computed as `u64`. A silent truncation would
-        // put the video under a stem no index entry names. It takes an event of
-        // over 49 days for that, which `max_event_duration_secs` makes
-        // unreachable; the conversion is here so the invariant is stated rather
-        // than assumed.
+        // put the video under a stem no index entry names.
+        //
+        // It takes an event of over 49 days for that. No single segment can
+        // contribute more than the span bound in
+        // `GopSegment::finalize_with_media_pts`, so no one bad measurement
+        // reaches it alone — but the sum is bounded only while
+        // `max_event_duration_secs` rolls the event, and in event mode 0 is a
+        // permitted setting meaning "never chunk, let motion end close it". A
+        // camera with 49 days of unbroken motion under that setting is exactly
+        // what this conversion is for: the event is dropped, loudly, rather
+        // than uploaded under a stem the index cannot name.
         let Ok(duration_ms) = u32::try_from(event.duration_ns() / NANOS_PER_MS) else {
             tracing::error!(
                 camera = %camera_id,

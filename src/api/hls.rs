@@ -32,17 +32,22 @@ pub fn generate_playlist(buffer: &HotBuffer, tail_count: Option<usize>) -> Strin
     playlist.push_str(&format!("#EXT-X-TARGETDURATION:{}\n", max_duration));
     playlist.push_str(&format!("#EXT-X-MEDIA-SEQUENCE:{}\n", base_sequence));
 
-    let mut prev_end_pts: Option<u64> = None;
+    // Where the previous segment was stamped and where it ended: the gap test
+    // needs both, because a stamp that carries no information cannot be read as
+    // a position on the timeline. See [`discontinuous`].
+    let mut previous: Option<(u64, u64)> = None;
     for (i, segment) in segments.iter().skip(skip).enumerate() {
         let sequence = base_sequence + i as u64;
         let duration = segment.duration_ns as f64 / NANOS_PER_SEC;
-        if let Some(prev_end) = prev_end_pts {
-            let gap = segment.start_pts.abs_diff(prev_end);
-            if gap > 100_000_000 {
+        if let Some((prev_start, prev_end)) = previous {
+            if discontinuous(prev_start, prev_end, segment.start_pts) {
                 playlist.push_str("#EXT-X-DISCONTINUITY\n");
             }
         }
-        prev_end_pts = Some(segment.start_pts + segment.duration_ns);
+        previous = Some((
+            segment.start_pts,
+            segment.start_pts.saturating_add(segment.duration_ns),
+        ));
         let secs = (segment.start_pts / 1_000_000_000) as i64;
         let millis = ((segment.start_pts % 1_000_000_000) / 1_000_000) as u32;
         let dt = format_datetime(secs, millis);
@@ -52,6 +57,37 @@ pub fn generate_playlist(buffer: &HotBuffer, tail_count: Option<usize>) -> Strin
     }
 
     playlist
+}
+
+/// Whether a segment fails to continue the one before it, and the player has to
+/// be told to re-align its decoder across the join.
+///
+/// The test is a gap between where the previous segment ended and where this
+/// one is stamped: a reconnect, or a stream that stalled long enough to lose
+/// footage, leaves one.
+///
+/// Two segments both stamped at the epoch are exempt. That is the sentinel
+/// `wall_clock_ns` (in [`crate::buffer`]) hands out while the box has no idea
+/// what time it is, and it is not a position on a timeline — it is the absence
+/// of one. Measured against it every segment looks discontinuous from
+/// its predecessor, by construction: the "gap" is exactly the previous
+/// segment's own duration, so a camera recording perfectly contiguous footage
+/// on a box whose clock has not been set would have a marker before every
+/// segment it produced. No timeline signal is derived from stamps that carry no
+/// timeline.
+///
+/// The joins into and out of that stretch stay marked, deliberately: the first
+/// segment stamped after NTP lands really does begin a new timeline, and a
+/// clock knocked back to before 1970 mid-run really does end one. Saturated
+/// far-future stamps need no clause of their own — consecutive `u64::MAX`
+/// stamps sit a zero-length gap apart and never trip the test, while the jumps
+/// at either end of them do.
+fn discontinuous(prev_start: u64, prev_end: u64, start: u64) -> bool {
+    const MAX_GAP_NS: u64 = 100_000_000;
+    if prev_start == 0 && start == 0 {
+        return false;
+    }
+    start.abs_diff(prev_end) > MAX_GAP_NS
 }
 
 /// Format unix timestamp as ISO 8601 for EXT-X-PROGRAM-DATE-TIME
@@ -94,6 +130,65 @@ pub fn generate_segment(buffer: &HotBuffer, sequence: u64) -> Option<Arc<Vec<u8>
 mod tests {
     use super::*;
     use crate::buffer::GopSegment;
+    use crate::locks::LockExt;
+
+    const SEC: u64 = 1_000_000_000;
+
+    fn buffer_of(stamps: &[u64]) -> Arc<std::sync::RwLock<HotBuffer>> {
+        let buffer = HotBuffer::new("cam".to_string(), 600);
+        for &start_pts in stamps {
+            let mut segment = GopSegment::new(start_pts);
+            segment.duration_ns = 2 * SEC;
+            segment.frame_count = 1;
+            segment.data = Arc::new(vec![0x47; 188]);
+            buffer.write_recover().push(segment);
+        }
+        buffer
+    }
+
+    fn markers(playlist: &str) -> usize {
+        playlist.matches("#EXT-X-DISCONTINUITY").count()
+    }
+
+    /// On a box whose clock has not been set, every segment is stamped at the
+    /// epoch while its duration is real — so the naive gap test finds the whole
+    /// of the previous segment between them and marks every join. The footage
+    /// is contiguous; the stamps just cannot say so.
+    #[test]
+    fn segments_stamped_by_an_unset_clock_are_not_all_marked_discontinuous() {
+        let buffer = buffer_of(&[0, 0, 0, 0]);
+        let playlist = generate_playlist(&buffer.read_recover(), None);
+        assert_eq!(markers(&playlist), 0, "{playlist}");
+    }
+
+    /// The join where NTP lands is a real discontinuity — the timeline the
+    /// player has been given jumps by decades — and stays marked.
+    #[test]
+    fn the_segment_stamped_once_the_clock_lands_is_marked_discontinuous() {
+        let buffer = buffer_of(&[0, 0, 1_700_000_000 * SEC, 1_700_000_002 * SEC]);
+        let playlist = generate_playlist(&buffer.read_recover(), None);
+        assert_eq!(markers(&playlist), 1, "{playlist}");
+    }
+
+    /// The exemption is for stamps that carry nothing, not for gaps: a real
+    /// break between two properly stamped segments is still announced.
+    #[test]
+    fn a_gap_between_stamped_segments_is_still_marked_discontinuous() {
+        let buffer = buffer_of(&[1_700_000_000 * SEC, 1_700_000_060 * SEC]);
+        let playlist = generate_playlist(&buffer.read_recover(), None);
+        assert_eq!(markers(&playlist), 1, "{playlist}");
+    }
+
+    /// A clock so far in the future that its stamps saturate must not overflow
+    /// the arithmetic that projects a segment's end, which in a debug build
+    /// would panic the request that asked for the playlist.
+    #[test]
+    fn saturated_stamps_do_not_overflow_the_playlist() {
+        let buffer = buffer_of(&[u64::MAX, u64::MAX]);
+        let playlist = generate_playlist(&buffer.read_recover(), None);
+        assert_eq!(markers(&playlist), 0, "{playlist}");
+        assert!(playlist.contains("#EXTINF:2.000"), "{playlist}");
+    }
 
     #[test]
     fn generate_segment_shares_bytes_without_copying() {

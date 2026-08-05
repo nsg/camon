@@ -20,7 +20,7 @@ use crate::analytics::{
 };
 use crate::api::{self, AppState};
 use crate::buffer::warm::{run_continuous_recorder, RetentionTask, WarmWriter, WriterMessage};
-use crate::buffer::HotBuffer;
+use crate::buffer::{wall_clock_ns, HotBuffer};
 use crate::camera::{self, FfmpegPipeline};
 use crate::config::{self, Config};
 use crate::locks::LockExt;
@@ -569,7 +569,7 @@ fn spawn_cameras(ctx: &SpawnContext, cameras: Vec<config::CameraConfig>) -> Came
                 ctx.storage
                     .as_ref()
                     .and_then(|backend| backend.newest_event_end_ns(&camera_id)),
-                storage::warm_index::wall_clock_ns(),
+                wall_clock_ns(),
             );
             ctx.recording_watchdog.register(
                 &camera_id,

@@ -1528,13 +1528,7 @@ impl MotionAnalyzer {
         let mask_jpeg = self.detector.fg_mask().and_then(gray_jpeg);
         self.motion_store.insert(
             &self.camera_id,
-            MotionEntry {
-                segment_sequence: seq,
-                start_time_ns: start_pts,
-                end_time_ns: start_pts + duration_ns,
-                motion_score: score,
-                mask_jpeg,
-            },
+            MotionEntry::spanning(seq, start_pts, duration_ns, score, mask_jpeg),
         );
         tracing::debug!(
             camera = %self.camera_id,

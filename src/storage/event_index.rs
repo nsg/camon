@@ -678,9 +678,19 @@ where
 /// Eviction order, cheapest footage to lose first. Both space-pressure paths —
 /// local disk's low-space guard and the remote store's byte budget — delete in
 /// this order, and both are deliberately outside [`cap_sweep_deletions`]:
-/// neither is clock-derived, and running out of room stops recording
+/// neither *trigger* is clock-derived, and running out of room stops recording
 /// altogether. So a pass here can delete the very footage a held-back sweep is
 /// holding.
+///
+/// The choice of victim within a tier is clock-derived even though the trigger
+/// is not: it is oldest [`start_pts`](crate::buffer::GopSegment) first, and
+/// that stamp is only as ordered as the clock that wrote it. On a box whose
+/// clock reads 0 until NTP lands, everything recorded before it lands sorts
+/// ahead of an archive that is genuinely years older, so sustained space
+/// pressure eats the newest footage first while age expiry — which needs the
+/// same clock — is inert. That is a known cost of recording through a wrong
+/// clock rather than not recording at all; it is not repaired here, because
+/// the alternative to evicting something under space pressure is stopping.
 const EVICTION_TIERS: [EventType; 3] = [
     EventType::Continuous,
     EventType::Movement,

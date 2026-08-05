@@ -5,6 +5,7 @@
 
 use std::path::PathBuf;
 
+use crate::buffer::wall_clock_ns;
 use crate::storage::event_index::{
     deduplicate_detections, evict_tiers, sweep_expired, DetectionDetail, EmergencyOutcome,
     EventIndex, EventRef, EventType, EvictionPolicy, Removal, WarmEventEntry,
@@ -502,18 +503,6 @@ pub(crate) fn free_space_bytes(path: &std::path::Path) -> std::io::Result<u64> {
 /// the guard entirely.
 pub(crate) fn should_emergency_prune(free_bytes: u64, min_free_bytes: u64) -> bool {
     min_free_bytes > 0 && free_bytes < min_free_bytes
-}
-
-/// Wall-clock nanoseconds since the epoch: the clock event start times are
-/// stamped with, and so the only one their age can be measured against. A clock
-/// set before 1970 reads as 0 rather than panicking — a box booting with no
-/// idea what time it is, which is the scenario the sweep's per-pass deletion
-/// cap exists for, must not take the process down.
-pub(crate) fn wall_clock_ns() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos() as u64
 }
 
 #[cfg(test)]

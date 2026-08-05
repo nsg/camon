@@ -2,19 +2,27 @@ use std::io::{BufRead, BufReader, Read};
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, RwLock};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 use thiserror::Error;
 
-use crate::buffer::{GopSegment, HotBuffer};
+use crate::buffer::{wall_clock_ns, GopSegment, HotBuffer, MAX_SEGMENT_SPAN_NS};
 use crate::config::CameraConfig;
 use crate::locks::LockExt;
 use crate::retry::Streak;
 
 /// Reconnect if no bytes are read from ffmpeg for this long.
 const DATA_TIMEOUT_SECS: u64 = 30;
-/// Reconnect if bytes are flowing but no segment (keyframe) is produced for this long.
+/// Reconnect if bytes are flowing but no segment (keyframe) is produced for this
+/// long. This is also what makes a segment's span bounded, so raising it past
+/// [`MAX_SEGMENT_SPAN_NS`] would leave every real segment looking implausible —
+/// both duration instruments refused, every duration zero. The assertion below
+/// is what makes that mistake fail to compile instead of shipping.
 const NO_SEGMENT_TIMEOUT_SECS: u64 = 60;
+const _: () = assert!(
+    MAX_SEGMENT_SPAN_NS > NO_SEGMENT_TIMEOUT_SECS * 1_000_000_000,
+    "the span bound must sit above the no-segment watchdog, or real GOPs lose their durations"
+);
 /// Consecutive runs that recorded nothing before the diagnosis is raised from a
 /// warning about this connection to an error about the camera as a whole.
 const ESCALATE_AFTER: u32 = 4;
@@ -440,12 +448,25 @@ impl FfmpegPipeline {
     }
 }
 
+/// The GOP being filled, paired with the monotonic instant the segmenter
+/// opened it at.
+///
+/// Two clocks, deliberately, for two different jobs: [`GopSegment::start_pts`]
+/// is the wall clock stamp the event's identity on disk is built from, while
+/// the duration is measured from this [`Instant`], which no clock adjustment
+/// can move. Held together so a segment's span can only ever be measured
+/// against its own anchor.
+struct OpenSegment {
+    segment: GopSegment,
+    opened_at: Instant,
+}
+
 /// Segments raw MPEG-TS stream based on keyframe detection
 /// Stores raw MPEG-TS packets directly - no re-muxing needed
 struct MpegTsSegmenter {
     camera_id: String,
     buffer: Arc<RwLock<HotBuffer>>,
-    current_segment: Option<GopSegment>,
+    current_segment: Option<OpenSegment>,
     /// Incremental byte buffer for the in-progress segment; wrapped in an Arc
     /// once at finalize time so readers share it without copying.
     current_data: Vec<u8>,
@@ -547,8 +568,7 @@ impl MpegTsSegmenter {
         if self.video_pes_starts < 2 {
             return;
         }
-        let now_ns = wall_clock_ns();
-        self.finalize_segment(now_ns);
+        self.finalize_segment(Instant::now());
     }
 
     fn failure(&self, end: RunEnd) -> RtspError {
@@ -654,16 +674,22 @@ impl MpegTsSegmenter {
 
         // Start new segment on keyframe
         if is_keyframe {
-            let pts_ns = wall_clock_ns();
-            self.finalize_segment(pts_ns);
-            self.start_segment(pts_ns);
+            // One instant for both ends, so the closing segment's span and the
+            // opening one's anchor meet exactly instead of leaving a gap
+            // between them that the durations would never account for. The
+            // wall clock is read after the close, not with it: the stamp names
+            // when this GOP begins, and closing the last one takes long enough
+            // (a shrink, a lock, a push) to be worth not backdating it by.
+            let now = Instant::now();
+            self.finalize_segment(now);
+            self.start_segment(wall_clock_ns(), now);
         }
 
         // Append packet to current segment
-        if let Some(ref mut segment) = self.current_segment {
+        if let Some(ref mut open) = self.current_segment {
             self.current_data.extend_from_slice(packet);
             if Some(pid) == self.video_pid {
-                segment.frame_count += 1;
+                open.segment.frame_count += 1;
                 if pusi {
                     self.video_pes_starts += 1;
                 }
@@ -671,7 +697,7 @@ impl MpegTsSegmenter {
         }
     }
 
-    fn start_segment(&mut self, pts_ns: u64) {
+    fn start_segment(&mut self, pts_ns: u64, opened_at: Instant) {
         let segment = GopSegment::new(pts_ns);
         self.video_pes_starts = 0;
 
@@ -686,13 +712,19 @@ impl MpegTsSegmenter {
             self.current_data.extend_from_slice(&pmt);
         }
 
-        self.current_segment = Some(segment);
+        self.current_segment = Some(OpenSegment { segment, opened_at });
     }
 
-    fn finalize_segment(&mut self, end_pts_ns: u64) {
-        if let Some(mut segment) = self.current_segment.take() {
+    /// Close the GOP being filled, as of `at` — the same instant the next one
+    /// is opened at, or [`Instant::now`] for the end-of-stream flush.
+    fn finalize_segment(&mut self, at: Instant) {
+        if let Some(OpenSegment {
+            mut segment,
+            opened_at,
+        }) = self.current_segment.take()
+        {
             segment.finalize_with_media_pts(
-                end_pts_ns,
+                at.saturating_duration_since(opened_at),
                 self.current_media_pts,
                 self.prev_media_pts,
             );
@@ -768,13 +800,6 @@ impl MpegTsSegmenter {
             pos += 5 + es_info_len;
         }
     }
-}
-
-fn wall_clock_ns() -> u64 {
-    SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos() as u64
 }
 
 /// Compute the start of a PSI table section inside an MPEG-TS packet.
@@ -1194,6 +1219,42 @@ mod tests {
         // Media PTS, not the wall clock: the flush closes the segment on the
         // last frame that arrived, not on the moment the connection dropped.
         assert_eq!(segment.duration_ns, 6_000 * 1_000_000_000 / 90_000);
+    }
+
+    /// A GOP is measured from the monotonic instant the segmenter opened it,
+    /// never from the wall clock stamps at its two ends. The two agree until
+    /// the clock steps between them — which on a box with no battery-backed
+    /// clock happens on every boot, the moment NTP lands.
+    ///
+    /// Aging the anchor stands in for a GOP that really did take two seconds;
+    /// the wall clock is untouched, so a duration that followed it would be the
+    /// microseconds this test actually takes.
+    #[test]
+    fn a_gop_is_measured_from_the_instant_it_was_opened_at() {
+        let mut segmenter = segmenter();
+        for packet in [pat(PMT_PID), pmt(H264, VIDEO_PID)] {
+            segmenter.process(&packet);
+        }
+        segmenter.process(&keyframe_packet(VIDEO_PID, 0, VIDEO_STREAM_ID));
+        // No predecessor to subtract a media PTS from, so this first segment is
+        // the one the monotonic span has to carry. Checked, because the
+        // monotonic clock starts at boot and subtracting from it is only
+        // representable once the box has been up that long.
+        let open = segmenter.current_segment.as_mut().unwrap();
+        open.opened_at = open
+            .opened_at
+            .checked_sub(Duration::from_secs(2))
+            .expect("host booted less than two seconds ago");
+        segmenter.process(&pes_packet(VIDEO_PID, 3_000));
+        segmenter.process(&keyframe_packet(VIDEO_PID, 90_000, VIDEO_STREAM_ID));
+
+        let buffer = segmenter.buffer.read_recover();
+        let first = buffer.segments().front().unwrap();
+        assert!(
+            first.duration_ns >= 2 * 1_000_000_000,
+            "measured {} ns, not the two seconds it was open",
+            first.duration_ns
+        );
     }
 
     /// A segment cut before its second frame started holds a fragment of a

@@ -24,6 +24,32 @@ pub struct MotionEntry {
     pub mask_jpeg: Option<Vec<u8>>,
 }
 
+impl MotionEntry {
+    /// One segment's motion, spanning from the segment's own stamp for as long
+    /// as the segment ran.
+    ///
+    /// The end is saturating because the start is a wall clock stamp, and a
+    /// clock reading nonsense hands out `u64::MAX` (`wall_clock_ns` in
+    /// [`crate::buffer`]): adding to it would overflow, which is a panic in the
+    /// debug builds this daemon ships. It also holds `end >= start` for
+    /// [`MotionStore::get_motion`], which reports the difference.
+    pub fn spanning(
+        segment_sequence: u64,
+        start_time_ns: u64,
+        duration_ns: u64,
+        motion_score: f32,
+        mask_jpeg: Option<Vec<u8>>,
+    ) -> Self {
+        Self {
+            segment_sequence,
+            start_time_ns,
+            end_time_ns: start_time_ns.saturating_add(duration_ns),
+            motion_score,
+            mask_jpeg,
+        }
+    }
+}
+
 /// One of the detector's pipeline-stage views, published as a JPEG for the
 /// debug UI. The string form is the stage's URL segment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -121,7 +147,7 @@ impl MotionStore {
                     .iter()
                     .map(|e| MotionSnapshot {
                         segment_sequence: e.segment_sequence,
-                        duration_ns: e.end_time_ns - e.start_time_ns,
+                        duration_ns: e.end_time_ns.saturating_sub(e.start_time_ns),
                         motion_score: e.motion_score,
                     })
                     .collect()
@@ -242,8 +268,37 @@ pub struct MotionSnapshot {
 mod tests {
     use super::*;
 
+    const SEC: u64 = 1_000_000_000;
+
     fn store() -> MotionStore {
         MotionStore::new(&["cam".to_string(), "other".to_string()])
+    }
+
+    #[test]
+    fn a_motion_entry_spans_the_duration_of_the_segment_it_was_seen_in() {
+        let store = store();
+        store.insert(
+            "cam",
+            MotionEntry::spanning(7, 10 * SEC, 2 * SEC, 0.5, None),
+        );
+        let motion = store.get_motion("cam");
+        assert_eq!(motion[0].segment_sequence, 7);
+        assert_eq!(motion[0].duration_ns, 2 * SEC);
+    }
+
+    /// A wall clock far enough in the future saturates its stamps, and the
+    /// segments carrying them still have to be reportable: projecting an end
+    /// from such a stamp must not overflow — a panic in the debug build this
+    /// daemon ships — and the span it reports must not come out negative.
+    #[test]
+    fn a_motion_entry_stamped_by_a_saturated_clock_has_no_span_and_no_overflow() {
+        let store = store();
+        store.insert(
+            "cam",
+            MotionEntry::spanning(0, u64::MAX, 2 * SEC, 0.5, None),
+        );
+        let motion = store.get_motion("cam");
+        assert_eq!(motion[0].duration_ns, 0);
     }
 
     #[test]
