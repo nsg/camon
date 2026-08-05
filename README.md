@@ -202,7 +202,11 @@ All sections are optional — defaults are shown below:
 enabled = false
 
 [buffer]
-# Hot buffer duration in seconds (default: 600 = 10 minutes)
+# Hot buffer duration in seconds (default: 600 = 10 minutes). At least 1 — a
+# zero-length buffer evicts every segment as it arrives — and capped at 10
+# years so the nanosecond arithmetic downstream cannot wrap a huge setting into
+# a tiny one. pre_padding_secs and max_event_duration_secs are capped the same
+# way, each while the code that multiplies it out is switched on.
 hot_duration_secs = 600
 
 [http]
@@ -232,8 +236,22 @@ enabled = true
 # roughly one frame per second at a 1-second GOP — and ignores this. Four
 # frames per run reach the vision model whatever this is set to: a higher
 # rate only widens what they are chosen from, it does not make the run hold
-# more of them.
+# more of them. At least 1: 0 becomes an "fps=0" filter that passes no frame
+# through — thumbnails and detection frames stop, recording carries on, and
+# nothing else reports it, so camon refuses to start on it.
 sample_fps = 5
+
+# Default motion-detection settings, seeding each camera's motion_settings.json
+# the first time it is seen; the per-camera file (edited live in the web UI)
+# wins after that. A number outside its range is clamped into it at startup
+# with a warning; a value that is not a number at all (TOML's nan/inf) is
+# refused, since no comparison against it is ever true and motion detection
+# would silently stop.
+[analytics.motion]
+# MOG2 var_threshold. Higher = less sensitive. Range 4-96 (default: 16).
+var_threshold = 16
+# Minimum object size in foreground pixels. Range 50-2000 (default: 200).
+min_contour_area = 200
 
 # Object detection via Ollama (requires analytics enabled).
 # One global worker serves all cameras, strictly serially (max one in-flight
@@ -241,7 +259,9 @@ sample_fps = 5
 [analytics.object_detection]
 # Enable object detection on motion segments (default: false)
 enabled = true
-# Minimum confidence threshold (default: 0.5)
+# Minimum confidence threshold (default: 0.5). Between 0.0 and 1.0; outside
+# that it is clamped with a warning. TOML's nan is refused at startup — it
+# filters nothing rather than everything, silently.
 confidence_threshold = 0.5
 # Object classes to detect. Omit the key for the defaults (person, car,
 # truck, dog, cat). While detection is enabled the list may not be empty and
@@ -257,7 +277,8 @@ url = "http://localhost:11434"
 # Vision model to use (default: gemma4:e4b)
 model = "gemma4:e4b"
 # Per-request timeout in seconds (default: 90). A timeout costs only that
-# event's object upgrade, never the footage.
+# event's object upgrade, never the footage. 0 is not "no timeout" here but a
+# deadline every request misses, so camon warns and uses 90.
 timeout_secs = 90
 
 # Optional fallback server if primary fails
@@ -278,7 +299,17 @@ enabled = true
 data_dir = "/var/camon/storage"
 # Seconds of context before first motion in an event (default: 5)
 pre_padding_secs = 5
-# Seconds of context after last motion in an event (default: 10)
+# Seconds of context after last motion in an event (default: 10). This is what
+# closes a motion run, so keep it well under buffer.hot_duration_secs: at or
+# above it camon warns and keeps recording, and the cost depends on the cap,
+# since a chunk closes on whichever comes first. No cap: the run's own segments
+# are always evicted first — every event. A cap under hot_duration_secs: the
+# cap wins every race, so nothing is lost to the quiet window and each run just
+# ends in up to post_padding_secs of padding-only chunks. A cap at or above it
+# (legal here): any chunk that holds motion is a whole buffer old when it
+# closes, so it loses its oldest footage — a padding-only follow-on can close
+# young and lose nothing. Any event that loses its head is still written, and
+# logged as "the event's head was already evicted".
 post_padding_secs = 10
 # Cap on a single event's length in seconds (default: 120). Longer runs are
 # split into chained, independently playable chunks (follow-ons flagged

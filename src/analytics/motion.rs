@@ -300,7 +300,9 @@ impl MotionDetector {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::analytics::motion_settings::{DEFAULT_MIN_CONTOUR_AREA, DEFAULT_VAR_THRESHOLD};
+    use crate::analytics::motion_settings::{
+        MotionSettings, DEFAULT_MIN_CONTOUR_AREA, DEFAULT_VAR_THRESHOLD,
+    };
 
     // --- End-to-end detector tests on synthetic frames ---
 
@@ -477,6 +479,35 @@ mod tests {
 
         let score = det.process_frame(&frame_with_blob(100, 80, 24), W, H);
         assert!(score > 0.0, "cleared mask must restore detection");
+    }
+
+    /// The defect this detector was blinded by: `min_contour_area = nan` in
+    /// config (TOML has a `nan` literal) survived `f64::clamp`, which returns
+    /// NaN for NaN, and landed here — where `area >= min_contour_area` is false
+    /// for every component ever labeled, so no blob is ever retained, no motion
+    /// is ever scored, and no event is ever recorded, with nothing logged and a
+    /// camera that looks like it is working. Config now refuses the value, and
+    /// the settings that seed the detector replace it with the default, so the
+    /// same input leaves detection intact.
+    #[test]
+    fn a_min_contour_area_that_is_not_a_number_cannot_blind_the_detector() {
+        let settings = MotionSettings::from_defaults(DEFAULT_VAR_THRESHOLD, f64::NAN);
+        let mut det = MotionDetector::new(settings.var_threshold, settings.min_contour_area);
+        warm_up(&mut det);
+
+        let score = det.process_frame(&frame_with_blob(100, 80, 24), W, H);
+        assert!(score > 0.0, "a blob this size has to score");
+        assert_eq!(det.motion_bboxes().len(), 1);
+
+        // The unprotected value, for contrast: every comparison against it is
+        // false, so the same frame is silently still.
+        let mut blind = MotionDetector::new(DEFAULT_VAR_THRESHOLD, f64::NAN);
+        warm_up(&mut blind);
+        assert_eq!(
+            blind.process_frame(&frame_with_blob(100, 80, 24), W, H),
+            0.0
+        );
+        assert!(blind.motion_bboxes().is_empty());
     }
 
     #[test]

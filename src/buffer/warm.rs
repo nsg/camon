@@ -111,6 +111,12 @@ impl EventUpgrade {
     }
 }
 
+/// The runtime warning for an event whose own motion was evicted before it
+/// could be assembled. Quoted by `Config::validate`, which can see the
+/// configurations that guarantee this from the config file alone and tells the
+/// operator what to look for — so the two must stay the same words.
+pub const EVICTED_HEAD_WARNING: &str = "the event's head was already evicted";
+
 /// Assemble a finished event from the hot buffer and detection store.
 ///
 /// Called by the analyzer the moment a motion run closes, while every segment
@@ -119,6 +125,19 @@ impl EventUpgrade {
 /// Pre-padding walks backwards from the first motion segment, staying within
 /// `pre_padding_ns` and never reaching before `min_start_seq` (the end of the
 /// previous event) or the start of the buffer.
+///
+/// Two different losses can happen at that lower bound, and only one of them is
+/// ordinary. Pre-padding that does not fit is context, best-effort by
+/// definition, and stopping short of it is silent. The run's own motion is not:
+/// if the buffer has already turned over past `first_motion_seq` — a run longer
+/// than the buffer, or one closed by a post-padding window wider than it — the
+/// event is written without the footage it exists for, and that is warned about
+/// once, with the count. Sequences below `min_start_seq` are neither: the
+/// previous event or the previous chunk of this one holds them. That clause is
+/// defensive — every production caller passes a `min_start_seq` at or below
+/// `first_motion_seq` (the tracker's barrier is settled before the next run
+/// opens), so `first_motion_seq` alone decides; the `max` only matters if a
+/// future caller breaks that shape, and then silence is the right answer.
 ///
 /// `filmstrip_frames` are the thumbnails the analyzer extracted for this run;
 /// they belong to the run, not to any single sequence, so they are handed in
@@ -169,6 +188,23 @@ pub fn assemble_event(
     }
     let first_pts = segments.first().map(|s| s.start_pts)?;
     let total_bytes = segments.iter().map(|s| s.data.len()).sum();
+
+    // Reported here rather than in the loop above, which never sees these: the
+    // clamp lifted its start past them, so an evicted head is the one gap that
+    // leaves no trace of itself. After the `?`, so this describes an event that
+    // was actually written — a run with nothing left at all is the caller's
+    // "skipping event", not a truncated one.
+    let wanted_start = first_motion_seq.max(min_start_seq);
+    if buffer.first_sequence() > wanted_start {
+        let lost = buffer.first_sequence() - wanted_start;
+        tracing::warn!(
+            camera = %camera_id,
+            first_motion_seq,
+            lost,
+            "{EVICTED_HEAD_WARNING}: {lost} motion segment(s) were gone before the event could \
+             be assembled, and it is recorded without them"
+        );
+    }
 
     // Metadata is read fresh, while the analyzer's store cleanup cannot have
     // pruned these sequences yet (they are still in the hot buffer).
@@ -683,6 +719,126 @@ mod tests {
         assert_eq!(event.segments.len(), 5);
     }
 
+    /// Somewhere for a subscriber to write, so a test can read what an operator
+    /// would have seen. The same shape `supervise` uses.
+    #[derive(Clone, Default)]
+    struct CapturedLog(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLog {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLog {
+        type Writer = Self;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// Everything `assemble` says at warn level while it runs.
+    fn warnings_from(assemble: impl FnOnce()) -> String {
+        let logs = CapturedLog::default();
+        {
+            let _reader = tracing::subscriber::set_default(
+                tracing_subscriber::fmt()
+                    .with_writer(logs.clone())
+                    .with_max_level(tracing::Level::WARN)
+                    .with_ansi(false)
+                    .finish(),
+            );
+            assemble();
+        }
+        let written = logs.0.lock().unwrap().clone();
+        String::from_utf8(written).unwrap()
+    }
+
+    /// A run longer than the buffer loses its opening motion, and the loop that
+    /// reports gaps never sees it: the clamp lifts the loop's start past the
+    /// evicted sequences, so the event used to be written short with nothing at
+    /// all in the log. This is the silent case the whole rule about padding and
+    /// buffer length exists to catch, so it has to be audible.
+    #[test]
+    fn an_evicted_event_head_is_warned_about_and_the_event_still_written() {
+        use crate::locks::LockExt;
+        // 5s buffer, 10 segments pushed: seq 0..=4 are gone.
+        let buffer = HotBuffer::new("cam".to_string(), 5);
+        {
+            let mut buf = buffer.write_recover();
+            for seq in 0..10u64 {
+                buf.push(segment(seq * SEC, SEC, seq as u8));
+            }
+        }
+        let buf = buffer.read_recover();
+        assert_eq!(buf.first_sequence(), 5);
+
+        // Motion started at seq 2 and ran to 9 — three of its segments (2, 3,
+        // 4) were evicted before the run closed.
+        let mut event = None;
+        let written = warnings_from(|| {
+            event = assemble_event(&buf, None, "cam", 2, 9, 0, 0, false, None);
+        });
+        let event = event.expect("the resident tail still makes an event");
+
+        assert!(
+            written.contains(EVICTED_HEAD_WARNING),
+            "the lost head was silent: {written:?}"
+        );
+        assert!(written.contains("lost=3"), "does not count them: {written}");
+        assert_eq!(written.matches("WARN").count(), 1, "{written}");
+
+        // Truncated, not abandoned: what survived is still recorded.
+        assert_eq!(event.segments.len(), 5);
+        assert_eq!(event.first_pts, 5 * SEC);
+    }
+
+    /// The other thing that stops at the same lower bound is pre-padding, and
+    /// losing that is the documented normal case — context is best-effort. Only
+    /// motion is worth a line, or every event on a busy camera would carry one.
+    #[test]
+    fn pre_padding_lost_to_the_same_clamp_stays_quiet() {
+        use crate::locks::LockExt;
+        let buffer = HotBuffer::new("cam".to_string(), 5);
+        {
+            let mut buf = buffer.write_recover();
+            for seq in 0..10u64 {
+                buf.push(segment(seq * SEC, SEC, seq as u8));
+            }
+        }
+        let buf = buffer.read_recover();
+
+        // Motion at seq 7 with 30s of pre-padding asked for: the reach-back is
+        // cut off at the start of the buffer, and no motion is missing.
+        let written = warnings_from(|| {
+            assemble_event(&buf, None, "cam", 7, 9, 0, 30 * SEC, false, None).unwrap();
+        });
+        assert!(
+            written.is_empty(),
+            "padding loss should be silent: {written}"
+        );
+
+        // Nor does a caller asking from behind min_start_seq: whatever lies
+        // below it belongs to the previous event or chunk, which recorded it.
+        // No production caller passes min_start_seq above first_motion_seq —
+        // this pins the defensive arm: the request reaches back to 2, the
+        // buffer starts at 5, and only the barrier at 8 says that gap is not
+        // a loss. Without the max against it, this would warn.
+        let written = warnings_from(|| {
+            assemble_event(&buf, None, "cam", 2, 9, 8, 0, true, None).unwrap();
+        });
+        assert!(
+            written.is_empty(),
+            "chunk boundary should be silent: {written}"
+        );
+    }
+
     #[test]
     fn assembly_returns_none_when_all_segments_evicted() {
         use crate::locks::LockExt;
@@ -694,7 +850,14 @@ mod tests {
             }
         }
         let buf = buffer.read_recover();
-        assert!(assemble_event(&buf, None, "cam", 1, 3, 0, 0, false, None).is_none());
+
+        // Nothing survived, so there is no truncated event to report — the
+        // analyzer says "skipping event" for this one, and a head warning here
+        // would be describing a write that never happened.
+        let written = warnings_from(|| {
+            assert!(assemble_event(&buf, None, "cam", 1, 3, 0, 0, false, None).is_none());
+        });
+        assert!(written.is_empty(), "nothing was written: {written}");
     }
 
     #[test]

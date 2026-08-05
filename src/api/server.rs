@@ -531,6 +531,11 @@ async fn motion_settings_put_handler(
         Ok(Err(e @ UpdateError::NotPersisted(_))) => {
             (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
         }
+        // The request is the problem, and the settings the detector is using
+        // are untouched — the client's, not camon's, and not a partial apply.
+        Ok(Err(e @ UpdateError::NotANumber { .. })) => {
+            (StatusCode::BAD_REQUEST, e.to_string()).into_response()
+        }
         Err(e) => {
             tracing::error!(error = %e, "motion settings update panicked");
             (StatusCode::INTERNAL_SERVER_ERROR, "settings update failed").into_response()
@@ -1378,19 +1383,23 @@ mod tests {
         (format!("http://{addr}"), dir)
     }
 
-    /// Serve with motion settings backed by `data_dir`.
-    async fn serve_with_motion_settings(data_dir: &std::path::Path) -> String {
+    /// State with one camera whose motion settings live under `data_dir`.
+    fn motion_settings_state(data_dir: &std::path::Path) -> AppState {
         let ids = vec!["cam".to_string()];
         let buffers = HashMap::from([("cam".to_string(), HotBuffer::new("cam".to_string(), 60))]);
-        let state = AppState::new(
+        AppState::new(
             buffers,
             MotionStore::new(&ids),
             DetectionStore::new(&ids),
             DetectionDebugStore::new(&ids),
             None,
             Some(MotionSettingsStore::new(&ids, data_dir, 16.0, 200.0)),
-        );
-        let app = build_router(state, None);
+        )
+    }
+
+    /// Serve with motion settings backed by `data_dir`.
+    async fn serve_with_motion_settings(data_dir: &std::path::Path) -> String {
+        let app = build_router(motion_settings_state(data_dir), None);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -1428,6 +1437,68 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(live["var_threshold"], 32.0);
+    }
+
+    /// A slider value that is not a real number would switch motion detection
+    /// off for that camera — `area >= NaN` is false for every blob — so no
+    /// route into the store accepts one and the live settings are left alone.
+    /// Over HTTP the body never gets that far: JSON has no way to spell a
+    /// non-finite number, so serde refuses it first. The store's own refusal,
+    /// which is what catches any other writer, is pinned in `motion_settings`.
+    #[tokio::test]
+    async fn a_settings_put_that_is_not_a_number_never_reaches_the_detector() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = serve_with_motion_settings(dir.path()).await;
+        let url = format!("{base}/api/cameras/cam/motion/settings");
+        let client = reqwest::Client::new();
+
+        client
+            .put(&url)
+            .json(&serde_json::json!({ "var_threshold": 32.0 }))
+            .send()
+            .await
+            .unwrap();
+
+        // Refused by serde as it is deserialized, before any handler runs —
+        // which is the point being pinned here, not the store's own guard: no
+        // spelling of a non-finite number survives the JSON body. The guard
+        // itself is covered by the test below, which calls the handler.
+        let response = client
+            .put(&url)
+            .header("content-type", "application/json")
+            .body(r#"{"var_threshold": 1e999}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+
+        let live: serde_json::Value = reqwest::get(&url).await.unwrap().json().await.unwrap();
+        assert_eq!(live["var_threshold"], 32.0, "the refused value took hold");
+    }
+
+    /// What the store's own refusal answers, reached by calling the handler
+    /// directly: no JSON body can carry a non-finite number today, so this is
+    /// the only way to see the arm that will answer for the writer that
+    /// eventually can. A bad request, not a server fault — camon's state is
+    /// fine, and untouched.
+    #[tokio::test]
+    async fn a_slider_value_the_store_refuses_is_a_400_not_a_500() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = motion_settings_state(dir.path());
+        let store = state.motion_settings.clone().unwrap();
+
+        let response = motion_settings_put_handler(
+            State(state),
+            Path("cam".to_string()),
+            Json(SettingsUpdate {
+                var_threshold: Some(f64::NAN),
+                ..Default::default()
+            }),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(store.get("cam").unwrap().var_threshold, 16.0);
     }
 
     #[tokio::test]

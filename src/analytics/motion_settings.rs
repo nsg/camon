@@ -81,7 +81,7 @@ impl Default for MotionSettings {
 }
 
 impl MotionSettings {
-    /// Build settings from configured defaults, clamped into range.
+    /// Build settings from configured defaults, forced into range.
     pub fn from_defaults(var_threshold: f64, min_contour_area: f64) -> Self {
         let mut s = Self {
             var_threshold,
@@ -89,26 +89,50 @@ impl MotionSettings {
             mask: default_mask(),
             detection_mask: default_mask(),
         };
-        s.clamp();
+        s.sanitize();
         s
     }
 
-    /// Clamp the sliders into their valid ranges and normalize the mask length.
+    /// Force the sliders into their valid ranges and normalize the mask length.
     /// Applied on load and on every update so out-of-range API/config input and
     /// stale on-disk state can never reach the detector.
-    pub fn clamp(&mut self) {
-        self.var_threshold = self
-            .var_threshold
-            .clamp(VAR_THRESHOLD_MIN, VAR_THRESHOLD_MAX);
-        self.min_contour_area = self
-            .min_contour_area
-            .clamp(MIN_CONTOUR_AREA_MIN, MIN_CONTOUR_AREA_MAX);
+    ///
+    /// Not simply a clamp, which is what this used to be: `f64::clamp` returns
+    /// NaN for NaN — both of its comparisons are false — so a NaN
+    /// `min_contour_area` passed straight through to the detector, where
+    /// `area >= min_contour_area` is false for every blob there will ever be.
+    /// Motion detection off, no error anywhere, a camera analyzing every frame
+    /// and reporting nothing. A value that is not a real number has no nearest
+    /// valid one to snap to, so it is replaced by the default instead.
+    pub fn sanitize(&mut self) {
+        self.var_threshold = bounded(
+            self.var_threshold,
+            DEFAULT_VAR_THRESHOLD,
+            VAR_THRESHOLD_MIN,
+            VAR_THRESHOLD_MAX,
+        );
+        self.min_contour_area = bounded(
+            self.min_contour_area,
+            DEFAULT_MIN_CONTOUR_AREA,
+            MIN_CONTOUR_AREA_MIN,
+            MIN_CONTOUR_AREA_MAX,
+        );
         if self.mask.len() != MASK_CELLS {
             self.mask.resize(MASK_CELLS, false);
         }
         if self.detection_mask.len() != MASK_CELLS {
             self.detection_mask.resize(MASK_CELLS, false);
         }
+    }
+}
+
+/// One slider held to `min..=max`, with a value that is not a real number
+/// replaced by `default` rather than clamped — see [`MotionSettings::sanitize`].
+fn bounded(value: f64, default: f64, min: f64, max: f64) -> f64 {
+    if value.is_finite() {
+        value.clamp(min, max)
+    } else {
+        default
     }
 }
 
@@ -121,6 +145,15 @@ pub enum UpdateError {
     /// disk, so they are lost on the next restart.
     #[error("settings applied to the running detector but not saved: {0}")]
     NotPersisted(#[source] std::io::Error),
+    /// A slider was sent a value that is not a real number. Refused outright
+    /// rather than substituted: the caller asked for something specific and
+    /// has to hear that it did not land, and nothing is touched, so the value
+    /// the detector is already using survives. Today's JSON body cannot carry
+    /// one — serde_json rejects `NaN` and an out-of-range literal alike — so
+    /// this guards the store's own API, which is what the analyzer reads every
+    /// tick, against every writer rather than against the one there is now.
+    #[error("{field} must be a real number, got {value}")]
+    NotANumber { field: &'static str, value: f64 },
 }
 
 /// Partial update accepted by the settings API. Absent fields are left
@@ -161,6 +194,30 @@ impl MotionSettingsStore {
     /// Load each camera's settings from disk (falling back to the configured
     /// defaults) and delete any stale learned-state files left by the removed
     /// auto-tuner / detection grid.
+    ///
+    /// A camera whose file could not be read starts with its **detection mask
+    /// fully painted**: the vision model is shown nothing from that camera
+    /// until a valid file is written, because the mask that file was holding
+    /// might have been hiding a bedroom window, and defaulting it to all-off
+    /// would put those pixels in front of the model with only a boot-time warn
+    /// on a box that logs warnings and above. The failure it costs is
+    /// classification, which is visible in the UI within a motion run and
+    /// repaired by painting the mask once.
+    ///
+    /// The **movement mask is deliberately not treated the same way.** Painting
+    /// it closed means no cell can ever report motion, which means no motion
+    /// runs, no events and no recording — an unreadable file would take the
+    /// camera off the air, which is the very failure this whole change exists
+    /// to prevent. Recording and motion detection carry on untouched; only what
+    /// the model is allowed to see fails closed.
+    ///
+    /// One consequence worth knowing: the fail-closed mask is only in memory
+    /// until the first edit, and that edit persists it. Move any slider and the
+    /// all-true detection mask is written to disk as a perfectly valid file, so
+    /// later restarts load it in silence — a camera that shows every detection
+    /// cell painted with nothing in the log to explain it. The UI does show
+    /// that state, and clearing the mask is one click, but the boot warning is
+    /// only printed for as long as the file stays unreadable.
     pub fn new(
         camera_ids: &[String],
         data_dir: &Path,
@@ -171,9 +228,16 @@ impl MotionSettingsStore {
         for id in camera_ids {
             remove_stale_learned_state(data_dir, id);
             let path = settings_path(data_dir, id);
-            let settings = load(&path).unwrap_or_else(|| {
-                MotionSettings::from_defaults(default_var_threshold, default_min_contour_area)
-            });
+            let defaults =
+                || MotionSettings::from_defaults(default_var_threshold, default_min_contour_area);
+            let settings = match load(&path) {
+                Persisted::Settings(settings) => settings,
+                Persisted::Absent => defaults(),
+                Persisted::Corrupt => MotionSettings {
+                    detection_mask: vec![true; MASK_CELLS],
+                    ..defaults()
+                },
+            };
             cameras.insert(
                 id.clone(),
                 Camera {
@@ -211,6 +275,16 @@ impl MotionSettingsStore {
             .cameras
             .get(camera_id)
             .ok_or(UpdateError::UnknownCamera)?;
+        // Before anything is locked or mutated: a rejected update leaves the
+        // live settings exactly as the detector already had them.
+        for (field, value) in [
+            ("var_threshold", update.var_threshold),
+            ("min_contour_area", update.min_contour_area),
+        ] {
+            if let Some(value) = value.filter(|v| !v.is_finite()) {
+                return Err(UpdateError::NotANumber { field, value });
+            }
+        }
         // Taken before the mutation, not just around the write, so that two
         // concurrent updates are applied and persisted in the same order.
         let _persist = cam.persist.lock_recover();
@@ -228,7 +302,7 @@ impl MotionSettingsStore {
             if let Some(m) = update.detection_mask {
                 state.settings.detection_mask = m;
             }
-            state.settings.clamp();
+            state.settings.sanitize();
             (state.path.clone(), state.settings.clone())
         };
         match save(&path, &settings) {
@@ -246,18 +320,74 @@ fn settings_path(data_dir: &Path, camera_id: &str) -> PathBuf {
     data_dir.join(camera_id).join("motion_settings.json")
 }
 
-fn load(path: &Path) -> Option<MotionSettings> {
-    let data = std::fs::read_to_string(path).ok()?;
-    let mut settings: MotionSettings = serde_json::from_str(&data).ok()?;
-    settings.clamp();
+/// What one camera's `motion_settings.json` turned out to be. The three cases
+/// are not interchangeable: [`Absent`](Self::Absent) is a camera nobody has
+/// adjusted yet, while [`Corrupt`](Self::Corrupt) is settings that existed and
+/// were lost — which is what [`MotionSettingsStore::new`] fails the detection
+/// mask closed over.
+enum Persisted {
+    Settings(MotionSettings),
+    Absent,
+    Corrupt,
+}
+
+/// Read one camera's persisted settings.
+///
+/// A file camon cannot read is recovered from rather than refused, which is the
+/// opposite of what [`crate::config::Config`] does with a value that would stop
+/// it recording — deliberately. A config file is what the operator wrote, and a
+/// camon that cannot record has to say so and stop. This file is runtime state
+/// a slider wrote, for one camera out of however many are on the box: refusing
+/// to boot over it would take every other camera off the air, to fix a value
+/// the web UI resets in a second — and that UI is only reachable while camon is
+/// running, so the refusal would also be the thing preventing the repair.
+///
+/// The recovery is not silent, which is the part that was missing: what an
+/// unreadable file costs is a painted mask, and a privacy control that quietly
+/// reverted to "watch everything" is exactly the failure nobody notices. So a
+/// file that was there and could not be used is warned about *and* separated
+/// from one that was never written — see [`MotionSettingsStore::new`] for what
+/// the caller does with the difference. The sliders are safe either way:
+/// [`sanitize`](MotionSettings::sanitize) substitutes this module's own
+/// constants for a value it cannot bound, so nothing a file holds can leave
+/// motion detection switched off.
+fn load(path: &Path) -> Persisted {
+    let data = match std::fs::read_to_string(path) {
+        Ok(data) => data,
+        // A camera seen for the first time has no file yet; that is the
+        // ordinary case, not a fault.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Persisted::Absent,
+        Err(e) => {
+            tracing::warn!(
+                path = %path.display(), error = %e,
+                "motion settings file cannot be read; starting this camera from the configured \
+                 defaults with its detection mask fully painted, so no frame reaches the \
+                 vision model until the mask is set again"
+            );
+            return Persisted::Corrupt;
+        }
+    };
+    let mut settings: MotionSettings = match serde_json::from_str(&data) {
+        Ok(settings) => settings,
+        Err(e) => {
+            tracing::warn!(
+                path = %path.display(), error = %e,
+                "motion settings file cannot be parsed; starting this camera from the \
+                 configured defaults with its detection mask fully painted, so no frame \
+                 reaches the vision model until the mask is set again"
+            );
+            return Persisted::Corrupt;
+        }
+    };
+    settings.sanitize();
     tracing::info!(path = %path.display(), "loaded motion settings");
-    Some(settings)
+    Persisted::Settings(settings)
 }
 
 /// Persist settings the way the storage layer commits an event: stage into
 /// `motion_settings.json.tmp`, fsync it, rename, then fsync the directory.
-/// `load` falls back to unmasked defaults on any parse error, so a torn write
-/// would silently drop a privacy mask; the rename makes that unreachable — a
+/// `load` cannot recover a painted mask from a file it cannot parse, so a torn
+/// write costs one; the rename makes that unreachable — a
 /// crash can only leave a stale `.tmp` beside an intact previous file — and the
 /// directory fsync is what keeps the rename itself from being lost.
 ///
@@ -316,14 +446,14 @@ mod tests {
     }
 
     #[test]
-    fn clamp_bounds_sliders() {
+    fn sanitize_bounds_sliders() {
         let mut s = MotionSettings {
             var_threshold: 1000.0,
             min_contour_area: 0.0,
             mask: vec![true; 3],
             detection_mask: vec![true; 5],
         };
-        s.clamp();
+        s.sanitize();
         assert_eq!(s.var_threshold, VAR_THRESHOLD_MAX);
         assert_eq!(s.min_contour_area, MIN_CONTOUR_AREA_MIN);
         // Mask length normalized, existing cells preserved where they fit.
@@ -341,7 +471,7 @@ mod tests {
             mask: default_mask(),
             detection_mask: default_mask(),
         };
-        low.clamp();
+        low.sanitize();
         assert_eq!(low.var_threshold, VAR_THRESHOLD_MIN);
         assert_eq!(low.min_contour_area, MIN_CONTOUR_AREA_MAX);
     }
@@ -375,7 +505,7 @@ mod tests {
             "mask": [true, false, true]
         }"#;
         let mut s: MotionSettings = serde_json::from_str(json).unwrap();
-        s.clamp();
+        s.sanitize();
         assert_eq!(s.detection_mask.len(), MASK_CELLS);
         assert!(s.detection_mask.iter().all(|&m| !m));
         // The movement mask still loads and is length-normalized.
@@ -477,6 +607,294 @@ mod tests {
         assert_eq!(updated.min_contour_area, MIN_CONTOUR_AREA_MIN);
     }
 
+    /// A clamp cannot bound NaN — it returns it — so a NaN slider reached the
+    /// detector, where `area >= min_contour_area` is false for every blob and
+    /// motion detection is over. There is no nearest valid value, so the
+    /// default is what it becomes.
+    #[test]
+    fn a_slider_that_is_not_a_number_becomes_its_default() {
+        // Every one becomes the default, infinities included. Clamping them
+        // instead would be defined — `inf` bounds to the maximum — but it would
+        // read an operator's typo as a deliberate request for the least
+        // sensitive detector there is, which is nearly no detector at all.
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let mut s = MotionSettings {
+                var_threshold: bad,
+                min_contour_area: bad,
+                mask: default_mask(),
+                detection_mask: default_mask(),
+            };
+            s.sanitize();
+            assert_eq!(s.var_threshold, DEFAULT_VAR_THRESHOLD, "from {bad}");
+            assert_eq!(s.min_contour_area, DEFAULT_MIN_CONTOUR_AREA, "from {bad}");
+            assert_ne!(s.var_threshold, VAR_THRESHOLD_MAX, "clamped, not defaulted");
+            assert_ne!(
+                s.min_contour_area, MIN_CONTOUR_AREA_MIN,
+                "clamped, not defaulted"
+            );
+        }
+
+        // The path a NaN in [analytics.motion] used to take into the detector.
+        let seeded = MotionSettings::from_defaults(f64::NAN, f64::NAN);
+        assert_eq!(seeded.var_threshold, DEFAULT_VAR_THRESHOLD);
+        assert_eq!(seeded.min_contour_area, DEFAULT_MIN_CONTOUR_AREA);
+    }
+
+    /// The store the analyzer re-reads every tick is the other way a valid
+    /// config can be turned into a blind camera, so a value that is not a real
+    /// number is refused there too — and refused whole: nothing in the same
+    /// update is applied, and the running detector keeps what it had.
+    #[test]
+    fn an_update_that_is_not_a_number_is_refused_and_changes_nothing() {
+        let dir = TempDir::new().unwrap();
+        let ids = vec!["cam1".to_string()];
+        let store = MotionSettingsStore::new(&ids, dir.path(), 16.0, 200.0);
+        store
+            .update(
+                "cam1",
+                SettingsUpdate {
+                    var_threshold: Some(48.0),
+                    min_contour_area: Some(500.0),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        for (field, update) in [
+            (
+                "var_threshold",
+                SettingsUpdate {
+                    var_threshold: Some(f64::NAN),
+                    min_contour_area: Some(600.0),
+                    ..Default::default()
+                },
+            ),
+            (
+                "min_contour_area",
+                SettingsUpdate {
+                    min_contour_area: Some(f64::INFINITY),
+                    ..Default::default()
+                },
+            ),
+        ] {
+            let err = store
+                .update("cam1", update)
+                .expect_err("accepted a non-number");
+            assert!(
+                matches!(err, UpdateError::NotANumber { field: f, .. } if f == field),
+                "got {err:?}"
+            );
+
+            let live = store.get("cam1").unwrap();
+            assert_eq!(live.var_threshold, 48.0, "live settings survived {field}");
+            assert_eq!(live.min_contour_area, 500.0, "no half-applied update");
+        }
+
+        // And the refusal never reached disk either.
+        let reloaded = MotionSettingsStore::new(&ids, dir.path(), 16.0, 200.0);
+        assert_eq!(reloaded.get("cam1").unwrap().var_threshold, 48.0);
+    }
+
+    /// A store over `data_dir` whose one camera's settings file holds
+    /// `content`.
+    fn store_over_settings_file(dir: &TempDir, content: &str) -> MotionSettingsStore {
+        let path = settings_path(dir.path(), "cam1");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, content).unwrap();
+        MotionSettingsStore::new(&["cam1".to_string()], dir.path(), 16.0, 200.0)
+    }
+
+    /// A settings file camon cannot read is one camera's runtime state, not the
+    /// operator's config: it starts from the defaults and says so, rather than
+    /// taking the whole box down over a value the web UI resets in a second.
+    #[test]
+    fn an_unreadable_settings_file_starts_from_the_defaults() {
+        let ids = vec!["cam1".to_string()];
+        for content in [
+            // What a camon holding a NaN wrote: serde_json has no NaN, so it
+            // serialized one as null, which does not read back as a number.
+            r#"{"var_threshold": null, "min_contour_area": 200.0}"#,
+            "{ truncated",
+            "",
+        ] {
+            let dir = TempDir::new().unwrap();
+            let store = store_over_settings_file(&dir, content);
+            let settings = store.get("cam1").expect("camera dropped over a bad file");
+            assert_eq!(settings.var_threshold, 16.0, "{content:?}");
+            assert_eq!(settings.min_contour_area, 200.0, "{content:?}");
+
+            // Still writable, so the next slider move replaces the bad file.
+            store
+                .update(
+                    "cam1",
+                    SettingsUpdate {
+                        var_threshold: Some(32.0),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            let reloaded = MotionSettingsStore::new(&ids, dir.path(), 16.0, 200.0);
+            assert_eq!(reloaded.get("cam1").unwrap().var_threshold, 32.0);
+        }
+    }
+
+    /// The masks a lost file was holding are unknowable, and one of them is a
+    /// privacy control: the pixels it was hiding must not go straight back in
+    /// front of the vision model on the strength of a single boot-time warn.
+    /// So the detection mask starts fully painted.
+    ///
+    /// The movement mask must NOT: painted closed it reports no motion, which
+    /// means no events and no recording — an unreadable file would take the
+    /// camera off the air, which is the failure this whole change exists to
+    /// prevent. Both halves are asserted, because getting the second one wrong
+    /// is worse than the bug being fixed here.
+    #[test]
+    fn a_lost_settings_file_hides_the_camera_from_the_model_but_keeps_it_recording() {
+        let dir = TempDir::new().unwrap();
+        let store = store_over_settings_file(&dir, "{ truncated");
+        let settings = store.get("cam1").unwrap();
+
+        assert!(
+            settings.detection_mask.iter().all(|&c| c),
+            "the model must see nothing until the mask is painted again"
+        );
+        assert!(
+            settings.mask.iter().all(|&c| !c),
+            "a closed movement mask would stop the camera recording"
+        );
+        // And motion detection is running on usable sliders, not on nothing.
+        assert_eq!(settings.var_threshold, 16.0);
+        assert_eq!(settings.min_contour_area, 200.0);
+
+        // Painting the mask from the UI is all it takes to get back.
+        let updated = store
+            .update(
+                "cam1",
+                SettingsUpdate {
+                    detection_mask: Some(default_mask()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(updated.detection_mask.iter().all(|&c| !c));
+        let reloaded = MotionSettingsStore::new(&["cam1".to_string()], dir.path(), 16.0, 200.0);
+        assert!(reloaded
+            .get("cam1")
+            .unwrap()
+            .detection_mask
+            .iter()
+            .all(|&c| !c));
+    }
+
+    /// A camera nobody has adjusted yet has no file, and that is not a loss:
+    /// it must start unmasked, or every new install would see nothing.
+    #[test]
+    fn a_camera_with_no_settings_file_yet_starts_unmasked() {
+        let dir = TempDir::new().unwrap();
+        let store = MotionSettingsStore::new(&["cam1".to_string()], dir.path(), 16.0, 200.0);
+        let settings = store.get("cam1").unwrap();
+        assert!(settings.detection_mask.iter().all(|&c| !c));
+        assert!(settings.mask.iter().all(|&c| !c));
+    }
+
+    /// The other corruption branch: a path that cannot be read at all, rather
+    /// than one holding something unparseable. A directory where the file
+    /// belongs is an I/O error on every platform and for every user.
+    #[test]
+    fn a_settings_path_that_cannot_be_read_fails_closed_the_same_way() {
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir_all(settings_path(dir.path(), "cam1")).unwrap();
+
+        let store = MotionSettingsStore::new(&["cam1".to_string()], dir.path(), 16.0, 200.0);
+        let settings = store.get("cam1").expect("camera dropped over an I/O error");
+        assert!(settings.detection_mask.iter().all(|&c| c));
+        assert!(settings.mask.iter().all(|&c| !c));
+        assert_eq!(settings.var_threshold, 16.0);
+    }
+
+    /// Somewhere for a subscriber to write, so a test can read what an operator
+    /// would have seen. The same shape `supervise` uses.
+    #[derive(Clone, Default)]
+    struct CapturedLog(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLog {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock_recover().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLog {
+        type Writer = Self;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// What the operator is told is the whole of this design: the recovery is
+    /// only defensible because it is loud, and production logs warnings and
+    /// above, so the line has to be a warning and it has to name the camera's
+    /// file. Silence here would be the failure the fallback was accused of.
+    #[test]
+    fn every_corrupt_settings_file_is_reported_at_warn() {
+        for (case, content) in [("parse", "{ truncated"), ("io", "")] {
+            let dir = TempDir::new().unwrap();
+            let logs = CapturedLog::default();
+            {
+                let _reader = tracing::subscriber::set_default(
+                    tracing_subscriber::fmt()
+                        .with_writer(logs.clone())
+                        .with_max_level(tracing::Level::WARN)
+                        .with_ansi(false)
+                        .finish(),
+                );
+                if case == "io" {
+                    // Unreadable rather than unparseable.
+                    std::fs::create_dir_all(settings_path(dir.path(), "cam1")).unwrap();
+                    MotionSettingsStore::new(&["cam1".to_string()], dir.path(), 16.0, 200.0);
+                } else {
+                    store_over_settings_file(&dir, content);
+                }
+            }
+
+            let written = String::from_utf8(logs.0.lock_recover().clone()).unwrap();
+            assert!(written.contains("WARN"), "{case}: not a warning: {written}");
+            assert!(
+                written.contains("motion_settings.json"),
+                "{case}: does not name the file: {written}"
+            );
+            assert!(
+                written.contains("detection mask"),
+                "{case}: does not say what it did: {written}"
+            );
+        }
+    }
+
+    /// A camera that simply has not been adjusted yet is the ordinary case, and
+    /// warning about every one of them on every boot would bury the line above.
+    #[test]
+    fn a_camera_with_no_settings_file_is_not_warned_about() {
+        let dir = TempDir::new().unwrap();
+        let logs = CapturedLog::default();
+        {
+            let _reader = tracing::subscriber::set_default(
+                tracing_subscriber::fmt()
+                    .with_writer(logs.clone())
+                    .with_max_level(tracing::Level::WARN)
+                    .with_ansi(false)
+                    .finish(),
+            );
+            MotionSettingsStore::new(&["cam1".to_string()], dir.path(), 16.0, 200.0);
+        }
+        let written = String::from_utf8(logs.0.lock_recover().clone()).unwrap();
+        assert!(written.is_empty(), "unexpected log: {written}");
+    }
+
     #[test]
     fn unknown_camera_returns_none() {
         let dir = TempDir::new().unwrap();
@@ -559,8 +977,9 @@ mod tests {
             w.join().unwrap();
         }
 
-        let persisted =
-            load(&settings_path(dir.path(), "cam1")).expect("no readable settings file");
+        let Persisted::Settings(persisted) = load(&settings_path(dir.path(), "cam1")) else {
+            panic!("no readable settings file");
+        };
         let i = (persisted.var_threshold - 20.0) as usize;
         assert!(
             i < 8,

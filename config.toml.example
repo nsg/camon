@@ -12,6 +12,23 @@
 # (a typo would otherwise silently leave the default in force), while keys camon
 # itself shipped and later removed are dropped with advice, so a config that
 # booted before keeps booting.
+#
+# Beyond what camon cannot run at all without (no cameras, an address that is
+# not an address, a hot buffer of zero), a value camon merely dislikes is fatal
+# only where the damage would be SILENT — where recording, detection or
+# classification would simply stop with nothing anywhere to say so. Where the
+# consequence is already logged where it happens, or where the value has a
+# reading somebody could have meant, camon corrects the value it read from this
+# file (clamping into range, or substituting the default), warns with the field
+# name and what it is using, and carries on. Refusing to start is the heavier
+# choice on a camera box: config is read before the self-updater runs, so an
+# install that auto-updated into a stricter camon and then refused to start
+# could never update out of it.
+#
+# This is about the values in this file. Per-camera settings edited later in
+# the web UI are a separate surface with its own rules: out-of-range slider
+# values from the API are clamped as they are applied, and a value that is not
+# a number is refused with the request.
 
 [update]
 # Auto-update from GitHub Releases on startup and every 12 hours (default:
@@ -35,7 +52,15 @@
 enabled = false
 
 [buffer]
-# Hot buffer duration in seconds (default: 600 = 10 minutes)
+# Hot buffer duration in seconds (default: 600 = 10 minutes). At least 1: a
+# zero-length buffer evicts every segment in the same push that added it, so
+# the analyzer is handed nothing and no event can be cut from it. Also capped
+# at 315360000 (10 years, the same span retention allows), because these
+# seconds are multiplied out to nanoseconds and past that the arithmetic wraps
+# u64 into a very SHORT duration — an absurd setting would quietly become no
+# recording rather than obviously too much of it. Both rules apply whatever
+# else is switched off: every camera gets a hot buffer, and the live view is
+# served from it even with analytics and storage disabled.
 hot_duration_secs = 600
 
 [http]
@@ -68,7 +93,12 @@ enabled = true
 # one frame per keyframe, so about one per second at a 1-second GOP — and is
 # not affected by this. Four frames per run reach the vision model whatever
 # this is set to: a higher rate only widens what they are chosen from, it
-# does not make the run hold more of them.
+# does not make the run hold more of them. At least 1 while analytics is on:
+# 0 reaches ffmpeg as an "fps=0" filter, which passes no frame through, so
+# events lose their thumbnails and the vision model is never shown anything.
+# Motion detection and recording are unaffected — they decode keyframes
+# through a different filter — which is exactly why camon refuses to start on
+# it: nothing else would ever report the loss.
 sample_fps = 5
 
 # Default motion-detection settings. These seed each camera's
@@ -79,6 +109,11 @@ sample_fps = 5
 # of every frame sent to the vision model) — takes over. Detection is fully
 # deterministic: there is no auto-tuning. Only the two sliders have config
 # defaults; both masks default to all-off and are painted per camera.
+# A number outside its range is clamped into it at startup, with a warning
+# naming the field and the value being used. A value that is not a number at
+# all — TOML accepts the literals nan, inf and -inf — is refused instead: no
+# comparison against it is ever true, so the detector would look at every frame
+# and find motion in none of them.
 [analytics.motion]
 # MOG2 var_threshold. Higher = less sensitive. Range 4-96 (default: 16).
 var_threshold = 16
@@ -93,7 +128,13 @@ min_contour_area = 200
 [analytics.object_detection]
 # Enable object detection on motion segments (default: false)
 enabled = true
-# Minimum confidence threshold (default: 0.5)
+# Minimum confidence threshold (default: 0.5). Between 0.0 (keep every
+# detection the model reports) and 1.0 (keep only a certain one). A number
+# outside that range is clamped into it with a warning, the same as the motion
+# sliders above. A value that is not a number at all is refused at startup:
+# the filter is "confidence < threshold", which is false for every detection
+# when the threshold is nan, so instead of a stricter detector you would get no
+# filtering whatsoever and never hear about it.
 confidence_threshold = 0.5
 # Object classes to detect. Omit the key for the defaults (person, car,
 # truck, dog, cat). While enabled = true above, the list may not be empty and
@@ -111,7 +152,9 @@ url = "http://localhost:11434"
 model = "gemma4:e4b"
 # Per-request timeout in seconds (default: 90). Warm inference on a modest
 # GPU takes up to ~50s per frame; a timeout only costs that event's object
-# upgrade, never the footage.
+# upgrade, never the footage. 0 does not mean "no timeout" here — it is a
+# deadline every request misses — so camon warns and uses 90 instead of
+# refusing to start: the detection worker already logs every job it costs.
 timeout_secs = 90
 
 # Optional fallback server if primary fails
@@ -136,9 +179,35 @@ enabled = true
 # wrong disk. The marker is rewritten on every start, so it is safe to delete
 # while camon is stopped.
 data_dir = "/var/camon/storage"
-# Seconds of context before first motion in an event (default: 5)
+# Seconds of context before first motion in an event (default: 5). Capped at
+# 315360000 (10 years) while analytics is enabled, which is where it is
+# multiplied out to nanoseconds; the event cap below is capped the same way
+# while storage is enabled. See hot_duration_secs above for why.
 pre_padding_secs = 5
-# Seconds of context after last motion in an event (default: 10)
+# Seconds of context after last motion in an event (default: 10). This is what
+# closes a motion run: a quiet stretch longer than this ends the event. Keep it
+# well under hot_duration_secs. At or above it camon warns at startup and keeps
+# recording, and what it costs depends on max_event_duration_secs below, since
+# a chunk closes at whichever of the two comes first (measured from the chunk's
+# own start: the cap at max_event_duration_secs, the quiet window a
+# post_padding after the last motion in the chunk):
+#   * cap 0 — the quiet window is the only close there is, so the run's own
+#     footage is always gone by then: every event holds nothing but padding.
+#   * cap below hot_duration_secs — the cap always wins the race, so every
+#     chunk holding motion is written while its footage is still in the buffer.
+#     Nothing is lost to the quiet window; the cost is that each run ends in up
+#     to post_padding seconds of padding-only chunks (how many depends on where
+#     motion stopped relative to the next cap boundary).
+#   * cap at or above hot_duration_secs — allowed here, unlike continuous mode,
+#     and it does lose footage: a chunk holding motion is at least
+#     hot_duration_secs old whichever way the race goes, so its oldest segments
+#     have been evicted. The chunk a run opens with loses the motion it opened
+#     on; later chunks lose as much as their motion is old.
+# Whenever an event does lose its head the write is still made and the log says
+# so: "the event's head was already evicted", with the number of segments lost.
+# Below the threshold the same loss is still possible but depends on how long
+# motion actually lasted (motion + post_padding has to fit in the buffer),
+# which is why only the extreme case can be reported at startup.
 post_padding_secs = 10
 # Cap on a single event's length in seconds (default: 120). A run longer than
 # this is split into chained, independently playable chunks — the follow-on
