@@ -1,3 +1,59 @@
+//! Motion analysis: one blocking loop per camera, turning hot-buffer segments
+//! into motion scores, event filmstrips and the crop jobs the vision model runs
+//! on.
+//!
+//! Two rules hold this loop together, and both exist because the camera thread
+//! filling the hot buffer is on the other side of them.
+//!
+//! **The hot buffer's read lock is only ever held to collect handles.** Every
+//! read here — the sequence bounds, a pending segment, a run's priming
+//! segments, an event's assembly — takes the lock, copies out `Arc`s and
+//! scalars, and drops it. The worst case is [`assemble_event`]'s walk over one
+//! event's segments, bounded by the event duration cap, forking nothing,
+//! decoding nothing and touching no disk; everything else is a handful of map
+//! lookups. A camera thread's `push` needs the *write* lock and so waits out
+//! every reader, which is why nothing under this one may be slower than a walk
+//! over pointers. The priming loop below used to decode three segments of video
+//! under it — hundreds of milliseconds per motion batch, seconds while ffmpeg
+//! was still probing its input — and it did so *during motion*, when the
+//! footage the camera is trying to push is the footage that matters most.
+//!
+//! **ffmpeg children belong to the camera, not to the batch.** Both decoders —
+//! the frame decoder that scores motion and the crop decoder that cuts the
+//! frames an event keeps — are spawned once and kept until their child dies.
+//! The crop decoder used to be forked, primed and killed per motion batch, up
+//! to five fork/exec/kill cycles a second per camera, each one paying ffmpeg's
+//! stream probe again. Death is noticed where it was always noticed, at the
+//! next use; see [`ensure_long_lived`] for what a respawn costs and for the one
+//! thing it will not do, which is start an ffmpeg for a camera that has already
+//! been asked to stop.
+//!
+//! What a child that outlives the batch inherits is the batch's timeline, and a
+//! per-batch fork never had one. This decoder is handed only the segments motion
+//! asked for, so a quiet stretch reaches it as a gap in its input's timestamps,
+//! and a camera up for a day and a half reaches it as an MPEG-TS timestamp
+//! running out of bits and starting over. Neither is expensive, and the reason
+//! is not symmetry: a gap wide enough to read as a break in the stream is
+//! rebased by libavformat before the `fps` filter is shown it, while a gap
+//! narrow enough to read as ordinary lateness is filled at one duplicated
+//! picture per step — so the *small* gaps are the ones that cost, and they are
+//! small. What bounds either is structural rather than argued. The frame
+//! channel holds four and a full one backpressures ffmpeg instead of growing;
+//! every extraction opens by draining what is queued, and what is left is let
+//! go of at every pass and at every wakeup of the backoff a pass can be parked
+//! in — so none of the waits this analyzer sets for *itself*, poll or backoff,
+//! leaves those frames longer than a poll, not even on a camera whose decoder
+//! will never come back. A wait it inherits from a stalled consumer downstream
+//! is another matter, and a small term of a larger one;
+//! [`MotionAnalyzer::release_idle_crop_frames`] names both such waits and why
+//! neither is worth interrupting. And a child that stops consuming its input
+//! is killed where the wedge is found. The worst
+//! case is one killed child and one lost
+//! batch of event frames — never a stalled analyzer, and never memory that
+//! grows with how long the camera has been up. Those are the claims
+//! [`crate::analytics::decoder`]'s gated tests answer against a real ffmpeg
+//! rather than reason about.
+
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
@@ -90,6 +146,11 @@ impl DecoderSpawnRetry {
 const CROP_PADDING: f32 = 0.2;
 const MIN_CROP_FRACTION: f32 = 0.15;
 
+/// Segments fed to a freshly forked crop decoder before its frames are kept.
+/// Three seconds of footage is enough to carry ffmpeg past the stream probe it
+/// swallows its first input for; see [`MotionAnalyzer::prime_with`].
+const PRIMING_SEGMENTS: u64 = 3;
+
 /// Consecutive zero-frame decodes tolerated before the decoder is declared
 /// blind. A segment is one GOP and always opens on a keyframe, so a healthy
 /// decode yields at least one I-frame — but a freshly spawned ffmpeg swallows
@@ -105,6 +166,27 @@ const BLIND_DECODER_STREAK: u32 = 30;
 /// cannot select against the shutdown notify the async tasks use; polling the
 /// same flag it already polls every tick is the equivalent.
 fn sleep_unless_shutdown(total: Duration, shutdown: &AtomicBool) {
+    sleep_unless_shutdown_watching(total, shutdown, || {});
+}
+
+/// The same sleep, with something to do each time it surfaces.
+///
+/// A sleep in this analyzer is not idle time. The ffmpeg children go on running
+/// through it — the crop decoder's reader thread keeps handing over frames from
+/// segments it was fed before the analyzer stopped asking — so a caller parked
+/// here is a caller not collecting them. The wait is already cut into
+/// [`POLL_INTERVAL`] slices to notice a shutdown; `at_each_wakeup` rides the
+/// same slices, which is what keeps the longest a backoff can leave those
+/// frames unattended at one slice rather than at the whole backoff.
+///
+/// The sleep's own semantics are untouched by it: same deadline arithmetic,
+/// same early return the moment a stop is requested, and nothing runs after
+/// that return.
+fn sleep_unless_shutdown_watching(
+    total: Duration,
+    shutdown: &AtomicBool,
+    mut at_each_wakeup: impl FnMut(),
+) {
     let deadline = Instant::now() + total;
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -112,6 +194,7 @@ fn sleep_unless_shutdown(total: Duration, shutdown: &AtomicBool) {
             return;
         }
         thread::sleep(remaining.min(POLL_INTERVAL));
+        at_each_wakeup();
     }
 }
 
@@ -145,6 +228,177 @@ impl ZeroFrameTripwire {
     fn reset(&mut self) {
         self.streak = 0;
     }
+}
+
+/// Whether this analyzer may start an ffmpeg *now* — asked where a fork would
+/// happen, not remembered from where the pass began.
+///
+/// The distinction is the whole point. A pass reaches the crop decoder at its
+/// very end, after every segment of the batch has been decoded and scored,
+/// which on a camera working through a backlog is seconds after the pass
+/// started. A stop requested in between has to be seen there, so `Open` carries
+/// the stop flag itself and reads it at the fork rather than passing a copy
+/// down. (The frame decoder needs none of this: its fork sits microseconds
+/// after the check at the top of the pass, and it is left alone.)
+///
+/// `Closed` is what the shutdown drain runs in, and the reason this is an enum
+/// rather than a flag on the analyzer. [`MotionAnalyzer::drain_tail`] holds no
+/// stop flag and needs none — nothing forks from there whatever any flag says —
+/// so the variant it passes carries nothing that could later be made to say
+/// otherwise.
+#[derive(Clone, Copy)]
+enum ForkWindow<'a> {
+    Open(&'a AtomicBool),
+    Closed,
+}
+
+impl ForkWindow<'_> {
+    fn is_open(self) -> bool {
+        match self {
+            Self::Open(stop_requested) => !stop_requested.load(Ordering::Relaxed),
+            Self::Closed => false,
+        }
+    }
+}
+
+/// A child process the analyzer keeps rather than re-forks. One method, because
+/// one question is all the reuse policy asks of it — and because a test can
+/// answer that question from a counter where production answers it from
+/// `waitpid`.
+trait Respawnable {
+    fn is_alive(&mut self) -> bool;
+}
+
+impl Respawnable for CropDecoder {
+    fn is_alive(&mut self) -> bool {
+        CropDecoder::is_alive(self)
+    }
+}
+
+/// A decoder that outlives the batch which first needed it, together with the
+/// one thing its current child has to be told before it is useful.
+struct LongLived<D> {
+    decoder: Option<D>,
+    /// How many segments the child in `decoder` has been fed to carry it past
+    /// ffmpeg's stream probe. Reset by nothing except a respawn, which is what
+    /// makes the probe a cost per child instead of a cost per batch:
+    /// re-priming a healthy decoder would decode three segments of footage on
+    /// every batch purely to throw all of it away.
+    ///
+    /// A count rather than a flag because the window a run can offer is not
+    /// always whole — the buffer's oldest sequences age out, and a camera
+    /// configured with seconds of retention may never hold
+    /// [`PRIMING_SEGMENTS`] of them behind a run at all. What the probe cares
+    /// about is how much input it has been given, not which sequences it came
+    /// from, so partial windows add up and a child that can only ever be fed
+    /// one segment at a time is primed by the third run instead of never.
+    primed_with: u64,
+}
+
+impl<D> LongLived<D> {
+    /// Whether this child has had enough input to be past its probe, and so
+    /// whether the next run may keep what it decodes.
+    fn primed(&self) -> bool {
+        self.primed_with >= PRIMING_SEGMENTS
+    }
+}
+
+/// Empty, and so unprimed: the state before the camera's first motion, and the
+/// state a batch leaves behind when its decoder could not be replaced.
+impl<D> Default for LongLived<D> {
+    fn default() -> Self {
+        Self {
+            decoder: None,
+            primed_with: 0,
+        }
+    }
+}
+
+/// Make sure `slot` holds a decoder whose child is alive, forking one only when
+/// it does not, and reporting whether this batch has one to decode with.
+///
+/// A living child is handed straight back — that is the whole point of the slot
+/// — so the fork happens on the camera's first motion and then only when the
+/// child is really gone: it crashed, or [`CropDecoder::decode_segment`] killed
+/// it for wedging. A respawn clears the priming count, because the protocol is
+/// addressed to a particular ffmpeg's stream probe and the replacement has its
+/// own.
+///
+/// A closed [`ForkWindow`] is the one refusal. Once a stop has been requested
+/// this analyzer starts no new ffmpeg — the same promise
+/// [`MotionAnalyzer::drain_tail`] makes for the frame decoder, and now kept for
+/// this one too, which used to fork per batch straight through the drain. A
+/// decoder already running is still used, so a stop only loses the frames of a
+/// camera whose crop decoder happened to die on the way out.
+fn ensure_long_lived<D: Respawnable>(
+    slot: &mut LongLived<D>,
+    window: ForkWindow,
+    camera_id: &str,
+    spawn: impl FnOnce() -> Result<D, std::io::Error>,
+) -> bool {
+    if slot.decoder.as_mut().is_some_and(D::is_alive) {
+        return true;
+    }
+    if !window.is_open() {
+        return false;
+    }
+    match spawn() {
+        Ok(decoder) => {
+            *slot = LongLived {
+                decoder: Some(decoder),
+                primed_with: 0,
+            };
+            true
+        }
+        Err(e) => {
+            // Dropping the dead one kills whatever is left of it, and leaves
+            // the next batch to try the fork again.
+            *slot = LongLived::default();
+            tracing::error!(camera = %camera_id, error = %e, "failed to create crop decoder");
+            false
+        }
+    }
+}
+
+/// What keeping a decoder across batches asks of whoever keeps it: the slot it
+/// lives in, and the camera a failed fork is reported under.
+///
+/// A trait for one reason. The reuse policy is the part of this worth pinning
+/// and no test can fork an ffmpeg, so the code a camera really runs is written
+/// against a stand-in that can count forks instead of making them — including
+/// the step that is easiest to lose and hardest to see, which is giving the
+/// decoder back at the end of the batch.
+trait KeepsDecoder<D> {
+    fn slot(&mut self) -> &mut LongLived<D>;
+    fn camera(&self) -> &str;
+}
+
+/// Lend a batch the decoder its camera keeps, and take it back.
+///
+/// The slot is emptied for the length of the batch because extracting a run
+/// needs the analyzer and its decoder mutably at the same moment, which a field
+/// cannot give. Returning it is not a separate step and must not become one: a
+/// batch that dropped the decoder instead of handing it back would kill the
+/// child on the way out and leave the next batch to fork another — per-batch
+/// forking again, silently, which is the whole thing the slot exists to
+/// prevent.
+///
+/// `batch` runs only when there is a decoder to run it with; see
+/// [`ensure_long_lived`] for when there is not.
+fn lend_for_batch<O, D>(
+    owner: &mut O,
+    window: ForkWindow,
+    spawn: impl FnOnce() -> Result<D, std::io::Error>,
+    batch: impl FnOnce(&mut O, &mut LongLived<D>),
+) where
+    O: KeepsDecoder<D>,
+    D: Respawnable,
+{
+    let mut lent = std::mem::take(owner.slot());
+    if ensure_long_lived(&mut lent, window, owner.camera(), spawn) {
+        batch(owner, &mut lent);
+    }
+    *owner.slot() = lent;
 }
 
 #[derive(Clone, Copy)]
@@ -568,6 +822,10 @@ pub struct MotionAnalyzer {
     config: AnalyticsConfig,
     detector: MotionDetector,
     decoder: FrameDecoder,
+    /// The camera's crop decoder, forked on its first motion and kept until its
+    /// child dies — never per batch. Empty until then, and empty again after a
+    /// fork that failed.
+    crop_decoder: LongLived<CropDecoder>,
     /// Backoff and log escalation for a decoder that will not respawn.
     decoder_retry: DecoderSpawnRetry,
     /// Watches for a decoder that consumes segments but returns no frames. The
@@ -596,6 +854,16 @@ pub struct MotionAnalyzer {
     event_tx: Option<tokio::sync::mpsc::Sender<WriterMessage>>,
     mqtt_tx: Option<tokio::sync::mpsc::Sender<MqttEvent>>,
     pre_padding_ns: u64,
+}
+
+impl KeepsDecoder<CropDecoder> for MotionAnalyzer {
+    fn slot(&mut self) -> &mut LongLived<CropDecoder> {
+        &mut self.crop_decoder
+    }
+
+    fn camera(&self) -> &str {
+        &self.camera_id
+    }
 }
 
 impl MotionAnalyzer {
@@ -644,6 +912,7 @@ impl MotionAnalyzer {
             config: ctx.config,
             detector,
             decoder,
+            crop_decoder: LongLived::default(),
             decoder_retry: DecoderSpawnRetry::new(DECODER_SPAWN_SCHEDULE),
             zero_frames: ZeroFrameTripwire::default(),
             detect_tx: ctx.detect_tx,
@@ -686,26 +955,39 @@ impl MotionAnalyzer {
     /// poll interval — a pass that gave up on the decoder has already waited
     /// its own respawn backoff.
     ///
-    /// The debug view's frames are freed first, above everything a decoder
-    /// could stop: a camera looping on a respawn that keeps failing analyzes
-    /// nothing, and that is precisely the state where the box is short enough
-    /// of memory for a fork to fail. Leaving the expiry below the decoder check
-    /// would pin the debug view's tens of megabytes exactly when they are least
-    /// affordable. Nothing else in a pass is like that — everything else here
-    /// needs frames to do anything at all.
+    /// Two things are given back before the decoder is so much as looked at,
+    /// and they are the two that have to survive a decoder which cannot be
+    /// brought back: the debug view's frames, and whatever the crop decoder has
+    /// emitted since the last motion batch. A camera looping on a respawn that
+    /// keeps failing analyzes nothing, and that is precisely the state where
+    /// the box is short enough of memory for a fork to fail — so it is
+    /// precisely the state in which neither the debug view's tens of megabytes
+    /// nor the crop channel's four raw frames may stay pinned. Below the gate
+    /// they would: a pass that gives up on the decoder returns from it, and the
+    /// backoff between attempts escalates to a minute and repeats for as long
+    /// as the fork keeps failing.
+    ///
+    /// Both are reachable without a frame ever being decoded, which is what
+    /// puts them above the gate. Everything below it needs frames to do
+    /// anything at all.
     fn tick(&mut self, shutdown: &AtomicBool) -> bool {
         if let Some(ref debug_store) = self.debug_store {
             debug_store.expire_unwatched(&self.camera_id);
         }
+        self.release_idle_crop_frames();
 
         // The stop can be requested while a pass is running, and a decoder
         // forked for a pass that will not happen is the fork the drain path
-        // already refuses to make.
+        // already refuses to make. This check covers the frame decoder's fork
+        // and nothing else — it sits directly above it. The crop decoder's fork
+        // is at the far end of the pass, seconds away on a camera with a
+        // backlog, so it is handed the flag rather than this reading of it; see
+        // [`ForkWindow`].
         if shutdown.load(Ordering::Relaxed) || !self.ensure_decoder_alive(shutdown) {
             return false;
         }
 
-        if let Err(e) = self.process_new_segments() {
+        if let Err(e) = self.process_new_segments(ForkWindow::Open(shutdown)) {
             tracing::error!(
                 camera = %self.camera_id,
                 error = %e,
@@ -727,6 +1009,13 @@ impl MotionAnalyzer {
     /// gets a final watermark, costs this analyzer the bound and no more. It is
     /// a parameter so a test can trip that bound without waiting out half a
     /// minute of it.
+    ///
+    /// Nothing forks from here on. That was already true of the frame decoder
+    /// below, which this loop declines to respawn; the passes it runs carry a
+    /// closed [`ForkWindow`] to extend it to the crop decoder, which used to
+    /// fork per batch straight through the drain. Closed is the only thing this
+    /// function can pass — it has no stop flag to offer and wants none — so the
+    /// invariant is the signature's rather than a flag's.
     fn drain_tail(&mut self, gate: DrainGate) {
         let mut said_the_decoder_was_gone = false;
         loop {
@@ -742,7 +1031,7 @@ impl MotionAnalyzer {
             // the wait is the same wait, held without decoding.
             let decoding = self.decoder.is_alive();
             if decoding {
-                if let Err(e) = self.process_new_segments() {
+                if let Err(e) = self.process_new_segments(ForkWindow::Closed) {
                     tracing::error!(
                         camera = %self.camera_id,
                         error = %e,
@@ -805,11 +1094,37 @@ impl MotionAnalyzer {
     }
 
     fn ensure_decoder_alive(&mut self, shutdown: &AtomicBool) -> bool {
+        self.ensure_decoder_alive_with(shutdown, FrameDecoder::new)
+    }
+
+    /// Replace the frame decoder if its child is gone, waiting out the backoff
+    /// here when the fork fails — which is what makes a pass that gave up cost
+    /// the caller nothing further, and why [`MotionAnalyzer::tick`] returns
+    /// without a poll of its own afterwards.
+    ///
+    /// The wait releases crop frames as it surfaces. Nothing else will while it
+    /// runs: this is the one place in a pass that can take a minute, the pass
+    /// above it has already done its release, and the crop decoder's reader
+    /// thread does not stop handing frames over just because the analyzer has
+    /// stopped asking for them. Left to the next pass, four frames — 24 MB at
+    /// the detection crop size — would sit through a backoff that widens
+    /// towards a minute, on the box that is failing to fork ffmpeg. Which is
+    /// the whole reason the release was hoisted above the gate in the first
+    /// place, undone by the sleep below the gate.
+    ///
+    /// `spawn` is a parameter for the same reason [`build_with_retry`] takes
+    /// one: the path worth pinning is the one where the fork keeps failing, and
+    /// a test cannot make a real fork fail.
+    fn ensure_decoder_alive_with(
+        &mut self,
+        shutdown: &AtomicBool,
+        spawn: impl FnOnce() -> Result<FrameDecoder, std::io::Error>,
+    ) -> bool {
         if self.decoder.is_alive() {
             return true;
         }
         tracing::warn!(camera = %self.camera_id, "decoder process died, restarting");
-        match FrameDecoder::new() {
+        match spawn() {
             Ok(d) => {
                 self.decoder = d;
                 self.decoder_retry.succeeded();
@@ -826,7 +1141,9 @@ impl MotionAnalyzer {
                         "failed to restart decoder"
                     );
                 }
-                sleep_unless_shutdown(delay, shutdown);
+                sleep_unless_shutdown_watching(delay, shutdown, || {
+                    self.release_idle_crop_frames();
+                });
                 false
             }
         }
@@ -853,7 +1170,10 @@ impl MotionAnalyzer {
         }
     }
 
-    fn process_new_segments(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    fn process_new_segments(
+        &mut self,
+        window: ForkWindow,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.sync_settings();
 
         let (first_seq, last_seq) = {
@@ -871,7 +1191,7 @@ impl MotionAnalyzer {
         let (motion_segments, closed_runs) = self.run_motion_analysis(segments)?;
 
         if !motion_segments.is_empty() {
-            self.process_motion_runs(motion_segments);
+            self.process_motion_runs(motion_segments, window);
         }
 
         // Emit after detection so runs that close in the same batch as their
@@ -1073,6 +1393,11 @@ impl MotionAnalyzer {
     /// reconciliation; what this function owns is the one case the detection
     /// worker cannot handle itself, a verdict that landed before the write was
     /// queued and so has to be sent from here, behind it.
+    ///
+    /// Those minutes are the analyzer's longest wait, and the one place its
+    /// crop decoder's frames are held without a release reaching them — a
+    /// small term beside the event this thread is holding meanwhile, which is
+    /// the point [`MotionAnalyzer::release_idle_crop_frames`] makes at length.
     fn emit_event(&self, run: ClosedRun, filmstrip: Option<Filmstrip>) {
         let tx = match self.event_tx {
             Some(ref tx) => tx,
@@ -1278,52 +1603,197 @@ impl MotionAnalyzer {
 
     // --- Phase 2: Generic frame extraction + detection ---
 
-    fn process_motion_runs(&mut self, segments: Vec<MotionSegment>) {
-        let crop_decoder = match CropDecoder::new(
-            self.config.sample_fps,
-            self.frame_use.crop_size(),
-        ) {
-            Ok(d) => d,
-            Err(e) => {
-                tracing::error!(camera = %self.camera_id, error = %e, "failed to create crop decoder");
-                return;
-            }
-        };
-
+    fn process_motion_runs(&mut self, segments: Vec<MotionSegment>, window: ForkWindow) {
         let runs = group_contiguous_runs(segments);
-        for run in runs {
-            self.process_run(run, &crop_decoder);
+        let (sample_fps, crop_size) = (self.config.sample_fps, self.frame_use.crop_size());
+        lend_for_batch(
+            self,
+            window,
+            || CropDecoder::new(sample_fps, crop_size),
+            |analyzer, crop| {
+                for run in runs {
+                    analyzer.process_run(run, crop);
+                }
+            },
+        );
+    }
+
+    /// Let go of whatever the crop decoder emitted after the last motion batch
+    /// stopped reading. Called from the two places a pass can be, and for the
+    /// same reason in both: at the top, above the gate that ends a pass with no
+    /// decoder to analyze with (see [`MotionAnalyzer::tick`]), and at every
+    /// wakeup of the respawn backoff below that gate (see
+    /// [`MotionAnalyzer::ensure_decoder_alive_with`]), which is the only part
+    /// of a pass that can last longer than a poll.
+    ///
+    /// Those frames are already forfeit: the next batch opens by draining them,
+    /// for the reason [`MotionAnalyzer::extract_run_frames`] gives. All that is
+    /// at stake is *when*, and until this the answer was "whenever the camera
+    /// next moves" — which on a quiet night is the morning. The channel holds
+    /// four, and four is 24 MB at the detection crop size, per camera, held
+    /// against a box whose analytics memory has already been the problem once.
+    ///
+    /// The top of a pass rather than the end of a batch, because at the end of
+    /// a batch ffmpeg is still working through the segments it was just fed and
+    /// refills the channel behind the drain. A pass begins a whole
+    /// [`POLL_INTERVAL`] after the last one ended, with no batch in flight and
+    /// — if the camera has gone quiet — nothing left for the child to make a
+    /// frame from, so this is the drain that sticks. It costs one `try_recv` on
+    /// an empty channel per poll.
+    ///
+    /// What an outage keeps, then, is one idle ffmpeg per camera and a channel
+    /// nothing accumulates in: a frame the reader hands over during a backoff
+    /// is taken at the next wakeup, so the residency through an outage is what
+    /// arrives in a [`POLL_INTERVAL`] and not what arrives in a backoff that
+    /// widens towards a minute. Killing that child too would free its process
+    /// while the primary decoder is down, and is not done: respawn backoffs
+    /// start at seconds, so a transient outage would cost a fork/exec cycle on
+    /// the way back in exactly the conditions where forks are what is failing —
+    /// and the memory that actually grows with an outage is the frames, which
+    /// this releases.
+    ///
+    /// What it promises is worth stating exactly, because it is not "the
+    /// channel is empty afterwards". [`CropDecoder::drain`] stops at the first
+    /// empty channel, and the pipe's reader thread is a thread: it can be
+    /// holding a frame it is about to hand over at that instant, and hand it
+    /// over immediately after. So one call is best-effort — it takes what has
+    /// arrived, and can leave one slot behind. What closes that is repetition
+    /// rather than synchronisation, and the repetition is what the two call
+    /// sites are for between them — though only over the waits this analyzer
+    /// sets for itself. Those it does cover completely: neither the poll
+    /// between passes nor a respawn backoff a minute wide goes longer than a
+    /// [`POLL_INTERVAL`] without one of them, and the child that produced a
+    /// straggler has no more input to make another from. Across those, the
+    /// worst residency is what a child can emit in one poll interval, which
+    /// the four-slot channel caps at four frames, and it is that for a poll
+    /// rather than for a night or a backoff. Reaching for cross-thread
+    /// bookkeeping to shave the last frame would buy a poll interval at the
+    /// price of a debt ledger between the analyzer and the reader thread.
+    ///
+    /// Two waits have neither call site, and both are deliberate.
+    ///
+    /// One is the shutdown drain's: bounded by [`TAIL_DRAIN_BOUND`], nothing
+    /// feeds the crop decoder during it, and the analyzer — child and channel
+    /// together — is dropped the moment it ends. Releasing there would be
+    /// freeing frames seconds before killing the process holding them.
+    ///
+    /// The other is [`MotionAnalyzer::emit_event`]'s blocking sends, which are
+    /// not this analyzer's wait but the warm writer's, and can last minutes
+    /// while that writer is stalled. They fall at the worst moment for this —
+    /// immediately after a motion batch, with the crop child still refilling
+    /// behind it — so four frames do sit through them. What decides it is what
+    /// else sits through them: the `FinishedEvent` in flight holds that event's
+    /// whole segment list, tens to hundreds of megabytes of footage handles,
+    /// for the identical duration and by the same durability argument. The crop
+    /// channel's 24 MB is a subordinate term of a residency this pipeline
+    /// already has, already documents, and already bounds through the writer's
+    /// own drain — and slicing a send that an event's survival depends on into
+    /// interleaved releases would complicate that path to buy back the smaller
+    /// of the two numbers.
+    ///
+    /// Reports how many it let go of, which is how a test sees the difference
+    /// between a pass that released them and one that only had nothing to
+    /// release.
+    fn release_idle_crop_frames(&self) -> usize {
+        let Some(decoder) = self.crop_decoder.decoder.as_ref() else {
+            return 0;
+        };
+        let dropped = decoder.drain();
+        if dropped > 0 {
+            tracing::debug!(
+                camera = %self.camera_id,
+                frames = dropped,
+                "released the frames the last motion batch left in the crop decoder"
+            );
         }
+        dropped
+    }
+
+    /// Feed the segments preceding `first_seq` to `decode`, so a freshly forked
+    /// ffmpeg spends its stream probe on footage nobody wants before it reaches
+    /// the footage somebody does. Those pictures predate the motion, so
+    /// whatever comes back out of them is dropped.
+    ///
+    /// Once per child, and the probe belongs to one particular ffmpeg — so a
+    /// decoder that has had [`PRIMING_SEGMENTS`] of footage is left alone from
+    /// then on, and one that has had less is fed again on the next run. What a
+    /// run can offer is not always the whole window: a run at the very start of
+    /// a camera's buffer has nothing behind it, a run near the buffer's edge
+    /// has only the part that has not aged out yet, and a camera configured
+    /// with seconds of retention may never hold the whole window behind any run
+    /// at all. All three are the same case. Feed what there is — it is footage
+    /// nobody keeps either way, and it still spends some of the probe — and add
+    /// it to what this child has already had, which is what makes even the
+    /// third of those converge instead of re-feeding forever.
+    ///
+    /// The handles are collected under the hot buffer's read lock and decoded
+    /// after it has been released, which is the whole point of the split.
+    /// Decoded under it, as this loop used to be, a camera thread's `push`
+    /// waited out three ffmpeg decodes on every motion batch — and only motion
+    /// gets here, so the stall landed on the footage that matters most.
+    ///
+    /// `decode` is a parameter for the same reason [`sample_run_frames`] takes
+    /// one: it lets a test put something that takes the buffer's *write* lock
+    /// where ffmpeg goes — the camera thread's exact position — and have it
+    /// succeed.
+    fn prime_with<D>(
+        &self,
+        crop: &mut LongLived<D>,
+        first_seq: u64,
+        mut decode: impl FnMut(&mut D, &Arc<Vec<u8>>, u64),
+    ) {
+        if crop.primed() {
+            return;
+        }
+        let Some(decoder) = crop.decoder.as_mut() else {
+            return;
+        };
+        let segments: Vec<(Arc<Vec<u8>>, u64)> = match first_seq.checked_sub(PRIMING_SEGMENTS) {
+            Some(from) => {
+                let buffer = self.buffer.read_recover();
+                (from..first_seq)
+                    .filter_map(|seq| buffer.get_segment_by_sequence(seq))
+                    .map(|seg| (Arc::clone(&seg.data), seg.duration_ns))
+                    .collect()
+            }
+            None => Vec::new(),
+        };
+        for (data, duration_ns) in &segments {
+            decode(decoder, data, *duration_ns);
+        }
+        crop.primed_with += segments.len() as u64;
     }
 
     /// Decode the sampled segments of one run down to the handful of frames
     /// [`subsample_tagged`] can still use, holding no more than
     /// [`RUN_FRAME_ACCUMULATOR_CAP`] of them at once.
     ///
-    /// The preceding segments are fed only to get ffmpeg past its stream probe;
-    /// their footage predates the motion, so it is decoded and dropped rather
-    /// than accumulated. What ffmpeg emitted by the end of that — including the
-    /// frames it swallowed while probing, which surface late — is then drained,
-    /// because a leftover taken by the first sampled segment's read would be
-    /// tagged with a crop measured on a different picture. The drain reaches
-    /// only what has arrived, so it narrows that window rather than closing it;
+    /// A child that is not yet past its stream probe is fed towards it first —
+    /// on the first run it decodes, and on the runs after that only for as long
+    /// as the buffer has been too short to finish the job in one go; never on
+    /// every batch, which is what it used to be. Everything that
+    /// arrived by the end of that is then drained, and so is everything left
+    /// over from the previous batch: a leftover taken by the first sampled
+    /// segment's read would be tagged with a crop measured on a different
+    /// picture. That drain is the one thing a decoder kept across batches needs
+    /// which a per-batch one got for free from being new; what the same decoder
+    /// is left holding between passes is
+    /// [`MotionAnalyzer::release_idle_crop_frames`]'s to let go of. It reaches
+    /// only what has arrived, so it narrows the window rather than closing it;
     /// [`frames_per_segment`] keeps more than one frame per segment so a lagged
     /// pipe costs the strip a frame instead of all of them.
     fn extract_run_frames(
         &self,
         run: &[MotionSegment],
-        crop_decoder: &CropDecoder,
+        crop: &mut LongLived<CropDecoder>,
     ) -> Vec<(RgbFrame, Option<NormalizedRect>)> {
-        let first_seq = run[0].seq;
-        if first_seq >= 3 {
-            let buffer = self.buffer.read_recover();
-            for prime_seq in (first_seq - 3)..first_seq {
-                if let Some(seg) = buffer.get_segment_by_sequence(prime_seq) {
-                    crop_decoder.decode_segment(&seg.data, seg.duration_ns, |_| {});
-                }
-            }
-        }
-        let stale = crop_decoder.drain();
+        self.prime_with(crop, run[0].seq, |decoder, data, duration_ns| {
+            decoder.decode_segment(data, duration_ns, |_| {});
+        });
+        let Some(decoder) = crop.decoder.as_mut() else {
+            return Vec::new();
+        };
+        let stale = decoder.drain();
         if stale > 0 {
             tracing::debug!(
                 camera = %self.camera_id,
@@ -1332,12 +1802,13 @@ impl MotionAnalyzer {
             );
         }
 
+        let (width, height) = (decoder.width() as usize, decoder.height() as usize);
         sample_run_frames(
             run,
             &self.segment_crops,
-            crop_decoder.width() as usize,
-            crop_decoder.height() as usize,
-            |data, duration_ns, sink| crop_decoder.decode_segment(data, duration_ns, sink),
+            width,
+            height,
+            |data, duration_ns, sink| decoder.decode_segment(data, duration_ns, sink),
         )
     }
 
@@ -1376,12 +1847,12 @@ impl MotionAnalyzer {
     /// worker. Handing that job off never blocks: a camera past its queue cap
     /// loses its oldest queued job instead, costing that object upgrade but
     /// never the event.
-    fn process_run(&mut self, run: Vec<MotionSegment>, crop_decoder: &CropDecoder) {
+    fn process_run(&mut self, run: Vec<MotionSegment>, crop: &mut LongLived<CropDecoder>) {
         if run.is_empty() {
             return;
         }
 
-        let tagged_frames = self.extract_run_frames(&run, crop_decoder);
+        let tagged_frames = self.extract_run_frames(&run, crop);
         if tagged_frames.is_empty() {
             return;
         }
@@ -2108,6 +2579,380 @@ mod tests {
         assert_eq!(attempts.load(Ordering::Relaxed), 0);
     }
 
+    // ---- The crop decoder's life, without an ffmpeg to fork ----
+
+    /// A child whose liveness is whatever the test says it is, so the reuse
+    /// policy can be driven past deaths and respawns in the suite that gates
+    /// commits rather than only behind `--ignored`.
+    struct CountedChild {
+        alive: bool,
+        /// Which fork produced it. A pid is how the gated tests tell a kept
+        /// child from its replacement; this is how the others do.
+        generation: u32,
+    }
+
+    impl Respawnable for CountedChild {
+        fn is_alive(&mut self) -> bool {
+            self.alive
+        }
+    }
+
+    /// A camera that keeps a decoder, standing in for the analyzer so the code
+    /// a real batch runs can be driven without an ffmpeg to fork.
+    struct TestCamera {
+        slot: LongLived<CountedChild>,
+    }
+
+    impl KeepsDecoder<CountedChild> for TestCamera {
+        fn slot(&mut self) -> &mut LongLived<CountedChild> {
+            &mut self.slot
+        }
+
+        fn camera(&self) -> &str {
+            "cam"
+        }
+    }
+
+    /// A stop that has not been requested: what every ordinary pass runs under.
+    fn running() -> AtomicBool {
+        AtomicBool::new(false)
+    }
+
+    /// What one motion batch asks of the slot, with the fork counted instead of
+    /// made.
+    fn ensure_counted(
+        slot: &mut LongLived<CountedChild>,
+        window: ForkWindow,
+        forks: &mut u32,
+    ) -> bool {
+        ensure_long_lived(slot, window, "cam", || {
+            *forks += 1;
+            Ok(CountedChild {
+                alive: true,
+                generation: *forks,
+            })
+        })
+    }
+
+    /// One whole motion batch, borrowed decoder and all.
+    fn batch_on(
+        camera: &mut TestCamera,
+        window: ForkWindow,
+        forks: &mut u32,
+        batch: impl FnOnce(&mut LongLived<CountedChild>),
+    ) {
+        lend_for_batch(
+            camera,
+            window,
+            || {
+                *forks += 1;
+                Ok(CountedChild {
+                    alive: true,
+                    generation: *forks,
+                })
+            },
+            |_, crop| batch(crop),
+        );
+    }
+
+    /// Up to five fork/exec/kill cycles a second per camera is what a crop
+    /// decoder built per batch cost, each one paying ffmpeg's stream probe
+    /// again. A batch that finds a living child must use it.
+    ///
+    /// Driven through [`lend_for_batch`] rather than the policy alone, because
+    /// the half of this that no policy can state is the return: a batch that
+    /// kept the decoder to itself would leave the camera empty and the next
+    /// batch would fork. That is per-batch forking again, and the only thing
+    /// that used to notice was a test needing a real ffmpeg and two pids.
+    #[test]
+    fn a_crop_decoder_is_forked_once_and_kept_across_batches() {
+        let stop = running();
+        let mut camera = TestCamera {
+            slot: LongLived::default(),
+        };
+        let mut forks = 0;
+        let mut children = Vec::new();
+        let window = ForkWindow::Open(&stop);
+        for _ in 0..5 {
+            batch_on(&mut camera, window, &mut forks, |crop| {
+                let child = crop.decoder.as_ref().expect("the batch got no decoder");
+                children.push(child.generation);
+                // What an extraction does with the child it was handed.
+                crop.primed_with = PRIMING_SEGMENTS;
+            });
+        }
+
+        assert_eq!(forks, 1, "the crop decoder was forked per batch");
+        assert_eq!(children, [1; 5], "the batches ran on different children");
+        assert!(
+            camera.slot.decoder.is_some(),
+            "the batch kept the camera's crop decoder instead of giving it back"
+        );
+        assert!(
+            camera.slot.primed(),
+            "the camera lost what its child had already been told"
+        );
+    }
+
+    /// Priming is addressed to one particular ffmpeg's stream probe, so it
+    /// follows the child rather than the batch: paid when the child appears,
+    /// paid again when it is replaced, and never in between.
+    #[test]
+    fn a_respawned_crop_decoder_is_primed_again_and_only_then() {
+        let stop = running();
+        let window = ForkWindow::Open(&stop);
+        let mut slot = LongLived::default();
+        let mut forks = 0;
+
+        assert!(ensure_counted(&mut slot, window, &mut forks));
+        assert!(
+            !slot.primed(),
+            "a fresh child arrived claiming to be primed"
+        );
+        slot.primed_with = PRIMING_SEGMENTS;
+
+        assert!(ensure_counted(&mut slot, window, &mut forks));
+        assert!(slot.primed(), "re-primed a child that never died");
+        assert_eq!(forks, 1);
+
+        slot.decoder.as_mut().unwrap().alive = false;
+        assert!(ensure_counted(&mut slot, window, &mut forks));
+        assert_eq!(forks, 2, "a dead child was not replaced");
+        assert!(!slot.primed(), "the replacement child was left unprimed");
+    }
+
+    /// The drain's promise, now kept for this decoder too: what is already
+    /// running is used to the end, and nothing new is started. A crop decoder
+    /// used to be forked per batch straight through the shutdown.
+    #[test]
+    fn the_drain_uses_a_running_crop_decoder_and_forks_no_other() {
+        let mut forks = 0;
+
+        let mut empty = LongLived::default();
+        assert!(!ensure_counted(&mut empty, ForkWindow::Closed, &mut forks));
+
+        let mut dead = LongLived {
+            decoder: Some(CountedChild {
+                alive: false,
+                generation: 0,
+            }),
+            primed_with: PRIMING_SEGMENTS,
+        };
+        assert!(!ensure_counted(&mut dead, ForkWindow::Closed, &mut forks));
+        assert_eq!(forks, 0, "the drain forked a crop decoder");
+
+        let mut running_child = LongLived {
+            decoder: Some(CountedChild {
+                alive: true,
+                generation: 0,
+            }),
+            primed_with: PRIMING_SEGMENTS,
+        };
+        assert!(
+            ensure_counted(&mut running_child, ForkWindow::Closed, &mut forks),
+            "the drain refused a decoder it was already holding"
+        );
+        assert_eq!(forks, 0);
+    }
+
+    /// The stop this refusal turns on is read where the fork is, not where the
+    /// pass began. Between the two lies a whole batch of segments — every one
+    /// of them decoded and scored, seconds of it on a camera working through a
+    /// backlog — and a stop requested in that window is one this camera has
+    /// already been told about by the time it forks.
+    #[test]
+    fn a_stop_requested_after_the_pass_began_forks_no_crop_decoder() {
+        let stop = running();
+        // What the top of the pass saw, carried down the way a pass carries it.
+        let window = ForkWindow::Open(&stop);
+        assert!(window.is_open(), "nothing had been requested yet");
+
+        // ... the batch is decoded, and the stop arrives while it is.
+        stop.store(true, Ordering::Relaxed);
+
+        let mut camera = TestCamera {
+            slot: LongLived::default(),
+        };
+        let mut forks = 0;
+        batch_on(&mut camera, window, &mut forks, |_| {
+            panic!("a batch ran on a decoder forked after the stop")
+        });
+        assert_eq!(forks, 0, "a stop mid-pass still forked a crop decoder");
+        assert!(camera.slot.decoder.is_none());
+    }
+
+    /// The priming loop's whole reason for this shape: the hot buffer's read
+    /// lock is held long enough to collect [`PRIMING_SEGMENTS`] handles and
+    /// released before ffmpeg is handed the first of them.
+    ///
+    /// Pinned from the camera thread's own position — the decode does what a
+    /// `push` does and takes the write lock. Under the old shape it could not
+    /// have: the read guard was still alive, and ingest waited out three
+    /// decodes on every motion batch.
+    #[test]
+    fn priming_decodes_with_the_hot_buffer_lock_already_released() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = test_context("cam", dir.path());
+        let buffer = Arc::clone(&ctx.buffer);
+        {
+            let mut buf = buffer.write_recover();
+            for seq in 0..5 {
+                buf.push(gop(seq));
+            }
+        }
+        let analyzer = MotionAnalyzer::with_decoder(ctx, FrameDecoder::dead());
+
+        let mut slot = LongLived {
+            decoder: Some(CountedChild {
+                alive: true,
+                generation: 1,
+            }),
+            primed_with: 0,
+        };
+        let mut primed: Vec<(Arc<Vec<u8>>, u64)> = Vec::new();
+        analyzer.prime_with(&mut slot, 3, |_, data, duration_ns| {
+            assert!(
+                buffer.try_write().is_ok(),
+                "the hot buffer was still locked while a priming segment was decoded"
+            );
+            primed.push((Arc::clone(data), duration_ns));
+        });
+
+        assert_eq!(primed.len(), PRIMING_SEGMENTS as usize);
+        assert_eq!(primed[0].1, SEC);
+        // Shared with the buffer rather than copied out of it: a GOP is
+        // megabytes, and the lock is held for the pointer.
+        let resident = buffer.read_recover();
+        assert!(
+            Arc::ptr_eq(
+                &primed[0].0,
+                &resident.get_segment_by_sequence(0).expect("seq 0").data
+            ),
+            "the priming segments were copied out from under the lock"
+        );
+        drop(resident);
+
+        // The next run of the same batch, and every run after it, finds the
+        // child already past its probe.
+        assert!(slot.primed());
+        analyzer.prime_with(&mut slot, 4, |_, _, _| {
+            panic!("primed a child that had already been primed")
+        });
+    }
+
+    /// Priming is a claim about one child having been carried past its stream
+    /// probe, and only the whole window carries it there. A run at the very
+    /// start of a camera's buffer has nothing behind it; a run just past the
+    /// buffer's edge has some of it, because the rest aged out while the
+    /// analyzer worked through the batch. Neither is past the probe, and
+    /// neither may leave the child recorded as though it were — the next run is
+    /// further in and finds the whole window resident, so the claim is only
+    /// deferred.
+    #[test]
+    fn a_child_primed_on_part_of_the_window_tries_again_on_the_next_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = test_context("cam", dir.path());
+        let buffer = Arc::clone(&ctx.buffer);
+        {
+            // More footage than the hot buffer's retention holds, so the oldest
+            // sequences are gone exactly as they go in production.
+            let mut buf = buffer.write_recover();
+            for seq in 0..33 {
+                buf.push(gop(seq));
+            }
+        }
+        let first_resident = buffer.read_recover().first_sequence();
+        assert!(
+            first_resident > 0,
+            "nothing was evicted, so nothing is partial"
+        );
+        let analyzer = MotionAnalyzer::with_decoder(ctx, FrameDecoder::dead());
+
+        let mut slot = LongLived {
+            decoder: Some(CountedChild {
+                alive: true,
+                generation: 1,
+            }),
+            primed_with: 0,
+        };
+
+        // A run so early in the camera's life that there is nothing behind it.
+        let mut fed = 0;
+        analyzer.prime_with(&mut slot, PRIMING_SEGMENTS - 1, |_, _, _| fed += 1);
+        assert_eq!(fed, 0, "primed with segments the buffer never held");
+        assert!(!slot.primed(), "a child that saw nothing was called primed");
+
+        // A run whose window straddles the buffer's edge: part of it is footage
+        // the camera has already dropped.
+        let partial = first_resident + PRIMING_SEGMENTS - 1;
+        analyzer.prime_with(&mut slot, partial, |_, _, _| fed += 1);
+        assert_eq!(fed, PRIMING_SEGMENTS - 1, "the resident part was not fed");
+        assert!(
+            !slot.primed(),
+            "a child that got part of the window was called primed"
+        );
+
+        // The next run, one sequence further in, has the whole window.
+        analyzer.prime_with(&mut slot, partial + 1, |_, _, _| fed += 1);
+        assert_eq!(
+            fed,
+            2 * PRIMING_SEGMENTS - 1,
+            "the run with the whole window did not prime"
+        );
+        assert!(slot.primed());
+    }
+
+    /// A camera whose hot buffer is shorter than the priming window never has
+    /// the whole thing behind a run — not on the next run, not on any of them.
+    /// Waiting for a window that cannot arrive would leave the child unprimed
+    /// for the life of the camera and re-feeding overlapping scraps on every
+    /// motion batch, forever: not a leak and not a stall, but a decoder
+    /// permanently paying a cost that is supposed to be paid once.
+    ///
+    /// What the child needs is input, not particular sequences, so scraps count
+    /// towards the same total and the third one settles it.
+    #[test]
+    fn a_buffer_too_short_for_the_priming_window_still_primes_its_child() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ctx = test_context("cam", dir.path());
+        // Two seconds of retention against a three-segment window: whatever the
+        // camera does, a run never has more than one segment behind it.
+        ctx.buffer = HotBuffer::new("cam".to_string(), 2);
+        let buffer = Arc::clone(&ctx.buffer);
+        let analyzer = MotionAnalyzer::with_decoder(ctx, FrameDecoder::dead());
+
+        let mut slot = LongLived {
+            decoder: Some(CountedChild {
+                alive: true,
+                generation: 1,
+            }),
+            primed_with: 0,
+        };
+
+        let mut fed = 0;
+        let mut fed_by_run = Vec::new();
+        for seq in 0..8 {
+            buffer.write_recover().push(gop(seq));
+            let before = fed;
+            analyzer.prime_with(&mut slot, seq, |_, _, _| fed += 1);
+            fed_by_run.push(fed - before);
+        }
+
+        assert!(
+            slot.primed(),
+            "a camera with a buffer this short never got its child past the probe"
+        );
+        assert_eq!(
+            fed, PRIMING_SEGMENTS,
+            "the child was fed {fed} segments to spend a {PRIMING_SEGMENTS}-segment probe"
+        );
+        assert_eq!(
+            fed_by_run.iter().sum::<u64>(),
+            PRIMING_SEGMENTS,
+            "runs kept feeding a child that was already primed: {fed_by_run:?}"
+        );
+    }
+
     /// The overlay's full frame is a 1080p encode per motion run, and up to a
     /// third of what the debug store then pins per entry. It follows the view
     /// being open — not detection being enabled, which is how it was decided
@@ -2218,6 +3063,111 @@ mod tests {
             debug_store.stored("cam"),
             0,
             "the viewer left and the frames stayed resident"
+        );
+    }
+
+    /// The other thing a pass gives back before it looks at its decoder, and
+    /// for the same reason as the expiry above.
+    ///
+    /// A crop decoder's channel fills itself: its reader thread keeps handing
+    /// frames over from segments the last batch fed, whatever the rest of the
+    /// analyzer is doing. Four of them is 24 MB at the detection crop size, and
+    /// the release used to sit inside the part of a pass that a dead primary
+    /// decoder never reaches — so a camera stuck in a respawn loop, on a box
+    /// too short of memory to fork, held those 24 MB for as long as the loop
+    /// ran. That is the same compounding shape the debug-frame expiry was
+    /// hoisted over this gate to avoid.
+    ///
+    /// Driven with a decoder that is already gone and the stop already
+    /// requested, which is what pins the *position*: this pass returns at the
+    /// gate having decoded nothing, so a release anywhere below it never runs.
+    /// The gate is one expression, so above it is above both of its halves.
+    #[test]
+    fn a_pass_that_gives_up_on_its_decoder_still_empties_the_crop_channel() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = test_context("cam", dir.path());
+        let mut analyzer = MotionAnalyzer::with_decoder(ctx, FrameDecoder::dead());
+        let (crop, frames) = CropDecoder::detached();
+        analyzer.crop_decoder = LongLived {
+            decoder: Some(crop),
+            primed_with: PRIMING_SEGMENTS,
+        };
+        // What the child handed over after the last batch stopped reading.
+        let fill = |frames: &std::sync::mpsc::SyncSender<Vec<u8>>| {
+            for _ in 0..4 {
+                frames.try_send(vec![0u8; 8]).expect("the channel has room");
+            }
+        };
+
+        fill(&frames);
+        assert!(
+            !analyzer.tick(&AtomicBool::new(true)),
+            "the pass was supposed to give up before analyzing anything"
+        );
+        assert_eq!(
+            analyzer.release_idle_crop_frames(),
+            0,
+            "a pass that gave up at the decoder left the crop decoder's frames pinned"
+        );
+
+        // And the harness can hold frames the release can find, so the
+        // assertion above was about the pass and not about an empty channel.
+        fill(&frames);
+        assert_eq!(analyzer.release_idle_crop_frames(), 4);
+    }
+
+    /// The release at the top of a pass is not the last word, because a pass
+    /// that cannot replace its decoder does not end at the gate — it waits out
+    /// the respawn backoff there, five seconds widening towards a minute, and
+    /// for as many cycles as the fork keeps failing. The crop decoder's reader
+    /// thread does not pause for any of that: it goes on handing over frames
+    /// from segments fed before the outage. Frames that arrive one millisecond
+    /// after the pass-top release, released only by the *next* pass, are 24 MB
+    /// pinned for a backoff — the thing the hoist above the gate was for,
+    /// undone by the sleep below it.
+    ///
+    /// So the frames here are handed over from another thread while the pass is
+    /// already parked, which no assertion at either end of a pass could tell
+    /// apart from frames that were there all along.
+    #[test]
+    fn frames_arriving_during_the_respawn_backoff_are_released_before_the_pass_returns() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = test_context("cam", dir.path());
+        let mut analyzer = MotionAnalyzer::with_decoder(ctx, FrameDecoder::dead());
+        let (crop, frames) = CropDecoder::detached();
+        analyzer.crop_decoder = LongLived {
+            decoder: Some(crop),
+            primed_with: PRIMING_SEGMENTS,
+        };
+        // The real schedule starts at five seconds. This one is the shape of a
+        // backoff — several [`POLL_INTERVAL`] wakeups — at the length of a
+        // test.
+        const BACKOFF: Duration = Duration::from_millis(800);
+        analyzer.decoder_retry = DecoderSpawnRetry::new(RetrySchedule {
+            start: BACKOFF,
+            max: BACKOFF,
+        });
+
+        // The reader thread's part: nothing at the top of the pass, and four
+        // frames once it is asleep in the backoff.
+        let reader = std::thread::spawn(move || {
+            std::thread::sleep(POLL_INTERVAL / 2);
+            for _ in 0..4 {
+                frames.try_send(vec![0u8; 8]).expect("the channel has room");
+            }
+        });
+
+        let stop = running();
+        assert!(
+            !analyzer.ensure_decoder_alive_with(&stop, || Err(std::io::Error::other("no ffmpeg"))),
+            "a fork that failed must not report a live decoder"
+        );
+        reader.join().expect("reader thread panicked");
+
+        assert_eq!(
+            analyzer.release_idle_crop_frames(),
+            0,
+            "frames handed over during the backoff stayed pinned until the next pass"
         );
     }
 
@@ -2440,6 +3390,37 @@ mod tests {
             flushed_event(&mut rx).segments.len(),
             6,
             "the flush left behind footage that was already in the buffer"
+        );
+    }
+
+    /// The drain's refusal through the analyzer's own path: a batch that
+    /// arrives after the drain has begun finds no crop decoder and starts none,
+    /// whatever ffmpeg the box has.
+    ///
+    /// What carries the refusal down to here is the signature rather than any
+    /// state — [`MotionAnalyzer::drain_tail`] holds no stop flag, so
+    /// [`ForkWindow::Closed`] is the only window its passes can run in — which
+    /// is why the drain is run first and then a batch is put through the window
+    /// it leaves behind.
+    #[test]
+    fn a_batch_arriving_inside_the_drain_forks_no_crop_decoder() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut analyzer, buffer, _rx) = analyzer_with_a_dead_decoder(dir.path(), 1);
+
+        buffer.write_recover().seal();
+        analyzer.drain_tail(DrainGate::starting_at(Instant::now(), TAIL_DRAIN_BOUND));
+
+        analyzer.process_motion_runs(
+            vec![MotionSegment {
+                seq: 1,
+                data: Arc::new(Vec::new()),
+                duration_ns: SEC,
+            }],
+            ForkWindow::Closed,
+        );
+        assert!(
+            analyzer.crop_decoder.decoder.is_none(),
+            "the drain forked a crop decoder"
         );
     }
 
@@ -2835,6 +3816,164 @@ mod tests {
             .await
             .expect("the analyzer ignored the watermark and sat out its whole drain bound")
             .expect("analyzer task panicked");
+    }
+
+    /// The fork count, against a real ffmpeg and through the real extraction
+    /// path: two motion batches, one child, primed once. A crop decoder built
+    /// per batch — as this one was — forked, primed and killed one for each of
+    /// them, up to five times a second on a camera with continuous motion.
+    ///
+    /// Driven through [`MotionAnalyzer::process_motion_runs`] rather than the
+    /// slot it keeps, because the slot is only half the claim: an extraction
+    /// that stopped asking it for a decoder would pass a test of the policy
+    /// alone. Ignored by default like every other test here that forks ffmpeg.
+    #[test]
+    #[ignore]
+    fn two_motion_batches_are_extracted_through_one_crop_decoder() {
+        const SEGMENTS: usize = 8;
+        let dir = tempfile::tempdir().unwrap();
+        let recorded = crate::analytics::decoder::tests::recorded_segments(SEGMENTS);
+        let ctx = test_context("cam", dir.path());
+        let buffer = Arc::clone(&ctx.buffer);
+        {
+            let mut buf = buffer.write_recover();
+            for (i, data) in recorded.iter().enumerate() {
+                buf.push(crate::buffer::GopSegment {
+                    start_pts: i as u64 * SEC,
+                    duration_ns: SEC,
+                    data: Arc::clone(data),
+                    frame_count: 25,
+                });
+            }
+        }
+        let mut analyzer = MotionAnalyzer::with_decoder(ctx, FrameDecoder::dead());
+        // The cheap crop size: this is about which ffmpeg decodes, not about
+        // what the vision model would have been sent.
+        analyzer.frame_use = FrameUse::Thumbnails;
+
+        let batch = |seq: u64| {
+            vec![MotionSegment {
+                seq,
+                data: Arc::clone(&recorded[seq as usize]),
+                duration_ns: SEC,
+            }]
+        };
+
+        let stop = running();
+        analyzer.process_motion_runs(batch(3), ForkWindow::Open(&stop));
+        let first = analyzer
+            .crop_decoder
+            .decoder
+            .as_ref()
+            .expect("the first batch forked no crop decoder")
+            .child_id();
+        assert!(first.is_some(), "the crop decoder has no child");
+        assert!(
+            analyzer.crop_decoder.primed(),
+            "the first batch never primed the child it forked"
+        );
+
+        analyzer.process_motion_runs(batch(7), ForkWindow::Open(&stop));
+        let second = analyzer
+            .crop_decoder
+            .decoder
+            .as_ref()
+            .expect("the second batch lost the crop decoder")
+            .child_id();
+        assert_eq!(
+            first, second,
+            "the second batch forked a crop decoder of its own"
+        );
+    }
+
+    /// What a kept decoder holds between batches, and for how long.
+    ///
+    /// A batch stops reading when it has the frames it wants; ffmpeg is still
+    /// working through the segments it was fed and fills the channel behind it.
+    /// Four frames is 24 MB at the detection crop size, per camera, and nothing
+    /// takes them until the camera moves again — which on a quiet night is the
+    /// morning, on a box whose analytics memory has been the problem before.
+    /// The top of the next pass is where they go.
+    ///
+    /// This is the half of that claim a real ffmpeg is needed for: that a batch
+    /// leaves frames behind at all. That a pass is what takes them is pinned
+    /// without one in
+    /// [`a_pass_that_gives_up_on_its_decoder_still_empties_the_crop_channel`],
+    /// which is also where the position of the release is pinned. Ignored by
+    /// default: it needs an `ffmpeg` binary.
+    #[test]
+    #[ignore]
+    fn a_batch_leaves_frames_behind_and_the_next_pass_takes_them() {
+        // Enough footage for ffmpeg to be past its stream probe and emitting,
+        // which is the only state in which it has anything to leave behind: a
+        // run is sampled, not fed whole, so a batch hands over four segments.
+        const SEGMENTS: usize = 16;
+        let dir = tempfile::tempdir().unwrap();
+        let recorded = crate::analytics::decoder::tests::recorded_segments(SEGMENTS);
+        let ctx = test_context("cam", dir.path());
+        let buffer = Arc::clone(&ctx.buffer);
+        {
+            let mut buf = buffer.write_recover();
+            for (i, data) in recorded.iter().enumerate() {
+                buf.push(crate::buffer::GopSegment {
+                    start_pts: i as u64 * SEC,
+                    duration_ns: SEC,
+                    data: Arc::clone(data),
+                    frame_count: 25,
+                });
+            }
+        }
+        let mut analyzer = MotionAnalyzer::with_decoder(ctx, FrameDecoder::dead());
+        analyzer.frame_use = FrameUse::Thumbnails;
+        let stop = running();
+        let batch = |from: u64| {
+            (from..from + 4)
+                .map(|seq| MotionSegment {
+                    seq,
+                    data: Arc::clone(&recorded[seq as usize]),
+                    duration_ns: SEC,
+                })
+                .collect::<Vec<_>>()
+        };
+        // Long enough for a child that has been handed everything it is going
+        // to get to finish saying so.
+        //
+        // It is also what this test does not pin, and the pause is here rather
+        // than absent for exactly that reason. The release is best-effort per
+        // pass — a drain stops at the first empty channel and the pipe's reader
+        // thread can hand over one more frame immediately after — so with a
+        // real child still emitting, a single pass is not guaranteed to empty
+        // anything. What closes that is the next pass a poll later, which
+        // is a property about repetition and not one an assertion here can hold
+        // still for; see [`MotionAnalyzer::release_idle_crop_frames`]. Waiting
+        // the child out first takes the race off the table so what remains is
+        // the claim this test is for: that a pass with no motion is what takes
+        // the frames, and that they are there to be taken.
+        let settle = || std::thread::sleep(Duration::from_millis(500));
+
+        analyzer.process_motion_runs(batch(3), ForkWindow::Open(&stop));
+        analyzer.process_motion_runs(batch(7), ForkWindow::Open(&stop));
+        settle();
+        assert!(
+            analyzer.release_idle_crop_frames() > 0,
+            "the batches left nothing behind, so there is nothing here to release"
+        );
+
+        analyzer.process_motion_runs(batch(11), ForkWindow::Open(&stop));
+        settle();
+        // A pass, driven the way the one above the decoder gate runs: the stop
+        // flag ends it immediately afterwards, which is the point — the release
+        // is above everything that can stop a pass, so a pass that does nothing
+        // else still does this.
+        assert!(
+            !analyzer.tick(&AtomicBool::new(true)),
+            "the pass was supposed to give up before analyzing anything"
+        );
+        assert_eq!(
+            analyzer.release_idle_crop_frames(),
+            0,
+            "the pass left the last batch's frames resident"
+        );
     }
 
     #[test]

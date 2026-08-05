@@ -421,15 +421,28 @@ impl CropDecoder {
                 "-hide_banner",
                 "-loglevel",
                 "quiet",
-                // A crop decoder is spawned per batch and fed ~4s of segments,
-                // less than ffmpeg's default stream-analysis window — without
-                // these it emits nothing before the pipe goes idle.
+                // A crop decoder goes long stretches with nothing to decode and
+                // is then fed a few seconds of segments at a time, less than
+                // ffmpeg's default stream-analysis window — without these it
+                // emits nothing before the pipe goes idle again.
                 "-probesize",
                 "262144",
                 "-analyzeduration",
                 "0",
                 "-fflags",
                 "nobuffer",
+                // The timeline handed to a decoder kept for the life of a
+                // camera is not continuous. It sees only the segments motion
+                // asked for, so a quiet stretch arrives as a jump, and a camera
+                // up for a day and a half hands it the moment a 33-bit MPEG-TS
+                // timestamp starts over. Both are libavformat's to absorb:
+                // past `-dts_delta_threshold` — ten seconds, and left at its
+                // default here — it rebases the timeline rather than believing
+                // it, and the `fps` filter below is handed a continuation
+                // instead of an hour to answer one duplicated picture at a
+                // time. Nothing raises that threshold, and
+                // `a_kept_crop_decoder_answers_jumped_timestamps_with_its_own_frames`
+                // is what notices if it ever moves.
                 "-f",
                 "mpegts",
                 "-i",
@@ -470,7 +483,7 @@ impl CropDecoder {
     /// detection crop size, 6 MB a frame — and make the peak scale with a
     /// number an operator can set to anything.
     pub fn decode_segment(
-        &self,
+        &mut self,
         data: &Arc<Vec<u8>>,
         duration_ns: u64,
         mut sink: impl FnMut(Vec<u8>),
@@ -478,11 +491,17 @@ impl CropDecoder {
         match send_segment(&self.pipe, Arc::clone(data)) {
             SendOutcome::Sent => {}
             SendOutcome::Closed => return,
-            // A crop decoder is spawned per batch and dropped after it, which
-            // kills the child — so the segment is simply skipped rather than
-            // respawned. The blast radius is this batch's event frames.
+            // A wedge never clears on its own, and this decoder outlives the
+            // batch that first needed it — so the child is killed here rather
+            // than left for the caller to notice. That is what turns a wedge
+            // back into an ordinary death: [`CropDecoder::is_alive`] reports it
+            // and the analyzer respawns before the next batch. The rest of this
+            // batch's segments then find a closed pipe and are skipped at once,
+            // instead of each spending [`SEND_DEADLINE`] rediscovering the
+            // wedge. The blast radius stays this batch's event frames.
             SendOutcome::Wedged => {
-                tracing::warn!("crop decoder stopped consuming input, skipping segment");
+                tracing::warn!("crop decoder stopped consuming input, killing it");
+                self.pipe.kill();
                 return;
             }
         }
@@ -524,6 +543,53 @@ impl CropDecoder {
     pub fn height(&self) -> u32 {
         self.height
     }
+
+    /// Whether the ffmpeg behind this decoder is still there. Asked once per
+    /// motion batch by the analyzer that keeps it, which is the only thing that
+    /// ever notices the child is gone — the same liveness check
+    /// [`FrameDecoder::is_alive`] answers, for the same reason.
+    pub fn is_alive(&mut self) -> bool {
+        self.pipe
+            .child
+            .as_mut()
+            .map(|c| c.try_wait().ok().flatten().is_none())
+            .unwrap_or(false)
+    }
+
+    /// The pid of the ffmpeg behind this decoder. For the tests that have to
+    /// tell one child from its replacement, which is the only way to see from
+    /// the outside whether a decoder was reused or re-forked.
+    #[cfg(test)]
+    pub(crate) fn child_id(&self) -> Option<u32> {
+        self.pipe.child.as_ref().map(Child::id)
+    }
+
+    /// A decoder with no ffmpeg behind it and a frame channel the caller fills
+    /// itself, handed back alongside it.
+    ///
+    /// The same bargain [`FrameDecoder::dead`] strikes, for the same reason.
+    /// What the analyzer does with the frames a crop decoder has already
+    /// emitted — and, more to the point, *when* it does it — is a question
+    /// about the shape of a pass, not about ffmpeg, and every test here that
+    /// forks one is `#[ignore]`d. Without this the position of that release
+    /// would be pinned only by a test the commit gate never runs.
+    #[cfg(test)]
+    pub(crate) fn detached() -> (Self, SyncSender<Vec<u8>>) {
+        let (frame_tx, frame_rx) = mpsc::sync_channel(4);
+        let decoder = Self {
+            pipe: FfmpegPipe {
+                segment_tx: None,
+                frame_rx,
+                child: None,
+                _writer_handle: thread::spawn(|| {}),
+                _reader_handle: thread::spawn(|| {}),
+            },
+            sample_fps: 5,
+            width: ANALYSIS_WIDTH,
+            height: ANALYSIS_HEIGHT,
+        };
+        (decoder, frame_tx)
+    }
 }
 
 fn expected_frame_count(duration_ns: u64, sample_fps: u32) -> usize {
@@ -532,7 +598,7 @@ fn expected_frame_count(duration_ns: u64, sample_fps: u32) -> usize {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// Test deadline: long enough for a couple of retry rounds, short enough
@@ -743,8 +809,31 @@ mod tests {
 
     /// One-GOP MPEG-TS segments with an audio track, straight out of ffmpeg's
     /// muxer — what the hot buffer holds, near enough. Needs an `ffmpeg`
-    /// binary, so only the `#[ignore]`d tests use it.
-    fn recorded_segments(count: usize) -> Vec<Arc<Vec<u8>>> {
+    /// binary, so only the `#[ignore]`d tests use it — here and in the
+    /// pipeline's, which needs a hot buffer holding footage that really decodes.
+    pub(crate) fn recorded_segments(count: usize) -> Vec<Arc<Vec<u8>>> {
+        recorded_segments_starting_at(count, 0)
+    }
+
+    /// The same footage, muxed `offset_secs` into a stream's timeline instead of
+    /// at the start of one.
+    ///
+    /// This is how a jump is synthesised honestly: the timestamps are the
+    /// muxer's own, written into the stream by the same code path a recording
+    /// goes through — including the modulo, since MPEG-TS gives a PTS 33 bits
+    /// and the muxer wraps anything past them. Two sets an hour apart, fed to
+    /// one decoder in order, are indistinguishable from a camera that was quiet
+    /// for an hour; two sets bracketing [`WRAP_SECS`] are indistinguishable
+    /// from a camera that has been up a day and a half.
+    ///
+    /// What holds that up is arithmetic and a status code, not inspection: the
+    /// offsets are chosen either side of [`WRAP_SECS`], and an ffmpeg that did
+    /// not understand `-output_ts_offset` would fail the assertion below rather
+    /// than quietly produce an unwrapped stream. What the *decoder* then did
+    /// with the wrap is a question for the frames, not the timestamps, and
+    /// [`a_kept_crop_decoder_answers_jumped_timestamps_with_its_own_frames`]
+    /// asks it there.
+    fn recorded_segments_starting_at(count: usize, offset_secs: u64) -> Vec<Arc<Vec<u8>>> {
         let dir = tempfile::TempDir::new().expect("temp dir");
         let status = Command::new("ffmpeg")
             .args([
@@ -771,6 +860,8 @@ mod tests {
                 "0",
                 "-c:a",
                 "aac",
+                "-output_ts_offset",
+                &offset_secs.to_string(),
                 "-f",
                 "segment",
                 "-segment_time",
@@ -785,6 +876,101 @@ mod tests {
                 Arc::new(std::fs::read(dir.path().join(format!("seg{i:03}.ts"))).expect("segment"))
             })
             .collect()
+    }
+
+    /// Where an MPEG-TS presentation timestamp runs out of bits: 33 of them at
+    /// 90 kHz, so a stream that has been up this long starts counting from zero
+    /// again mid-recording. A crop decoder forked per batch never lived long
+    /// enough to see it; one kept for the life of the camera sees it about once
+    /// a day.
+    const WRAP_SECS: u64 = (1 << 33) / 90_000;
+
+    /// Which picture a frame is, cheaply. Counting frames cannot tell footage
+    /// from padding — a duplicated picture is a frame like any other — so every
+    /// question about *whose* frames came back is asked through one of these.
+    fn picture(frame: &[u8]) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        frame.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    /// Feed `segments` the way an extraction feeds a run, reporting the
+    /// pictures that came back in the order they arrived.
+    fn pictures_of(decoder: &mut CropDecoder, segments: &[Arc<Vec<u8>>]) -> Vec<u64> {
+        let mut pictures = Vec::new();
+        for segment in segments {
+            decoder.decode_segment(segment, 1_000_000_000, |frame| {
+                pictures.push(picture(&frame))
+            });
+        }
+        pictures
+    }
+
+    /// Feed `segments`, reporting how many frames came back.
+    fn frames_of(decoder: &mut CropDecoder, segments: &[Arc<Vec<u8>>]) -> usize {
+        pictures_of(decoder, segments).len()
+    }
+
+    /// The longest stretch of the same picture in a row.
+    ///
+    /// This is what a gap the `fps` filter filled looks like from the reading
+    /// end, and the only shape of it that survives the pipe running behind its
+    /// input: the filter answers a gap with one picture repeated, and the
+    /// repeats stay next to each other however many batches later the reader
+    /// reaches them.
+    fn longest_repeat(pictures: &[u64]) -> usize {
+        let mut longest = 0;
+        let mut run = 0;
+        let mut previous = None;
+        for &p in pictures {
+            run = if previous == Some(p) { run + 1 } else { 1 };
+            previous = Some(p);
+            longest = longest.max(run);
+        }
+        longest
+    }
+
+    /// How many identical pictures in a row are still footage rather than
+    /// padding. Real footage at a few frames a second of a moving scene never
+    /// repeats at all, so this is slack; the smallest gap the `fps` filter can
+    /// fill is a second of it, which at these rates is five.
+    const MAX_REPEATS: usize = 3;
+
+    /// Everything the child still has to say, counted until it has said nothing
+    /// for [`QUIET_ROUNDS`] rounds running.
+    ///
+    /// The analyzer never does this — it drains what has arrived and moves on,
+    /// which is what bounds its memory. A test asking whether ffmpeg *generated*
+    /// padding has to keep draining, because the four-slot channel would
+    /// otherwise cap the answer at four whatever the filter did. `cap` is the
+    /// escape hatch: a filter answering an hour-long jump one frame at a time
+    /// has 18,000 pictures to hand over, and the assertion should fire rather
+    /// than wait for them.
+    ///
+    /// Silence is *not* proof the child has finished — a fifth of a second of
+    /// it is only evidence, and a child midway through a flood could pause that
+    /// long between bursts. Nothing about the pipe offers a completion barrier
+    /// to wait on instead, so a caller that needs one asks the child a question
+    /// afterwards rather than trusting the silence; see the sentinel segment in
+    /// [`a_kept_crop_decoder_answers_jumped_timestamps_with_its_own_frames`].
+    fn frames_until_quiet(decoder: &CropDecoder, cap: usize) -> usize {
+        const QUIET_ROUNDS: u32 = 4;
+        let mut total = 0;
+        let mut quiet = 0;
+        while quiet < QUIET_ROUNDS && total < cap {
+            match decoder.drain() {
+                0 => {
+                    quiet += 1;
+                    thread::sleep(Duration::from_millis(50));
+                }
+                n => {
+                    quiet = 0;
+                    total += n;
+                }
+            }
+        }
+        total
     }
 
     /// Fed the way the analyzer feeds them, real segments must pin the two
@@ -892,6 +1078,218 @@ mod tests {
         );
     }
 
+    /// One crop decoder across two motion batches with four seconds of quiet
+    /// footage in between: the shape a decoder kept for the life of the camera
+    /// sees every night, and one a per-batch fork never had to survive.
+    ///
+    /// What this pins is the *short* gap, and it is the expensive one. These
+    /// frames come out of an `fps` filter, whose job is to answer a constant
+    /// output rate from an irregular input, and a gap this size is inside what
+    /// libavformat still reads as ordinary lateness rather than as a break in
+    /// the stream — so the filter fills it, one duplicated picture per step,
+    /// twenty of them here. (Past roughly ten seconds it stops: the demuxer
+    /// rebases the timeline instead, which is why the hour-long jump below
+    /// costs *less* than this does. See
+    /// [`a_kept_crop_decoder_answers_jumped_timestamps_with_its_own_frames`].)
+    ///
+    /// So the claim is not that nothing is duplicated. It is that the fill is
+    /// the size of the gap and stops there — twenty pictures, not twenty
+    /// thousand — and that the child comes out of the gap alive with this
+    /// batch's own frames still to give. Ignored by default: it needs an
+    /// `ffmpeg` binary.
+    ///
+    /// How much was left sitting in the channel at the end is deliberately not
+    /// asserted. That number says how far the child happens to be running
+    /// behind the reader, which is a fact about the box's spare CPU, and it
+    /// cannot exceed four however badly the fill goes — so it is a measurement
+    /// of the machine dressed as a measurement of ffmpeg. Counting everything
+    /// the child emitted says the thing that was meant.
+    #[test]
+    #[ignore]
+    fn crop_decoder_reuses_one_child_across_a_gap_between_batches() {
+        const FPS: u32 = 5;
+        // Three priming segments, a batch of six, four skipped, a batch of
+        // three: twelve segments of footage across sixteen seconds of timeline.
+        const SPANNED: usize = 16;
+        let segments = recorded_segments(16);
+        let mut decoder = CropDecoder::new(FPS, (320, 180)).expect("spawn ffmpeg");
+
+        // Primed once, the way the analyzer primes a child it has just forked.
+        let mut emitted = frames_of(&mut decoder, &segments[..3]);
+        emitted += decoder.drain();
+
+        let first_batch = frames_of(&mut decoder, &segments[3..9]);
+        // Four seconds of footage nobody asked to decode — a quiet stretch
+        // between two motion runs, seen from the decoder as a jump in PTS.
+        let second_batch = frames_of(&mut decoder, &segments[13..16]);
+
+        assert!(first_batch > 0, "the primed decoder produced nothing");
+        assert!(
+            second_batch > 0,
+            "the child did not survive the gap between batches"
+        );
+        assert!(decoder.is_alive(), "the child died between batches");
+
+        // Twice what the timeline it was walked across can hold at this rate.
+        // The gap's own twenty pictures are inside that; a gap answered without
+        // a bound is not.
+        let budget = SPANNED * FPS as usize * 2;
+        emitted += first_batch + second_batch + frames_until_quiet(&decoder, budget + 1);
+        assert!(
+            emitted <= budget,
+            "twelve seconds of footage across sixteen came back as {emitted} frames"
+        );
+    }
+
+    /// A decoder kept for the life of a camera outlives its input's timeline.
+    /// An hour of quiet puts an hour into its timestamps; a day of running puts
+    /// a 33-bit MPEG-TS PTS back at zero mid-stream, once every
+    /// [`WRAP_SECS`]. A child forked per batch met neither — it was born after
+    /// the jump and died before the next one — so both are new, and both are
+    /// answered here against a real ffmpeg rather than argued about.
+    ///
+    /// The fear is the `fps` filter: told the stream has moved on an hour, a
+    /// filter that believes it owes one picture per step of that owes 18,000 of
+    /// them, at 6 MB each on the detection crop. It does not, and the reason is
+    /// one step earlier — a jump this size is past what libavformat reads as
+    /// lateness, so the demuxer rebases the timeline and the filter is handed a
+    /// continuation. The wrap arrives the same way. Both therefore cost *less*
+    /// than the four-second gap above, which is small enough to be filled.
+    ///
+    /// This test is what stands in for a resync this decoder does not have, so
+    /// it is asked to fail two different ways.
+    ///
+    /// **Whose frames** came back, by [`longest_repeat`]: a filled gap is one
+    /// picture repeated, and no batch may come back as one. The obvious form of
+    /// this check — compare a batch against the last picture before the jump —
+    /// was tried and does not hold, because the pipe runs seconds behind its
+    /// input: put a fillable gap where the hour goes and the padding lands two
+    /// batches later, repeating a picture the reader had not reached yet, so
+    /// every batch has "a frame that differs from the one before it" while one
+    /// of them is nothing but padding. A repeat is still a repeat wherever it
+    /// lands.
+    ///
+    /// **How many** the child ever emitted, drained to silence — the four-slot
+    /// channel would otherwise answer "four" whatever the filter did — with the
+    /// silence itself checked by feeding one more segment afterwards and
+    /// requiring that segment's own pictures back. Neither half would do alone.
+    /// A count within budget can be batches that spent themselves on stale
+    /// duplicates while their real frames waited in the pipe, and pictures that
+    /// move can be the leading edge of a flood the count stopped short of.
+    ///
+    /// Ignored by default: it needs an `ffmpeg` binary and four encodes.
+    #[test]
+    #[ignore]
+    fn a_kept_crop_decoder_answers_jumped_timestamps_with_its_own_frames() {
+        const FPS: u32 = 5;
+        const BATCH: usize = 3;
+        // One camera's night: the footage in front of it now, the footage an
+        // hour later, and the batches either side of the moment its timestamps
+        // run out of bits. `now` is long enough to carry the child past the
+        // stream probe *and* past the padding that probe leaves queued behind
+        // it, so the picture the first jump is measured against is real footage
+        // rather than the frozen one ffmpeg fills the wait with.
+        let now = recorded_segments(20);
+        let an_hour_on = recorded_segments_starting_at(BATCH, 3600);
+        let before_the_wrap = recorded_segments_starting_at(BATCH, WRAP_SECS - 6);
+        // One segment longer than a batch: the last is the sentinel.
+        let after_the_wrap = recorded_segments_starting_at(BATCH + 1, WRAP_SECS + 2);
+        let fed = now.len() + an_hour_on.len() + before_the_wrap.len() + after_the_wrap.len();
+
+        let mut decoder = CropDecoder::new(FPS, (320, 180)).expect("spawn ffmpeg");
+        pictures_of(&mut decoder, &now[..BATCH]);
+        decoder.drain();
+
+        let before_the_jump = pictures_of(&mut decoder, &now[BATCH..]);
+        let mut emitted = before_the_jump.len();
+        // The premise every assertion below rests on. A probing ffmpeg pads the
+        // wait for its first real frame with one frozen picture — the same
+        // shape a filled gap has — so a jump measured while that is still
+        // coming out proves nothing. This says the child had reached real
+        // footage before the first jump, and is why `now` is several times the
+        // length of a batch.
+        let settled = &before_the_jump[before_the_jump.len().saturating_sub(MAX_REPEATS * 2)..];
+        assert!(
+            !settled.is_empty() && longest_repeat(settled) <= MAX_REPEATS,
+            "the child was still padding when the first jump was measured: \
+             {} frames before it, ending in a run of {}",
+            before_the_jump.len(),
+            longest_repeat(settled)
+        );
+
+        for (what, batch) in [
+            ("an hour on", &an_hour_on[..]),
+            ("just before the wrap", &before_the_wrap[..]),
+            ("just after the wrap", &after_the_wrap[..BATCH]),
+        ] {
+            let pictures = pictures_of(&mut decoder, batch);
+            assert!(
+                !pictures.is_empty(),
+                "the batch {what} got no frames at all"
+            );
+            let repeated = longest_repeat(&pictures);
+            assert!(
+                repeated <= MAX_REPEATS,
+                "{repeated} of the {} frames the batch {what} got were the same \
+                 picture over again: the jump was filled in, not crossed",
+                pictures.len()
+            );
+            assert!(decoder.is_alive(), "the child died {what}");
+            emitted += pictures.len();
+        }
+
+        // Twice the footage the child was ever fed. Rebased jumps cost it
+        // nothing at all, so half of this is slack; an hour taken literally is
+        // two hundred times it, and a wrap a thousand.
+        let budget = fed * FPS as usize * 2;
+        emitted += frames_until_quiet(&decoder, budget + 1);
+
+        // The question that turns silence into evidence. A child that has
+        // really run out of input answers the next segment with that segment's
+        // own pictures; one that only paused mid-flood answers with the flood,
+        // which is more copies of the picture it froze on.
+        let sentinel = pictures_of(&mut decoder, &after_the_wrap[BATCH..]);
+        assert!(
+            !sentinel.is_empty() && longest_repeat(&sentinel) <= MAX_REPEATS,
+            "the child answered a fresh segment with {} of the same picture: \
+             the silence the count stopped on was a pause in a flood",
+            longest_repeat(&sentinel)
+        );
+        emitted += sentinel.len();
+        emitted += frames_until_quiet(&decoder, budget + 1);
+
+        assert!(
+            emitted <= budget,
+            "{fed}s of footage came back as {emitted} frames: the jumps were filled in"
+        );
+    }
+
+    /// A wedged crop decoder must not stay wedged. Its child is alive — SIGSTOP
+    /// keeps it that way, past every liveness check there is — so nothing but
+    /// killing it can end the wedge, and a decoder that outlives the batch it
+    /// wedged on would otherwise carry the wedge for the life of the camera.
+    /// Ignored by default: it needs an `ffmpeg` binary and burns
+    /// [`SEND_DEADLINE`] once the pipe is full.
+    #[test]
+    #[ignore]
+    fn crop_decoder_kills_a_child_that_stopped_reading_stdin() {
+        let mut decoder = CropDecoder::new(5, (320, 180)).expect("spawn ffmpeg");
+        let pid = decoder.pipe.child.as_ref().expect("child").id() as libc::pid_t;
+        assert_eq!(unsafe { libc::kill(pid, libc::SIGSTOP) }, 0, "SIGSTOP");
+        assert!(decoder.is_alive(), "a stopped child is still a child");
+
+        // Junk bytes ffmpeg never gets to parse, and a duration short enough
+        // that each segment's frame read costs one timeout rather than five.
+        let segment = Arc::new(vec![0u8; 256 * 1024]);
+        for _ in 0..64 {
+            decoder.decode_segment(&segment, 1, |_| panic!("a stopped ffmpeg emitted a frame"));
+            if !decoder.is_alive() {
+                return;
+            }
+        }
+        panic!("a stopped ffmpeg was left wedged and alive");
+    }
+
     /// The crop decoder driven exactly as the analyzer drives it — three
     /// priming segments discarded, a drain, then the sampled segments — against
     /// a real ffmpeg.
@@ -909,7 +1307,7 @@ mod tests {
         const PRIMING: usize = 3;
         const SAMPLED: usize = 4;
         let segments = recorded_segments(PRIMING + SAMPLED);
-        let decoder = CropDecoder::new(5, (320, 180)).expect("spawn ffmpeg");
+        let mut decoder = CropDecoder::new(5, (320, 180)).expect("spawn ffmpeg");
 
         for segment in &segments[..PRIMING] {
             decoder.decode_segment(segment, 1_000_000_000, |_| {});
