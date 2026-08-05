@@ -263,6 +263,11 @@ impl WarmEventIndex {
             duration_ms,
             event_type,
             file_size,
+            // Zero, and deliberately: `statvfs` is this backend's accounting
+            // authority and already counts these bytes — see
+            // [`crate::storage::contract`].
+            sidecar_bytes: 0,
+            thumbnail_bytes: 0,
             object_classes: sidecar.classes,
             backend: sidecar.backend,
             model: sidecar.model,
@@ -478,6 +483,13 @@ impl WarmEventIndex {
             },
             |_, entry| entry.event_type,
             satisfied,
+            // Never cancelled: an eviction here is a handful of `unlink`s
+            // bounded by the filesystem, so there is no wait for a shutdown to
+            // cut short — this backend discharges the cancellation guarantee
+            // structurally (see [`crate::storage::contract`]). Abandoning the
+            // pass would only trade a bounded delay for a disk that is still
+            // full when recording resumes.
+            || false,
             |camera_id, entry| async move { self.remove_event_files(&camera_id, &entry).await },
         )
         .await
@@ -559,6 +571,8 @@ mod tests {
                     duration_ms,
                     event_type: EventType::Continuous,
                     file_size: 0,
+                    sidecar_bytes: 0,
+                    thumbnail_bytes: 0,
                     object_classes: Vec::new(),
                     backend: None,
                     model: None,
@@ -1132,6 +1146,8 @@ mod tests {
                 duration_ms: 5000,
                 event_type: EventType::Movement,
                 file_size: 0,
+                sidecar_bytes: 0,
+                thumbnail_bytes: 0,
                 object_classes: Vec::new(),
                 backend: None,
                 model: None,

@@ -1,5 +1,6 @@
 pub mod anchor;
 pub mod backend;
+pub mod contract;
 mod debug_store;
 mod detection_store;
 pub mod event_index;
@@ -14,6 +15,7 @@ pub use anchor::StorageAnchor;
 pub use backend::{
     LocalDiskBackend, RangeRequest, ServedRange, ThumbnailError, VideoStream, WarmStorageBackend,
 };
+pub use contract::StopFlag;
 pub use debug_store::DetectionDebugStore;
 pub use detection_store::{DetectionEntry, DetectionStore};
 pub use event_index::{EventRef, EventType, WarmEventEntry};

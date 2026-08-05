@@ -318,7 +318,17 @@ struct Storage {
     scanned: bool,
 }
 
-async fn init_storage(config: &Config, camera_ids: &[String]) -> Storage {
+/// `stop` is the process shutdown flag. The remote backend takes it at
+/// construction rather than being handed one per call: every request-issuing
+/// loop it owns reads it before sending, which is what keeps a single event
+/// write inside the drain's phase-3 budget (see
+/// [`crate::storage::contract`]). Local disk needs none — its every step is
+/// local I/O with nothing to cancel.
+async fn init_storage(
+    config: &Config,
+    camera_ids: &[String],
+    stop: crate::storage::StopFlag,
+) -> Storage {
     if !config.storage.enabled {
         return Storage {
             backend: None,
@@ -334,7 +344,7 @@ async fn init_storage(config: &Config, camera_ids: &[String]) -> Storage {
             bucket = %stathost.bucket,
             "using remote stathost warm-storage backend"
         );
-        let backend = StathostBackend::new(stathost, camera_ids);
+        let backend = StathostBackend::new(stathost, camera_ids, stop);
         backend.recover_orphans();
         // A store that cannot be listed does not stop camon: the cameras record
         // and upload either way, and holding startup for a host that may be
@@ -717,12 +727,17 @@ async fn wait_for_shutdown(shutdown: &ShutdownSignal) -> ShutdownReason {
 /// old code after an update, or running without whatever task just died.
 ///
 /// It guarantees the restart *eventually* happens; it does not guarantee that
-/// what it terminates was stuck. No honest value could: against a black-holing
-/// stathost server a single event legitimately takes longer than any deadline
-/// worth having — the video is put with one retry (2 x `UPLOAD_TIMEOUT`),
-/// then the sidecar, then one put per filmstrip frame, all serial — and a
-/// writer queue can hold several events. So this can abandon a drain that is
-/// still making progress, losing the remainder. That is the accepted trade:
+/// what it terminates was stuck. What it has to cover, against a black-holing
+/// stathost server, is one request that uses its whole `UPLOAD_TIMEOUT` — the
+/// one already in flight when the flag went up. Nothing queues behind it any
+/// more: every request-issuing loop in the storage layer reads the flag before
+/// sending (see [`crate::storage::contract`]'s third guarantee), so the rest of
+/// a writer's queue drains without touching the network, an event still being
+/// uploaded is abandoned after its current request rather than after the seven
+/// that used to follow it — sidecar, video, a retry each, then a put per
+/// filmstrip frame, all serial — and the retention sweep stops between the
+/// deletes of a single event. So this can still abandon a drain that is making
+/// progress, but only ever by one request per task. That is the accepted trade:
 /// the alternative is an NVR that silently never restarts.
 ///
 /// It is also the budget the drain's own phases are sized against, and
@@ -971,10 +986,11 @@ async fn graceful_shutdown(
     //   `a_healing_rescan_leaves_orphaned_metadata_for_the_next_startup` — so
     //   this survivor waits for a restart rather than for the next sweep. It
     //   costs a few hundred bytes until then and nothing else: nothing indexes
-    //   it, counts it against the budget or reads it. No test reaches that
-    //   state by interrupting a delete, but `an_orphan_sidecar_indexes_nothing_
-    //   and_is_collected` reaches the identical on-disk state from the other
-    //   direction — an upload whose video failed — and pins the collection.
+    //   it, counts it against the budget or reads it. A delete abandoned for
+    //   shutdown reaches the same state deliberately and stops there
+    //   (`a_sweep_stops_between_the_deletes_of_a_single_event`), and
+    //   `orphaned_thumbnails_are_collected_and_live_ones_are_not` pins the
+    //   collection that eventually follows.
     //
     // Moving the wait here from the head of the drain changes no interleaving:
     // the sweep has been running concurrently with everything since the flag
@@ -1134,7 +1150,12 @@ where
     let Storage {
         backend: storage,
         scanned: warm_index_scanned,
-    } = init_storage(&config, &camera_ids).await;
+    } = init_storage(
+        &config,
+        &camera_ids,
+        crate::storage::StopFlag::shared(Arc::clone(&shutdown.flag)),
+    )
+    .await;
     // The recording-silence watchdog cannot see the storage volume being
     // unmounted: writes to the bare mountpoint succeed and keep resetting it.
     // So the volume is watched directly — by the backends that have one to

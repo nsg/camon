@@ -185,11 +185,33 @@ pub trait WarmStorageBackend: Send + Sync {
     /// per-camera share one sweep may take (`cap_sweep_deletions`), so a
     /// forward clock jump cannot empty an archive in a single pass.
     ///
-    /// `cancel` is the shutdown flag. A sweep is long (a remote backend deletes
-    /// one event at a time, each able to sit on a request timeout) and the
-    /// drain waits for it, so implementations must poll this between events and
-    /// stop early — but never part-way through one event, which would strip a
-    /// `.ts` and orphan its sidecar and thumbnails where no scan can find them.
+    /// `cancel` is the shutdown flag, and how finely it must be polled is part
+    /// of this contract rather than a matter of taste. A sweep is long, and on
+    /// a remote backend *one event* is several requests, each able to sit on a
+    /// request timeout: polling only between events therefore leaves a whole
+    /// event's worth of them inside the one that was in progress when the flag
+    /// went up, which is more than the drain's phase 3 has to give (see
+    /// [`crate::storage::contract`]'s third guarantee). So an implementation
+    /// whose deletions are remote requests **must poll `cancel` between them**
+    /// — this `cancel`, the one passed here, and not merely some flag of its
+    /// own that production happens to alias to it — and may report
+    /// [`Removal::Abandoned`](crate::storage::event_index::Removal) to say that
+    /// it did: the entry stays indexed, unflagged and uncounted, and the pass
+    /// ends. A backend that read only its own stop would keep this promise by
+    /// coincidence and break it for any caller whose `cancel` is its own.
+    ///
+    /// What that costs is bounded by the *order* a backend deletes in, and
+    /// choosing that order so a stop is survivable anywhere is the real
+    /// obligation here. Stopping part-way must never be able to leave a video
+    /// whose type record is gone — an event the next rebuild reads back as the
+    /// wrong class, and expires on the wrong retention. Both backends arrange
+    /// that, in opposite directions and for reasons of their own: local disk
+    /// unlinks the metadata first and the `.ts` last, so the survivor of an
+    /// interrupted delete is a bare `.ts` whose type is still its directory and
+    /// which the next sweep expires again; the remote store deletes the video
+    /// before the sidecar, so the survivor is metadata with no video, which
+    /// indexes nothing and the next startup collects. Neither can produce a
+    /// video that has lost the record of what it is.
     async fn prune(
         &self,
         movement_max_age_ns: u64,
@@ -638,6 +660,12 @@ fn build_index_entry(
         duration_ms: duration_ms as u32,
         event_type: event.event_type(),
         file_size,
+        // The filesystem counts the sidecar and the thumbnails without being
+        // told to, and `statvfs` is this backend's accounting authority — see
+        // [`crate::storage::contract`]. A second figure maintained here could
+        // only drift from the one that decides anything.
+        sidecar_bytes: 0,
+        thumbnail_bytes: 0,
         object_classes: event.object_classes.clone(),
         backend: event.backend.clone(),
         model: event.model.clone(),
@@ -958,6 +986,8 @@ async fn reindexed_upgrade(
         duration_ms: upgrade.duration_ms,
         event_type: EventType::Object,
         file_size,
+        sidecar_bytes: 0,
+        thumbnail_bytes: 0,
         object_classes: upgrade.object_classes.clone(),
         backend: Some(upgrade.backend.clone()),
         model: Some(upgrade.model.clone()),
@@ -1121,6 +1151,86 @@ mod tests {
     use crate::storage::event_index::DetectionDetail;
 
     const SEC: u64 = 1_000_000_000;
+
+    // ---- the shared storage contract --------------------------------------
+    //
+    // One assertion body, two backends: see `storage::contract::contract_tests`
+    // for why these are written there and called here. Local disk is the
+    // backend whose guarantees the remote one was supposed to reproduce, so it
+    // is also the one whose passing them proves the assertions are about the
+    // contract rather than about stathost.
+
+    fn contract_backend() -> (tempfile::TempDir, LocalDiskBackend) {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = LocalDiskBackend::new(dir.path().to_path_buf(), &["cam".to_string()]);
+        (dir, backend)
+    }
+
+    /// Every byte under `dir`, which is what this backend's store *is*.
+    fn bytes_under(dir: &Path) -> u64 {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return 0;
+        };
+        entries
+            .filter_map(Result::ok)
+            .map(|e| match e.metadata() {
+                Ok(m) if m.is_dir() => bytes_under(&e.path()),
+                Ok(m) => m.len(),
+                Err(_) => 0,
+            })
+            .sum()
+    }
+
+    #[tokio::test]
+    async fn contract_a_written_event_reads_back_whole() {
+        let (_dir, backend) = contract_backend();
+        crate::storage::contract::contract_tests::a_written_event_reads_back_whole(&backend).await;
+    }
+
+    #[tokio::test]
+    async fn contract_an_event_costs_nothing_once_it_is_deleted() {
+        let (dir, backend) = contract_backend();
+        let root = dir.path().to_path_buf();
+        crate::storage::contract::contract_tests::an_event_costs_nothing_once_it_is_deleted(
+            &backend,
+            || bytes_under(&root),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn contract_a_prune_that_starts_stopped_deletes_nothing() {
+        let (_dir, backend) = contract_backend();
+        crate::storage::contract::contract_tests::a_prune_that_starts_stopped_deletes_nothing(
+            &backend,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn contract_a_rewritten_event_replaces_its_entry() {
+        let (_dir, backend) = contract_backend();
+        crate::storage::contract::contract_tests::a_rewritten_event_replaces_its_entry(&backend)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn contract_an_upgrade_reclassifies_the_one_indexed_event() {
+        let (_dir, backend) = contract_backend();
+        crate::storage::contract::contract_tests::an_upgrade_reclassifies_the_one_indexed_event(
+            &backend,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn contract_an_upgrade_of_a_deleted_event_indexes_nothing() {
+        let (_dir, backend) = contract_backend();
+        crate::storage::contract::contract_tests::an_upgrade_of_a_deleted_event_indexes_nothing(
+            &backend,
+        )
+        .await;
+    }
 
     /// Drain a [`VideoStream`] body to bytes (test-only; real callers stream).
     async fn drain(vs: VideoStream) -> Vec<u8> {

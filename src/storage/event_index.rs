@@ -83,7 +83,29 @@ pub struct WarmEventEntry {
     pub start_pts_ns: u64,
     pub duration_ms: u32,
     pub event_type: EventType,
+    /// Size of the event's video object. What playback ranges are resolved
+    /// against, and so the *video's* size and nothing else's.
     pub file_size: u64,
+    /// Size of the event's sidecar, or zero where there is none.
+    /// Kept apart from `file_size` because the two answer different questions —
+    /// one is how many bytes a player may seek within, the other is how many
+    /// bytes retention will reclaim — and a backend that folded them together
+    /// would serve ranges past the end of the video.
+    ///
+    /// Kept apart from [`thumbnail_bytes`](Self::thumbnail_bytes) because the
+    /// two change at different moments: an object upgrade rewrites the sidecar
+    /// and touches no frame, and a shorter rewrite of a stem drops frames and
+    /// leaves the sidecar. A single lumped figure could follow neither without
+    /// knowing what the other half of it had been.
+    ///
+    /// Filled by whichever backend's accounting depends on it. Local disk leaves
+    /// it zero and says why in [`contract`](crate::storage::contract): there the
+    /// filesystem counts every byte natively and `statvfs` is the authority, so
+    /// a figure maintained beside it could only ever be a second opinion that
+    /// drifts.
+    pub sidecar_bytes: u64,
+    /// Size of the event's filmstrip frames, all `filmstrip_frames` of them.
+    pub thumbnail_bytes: u64,
     pub object_classes: Vec<String>,
     pub backend: Option<String>,
     pub model: Option<String>,
@@ -109,6 +131,21 @@ pub struct WarmEventEntry {
 }
 
 impl WarmEventEntry {
+    /// Every byte this event costs the store — the figure a client-side budget
+    /// is measured against.
+    ///
+    /// Counting the video alone is what let a store sit permanently over a cap
+    /// it believed it was under: an event's sidecar and its four filmstrip
+    /// frames are small next to its video and are not small next to nothing, and
+    /// they are never reclaimed on their own — they go when the event goes. So
+    /// they are charged when the event is charged. Saturating, because a corrupt
+    /// listing must not wrap a budget into "empty".
+    pub fn stored_bytes(&self) -> u64 {
+        self.file_size
+            .saturating_add(self.sidecar_bytes)
+            .saturating_add(self.thumbnail_bytes)
+    }
+
     /// End of this event in wall-clock nanoseconds. Saturating, because a
     /// corrupt or hostile duration must not wrap the window arithmetic that
     /// decides what is served.
@@ -262,6 +299,17 @@ pub(crate) enum Removal {
     /// The video was already absent. Nothing was reclaimed, but the index entry
     /// has to go too — it describes something that does not exist.
     Missing,
+    /// Shutdown arrived before the deletion could be started, or between two of
+    /// the requests it takes. Nothing is flagged and nothing is counted — the
+    /// pass simply ends, because whatever was not deleted is not a fault of the
+    /// store's and the next sweep (or the next start) finds it exactly as it
+    /// was.
+    ///
+    /// Distinct from [`Failed`](Self::Failed) because that flag is read by
+    /// eviction, which demotes what carries it: a store that was working
+    /// perfectly must not come back from a restart-free shutdown with its
+    /// oldest events marked as having resisted deletion.
+    Abandoned,
     /// The store refused or could not be reached. The entry stays indexed so a
     /// later pass retries it instead of leaking the objects.
     ///
@@ -334,7 +382,8 @@ impl<K: EventIdentity> EventIndex<K> {
         self.cameras.contains_key(camera_id)
     }
 
-    /// Sum of indexed `file_size` across every camera.
+    /// Sum of what every indexed event costs the store
+    /// ([`WarmEventEntry::stored_bytes`]), across every camera.
     pub(crate) fn used_bytes(&self) -> u64 {
         self.used_bytes.load(Ordering::Relaxed)
     }
@@ -366,10 +415,10 @@ impl<K: EventIdentity> EventIndex<K> {
             return;
         };
         entries.sort_by_key(|e| e.start_pts_ns);
-        let added: u64 = entries.iter().map(|e| e.file_size).sum();
+        let added: u64 = entries.iter().map(WarmEventEntry::stored_bytes).sum();
         let removed: u64 = {
             let mut slot = lock.write_recover();
-            let removed = slot.iter().map(|e| e.file_size).sum();
+            let removed = slot.iter().map(WarmEventEntry::stored_bytes).sum();
             *slot = entries;
             removed
         };
@@ -387,9 +436,12 @@ impl<K: EventIdentity> EventIndex<K> {
     /// the same bytes twice.
     pub(crate) fn insert(&self, camera_id: &str, entry: WarmEventEntry) -> Option<WarmEventEntry> {
         let lock = self.cameras.get(camera_id)?;
-        let added = entry.file_size;
+        let added = entry.stored_bytes();
         let replaced = Self::insert_locked(&mut lock.write_recover(), entry);
-        self.charge(added, replaced.as_ref().map_or(0, |e| e.file_size));
+        self.charge(
+            added,
+            replaced.as_ref().map_or(0, WarmEventEntry::stored_bytes),
+        );
         replaced
     }
 
@@ -407,7 +459,7 @@ impl<K: EventIdentity> EventIndex<K> {
         let Some(lock) = self.cameras.get(camera_id) else {
             return false;
         };
-        let added = entry.file_size;
+        let added = entry.stored_bytes();
         {
             let mut entries = lock.write_recover();
             if position(&entries, K::of(&entry)).is_some() {
@@ -444,7 +496,7 @@ impl<K: EventIdentity> EventIndex<K> {
             let idx = position(&entries, key)?;
             entries.remove(idx)
         };
-        self.charge(0, removed.file_size);
+        self.charge(0, removed.stored_bytes());
         Some(removed)
     }
 
@@ -481,11 +533,12 @@ impl<K: EventIdentity> EventIndex<K> {
     /// sibling event and leave the one it named untouched. See
     /// [`EventIdentity`].
     ///
-    /// Unlike [`update`](Self::update), `f` *may* change `file_size`: the
-    /// entry is re-placed rather than edited where it lies, so the accounting
-    /// below can follow the resize. What it must not do is lie — `file_size`
-    /// on return is what `used_bytes` will count, so it has to be the size of
-    /// the objects the store now holds under the new identity.
+    /// Unlike [`update`](Self::update), `f` *may* change what the entry weighs
+    /// ([`WarmEventEntry::stored_bytes`]): the entry is re-placed rather than
+    /// edited where it lies, so the accounting below can follow the resize.
+    /// What it must not do is lie — what it leaves behind is what `used_bytes`
+    /// will count, so it has to be the size of the objects the store now holds
+    /// under the new identity.
     ///
     /// `f` runs on a copy, and the list is touched only once it has returned.
     /// A panic inside it therefore leaves the index exactly as it was, bytes
@@ -497,6 +550,26 @@ impl<K: EventIdentity> EventIndex<K> {
         key: K,
         f: impl FnOnce(&mut WarmEventEntry),
     ) -> bool {
+        self.reidentify_if(camera_id, key, |entry| {
+            f(entry);
+            true
+        })
+    }
+
+    /// [`reidentify`](Self::reidentify) for a mutation that decides, once it
+    /// has the entry in front of it, whether to happen at all — returning
+    /// `false` to leave the index exactly as it was.
+    ///
+    /// The decision has to be made *inside* the write lock, which is what this
+    /// exists for: the callers are repairs applied to an entry a concurrent
+    /// live write may have already made the repair unnecessary for, and a look
+    /// followed by a separate mutation can be overtaken between the two.
+    pub(crate) fn reidentify_if(
+        &self,
+        camera_id: &str,
+        key: K,
+        f: impl FnOnce(&mut WarmEventEntry) -> bool,
+    ) -> bool {
         let Some(lock) = self.cameras.get(camera_id) else {
             return false;
         };
@@ -506,9 +579,11 @@ impl<K: EventIdentity> EventIndex<K> {
                 return false;
             };
             let mut entry = entries[i].clone();
-            let old_size = entry.file_size;
-            f(&mut entry);
-            let new_size = entry.file_size;
+            let old_size = entry.stored_bytes();
+            if !f(&mut entry) {
+                return false;
+            }
+            let new_size = entry.stored_bytes();
             entries.remove(i);
             (old_size, new_size, Self::insert_locked(&mut entries, entry))
         };
@@ -518,7 +593,7 @@ impl<K: EventIdentity> EventIndex<K> {
         // refund.
         self.charge(
             new_size,
-            old_size.saturating_add(displaced.map_or(0, |e| e.file_size)),
+            old_size.saturating_add(displaced.map_or(0, |e| e.stored_bytes())),
         );
         true
     }
@@ -636,9 +711,19 @@ impl<K: EventIdentity> EventIndex<K> {
 /// reclaimed nothing, and is counted separately. Neither ends the pass: the
 /// events behind a poisoned one are the space this exists to reclaim.
 ///
-/// `cancel` is polled between events and never within one, so a shutdown cannot
-/// strip an event's metadata and leave the video behind (or the reverse) — see
-/// each backend's deletion ordering for why that matters.
+/// `cancel` is polled between events. It is deliberately *not* the only place a
+/// shutdown is noticed: one event can be several remote requests, and a flag
+/// read only here would leave all of them to run after it went up. A backend
+/// whose deletion is remote reads the flag between its own requests too and
+/// reports [`Removal::Abandoned`], which ends the pass from the inside — the
+/// entry stays, nothing is flagged, and nothing is counted, because a shutdown
+/// is not the store refusing.
+///
+/// What makes stopping mid-event safe is each backend's deletion *order*, not
+/// this poll: both are arranged so that whatever survives an interruption is
+/// something a later pass or a later start can finish, and never a video that
+/// has lost the record of what it is. See each backend's `remove`/`delete` for
+/// which way round it goes and why.
 pub(crate) async fn sweep_expired<K, F, Fut>(
     index: &EventIndex<K>,
     camera_id: &str,
@@ -670,6 +755,10 @@ where
                 outcome.failed += 1;
                 index.flag_delete_failed(camera_id, key);
             }
+            // The entry stays, unflagged and uncounted; the loop's own `cancel`
+            // would end the pass on the next turn anyway, and ending it here
+            // saves that turn.
+            Removal::Abandoned => break,
         }
     }
     outcome
@@ -740,11 +829,21 @@ pub(crate) struct EvictionPolicy {
 /// `tier_of` is asked rather than read off the entry because the remote backend
 /// evicts an event whose type it could not establish with the objects — the
 /// tier kept longest — where the entry's own `event_type` is only a placeholder.
+///
+/// `cancel` is the shutdown flag, polled between events exactly as
+/// [`sweep_expired`] polls it and for a stronger reason: this pass runs *ahead
+/// of a write*, on a camera's own writer task, which the drain is waiting on.
+/// A pass that kept evicting after the flag went up would spend the drain's
+/// budget deleting real stored footage to make room for an event the same
+/// shutdown is about to abandon unwritten. Local disk passes a predicate that
+/// never fires, which is the honest answer for a backend whose eviction is a
+/// handful of unlinks — see [`crate::storage::contract`]'s third guarantee.
 pub(crate) async fn evict_tiers<K, F, Fut>(
     index: &EventIndex<K>,
     policy: EvictionPolicy,
     tier_of: impl Fn(&str, &WarmEventEntry) -> EventType,
     mut satisfied: impl FnMut() -> bool,
+    mut cancel: impl FnMut() -> bool,
     mut remove: F,
 ) -> EmergencyOutcome
 where
@@ -765,7 +864,7 @@ where
         candidates.sort_by_key(|(_, e)| (e.delete_failed, e.start_pts_ns));
 
         for (camera_id, entry) in candidates {
-            if satisfied() {
+            if satisfied() || cancel() {
                 break 'tiers;
             }
             let key = K::of(&entry);
@@ -778,6 +877,9 @@ where
                         break 'tiers;
                     }
                 }
+                // Shutdown, part-way through this event: unflagged, uncounted,
+                // and the end of the pass.
+                Removal::Abandoned => break 'tiers,
                 Removal::Missing => {
                     index.remove(&camera_id, key);
                     outcome.missing += 1;
@@ -906,6 +1008,8 @@ mod tests {
             duration_ms,
             event_type,
             file_size: 0,
+            sidecar_bytes: 0,
+            thumbnail_bytes: 0,
             object_classes: Vec::new(),
             backend: None,
             model: None,
@@ -1161,6 +1265,71 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].file_size, 500);
         assert_eq!(index.used_bytes(), 500);
+    }
+
+    /// The shared sweep polls its cancel between events, which is what stops a
+    /// pass that was already under way when the flag went up. Both backends'
+    /// `prune` also check before the camera loop, so a sweep that starts
+    /// stopped never reaches this — which is exactly why it is pinned here,
+    /// against the skeleton, rather than only through a backend.
+    #[tokio::test]
+    async fn a_sweep_stops_between_events_when_it_is_cancelled_part_way() {
+        let index = index_with_cam();
+        let expired: Vec<WarmEventEntry> = (1..=4)
+            .map(|i| sized(entry(i * 1000, EventType::Movement, 500), 10))
+            .collect();
+        for e in expired.iter() {
+            index.insert("cam", e.clone());
+        }
+
+        // Runs on the second ask: one event is deleted, the rest are not.
+        let mut asked = 0;
+        let outcome = sweep_expired(
+            &index,
+            "cam",
+            expired,
+            || {
+                asked += 1;
+                asked > 1
+            },
+            |_| async { Removal::Deleted },
+        )
+        .await;
+
+        assert_eq!(outcome.deleted, 1);
+        assert_eq!(index.query("cam", 0, u64::MAX).len(), 3);
+    }
+
+    /// The same for the eviction pass, which runs ahead of a write on a
+    /// camera's own writer task — so a flag that goes up mid-pass has a drain
+    /// waiting behind it.
+    #[tokio::test]
+    async fn an_eviction_stops_between_events_when_it_is_cancelled_part_way() {
+        let index = index_with_cam();
+        for i in 1..=4 {
+            index.insert("cam", sized(entry(i * 1000, EventType::Movement, 500), 10));
+        }
+
+        let mut asked = 0;
+        let outcome = evict_tiers(
+            &index,
+            EvictionPolicy {
+                skip_failed: false,
+                stop_on_failure: true,
+                reason: "test",
+            },
+            |_, e| e.event_type,
+            || false,
+            || {
+                asked += 1;
+                asked > 1
+            },
+            |_, _| async { Removal::Deleted },
+        )
+        .await;
+
+        assert_eq!(outcome.deleted, 1);
+        assert_eq!(index.query("cam", 0, u64::MAX).len(), 3);
     }
 
     /// A panic in the closure leaves the index exactly as it was: the entry is
