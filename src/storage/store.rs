@@ -165,6 +165,10 @@ impl MotionStore {
             .and_then(|e| e.mask_jpeg.clone())
     }
 
+    /// Popping from the front is sound here, unlike in the detection store:
+    /// the analyzer inserts these itself, one per segment as it scores them, so
+    /// the deque is always ascending by sequence — which the mask trim below
+    /// relies on as well, taking the oldest entries by position.
     pub fn cleanup(&self, camera_id: &str, min_sequence: u64) {
         if let Some(lock) = self.cameras.get(camera_id) {
             let mut entries = lock.write_recover();

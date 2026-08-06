@@ -26,14 +26,35 @@
 //! assembled event, giant `.ts` files, and — for runs longer than the hot
 //! buffer — gaps as early segments age out before the run closes). When the
 //! open chunk reaches `max_event_duration`, the tracker closes it as a
-//! *complete, independently playable* event and immediately opens a follow-on
-//! chunk continuing the same run. Because chunks split on whole GOP segments,
-//! every chunk starts with PAT/PMT + keyframe and decodes on its own.
+//! *complete, independently playable* event — always at the cap, never later,
+//! because the buffer arithmetic in `config.rs` is derived from that span.
+//! Because chunks split on whole GOP segments, every chunk starts with
+//! PAT/PMT + keyframe and decodes on its own.
 //!
-//! Follow-on chunks are flagged [`ClosedRun::continues`]. They get no
-//! pre-padding: the barrier advances past the previous chunk, so assembly
-//! cannot reach back into it. The first chunk of a chain keeps normal
-//! pre-padding; the final chunk closes through the normal post-padding path.
+//! What happens next depends on the segment that crossed the cap, and this is
+//! the one rule the split obeys above all: **no chunk ever opens on padding.**
+//!
+//! - It carries motion: a follow-on chunk opens on it immediately, flagged
+//!   [`ClosedRun::continues`], and the run rolls on with no visible boundary.
+//! - It is padding: nothing opens. The run enters a *pending* state — alive,
+//!   because its quiet window has not elapsed, but with no chunk to put
+//!   segments in. Opening one there would produce an event holding nothing but
+//!   padding: footage of nothing, recorded and retained as if something had
+//!   happened in it.
+//!
+//! Padding that passes while a run is pending belongs to no event at all. That
+//! is the honest answer — it was only ever context for motion, and past the cap
+//! there is no motion left for it to be context *for*. If motion returns before
+//! the quiet window elapses, the follow-on opens on that motion segment and the
+//! chain continues; if the window elapses first, the run just ends, with the
+//! chunk the cap already closed as its last.
+//!
+//! Follow-on chunks cannot pre-pad into the chunk before them: the barrier
+//! advances past it as it closes. One that opened lazily, after a pending
+//! stretch, does get ordinary pre-padding back over that stretch — segments no
+//! event holds, sitting between the barrier and the returning motion, which is
+//! exactly what pre-padding is for. The first chunk of a chain keeps normal
+//! pre-padding; the last closes through the normal post-padding path.
 
 use std::time::{Duration, Instant};
 
@@ -41,17 +62,21 @@ use std::time::{Duration, Instant};
 /// assembly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ClosedRun {
-    /// Sequence of the first segment of this chunk. For the first chunk this is
-    /// the first motion-positive segment; for follow-on chunks it is the
-    /// segment that continued the run past the cap.
+    /// Sequence of the first segment of this chunk, motion-positive whichever
+    /// kind of chunk this is: the segment that opened the run, the motion
+    /// segment that carried it past the cap, or — when the cap crossed on
+    /// padding and left the run pending — the motion that returned inside the
+    /// quiet window and resumed it.
     pub first_motion_seq: u64,
     /// Sequence of the last segment included in the event (motion or
     /// post-padding).
     pub last_seq: u64,
-    /// Earliest sequence pre-padding may reach back to. Prevents the
-    /// pre-padding of this event from overlapping the previous event (or, for a
-    /// follow-on chunk, the previous chunk — which suppresses pre-padding
-    /// entirely).
+    /// Earliest sequence pre-padding may reach back to, which keeps this
+    /// event's pre-padding clear of the previous event or chunk. A follow-on
+    /// that opened at the cap boundary sits directly on that barrier and so
+    /// gets no pre-padding at all; one that opened later, on motion returning
+    /// after a pending stretch, may pre-pad back over the segments that stretch
+    /// left to no event.
     pub min_start_seq: u64,
     /// True when this chunk continues a previous chunk of the same motion run
     /// (produced by the duration cap). Drives the `"continues": true` sidecar
@@ -73,14 +98,37 @@ struct OpenRun {
     continues: bool,
 }
 
+/// Where a camera's motion run stands. The middle state is the one worth
+/// naming: a run can be alive with no chunk open, which is how the cap closes
+/// on a padding segment without inventing an event to hold the padding.
+enum State {
+    /// No run. The next motion segment opens one.
+    Idle,
+    /// A chunk is open and collecting segments.
+    Open(OpenRun),
+    /// The cap closed a chunk on a padding segment. The run is still alive —
+    /// its quiet window has not elapsed — but nothing is collecting segments,
+    /// so the padding passing meanwhile lands in no event. Motion returning
+    /// before the window elapses opens the follow-on on itself; otherwise the
+    /// run ends here, with the chunk the cap closed as its last.
+    Pending {
+        /// The last motion of the run, still counting the quiet window down.
+        last_motion_instant: Instant,
+    },
+}
+
 pub struct RunTracker {
     post_padding: Duration,
     /// Maximum wall-clock duration of a single event chunk. `Duration::ZERO`
     /// disables chunking (a run grows until motion stops).
     max_event_duration: Duration,
-    open: Option<OpenRun>,
+    state: State,
     /// One past the last segment of the previously closed run or chunk.
     barrier_seq: u64,
+    /// Identity of the current motion period — bumped every time a run opens
+    /// out of [`State::Idle`], never when a chunk rolls within one. See
+    /// [`motion_period`](Self::motion_period).
+    period: u64,
 }
 
 impl RunTracker {
@@ -88,27 +136,28 @@ impl RunTracker {
         Self {
             post_padding,
             max_event_duration,
-            open: None,
+            state: State::Idle,
             barrier_seq: 0,
+            period: 0,
         }
     }
 
     /// Feed one scored segment, observed at monotonic time `now`. Returns a
     /// `ClosedRun` when this segment ends an open run (post-padding elapsed) or
-    /// when it crosses the duration cap (the chunk closes and a follow-on opens
-    /// starting at `seq`).
+    /// when it crosses the duration cap — in which case it either starts the
+    /// follow-on itself (it carries motion) or leaves the run pending (it does
+    /// not).
     pub fn observe(&mut self, seq: u64, has_motion: bool, now: Instant) -> Option<ClosedRun> {
-        let (last_motion_instant, chunk_start_instant) = match self.open {
-            Some(ref run) => (run.last_motion_instant, run.chunk_start_instant),
-            None => {
+        let (last_motion_instant, chunk_start_instant) = match self.state {
+            State::Open(ref run) => (run.last_motion_instant, run.chunk_start_instant),
+            State::Pending {
+                last_motion_instant,
+            } => return self.observe_pending(seq, has_motion, now, last_motion_instant),
+            State::Idle => {
                 if has_motion {
-                    self.open = Some(OpenRun {
-                        first_motion_seq: seq,
-                        last_motion_instant: now,
-                        last_seq: seq,
-                        chunk_start_instant: now,
-                        continues: false,
-                    });
+                    // The one place a motion period begins.
+                    self.period += 1;
+                    self.open_chunk(seq, now, false);
                 }
                 return None;
             }
@@ -120,16 +169,22 @@ impl RunTracker {
             return self.close();
         }
 
-        // The segment belongs to the run. If the open chunk has reached the cap,
-        // close it as a complete event and continue this segment in a new chunk.
+        // The chunk has reached the cap, so it closes here whatever this
+        // segment is — its span must stay within the cap. Motion carries
+        // straight into a follow-on; padding leaves the run pending, because a
+        // chunk opened on padding could only ever hold padding.
         if !self.max_event_duration.is_zero()
             && now.saturating_duration_since(chunk_start_instant) >= self.max_event_duration
         {
-            return Some(self.chunk(seq, has_motion, now));
+            return Some(if has_motion {
+                self.chunk(seq, now)
+            } else {
+                self.suspend(last_motion_instant)
+            });
         }
 
         // Extend the current chunk with this segment.
-        if let Some(ref mut run) = self.open {
+        if let State::Open(ref mut run) = self.state {
             run.last_seq = seq;
             if has_motion {
                 run.last_motion_instant = now;
@@ -138,13 +193,59 @@ impl RunTracker {
         None
     }
 
-    /// Whether a run (or a chunk of one) is currently open. Compared before and
-    /// after [`observe`](Self::observe) to spot the physical start and end of
-    /// motion: the duration cap closes and reopens within a single call, so a
-    /// chunk boundary leaves this `true` throughout and is invisible to
-    /// consumers that only care about "is something moving".
+    /// One segment while the run is pending: the quiet window is still counting
+    /// down from the run's last motion, and nothing is collecting segments.
+    fn observe_pending(
+        &mut self,
+        seq: u64,
+        has_motion: bool,
+        now: Instant,
+        last_motion_instant: Instant,
+    ) -> Option<ClosedRun> {
+        if now.saturating_duration_since(last_motion_instant) > self.post_padding {
+            // The window elapsed with no motion, so the run is over — and it
+            // needs no closing, because the cap already closed its last chunk
+            // and advanced the barrier past it. This segment is then judged as
+            // if the tracker had been idle all along: motion on it starts a new
+            // run rather than continuing a dead one.
+            self.state = State::Idle;
+            return self.observe(seq, has_motion, now);
+        }
+        if has_motion {
+            // Motion inside the window: the chain continues, and the follow-on
+            // opens here — on the motion segment, never on the padding before
+            // it.
+            self.open_chunk(seq, now, true);
+        }
+        None
+    }
+
+    /// Which motion period is alive, or `None` when none is — the physical
+    /// "is something moving" the Home Assistant sensor mirrors, as opposed to
+    /// the event bookkeeping.
+    ///
+    /// Chunk boundaries do not change it: a run rolling at the cap, or pausing
+    /// pending between the cap and the motion that resumes it, is one period
+    /// throughout, and the sensor must not flicker at either. What does change
+    /// it is a period *ending* and another *beginning*, and the caller cannot
+    /// always see that as a change in liveness: a pending run whose window
+    /// elapses on a motion segment dies and is replaced inside a single
+    /// [`observe`](Self::observe), leaving a tracker that was alive before and
+    /// alive after with two distinct runs either side. Comparing this value
+    /// across the call is what separates the two — same number, nothing
+    /// happened; different number, one period ended and the next began, in
+    /// that order.
+    pub fn motion_period(&self) -> Option<u64> {
+        match self.state {
+            State::Idle => None,
+            State::Open(_) | State::Pending { .. } => Some(self.period),
+        }
+    }
+
+    /// Whether a run is alive — a chunk collecting segments, or one pending
+    /// between the cap and whatever comes next.
     pub fn is_open(&self) -> bool {
-        self.open.is_some()
+        self.motion_period().is_some()
     }
 
     /// Close an open run immediately (shutdown flush — no post-padding wait),
@@ -160,17 +261,38 @@ impl RunTracker {
     /// there are no motion scores or detections over the extension, which is
     /// the honest outcome — nothing looked at it.
     ///
+    /// A pending run has nothing to extend and nothing to close: its last chunk
+    /// is already sealed and written, and the only thing the flush could add is
+    /// an event made of the padding that followed it. So it is sealed as ended
+    /// and yields no run.
+    ///
     /// `None` extends nothing, which is every caller that is not the shutdown
     /// flush.
     pub fn flush(&mut self, through: Option<u64>) -> Option<ClosedRun> {
-        if let (Some(through), Some(run)) = (through, self.open.as_mut()) {
+        if let (Some(through), State::Open(run)) = (through, &mut self.state) {
             run.last_seq = run.last_seq.max(through);
         }
         self.close()
     }
 
+    /// Open a chunk on `seq`, which is always a motion segment.
+    fn open_chunk(&mut self, seq: u64, now: Instant, continues: bool) {
+        self.state = State::Open(OpenRun {
+            first_motion_seq: seq,
+            last_motion_instant: now,
+            last_seq: seq,
+            chunk_start_instant: now,
+            continues,
+        });
+    }
+
+    /// Close whatever chunk is open and go idle. A pending run has no chunk, so
+    /// this ends it without producing one.
     fn close(&mut self) -> Option<ClosedRun> {
-        let run = self.open.take()?;
+        let run = match std::mem::replace(&mut self.state, State::Idle) {
+            State::Open(run) => run,
+            State::Idle | State::Pending { .. } => return None,
+        };
         let closed = ClosedRun {
             first_motion_seq: run.first_motion_seq,
             last_seq: run.last_seq,
@@ -181,31 +303,26 @@ impl RunTracker {
         Some(closed)
     }
 
-    /// Close the current chunk at the duration cap and open a follow-on chunk
-    /// beginning at `seq`. The barrier advances past the closed chunk, so the
-    /// follow-on gets no pre-padding, and it is flagged `continues`.
-    fn chunk(&mut self, seq: u64, has_motion: bool, now: Instant) -> ClosedRun {
-        let prev = self.open.take().expect("chunk requires an open run");
-        let closed = ClosedRun {
-            first_motion_seq: prev.first_motion_seq,
-            last_seq: prev.last_seq,
-            min_start_seq: self.barrier_seq,
-            continues: prev.continues,
+    /// Close the current chunk at the duration cap and open its follow-on on
+    /// `seq`, the motion segment that crossed the cap. The barrier advances
+    /// past the closed chunk, so the follow-on cannot pre-pad back into it —
+    /// and, opening on the very next segment, gets no pre-padding at all.
+    fn chunk(&mut self, seq: u64, now: Instant) -> ClosedRun {
+        let closed = self.close().expect("chunk requires an open run");
+        self.open_chunk(seq, now, true);
+        closed
+    }
+
+    /// Close the current chunk at the duration cap without opening a follow-on:
+    /// the segment that crossed it is padding, and a chunk opened on padding
+    /// would hold nothing else. The run stays alive as [`State::Pending`], its
+    /// quiet window still counting down from `last_motion_instant`, and the
+    /// padding that passes until it elapses belongs to no event.
+    fn suspend(&mut self, last_motion_instant: Instant) -> ClosedRun {
+        let closed = self.close().expect("a cap crossing requires an open run");
+        self.state = State::Pending {
+            last_motion_instant,
         };
-        self.barrier_seq = prev.last_seq + 1;
-        self.open = Some(OpenRun {
-            first_motion_seq: seq,
-            // Preserve the last real motion time so the follow-on's post-padding
-            // countdown stays correct even if it opens on a padding segment.
-            last_motion_instant: if has_motion {
-                now
-            } else {
-                prev.last_motion_instant
-            },
-            last_seq: seq,
-            chunk_start_instant: now,
-            continues: true,
-        });
         closed
     }
 }
@@ -424,6 +541,154 @@ mod tests {
         assert_eq!(c.min_start_seq, 2);
         // Final chunk of a chain still carries continues (it continues B).
         assert!(c.continues);
+    }
+
+    /// The shape `config.rs` warns about and pins: a quiet window as wide as
+    /// the hot buffer, with a cap well under it. What makes that warning true
+    /// is the cap winning the race every time — a chunk holding motion is
+    /// assembled while its own footage is still resident. It only wins if it
+    /// fires on padding too: a chunk left open through the whole quiet window
+    /// would be older than the buffer when it finally closed, and the motion
+    /// inside it would have been evicted before assembly could reach it.
+    #[test]
+    fn the_cap_closes_a_motion_chunk_before_a_buffer_wide_quiet_window_can() {
+        const WIDE_POST: Duration = Duration::from_secs(600);
+        let mut t = RunTracker::new(WIDE_POST, CAP);
+        let t0 = base();
+        assert_eq!(t.observe(0, true, t0), None);
+        assert_eq!(t.observe(1, true, t0 + Duration::from_secs(30)), None);
+        assert_eq!(t.observe(2, false, t0 + Duration::from_secs(60)), None);
+        // 480s of quiet window still to run, and the chunk closes anyway — at
+        // the cap, with every segment in it younger than the cap.
+        let closed = t.observe(3, false, t0 + CAP).unwrap();
+        assert_eq!(
+            closed,
+            ClosedRun {
+                first_motion_seq: 0,
+                last_seq: 2,
+                min_start_seq: 0,
+                continues: false,
+            }
+        );
+        // The run is pending, not finished: motion has not been quiet long
+        // enough to end it.
+        assert!(t.is_open());
+    }
+
+    /// The cap closing on padding must not open a follow-on to put that padding
+    /// in. Such an event holds no motion at all — footage of nothing, recorded
+    /// and retained as if something had happened in it. The padding belongs to
+    /// no event, and the run ends with the chunk the cap closed as its last.
+    #[test]
+    fn padding_past_the_cap_never_opens_a_motionless_follow_on() {
+        let mut t = RunTracker::new(POST, CAP);
+        let t0 = base();
+        let last_motion = t0 + CAP - Duration::from_secs(2);
+        assert_eq!(t.observe(0, true, t0), None);
+        assert_eq!(t.observe(1, true, last_motion), None);
+        // The cap crosses on padding: the chunk closes here, nothing opens.
+        let closed = t.observe(2, false, t0 + CAP).unwrap();
+        assert_eq!(closed.last_seq, 1);
+        assert!(!closed.continues);
+        // Padding keeps arriving inside the quiet window and lands nowhere.
+        assert_eq!(t.observe(3, false, t0 + CAP + Duration::from_secs(1)), None);
+        assert_eq!(t.observe(4, false, t0 + CAP + Duration::from_secs(5)), None);
+        // The window elapses: the run ends without a second event.
+        assert_eq!(
+            t.observe(5, false, last_motion + POST + Duration::from_nanos(1)),
+            None
+        );
+        assert!(!t.is_open());
+        assert_eq!(t.flush(None), None);
+    }
+
+    /// Motion returning inside the quiet window is the same run: the follow-on
+    /// opens on that motion segment and carries `continues`. Its pre-padding
+    /// may reach back over the segments no chunk took — that is what
+    /// pre-padding is — but not into the chunk the cap closed, which the
+    /// barrier still guards.
+    #[test]
+    fn motion_returning_after_a_cap_on_padding_continues_the_chain() {
+        let mut t = RunTracker::new(POST, CAP);
+        let t0 = base();
+        assert_eq!(t.observe(0, true, t0), None);
+        assert_eq!(t.observe(1, true, t0 + CAP - Duration::from_secs(2)), None);
+        assert_eq!(t.observe(2, false, t0 + CAP).unwrap().last_seq, 1);
+        assert_eq!(t.observe(3, false, t0 + CAP + Duration::from_secs(1)), None);
+        // Still inside the window: this opens the follow-on, on seq 4.
+        assert_eq!(t.observe(4, true, t0 + CAP + Duration::from_secs(2)), None);
+        let follow = t.flush(None).unwrap();
+        assert_eq!(follow.first_motion_seq, 4);
+        assert_eq!(follow.min_start_seq, 2);
+        assert!(follow.continues);
+    }
+
+    /// A pending run whose window elapses is simply over. Motion after that is
+    /// a new run — chaining it onto a run that ended while nothing was
+    /// recording would claim a continuity that does not exist.
+    #[test]
+    fn a_pending_run_ends_when_its_window_elapses_and_later_motion_starts_a_new_one() {
+        let mut t = RunTracker::new(POST, CAP);
+        let t0 = base();
+        let last_motion = t0 + CAP - Duration::from_secs(2);
+        t.observe(0, true, t0);
+        t.observe(1, true, last_motion);
+        assert!(t.observe(2, false, t0 + CAP).is_some());
+        assert!(t.is_open());
+        assert_eq!(
+            t.observe(3, true, last_motion + POST + Duration::from_secs(1)),
+            None
+        );
+        let fresh = t.flush(None).unwrap();
+        assert_eq!(fresh.first_motion_seq, 3);
+        assert_eq!(fresh.min_start_seq, 2);
+        assert!(!fresh.continues);
+    }
+
+    /// The shutdown flush has nothing to close on a pending run: its last chunk
+    /// is sealed and written, and the only event left to make would be one of
+    /// pure padding. Extending it through unscored footage would make that
+    /// event longer, not truer.
+    #[test]
+    fn the_shutdown_flush_seals_a_pending_run_without_writing_padding() {
+        let mut t = RunTracker::new(POST, CAP);
+        let t0 = base();
+        t.observe(0, true, t0);
+        t.observe(1, true, t0 + CAP - Duration::from_secs(2));
+        assert!(t.observe(2, false, t0 + CAP).is_some());
+        assert_eq!(t.flush(Some(99)), None);
+        assert!(!t.is_open());
+    }
+
+    /// The period is the physical motion, not the event bookkeeping: rolling a
+    /// chunk at the cap and pausing pending on padding both leave it alone,
+    /// while a pending run dying and another opening in its place changes it —
+    /// which is the only way the caller can tell those two runs apart, since
+    /// the tracker is alive on both sides of that single call.
+    #[test]
+    fn the_motion_period_changes_only_when_one_run_gives_way_to_another() {
+        let mut t = RunTracker::new(POST, CAP);
+        let t0 = base();
+        assert_eq!(t.motion_period(), None);
+        t.observe(0, true, t0);
+        let first = t.motion_period().expect("a run is open");
+        // A cap boundary with motion: same period.
+        assert!(t.observe(1, true, t0 + CAP).is_some());
+        assert_eq!(t.motion_period(), Some(first));
+        // A cap boundary on padding, leaving the run pending: same period.
+        let last_motion = t0 + CAP + CAP - Duration::from_secs(2);
+        assert_eq!(t.observe(2, true, last_motion), None);
+        assert!(t.observe(3, false, t0 + CAP + CAP).is_some());
+        assert_eq!(t.motion_period(), Some(first));
+        // The window elapses on a motion segment: that run ends and another
+        // begins inside the one call, and only the period says so.
+        let resumed = last_motion + POST + Duration::from_secs(1);
+        t.observe(4, true, resumed);
+        assert!(t.is_open());
+        assert_ne!(t.motion_period(), Some(first));
+        // Post-padding elapsing ends the period outright.
+        t.observe(5, false, resumed + POST + Duration::from_nanos(1));
+        assert_eq!(t.motion_period(), None);
     }
 
     #[test]

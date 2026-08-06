@@ -311,16 +311,19 @@ pre_padding_secs = 5
 # above it camon warns and keeps recording, and the cost depends on the cap,
 # since a chunk closes on whichever comes first. No cap: the run's own segments
 # are always evicted first — every event. A cap under hot_duration_secs: the
-# cap wins every race, so nothing is lost to the quiet window and each run just
-# ends in up to post_padding_secs of padding-only chunks. A cap at or above it
-# (legal here): any chunk that holds motion is a whole buffer old when it
-# closes, so it loses its oldest footage — a padding-only follow-on can close
-# young and lose nothing. Any event that loses its head is still written, and
-# logged as "the event's head was already evicted".
+# cap wins every race, so nothing is lost to the quiet window, and the cost is
+# the tail — a run keeps the quiet only up to its chunk's next cap boundary,
+# and the rest is recorded nowhere. A cap at or above it (legal here): every
+# chunk is a whole buffer old when it closes, so it loses its oldest footage,
+# and since no chunk opens on padding that footage is always motion. Any event
+# that loses its head is still written, and logged as "the event's head was
+# already evicted".
 post_padding_secs = 10
 # Cap on a single event's length in seconds (default: 120). Longer runs are
 # split into chained, independently playable chunks (follow-ons flagged
-# "continues"). In continuous mode this is the length of each chunk. A recording
+# "continues"), and a chunk never opens on padding: if the cap falls in a run's
+# quiet tail, the chunk closes there and the next one waits for motion to come
+# back. In continuous mode this is the length of each chunk. A recording
 # must fit inside buffer.hot_duration_secs: cap + pre_padding_secs with analytics
 # on (a warning), the cap alone in continuous mode (an error). 0 disables
 # chunking — fine with analytics on, rejected in continuous mode.

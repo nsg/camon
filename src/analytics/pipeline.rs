@@ -1335,26 +1335,12 @@ impl MotionAnalyzer {
                 crop,
                 motion_rects,
             } = analysis;
-            // The physical motion period, as opposed to the event chunking:
-            // the duration cap closes one chunk and opens the next inside a
-            // single `observe`, so a chunk boundary leaves the tracker open
-            // and produces no MQTT transition.
-            let was_open = self.run_tracker.is_open();
             // Whatever has accumulated belongs to the run that just closed:
             // this batch's own frames are extracted later, in
             // `process_motion_runs`.
-            if let Some(run) = self.run_tracker.observe(seg.seq, has_motion, now) {
+            if let Some(run) = self.observe_run(seg.seq, has_motion, now) {
                 let filmstrip = self.run_filmstrip.take();
                 closed_runs.push((run, filmstrip));
-            }
-            match (was_open, self.run_tracker.is_open()) {
-                (false, true) => self.send_motion_event(MqttEvent::MotionStart {
-                    camera_id: self.camera_id.clone(),
-                }),
-                (true, false) => self.send_motion_event(MqttEvent::MotionEnd {
-                    camera_id: self.camera_id.clone(),
-                }),
-                _ => {}
             }
 
             if has_motion {
@@ -1483,6 +1469,42 @@ impl MotionAnalyzer {
         }
     }
 
+    /// Feed one scored segment to the run tracker and send whatever the motion
+    /// sensor owes as a result, returning the chunk that closed (if any) for
+    /// the caller to emit.
+    ///
+    /// The sensor tracks the *physical* motion period, which is not the same
+    /// question as "did a chunk close" and cannot be read off the tracker's
+    /// liveness alone. Two shapes make that concrete, and both are why this
+    /// compares [`RunTracker::motion_period`] rather than `is_open`:
+    ///
+    /// - The cap rolls a chunk, or suspends one on padding. A chunk closed and
+    ///   perhaps another opened, but nothing physically stopped moving, and the
+    ///   period is the same on both sides — so the sensor hears nothing.
+    /// - A pending run's quiet window elapses on a motion segment. The old run
+    ///   dies and a new one opens inside that single call, so the tracker is
+    ///   alive before and alive after while the runs either side are strangers
+    ///   to each other. Two periods, in order: the old one ended, then the new
+    ///   one began, and the sensor is told both. Inferring from liveness would
+    ///   fuse them into one and leave Home Assistant showing continuous motion
+    ///   across a gap that the events themselves report as separate.
+    fn observe_run(&mut self, seq: u64, has_motion: bool, now: Instant) -> Option<ClosedRun> {
+        let before = self.run_tracker.motion_period();
+        let closed = self.run_tracker.observe(seq, has_motion, now);
+        let after = self.run_tracker.motion_period();
+        if before.is_some() && before != after {
+            self.send_motion_event(MqttEvent::MotionEnd {
+                camera_id: self.camera_id.clone(),
+            });
+        }
+        if after.is_some() && before != after {
+            self.send_motion_event(MqttEvent::MotionStart {
+                camera_id: self.camera_id.clone(),
+            });
+        }
+        closed
+    }
+
     /// Hand a motion transition to the MQTT bridge. This runs on the blocking
     /// analyzer thread, so it must never await: a full or closed queue drops
     /// the event rather than stalling motion detection.
@@ -1506,6 +1528,7 @@ impl MotionAnalyzer {
     /// protect. The analysis ends early; the recording does not.
     fn flush_open_run(&mut self) {
         let through = self.buffer.read_recover().last_sequence().checked_sub(1);
+        let was_moving = self.run_tracker.motion_period().is_some();
         if let Some(run) = self.run_tracker.flush(through) {
             tracing::info!(
                 camera = %self.camera_id,
@@ -1514,10 +1537,18 @@ impl MotionAnalyzer {
             );
             let filmstrip = self.run_filmstrip.take();
             self.emit_event(run, filmstrip);
-            // The run never saw its post-padding close, so nothing else would
-            // clear the motion sensor. The bridge restates every entity on its
-            // next connect, but that only helps if camon comes back — and it
-            // leaves HA holding movement until it does.
+        }
+        // The run never saw its post-padding close, so nothing else would clear
+        // the motion sensor. The bridge restates every entity on its next
+        // connect, but that only helps if camon comes back — and it leaves HA
+        // holding movement until it does.
+        //
+        // Driven off the period, not off the flush returning something: a run
+        // suspended pending by the cap has no chunk left to write and flushes
+        // nothing, while the sensor it turned on is still on. That shape —
+        // shutdown inside the quiet window of a run longer than the cap — is
+        // exactly when restarts and upgrades sample a busy camera.
+        if was_moving {
             self.send_motion_event(MqttEvent::MotionEnd {
                 camera_id: self.camera_id.clone(),
             });
@@ -3460,6 +3491,103 @@ mod tests {
         analyzer.last_processed = analyzed_through + 1;
         analyzer.observed_sequences = true;
         (analyzer, registry, buffer, tx, rx)
+    }
+
+    /// An analyzer wired to a motion sensor and nothing else. These tests feed
+    /// the run tracker straight through [`MotionAnalyzer::observe_run`], the
+    /// one place segments reach it in production, so the sensor's view of a
+    /// camera is pinned without a decoder in the way.
+    fn analyzer_with_a_motion_sensor(
+        dir: &std::path::Path,
+    ) -> (MotionAnalyzer, tokio::sync::mpsc::Receiver<MqttEvent>) {
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        let mut ctx = test_context("cam", dir);
+        ctx.mqtt_tx = Some(tx);
+        (MotionAnalyzer::with_decoder(ctx, FrameDecoder::dead()), rx)
+    }
+
+    fn sensor_events(rx: &mut tokio::sync::mpsc::Receiver<MqttEvent>) -> Vec<&'static str> {
+        let mut seen = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            seen.push(match event {
+                MqttEvent::MotionStart { .. } => "start",
+                MqttEvent::MotionEnd { .. } => "end",
+                _ => "other",
+            });
+        }
+        seen
+    }
+
+    /// Shutdown inside the quiet window of a run longer than the cap: the cap
+    /// suspended the run on a padding segment, so its last chunk is already
+    /// written and the flush has nothing to return. The motion sensor is still
+    /// on all the same, and the shutdown flush is the last chance to clear it —
+    /// gate that on the flush returning an event and Home Assistant shows
+    /// movement until camon comes back, which is the leak the whole drain
+    /// exists to close.
+    #[test]
+    fn the_shutdown_flush_clears_the_sensor_for_a_run_that_was_only_pending() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut analyzer, mut rx) = analyzer_with_a_motion_sensor(dir.path());
+        let t0 = Instant::now();
+        let cap = Duration::from_secs(120);
+        analyzer.observe_run(0, true, t0);
+        analyzer.observe_run(1, true, t0 + cap - Duration::from_secs(2));
+        // The cap crosses on padding: the chunk closes, the run stays pending.
+        assert!(analyzer.observe_run(2, false, t0 + cap).is_some());
+        assert_eq!(
+            sensor_events(&mut rx),
+            vec!["start"],
+            "the cap boundary is event bookkeeping and must not touch the sensor"
+        );
+
+        analyzer.flush_open_run();
+        assert_eq!(sensor_events(&mut rx), vec!["end"]);
+    }
+
+    /// A pending run whose window elapses on a motion segment dies and is
+    /// replaced inside one call. Two physically separate motion periods, with a
+    /// real gap between them that the events themselves report (the new run is
+    /// not a continuation) — so the sensor must go off and on again, in that
+    /// order. Read off liveness alone the tracker looks open throughout and the
+    /// two fuse into one uninterrupted movement.
+    #[test]
+    fn a_run_replaced_after_its_window_elapses_ends_the_sensor_before_starting_it_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut analyzer, mut rx) = analyzer_with_a_motion_sensor(dir.path());
+        let t0 = Instant::now();
+        let cap = Duration::from_secs(120);
+        let post = Duration::from_secs(10);
+        let last_motion = t0 + cap - Duration::from_secs(2);
+        analyzer.observe_run(0, true, t0);
+        analyzer.observe_run(1, true, last_motion);
+        assert!(analyzer.observe_run(2, false, t0 + cap).is_some());
+        assert_eq!(sensor_events(&mut rx), vec!["start"]);
+
+        // Motion again, past the quiet window: a new run, not a continuation.
+        assert_eq!(
+            analyzer.observe_run(3, true, last_motion + post + Duration::from_secs(1)),
+            None
+        );
+        assert_eq!(sensor_events(&mut rx), vec!["end", "start"]);
+    }
+
+    /// The ordinary cap boundary — motion straight through it — closes a chunk
+    /// and opens its follow-on with nothing physically changing. The sensor
+    /// must not hear about it, then or when the run finally ends.
+    #[test]
+    fn a_cap_boundary_in_the_middle_of_motion_is_silent_on_the_sensor() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut analyzer, mut rx) = analyzer_with_a_motion_sensor(dir.path());
+        let t0 = Instant::now();
+        let cap = Duration::from_secs(120);
+        let post = Duration::from_secs(10);
+        analyzer.observe_run(0, true, t0);
+        assert!(analyzer.observe_run(1, true, t0 + cap).is_some());
+        assert_eq!(sensor_events(&mut rx), vec!["start"]);
+
+        analyzer.observe_run(2, false, t0 + cap + post + Duration::from_secs(1));
+        assert_eq!(sensor_events(&mut rx), vec!["end"]);
     }
 
     fn person() -> crate::storage::Verdict {

@@ -209,15 +209,17 @@ pre_padding_secs = 5
 #   * cap 0 — the quiet window is the only close there is, so the run's own
 #     footage is always gone by then: every event holds nothing but padding.
 #   * cap below hot_duration_secs — the cap always wins the race, so every
-#     chunk holding motion is written while its footage is still in the buffer.
-#     Nothing is lost to the quiet window; the cost is that each run ends in up
-#     to post_padding seconds of padding-only chunks (how many depends on where
-#     motion stopped relative to the next cap boundary).
+#     chunk is written while its footage is still in the buffer. Nothing is
+#     lost to the quiet window; the cost is the tail, since no chunk opens on
+#     padding: a run keeps the quiet only as far as its last chunk's cap
+#     boundary (anywhere from nothing to a full cap, depending on where motion
+#     stopped) and the rest of the window is recorded nowhere.
 #   * cap at or above hot_duration_secs — allowed here, unlike continuous mode,
-#     and it does lose footage: a chunk holding motion is at least
-#     hot_duration_secs old whichever way the race goes, so its oldest segments
-#     have been evicted. The chunk a run opens with loses the motion it opened
-#     on; later chunks lose as much as their motion is old.
+#     and it does lose footage: a chunk is at least hot_duration_secs old
+#     whichever way the race goes, so its oldest segments have been evicted.
+#     Every chunk opens on motion, so what it loses is motion — the run's first
+#     chunk loses the motion it opened on, later chunks as much as theirs is
+#     old.
 # Whenever an event does lose its head the write is still made and the log says
 # so: "the event's head was already evicted", with the number of segments lost.
 # Below the threshold the same loss is still possible but depends on how long
@@ -226,7 +228,9 @@ pre_padding_secs = 5
 post_padding_secs = 10
 # Cap on a single event's length in seconds (default: 120). A run longer than
 # this is split into chained, independently playable chunks — the follow-on
-# chunks are flagged "continues" in their sidecar. In continuous mode this is
+# chunks are flagged "continues" in their sidecar. A chunk never opens on
+# padding: when the cap falls in a run's quiet tail the chunk closes there and
+# the next one waits for motion to come back. In continuous mode this is
 # also the length of each recording chunk. A recording must fit inside
 # buffer.hot_duration_secs above, or its oldest segments are evicted before it
 # can be written. With analytics enabled that means max_event_duration_secs +

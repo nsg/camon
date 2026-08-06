@@ -1059,22 +1059,25 @@ impl Config {
                         // below may be reporting a loss of its own in the very
                         // next line, by a mechanism this one says nothing about.
                         //
-                        // The cost is the tail. The quiet window still has to
-                        // elapse before the run ends, and the cap keeps slicing
-                        // chunks the whole way; how many of them hold nothing
-                        // but padding depends on where motion stopped relative
-                        // to the next cap boundary — anywhere from none to the
-                        // whole window, hence "up to".
+                        // The cost is the tail. Motion stopping does not end the
+                        // run — the quiet window still has to elapse — but the
+                        // chunk it stopped in closes at the next cap boundary,
+                        // and no chunk opens on padding, so the quiet after
+                        // that boundary is recorded nowhere. How much trailing
+                        // context a run keeps is where motion stopped relative
+                        // to the boundary: anywhere from nothing to a full cap,
+                        // never the {post}s the setting names.
                         tracing::warn!(
                             post_padding_secs = post,
                             hot_duration_secs = hot,
                             cap,
                             "[storage] post_padding_secs ({post}) is not shorter than [buffer] \
-                             hot_duration_secs ({hot}): the {cap}s cap closes every chunk that \
-                             holds motion well inside the buffer, so nothing is lost to the \
-                             quiet window — but each motion run then ends in up to ~{post}s of \
-                             padding-only chunks while that window elapses. Lower \
-                             post_padding_secs — it is 10 unless you set it"
+                             hot_duration_secs ({hot}): the {cap}s cap closes every chunk while \
+                             its footage is still in the buffer, so nothing is lost to the quiet \
+                             window — but the quiet past a run's last chunk is recorded nowhere, \
+                             so this buys at most {cap}s of trailing context while still taking \
+                             up to ~{post}s to end the run. Lower post_padding_secs — it is 10 \
+                             unless you set it"
                         );
                     } else {
                         // `cap >= hot` is legal in event mode (only continuous
@@ -1083,11 +1086,12 @@ impl Config {
                         // `min(cap, e + post)`, and with both `cap` and `post`
                         // at least `hot` that is at least `hot` however the race
                         // goes — so by the time the chunk is assembled its
-                        // oldest segments have been evicted. The run's first
-                        // chunk opens *on* motion, so what it loses is motion;
-                        // a later chunk opens whenever the previous one rolled,
-                        // so how much of its motion survives depends on where in
-                        // the chunk that motion falls.
+                        // oldest segments have been evicted. Every chunk opens
+                        // *on* motion (the first on the motion that started the
+                        // run, a follow-on on the motion that carried it past
+                        // the cap or returned inside the quiet window), so what
+                        // is evicted is always motion, and there is no
+                        // cheap-to-lose chunk anywhere in the chain.
                         //
                         // The span rule below always fires too (`cap + pre` is
                         // at least `cap`, so at least `hot`), and the two do not
@@ -1101,12 +1105,11 @@ impl Config {
                             cap,
                             "[storage] post_padding_secs ({post}) is not shorter than [buffer] \
                              hot_duration_secs ({hot}), and neither is the {cap}s cap: whichever \
-                             of them closes a chunk that holds motion, that chunk is at least \
-                             {hot}s old by then, so its oldest footage has already been evicted \
-                             (\"{evicted_head}\" at runtime; a follow-on holding only padding \
-                             can close young and lose nothing). The chunk a run opens with loses the \
-                             motion it opened on; how much later chunks lose depends on where \
-                             their motion falls. Bring max_event_duration_secs under \
+                             of them closes a chunk, that chunk is at least {hot}s old by then, \
+                             so its oldest footage has already been evicted (\"{evicted_head}\" \
+                             at runtime). No chunk escapes it, because none opens on padding — \
+                             every one of them holds motion, and the motion it opened on is \
+                             exactly what it loses. Bring max_event_duration_secs under \
                              hot_duration_secs, and lower post_padding_secs — it is 10 unless \
                              you set it"
                         );
@@ -1478,11 +1481,12 @@ impl Config {
 
 /// The span of an event that will not fit in the hot buffer, or `None` when it
 /// fits. Only `pre` widens an event — it reaches back before the first motion
-/// segment at assembly time — while post-padding cannot, because
-/// `RunTracker::observe` tests the post-padding close before the cap, so a
-/// chunk still ends at the cap. The comparison is strict because both the
-/// recorder's tick and segment rounding overshoot slightly; with integer
-/// seconds that leaves at least a second of slack.
+/// segment at assembly time — while post-padding cannot: a chunk ends at the
+/// cap whatever the segment that crosses it is, since padding there closes the
+/// chunk and leaves the run pending rather than extending it. So the padding a
+/// chunk carries is padding *inside* the cap. The comparison is strict because
+/// both the recorder's tick and segment rounding overshoot slightly; with
+/// integer seconds that leaves at least a second of slack.
 fn event_span_overrun(cap: u64, pre: u64, hot: u64) -> Option<u64> {
     let total = cap.saturating_add(pre);
     (total >= hot).then_some(total)
@@ -2820,7 +2824,8 @@ url = "rtsp://10.0.0.5:554/stream1"
     ///   event, and the runtime warning follows every one of them.
     /// - a cap under the buffer: the cap always wins the race, so every chunk
     ///   holding motion is assembled while its footage is resident — nothing is
-    ///   lost *to this mechanism*, and the cost is a padding-only tail.
+    ///   lost *to this mechanism*, and the cost is a trailing quiet that no
+    ///   chunk records.
     /// - a cap at or above the buffer (legal in event mode): a motion-bearing
     ///   chunk closes at `min(cap, e + post)`, which is at least a buffer's
     ///   worth of time however the race goes, so footage is lost again.
@@ -2848,17 +2853,21 @@ url = "rtsp://10.0.0.5:554/stream1"
         );
 
         // A cap under the buffer wins the race every time, so nothing is
-        // evicted and no runtime warning fires — the cost is a padding-only
-        // tail, and the size of it depends on where motion stopped. 599 is the
-        // last cap that is safe here, and the boundary is pinned rather than a
-        // comfortable value, because the whole point of the split is where it
-        // falls.
+        // evicted and no runtime warning fires — the cost is the trailing quiet
+        // past a run's last chunk, which nothing records, and how much context
+        // survives depends on where motion stopped. 599 is the last cap that is
+        // safe here, and the boundary is pinned rather than a comfortable
+        // value, because the whole point of the split is where it falls.
         for cap in [120, 599] {
             let written = warnings_from(&event_mode(600, cap));
-            assert!(written.contains("padding-only"), "cap {cap}: {written}");
+            assert!(written.contains("recorded nowhere"), "cap {cap}: {written}");
+            assert!(
+                written.contains(&format!("at most {cap}s of trailing context")),
+                "cap {cap} promises the padding the setting names: {written}"
+            );
             assert!(
                 written.contains("up to ~600s"),
-                "cap {cap} states the tail as a certainty: {written}"
+                "cap {cap} states the wait as a certainty: {written}"
             );
             assert!(
                 !written.contains("every event"),
@@ -2904,9 +2913,20 @@ url = "rtsp://10.0.0.5:554/stream1"
                 "cap {cap} overclaims: {written}"
             );
             assert!(
-                !written.contains("padding-only"),
+                !written.contains("recorded nowhere"),
                 "cap {cap} claims the safe shape's cost: {written}"
             );
+            // The escape hatch this line used to offer — a follow-on holding
+            // only padding, closing young and losing nothing — described a
+            // chunk that cannot exist any more, because none opens on padding.
+            // Every chunk here holds motion and every one of them loses its
+            // head, so any wording that offers a cheap chunk is false.
+            for absolution in ["only padding", "lose nothing", "loses nothing"] {
+                assert!(
+                    !written.contains(absolution),
+                    "cap {cap} offers a chunk that loses nothing: {written}"
+                );
+            }
         }
 
         // The ordinary shape of the same pair says nothing at all.
@@ -2940,12 +2960,12 @@ url = "rtsp://10.0.0.5:554/stream1"
         // padding is ordinary.
         let written = warnings_from(&event_mode(10, 595, 5));
         assert!(written.contains("max_event_duration_secs"), "{written}");
-        assert!(!written.contains("padding-only"), "{written}");
+        assert!(!written.contains("recorded nowhere"), "{written}");
         assert_eq!(written.matches("WARN").count(), 1, "{written}");
 
         // The padding alone: the span fits.
         let written = warnings_from(&event_mode(600, 120, 5));
-        assert!(written.contains("padding-only"), "{written}");
+        assert!(written.contains("recorded nowhere"), "{written}");
         assert_eq!(written.matches("WARN").count(), 1, "{written}");
 
         // Both, with the cap under the buffer: neither hides the other, because
@@ -2954,7 +2974,7 @@ url = "rtsp://10.0.0.5:554/stream1"
         // is saying footage is lost, and both are true of their own mechanism.
         let written = warnings_from(&event_mode(600, 595, 5));
         assert!(
-            written.contains("padding-only"),
+            written.contains("recorded nowhere"),
             "no padding warning: {written}"
         );
         assert!(
@@ -2982,6 +3002,9 @@ url = "rtsp://10.0.0.5:554/stream1"
             "the span warning was swallowed: {written}"
         );
         assert!(!written.contains("nothing is lost"), "{written}");
+        // Nor the old absolution for a padding-only follow-on, which is not a
+        // thing that can be written any more.
+        assert!(!written.contains("only padding"), "{written}");
         assert_eq!(written.matches("WARN").count(), 2, "{written}");
     }
 
