@@ -478,10 +478,6 @@ struct MpegTsSegmenter {
     partial_packet: Vec<u8>,
     current_media_pts: Option<u64>,
     prev_media_pts: Option<u64>,
-    /// PES starts on the video PID inside the segment being filled. Two of them
-    /// mean its first frame is complete, which is what an end-of-stream flush
-    /// needs to know.
-    video_pes_starts: u32,
     last_segment_at: Instant,
     counts: StreamCounts,
     started: Instant,
@@ -507,7 +503,6 @@ impl MpegTsSegmenter {
             partial_packet: Vec::with_capacity(188),
             current_media_pts: None,
             prev_media_pts: None,
-            video_pes_starts: 0,
             last_segment_at: Instant::now(),
             counts: StreamCounts::default(),
             started: Instant::now(),
@@ -537,8 +532,17 @@ impl MpegTsSegmenter {
             }
 
             // Poll with timeout so we can check the shutdown flag
-            if !poll_readable(fd, 500) {
-                continue;
+            match poll_readable(fd, 500) {
+                Readiness::Readable => {}
+                Readiness::Timeout => continue,
+                // The descriptor hung up, errored, or is no longer a
+                // descriptor at all. Reported as the end of the stream, like
+                // the zero-length read below, because that is what it is —
+                // and it routes to the same full diagnosis. (The old code
+                // reached that diagnosis too, through the read the error bits
+                // provoked; what classification buys is the honest path there,
+                // not an escape from a spin the read already broke.)
+                Readiness::Ended => return Err(self.failure(RunEnd::Eof)),
             }
             let n = reader.read(&mut buf)?;
             if n == 0 {
@@ -564,8 +568,16 @@ impl MpegTsSegmenter {
     /// unterminated tail. Below that the segment holds a fragment of a keyframe
     /// and nothing can be decoded from it, so it is dropped rather than left in
     /// the buffer for the analyzer and the player to choke on.
+    ///
+    /// "A second frame started" is exactly what the open segment's frame count
+    /// reads, so it is read from there rather than tallied a second time
+    /// alongside it.
     fn flush_end_of_stream(&mut self) {
-        if self.video_pes_starts < 2 {
+        let frames_started = self
+            .current_segment
+            .as_ref()
+            .map_or(0, |open| open.segment.frame_count);
+        if frames_started < 2 {
             return;
         }
         self.finalize_segment(Instant::now());
@@ -688,18 +700,19 @@ impl MpegTsSegmenter {
         // Append packet to current segment
         if let Some(ref mut open) = self.current_segment {
             self.current_data.extend_from_slice(packet);
-            if Some(pid) == self.video_pid {
+            // Frames, not packets. One video frame is one PES packet spread
+            // over dozens of TS packets, and only its first carries the
+            // payload_unit_start_indicator — counting every packet on the
+            // video PID inflates the count by however many packets a frame
+            // happens to take.
+            if Some(pid) == self.video_pid && pusi {
                 open.segment.frame_count += 1;
-                if pusi {
-                    self.video_pes_starts += 1;
-                }
             }
         }
     }
 
     fn start_segment(&mut self, pts_ns: u64, opened_at: Instant) {
         let segment = GopSegment::new(pts_ns);
-        self.video_pes_starts = 0;
 
         // Prepend PAT and PMT for segment independence
         // Reset continuity counters to 0 for clean segment start
@@ -732,8 +745,32 @@ impl MpegTsSegmenter {
             // Wrap the accumulated bytes once; readers share via Arc clone.
             // Drop the Vec's growth slack first — the segment lives in the
             // hot buffer for minutes, so excess capacity is held that long.
+            //
+            // What goes on filling is a buffer sized to the GOP just closed,
+            // not an empty one: taking the Vec leaves capacity zero behind, so
+            // every GOP regrew from nothing through some twenty reallocations,
+            // each copying everything accumulated so far. The trade is one
+            // allocation per GOP against those, at the cost of holding one
+            // GOP's worth of empty bytes per camera between GOPs — memory the
+            // buffer reaches anyway a moment later while filling. The estimate
+            // is only as good as the last GOP: the first of a connection still
+            // grows from zero, and a GOP bigger than its predecessor regrows
+            // over the gap. Nothing is pinned at a peak, though — an outsized
+            // estimate is given back at the very next finalize.
+            let next_capacity = self.current_data.len();
             self.current_data.shrink_to_fit();
-            segment.data = Arc::new(std::mem::take(&mut self.current_data));
+            segment.data = Arc::new(std::mem::replace(
+                &mut self.current_data,
+                Vec::with_capacity(next_capacity),
+            ));
+            // At least one frame started inside it; a segment holding only the
+            // tail of a frame begun in the previous one decodes to nothing.
+            // This gate rests on RAI implying PUSI (a keyframe flag on a
+            // packet that also starts its frame) — true of ffmpeg's mpegts
+            // muxer, whose output is all camon ever reads. A stream that
+            // flagged RAI on a non-start packet would count zero frames and
+            // lose every segment here, so if that assumption ever breaks,
+            // this is the line to suspect.
             if segment.frame_count > 0 {
                 self.buffer.write_recover().push(segment);
                 self.last_segment_at = Instant::now();
@@ -909,16 +946,76 @@ fn table_section_start(packet: &[u8]) -> Option<usize> {
     Some(start)
 }
 
+/// What one poll of ffmpeg's stdout said about it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Readiness {
+    /// There are bytes to read, or a read will at least tell us something.
+    Readable,
+    /// Nothing happened within the timeout. Poll again.
+    Timeout,
+    /// The descriptor will never carry data again.
+    Ended,
+}
+
 /// Poll a file descriptor for readability with a timeout in milliseconds.
-/// Returns true if the fd is readable, false on timeout.
-fn poll_readable(fd: RawFd, timeout_ms: i32) -> bool {
+///
+/// The kernel's return value alone does not say the fd is readable: `poll`
+/// reports `POLLERR`, `POLLHUP` and `POLLNVAL` whether or not they were asked
+/// for, and each of them makes the call return a positive count. Reading them
+/// as readability sends the caller into a read that fails or comes back
+/// empty, and the diagnosis then depends on which of those the kernel picked;
+/// classifying here routes every dead-descriptor shape to the one stream-end
+/// diagnosis instead.
+fn poll_readable(fd: RawFd, timeout_ms: i32) -> Readiness {
     let mut pollfd = libc::pollfd {
         fd,
         events: libc::POLLIN,
         revents: 0,
     };
     let ret = unsafe { libc::poll(&mut pollfd, 1, timeout_ms) };
-    ret > 0
+    readiness(if ret < 0 {
+        Err(std::io::Error::last_os_error().kind())
+    } else if ret > 0 {
+        Ok(pollfd.revents)
+    } else {
+        // A timeout leaves nothing behind to classify.
+        Ok(0)
+    })
+}
+
+/// Read one completed poll: the `revents` it filled in, or the error it failed
+/// with. Split from the syscall so the decision can be tested without arranging
+/// a descriptor in each of these states.
+///
+/// `POLLIN` wins over a hangup reported beside it, because a pipe whose writer
+/// closed still hands over whatever it buffered before the close; reading it
+/// out is what turns a hangup into the ordinary zero-length read the caller
+/// already diagnoses. (Should that read itself fail — possible for descriptor
+/// kinds that raise `POLLERR` with data queued, which a pipe read end does not
+/// — it surfaces as a plain I/O error, as before this classification existed.)
+/// Only when nothing is readable do the error bits end the stream.
+///
+/// An interrupted poll is a wait that ended early and nothing more — the
+/// descriptor is untouched, so the caller simply waits again. That is a spin
+/// for as long as the signals keep arriving, which the data watchdog bounds at
+/// [`DATA_TIMEOUT_SECS`]; any other failure is treated as a poll that cannot
+/// be made to work on this fd and ends the run. (Strictly, `poll` can also
+/// fail transiently — `ENOMEM` under pressure — where the updater's taxonomy
+/// would retry; here the run's ending IS the retry, through the ordinary
+/// reconnect backoff, which beats spinning on a wait that just failed.)
+fn readiness(poll: Result<libc::c_short, std::io::ErrorKind>) -> Readiness {
+    let revents = match poll {
+        Ok(revents) => revents,
+        Err(std::io::ErrorKind::Interrupted) => return Readiness::Timeout,
+        Err(_) => return Readiness::Ended,
+    };
+    if revents & libc::POLLIN != 0 {
+        Readiness::Readable
+    } else if revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
+        Readiness::Ended
+    } else {
+        Readiness::Timeout
+    }
 }
 
 #[cfg(test)]
@@ -1068,6 +1165,15 @@ mod tests {
 
     fn levels(logs: &[(Level, String)]) -> Vec<Level> {
         logs.iter().map(|(level, _)| *level).collect()
+    }
+
+    /// A video packet continuing the frame already in progress: the same PID,
+    /// no payload_unit_start_indicator. Every frame is one of the builders
+    /// above followed by dozens of these.
+    fn continuation(pid: u16) -> [u8; TS_PACKET_SIZE] {
+        let mut p = pes_packet(pid, 0);
+        p[1] &= !0x40;
+        p
     }
 
     /// A stream carrying video that never flags a random access point.
@@ -1567,6 +1673,134 @@ mod tests {
         segmenter.flush_end_of_stream();
 
         assert_eq!(segmenter.buffer.read_recover().segment_count(), 1);
+    }
+
+    /// A frame is one PES packet spread over many TS packets. Counting the
+    /// packets instead reports a GOP of three frames as one of a dozen.
+    #[test]
+    fn a_frame_spread_over_many_packets_is_counted_once() {
+        let mut segmenter = segmenter();
+        for packet in [pat(PMT_PID), pmt(H264, VIDEO_PID)] {
+            segmenter.process(&packet);
+        }
+        // Three frames of four packets each, the first of them the keyframe
+        // the GOP opens on, with audio interleaved as a real stream has it.
+        segmenter.process(&keyframe_packet(VIDEO_PID, 0, VIDEO_STREAM_ID));
+        for frame in 1..3 {
+            for _ in 0..3 {
+                segmenter.process(&continuation(VIDEO_PID));
+            }
+            segmenter.process(&pes_packet(AUDIO_PID, frame * 3_000));
+            segmenter.process(&pes_packet(VIDEO_PID, frame * 3_000));
+        }
+        for _ in 0..3 {
+            segmenter.process(&continuation(VIDEO_PID));
+        }
+        segmenter.process(&keyframe_packet(VIDEO_PID, 90_000, VIDEO_STREAM_ID));
+
+        let buffer = segmenter.buffer.read_recover();
+        let segment = buffer.segments().front().unwrap();
+        assert_eq!(segment.frame_count, 3);
+        // The packets really are all in there: the count is a reading of the
+        // stream, not of how much was stored.
+        assert_eq!(segment.data.len() / TS_PACKET_SIZE, 16);
+    }
+
+    /// The buffer the next GOP is accumulated into keeps the capacity the last
+    /// one needed, while the bytes handed to the hot buffer carry no slack at
+    /// all — they are held there for minutes, the working buffer for a second.
+    #[test]
+    fn the_segment_buffer_keeps_its_capacity_for_the_next_gop() {
+        let mut segmenter = segmenter();
+        for packet in [pat(PMT_PID), pmt(H264, VIDEO_PID)] {
+            segmenter.process(&packet);
+        }
+        segmenter.process(&keyframe_packet(VIDEO_PID, 0, VIDEO_STREAM_ID));
+        for i in 1..40 {
+            segmenter.process(&pes_packet(VIDEO_PID, i * 3_000));
+        }
+        segmenter.process(&keyframe_packet(VIDEO_PID, 90_000, VIDEO_STREAM_ID));
+
+        let closed_len = {
+            let buffer = segmenter.buffer.read_recover();
+            let segment = buffer.segments().front().unwrap();
+            assert_eq!(
+                segment.data.capacity(),
+                segment.data.len(),
+                "growth slack shipped to the hot buffer"
+            );
+            segment.data.len()
+        };
+        assert!(closed_len > 7_000, "{closed_len} is too small to tell");
+        assert!(
+            segmenter.current_data.capacity() >= closed_len,
+            "regrown from {} rather than reusing {closed_len}",
+            segmenter.current_data.capacity()
+        );
+    }
+
+    /// A descriptor that hangs up or errors is reported ready by `poll` — with
+    /// an error bit, not `POLLIN`. Taking that for readability leaves the loop
+    /// polling a dead descriptor as fast as the kernel answers.
+    #[test]
+    fn a_descriptor_in_error_ends_the_run_instead_of_being_polled_again() {
+        use std::os::unix::io::FromRawFd;
+
+        let mut fds = [0 as libc::c_int; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe");
+        // The write end of a pipe with no reader: a live descriptor that poll
+        // flags POLLERR on and that can never be read from.
+        let write_end = unsafe { std::fs::File::from_raw_fd(fds[1]) };
+        drop(unsafe { std::fs::File::from_raw_fd(fds[0]) });
+
+        let shutdown = std::sync::atomic::AtomicBool::new(false);
+        let result = std::thread::scope(|scope| {
+            // Bounds a run that spins instead of ending, so the mistake shows
+            // up as a failed assertion rather than a hung test.
+            scope.spawn(|| {
+                std::thread::sleep(Duration::from_millis(250));
+                shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
+            });
+            segmenter().read_stream(write_end, &shutdown)
+        });
+
+        match result {
+            Err(RtspError::NoRecording(failure)) => assert_eq!(failure.end, RunEnd::Eof),
+            // Ok means the poll was read as a timeout and the loop spun until
+            // the shutdown flag stopped it; an io error means it was read as
+            // readable and the read was attempted on a write-only descriptor.
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn poll_readiness_separates_data_from_a_dead_descriptor() {
+        // Bytes to read, whatever else is flagged beside them: a pipe whose
+        // writer closed still hands over what it buffered first, and the
+        // zero-length read that follows is the caller's own end-of-stream.
+        for revents in [
+            libc::POLLIN,
+            libc::POLLIN | libc::POLLHUP,
+            libc::POLLIN | libc::POLLERR,
+        ] {
+            assert_eq!(readiness(Ok(revents)), Readiness::Readable, "{revents:#x}");
+        }
+        // Nothing to read and the descriptor is finished.
+        for revents in [libc::POLLERR, libc::POLLHUP, libc::POLLNVAL] {
+            assert_eq!(readiness(Ok(revents)), Readiness::Ended, "{revents:#x}");
+        }
+        // Nothing happened, and a signal that ended the wait early is nothing
+        // happening: the descriptor is untouched, so the caller waits again.
+        assert_eq!(readiness(Ok(0)), Readiness::Timeout);
+        assert_eq!(
+            readiness(Err(std::io::ErrorKind::Interrupted)),
+            Readiness::Timeout
+        );
+        // Any other failure is one that would repeat on every call.
+        assert_eq!(
+            readiness(Err(std::io::ErrorKind::InvalidInput)),
+            Readiness::Ended
+        );
     }
 
     #[test]
