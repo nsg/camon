@@ -374,7 +374,8 @@ discovery_prefix = "homeassistant"
 # announcing the remembered ones, so their entities and history survive
 # instead of being deleted by a temporary condition.
 # How often the snapshot camera image is republished while motion is active,
-# in seconds (default: 5)
+# in seconds (default: 5; values above one day are clamped to one day, with a
+# warning at startup)
 snapshot_interval_secs = 5
 # Seconds an occupancy sensor stays "on" after the last sighting of that
 # class before it clears (default: 60)

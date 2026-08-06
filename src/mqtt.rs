@@ -145,6 +145,25 @@
 //! everything queued before it on the wire. An unclean exit therefore costs one
 //! redundant round of clears, which is a no-op on a topic that no longer holds
 //! anything; the opposite trade would cost an entity that never came back.
+//!
+//! # One connection per instance
+//!
+//! The broker identifies a session by its client id, and enforces that identity
+//! by disconnecting the older session whenever a second one arrives claiming
+//! the same id. Two camon instances pointed at one broker under a shared id
+//! therefore kick each other off for ever — each reconnect ends the other's
+//! connection, and neither ever finishes a reconnect burst. So the id is
+//! derived per instance; see [`derive_client_id`]. It is camon's identity *to
+//! the broker* and nothing else: Home Assistant discovers entities by the
+//! object ids and `unique_id`s in the discovery payloads, which are built from
+//! camera ids alone, so what this id is cannot move, rename or duplicate a
+//! single entity.
+//!
+//! Coexisting is not the same as being independent. Two instances that share a
+//! `topic_prefix` share the one availability topic under it, last writer and
+//! last will included — see [`Topics::availability`]. The id makes them able to
+//! stay connected at the same time; only distinct prefixes make what they say
+//! about themselves distinguishable.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -155,6 +174,7 @@ use std::time::{Duration, Instant};
 
 use rumqttc::{AsyncClient, Event, Incoming, LastWill, MqttOptions, QoS};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::buffer::HotBuffer;
@@ -201,6 +221,188 @@ fn request_queue_capacity(cameras: usize, classes: usize, orphans: usize) -> usi
 /// snapshot would exceed; a 1280x720 JPEG at quality 90 is a few hundred KiB.
 const MAX_OUTGOING_PACKET_BYTES: usize = 4 * 1024 * 1024;
 
+/// How many image bytes may be handed to the request queue between two ticks.
+///
+/// This is a bound on the *rate* at which camon can commit memory to the queue,
+/// and it is worth being exact about what that does and does not buy, because
+/// [`request_queue_capacity`] bounds the queue in slots only: fifteen cameras
+/// with five classes size it at 527 of them, and a slot holding a JPEG is worth
+/// up to [`MAX_OUTGOING_PACKET_BYTES`]. Only images come near that — every
+/// other publish this bridge makes is a discovery document or a two-byte state.
+///
+/// What camon cannot do is bound residency directly. rumqttc offers no signal
+/// for a request having left the queue, so nothing here can know how full it
+/// is; a real residency budget would need drain feedback that does not exist.
+/// That is the residual, and it leaves three regimes:
+///
+/// - **Healthy link.** rumqttc takes each request and writes it straight out,
+///   so the queue is near enough empty and this ceiling is purely a rate cap.
+///   It is set well above what a healthy second costs: fifteen cameras all
+///   opening a motion run at once is fifteen snapshots of a few hundred KiB.
+/// - **Outage.** The connection fails, whereupon rumqttc moves the queue into
+///   its pending set — and *keeps* that set across every failed reconnect,
+///   dropping it only at the first successful `ConnAck`, since camon's
+///   sessions are clean ones. What that set holds is whatever the queue held
+///   at the moment of failure. A socket that errors outright is caught within
+///   a tick, so roughly one window, 16 MiB; a flush that stalls takes up to
+///   rumqttc's five-second timeout to be declared dead, and the bridge counts
+///   as connected for all of it, so up to five refilled windows — some 80 MiB
+///   — can be admitted first; and a failure that ends the regime below
+///   inherits everything that regime accumulated. Snapshots already admitted
+///   before the disconnect also finish their publish from their detached
+///   tasks (bounded by the one-in-flight-per-camera guard); only new decodes
+///   stop, see [`spawn_snapshot`].
+/// - **A broker that answers but never acknowledges.** The bad one. rumqttc
+///   stops taking requests once 100 QoS-1 publishes are unacked, so a broker
+///   that accepts packets and answers keepalives while withholding PUBACKs
+///   holds a connection camon believes in while nothing drains — and the
+///   channel fills to the item cap. (The images themselves are QoS 0 and hold
+///   no inflight slots; it is the two-byte QoS-1 state publishes that fill
+///   the window, and the disabled request branch that strands the images
+///   behind them.) Residency is then bounded by that cap alone: 527 slots of
+///   realistic ~300 KiB snapshots is some 160 MiB, and the 4 MiB packet
+///   ceiling makes 2 GiB the theoretical worst. What this ceiling does buy is
+///   time — filling it takes at least the total divided by 16 MiB in ticks,
+///   ten seconds for the realistic figure and two minutes for the theoretical
+///   one. By this regime's own premise the keepalive path never fires, so
+///   camon does not leave it on its own: as the residual above says, it ends
+///   when an operator restarts something or the broker's behaviour changes,
+///   and only then does the outage regime inherit the accumulation.
+const MAX_IMAGE_BYTES_PER_TICK: usize = 16 * 1024 * 1024;
+
+/// The image allowance of [`MAX_IMAGE_BYTES_PER_TICK`], shared by the bridge
+/// loop and every detached snapshot task, since both queue images and the
+/// bound is on their sum.
+#[derive(Clone, Default)]
+struct ImageBudget {
+    spent: Arc<std::sync::atomic::AtomicUsize>,
+    /// Whether this window's refusal has already been reported. A stalled
+    /// broker refuses every camera every second; the operator needs to hear
+    /// that once a second, not once per camera per second.
+    reported: Arc<AtomicBool>,
+}
+
+impl ImageBudget {
+    /// Charge one image, reporting whether it may be queued. A refusal is a
+    /// dropped image and nothing more: the camera tile keeps the frame it has
+    /// until the next one is due, exactly as it does for a decode that produced
+    /// nothing.
+    fn take(&self, bytes: usize) -> bool {
+        let taken = self
+            .spent
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |spent| {
+                spent
+                    .checked_add(bytes)
+                    .filter(|&total| total <= MAX_IMAGE_BYTES_PER_TICK)
+            })
+            .is_ok();
+        if !taken && !self.reported.swap(true, Ordering::Relaxed) {
+            tracing::warn!(
+                bytes,
+                limit = MAX_IMAGE_BYTES_PER_TICK,
+                "mqtt image budget spent for this second, dropping images"
+            );
+        }
+        taken
+    }
+
+    /// A new window: on a healthy link whatever the last one queued has had a
+    /// tick to reach the socket. On an unhealthy one the windows accumulate in
+    /// the queue instead — see [`MAX_IMAGE_BYTES_PER_TICK`] for what bounds
+    /// that.
+    fn refill(&self) {
+        self.spent.store(0, Ordering::Relaxed);
+        self.reported.store(false, Ordering::Relaxed);
+    }
+}
+
+/// The MQTT client id this instance connects under. See [`derive_client_id`].
+fn client_id(ctx: &BridgeContext) -> String {
+    derive_client_id(
+        &hostname().unwrap_or_default(),
+        ctx.entities_path.as_deref(),
+    )
+}
+
+/// Derive the client id camon connects under, as
+/// `camon-<[`CLIENT_ID_HASH_BYTES`] hex>`.
+///
+/// Uniqueness is the load-bearing property: a broker disconnects the older
+/// session the moment a second one claims the same id, so two camons sharing an
+/// id spend their lives evicting each other. Stability across restarts is worth
+/// less than it looks — camon's sessions are clean ones, so the broker keeps no
+/// state under the id, retained messages belong to their topics and the last
+/// will belongs to the connection, none of it held for an id that comes back —
+/// but it is still worth having: it is what makes a broker's logs, its ACLs and
+/// its connected-clients list say the same thing about this camon tomorrow as
+/// they do today, rather than accumulating a new name per restart.
+///
+/// So it is derived from what identifies the instance rather than generated:
+///
+/// - the machine's hostname, which is what separates two camons on two hosts
+///   publishing to one broker — their data dirs are very likely the same path;
+/// - the path of the entity record, which lives in the data dir and so is what
+///   separates two camons on one host: they cannot share a data dir, each
+///   owning its own hot buffer state, warm index and entity record in it.
+///
+/// Deliberately nothing else. Not the camera list or the classes, which change
+/// whenever the operator adds a camera and would take the session identity with
+/// them; not the topic or discovery prefixes, which two instances may share —
+/// permitted, though not advisable (see [`Topics::availability`]); and not the
+/// broker address, which
+/// is by definition the same for the two instances that would collide.
+///
+/// The path is taken as configured rather than canonicalized: resolving it is
+/// I/O against a directory that need not exist yet, and a config that keeps
+/// saying the same thing keeps producing the same id, which is all stability
+/// asks for. It follows that the path separates instances only *as spelled* —
+/// two camons started from different working directories with the same relative
+/// `data_dir` are distinct instances that derive one id, and the operator who
+/// arranges that wants absolute paths (or distinct ones).
+///
+/// Both halves of the identity are handed in rather than read here, so each can
+/// be varied on its own.
+fn derive_client_id(hostname: &str, entities_path: Option<&Path>) -> String {
+    use std::os::unix::ffi::OsStrExt;
+    let mut hasher = Sha256::new();
+    hasher.update(hostname.as_bytes());
+    // A separator no path or hostname can contain, so that a hostname ending
+    // where a path begins cannot read as another pair.
+    hasher.update([0u8]);
+    if let Some(path) = entities_path {
+        hasher.update(path.as_os_str().as_bytes());
+    }
+    let digest = hasher.finalize();
+    let mut id = String::from("camon-");
+    for byte in &digest[..CLIENT_ID_HASH_BYTES] {
+        use std::fmt::Write as _;
+        let _ = write!(id, "{byte:02x}");
+    }
+    id
+}
+
+/// How much of the digest the client id carries. Six bytes is 48 bits against a
+/// handful of instances per broker, and keeps the whole id at 18 characters —
+/// inside the 23 that MQTT 3.1.1 requires every broker to accept, which a
+/// hostname pasted in raw would not be.
+const CLIENT_ID_HASH_BYTES: usize = 6;
+
+/// The kernel's hostname, or `None` when there is none to read. An unnamed host
+/// costs [`derive_client_id`] one of its two dimensions, never the id itself.
+fn hostname() -> Option<String> {
+    let mut buf = [0u8; 256];
+    // SAFETY: `gethostname` writes at most `buf.len()` bytes into a buffer of
+    // exactly that size, which is ours alone for the length of the call.
+    if unsafe { libc::gethostname(buf.as_mut_ptr().cast::<libc::c_char>(), buf.len()) } != 0 {
+        return None;
+    }
+    // POSIX allows a truncated name to come back unterminated, so the end is
+    // the first NUL *or* the end of the buffer.
+    let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    let name = String::from_utf8_lossy(&buf[..end]).into_owned();
+    (!name.is_empty()).then_some(name)
+}
+
 /// Delay before re-polling after a connection error. `poll()` reconnects on its
 /// own but does not pace itself, so without this a down broker becomes a busy
 /// loop.
@@ -229,6 +431,20 @@ const SNAPSHOT_JPEG_QUALITY: u8 = 90;
 /// How long shutdown waits for the retained `offline` marker and the DISCONNECT
 /// to reach the socket.
 const SHUTDOWN_FLUSH: Duration = Duration::from_secs(2);
+
+/// The longest snapshot cadence camon will honour. The cadence only runs while
+/// a motion run is open, and a run that stays open a whole day paces at most
+/// one snapshot in it either way; the ceiling exists so that an operator's
+/// `u64` cannot be turned into an `Instant` that does not exist. A configured
+/// cadence above a day is honoured as "one per day", clamped with a warning.
+const MAX_SNAPSHOT_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// How soon a snapshot that produced nothing is attempted again, instead of
+/// waiting out the whole cadence. Short enough that a camera recovering within
+/// a motion run still gets a tile out of it, long enough that a camera failing
+/// for good forks one ffmpeg every couple of seconds rather than every tick.
+/// Only ever shortens the wait: a cadence faster than this keeps its own pace.
+const SNAPSHOT_RETRY_DELAY: Duration = Duration::from_secs(2);
 
 /// How long one snapshot decode may run before its ffmpeg is killed. Generous
 /// for a single-GOP decode: the point is that a wedged ffmpeg cannot hold a
@@ -337,6 +553,16 @@ impl Topics {
         }
     }
 
+    /// The one topic every entity of this prefix reports its availability on —
+    /// and it is the *prefix's*, not the instance's. Two camons configured with
+    /// the same `topic_prefix` therefore share it: last writer wins, the last
+    /// will included, so a dying instance's retained `offline` sits over a
+    /// perfectly healthy sibling until that sibling next reconnects and
+    /// republishes `online`. Distinct instances want distinct prefixes for
+    /// availability to mean anything about any one of them. The per-instance
+    /// client id (see [`derive_client_id`]) makes coexistence possible at all —
+    /// before it they evicted each other's sessions — but it does not divide
+    /// this namespace, and nothing but the prefix can.
     fn availability(&self) -> String {
         format!("{}/availability", self.prefix)
     }
@@ -621,9 +847,17 @@ struct EntityMemory {
     /// The record believed to be on disk, so a write is skipped when it would
     /// change nothing and retried when it failed.
     on_disk: Option<EntityRecord>,
-    /// Whether a burst carrying the clears has been taken by the request queue.
-    /// Without one there is nothing for a disconnect to prove.
-    burst_accepted: bool,
+    /// Whether the clears are sitting in the request queue of the session that
+    /// is up *now*.
+    ///
+    /// Scoped to the session on purpose. A queued request survives exactly as
+    /// long as the connection it was queued on: when that connection fails,
+    /// rumqttc moves whatever the queue still held into its pending set, and
+    /// the next connect — camon's sessions are clean ones — throws that set
+    /// away unwritten. So a burst accepted on a connection that has since
+    /// dropped proves nothing about the broker, and only a fresh burst on the
+    /// live session can put the clears back in front of it.
+    clears_queued: bool,
 }
 
 impl EntityMemory {
@@ -634,7 +868,7 @@ impl EntityMemory {
                 announced: EntityRecord::current(None, topics, ctx),
                 orphans: Vec::new(),
                 on_disk: None,
-                burst_accepted: false,
+                clears_queued: false,
             };
         };
         let previous = load_record(&path);
@@ -670,7 +904,7 @@ impl EntityMemory {
             announced,
             orphans,
             on_disk: previous,
-            burst_accepted: false,
+            clears_queued: false,
         }
     }
 
@@ -680,9 +914,20 @@ impl EntityMemory {
     /// process that dies in between must clear them again rather than believe
     /// the job done.
     fn note_burst_accepted(&mut self) {
-        self.burst_accepted = true;
+        self.clears_queued = true;
         let owed = self.orphans.clone();
         self.write(owed);
+    }
+
+    /// A session ended, or a new one began: whatever the old one's queue was
+    /// holding is unwritten and unreachable, so the clears are owed again.
+    ///
+    /// Called for both edges because both destroy the same evidence. It costs
+    /// nothing when the clears did in fact go out before the connection
+    /// dropped — the next start clears topics that hold nothing — while the
+    /// opposite mistake costs an entity that never goes away.
+    fn note_session_lost(&mut self) {
+        self.clears_queued = false;
     }
 
     /// Drop the owed clears, now that a `Disconnect` has gone out. Requests are
@@ -691,8 +936,16 @@ impl EntityMemory {
     /// too. Only ever reached from a clean shutdown; a killed camon simply
     /// clears the same topics again next start, which is a no-op on a topic
     /// that no longer holds anything.
+    ///
+    /// The ordering argument only holds within one session, which is what
+    /// [`clears_queued`](Self::clears_queued) tracks: a disconnect written on a
+    /// *later* connection than the burst says nothing at all about the burst,
+    /// since the reconnect in between threw its queue away. That is a real
+    /// sequence, not a hypothetical one — a broker that drops out just before
+    /// shutdown has the bridge queue its `offline` marker and its `Disconnect`
+    /// while down, and the poller reconnects and writes exactly those two.
     fn note_clears_flushed(&mut self) {
-        if self.burst_accepted {
+        if self.clears_queued {
             self.write(Vec::new());
         }
     }
@@ -834,6 +1087,11 @@ async fn run_eventloop(
 struct Link {
     connected: bool,
     republish_pending: bool,
+    /// What the queue may still be asked to carry in images this tick. Here
+    /// because it is a property of the same request queue the rest of this
+    /// struct is about, and because every site that queues an image already
+    /// holds a `Link` to decide whether the connection is up.
+    images: ImageBudget,
 }
 
 impl Link {
@@ -858,32 +1116,71 @@ struct SensorState {
     snapshot_interval: Duration,
     occupancy_hold: Duration,
     motion_active: HashSet<String>,
-    /// When each camera last had a snapshot published.
-    last_snapshot: HashMap<String, Instant>,
+    /// When each camera's next snapshot falls due. Absent means "now": a run
+    /// that has just opened is due immediately.
+    next_snapshot: HashMap<String, Instant>,
+    /// Cameras whose last decode produced no frame, so that a failure is
+    /// reported when it starts rather than once per retry.
+    snapshot_failing: HashSet<String>,
+    /// How many motion runs each camera has opened. A decode outcome is only
+    /// folded back into the cadence when it carries the run that is open now;
+    /// see [`SnapshotTask`].
+    snapshot_run: HashMap<String, u64>,
     /// `(camera_id, class)` -> last sighting. Presence means the sensor is ON.
     occupancy: HashMap<(String, String), Instant>,
 }
 
 impl SensorState {
+    /// `snapshot_interval` is an operator's number and is clamped to
+    /// [`MAX_SNAPSHOT_INTERVAL`] on the way in, because everything downstream
+    /// of it is `now + interval`: an interval of `u64::MAX` seconds is a
+    /// panic on the first tick with motion open, and it is far likelier to be
+    /// a fat-fingered "effectively never" than an attack.
     fn new(snapshot_interval: Duration, occupancy_hold: Duration) -> Self {
+        let snapshot_interval = if snapshot_interval > MAX_SNAPSHOT_INTERVAL {
+            tracing::warn!(
+                configured = ?snapshot_interval,
+                clamped = ?MAX_SNAPSHOT_INTERVAL,
+                "mqtt snapshot interval is longer than any motion run, clamping it"
+            );
+            MAX_SNAPSHOT_INTERVAL
+        } else {
+            snapshot_interval
+        };
         Self {
             snapshot_interval,
             occupancy_hold,
             motion_active: HashSet::new(),
-            last_snapshot: HashMap::new(),
+            next_snapshot: HashMap::new(),
+            snapshot_failing: HashSet::new(),
+            snapshot_run: HashMap::new(),
             occupancy: HashMap::new(),
         }
     }
 
     /// Open a motion run. `false` when it was already open (a duplicate start,
     /// which must not restart the snapshot cadence).
+    ///
+    /// A fresh run is a new generation: decodes started for the run that just
+    /// closed are still out there, and their outcomes belong to that run and
+    /// not to this one.
     fn motion_start(&mut self, camera_id: &str) -> bool {
-        self.motion_active.insert(camera_id.to_string())
+        let opened = self.motion_active.insert(camera_id.to_string());
+        if opened {
+            let run = self.snapshot_run.entry(camera_id.to_string()).or_insert(0);
+            *run = run.wrapping_add(1);
+        }
+        opened
+    }
+
+    /// The run a decode started now would belong to.
+    fn snapshot_run(&self, camera_id: &str) -> u64 {
+        self.snapshot_run.get(camera_id).copied().unwrap_or(0)
     }
 
     /// Close a motion run. `false` when nothing was open.
     fn motion_end(&mut self, camera_id: &str) -> bool {
-        self.last_snapshot.remove(camera_id);
+        self.next_snapshot.remove(camera_id);
         self.motion_active.remove(camera_id)
     }
 
@@ -906,7 +1203,40 @@ impl SensorState {
 
     /// Note that `camera_id` has just been snapshotted, restarting its cadence.
     fn mark_snapshot(&mut self, camera_id: &str, now: Instant) {
-        self.last_snapshot.insert(camera_id.to_string(), now);
+        self.next_snapshot
+            .insert(camera_id.to_string(), now + self.snapshot_interval);
+    }
+
+    /// Note that a decode produced no frame, so the camera's tile still holds
+    /// whatever it held before the attempt.
+    ///
+    /// The cadence paces *pictures*, not attempts: a camera whose decodes all
+    /// fail would otherwise sit out a full interval between failures and
+    /// publish nothing at all, so the next attempt is brought forward to
+    /// [`SNAPSHOT_RETRY_DELAY`] — never later than the cadence would have had
+    /// it, and never sooner than the cadence when that is the shorter of the
+    /// two. Only while the run is still open: a failure reported after
+    /// `MotionEnd` closed it must not put the camera back on a schedule that
+    /// [`motion_end`](Self::motion_end) just took it off.
+    ///
+    /// Reports `true` the first time a camera fails in a row, which is what the
+    /// caller says out loud — a permanently failing camera is silence on a
+    /// dashboard tile, and silence is what nobody notices.
+    fn note_snapshot_failed(&mut self, camera_id: &str, now: Instant) -> bool {
+        if self.motion_active.contains(camera_id) {
+            let retry = now + SNAPSHOT_RETRY_DELAY.min(self.snapshot_interval);
+            self.next_snapshot
+                .entry(camera_id.to_string())
+                .and_modify(|next| *next = (*next).min(retry))
+                .or_insert(retry);
+        }
+        self.snapshot_failing.insert(camera_id.to_string())
+    }
+
+    /// Note that a decode produced a frame. Reports `true` when that ends a run
+    /// of failures, so the recovery is as audible as the failure was.
+    fn note_snapshot_decoded(&mut self, camera_id: &str) -> bool {
+        self.snapshot_failing.remove(camera_id)
     }
 
     /// Turn OFF every occupancy sensor whose hold-off has elapsed, returning
@@ -925,22 +1255,26 @@ impl SensorState {
         expired
     }
 
-    /// Cameras whose next motion snapshot is due, marking each as taken. A
-    /// camera that just opened its run has no `last_snapshot` and is therefore
-    /// due immediately.
+    /// Cameras whose next motion snapshot is due, putting each on the cadence
+    /// again. A camera that just opened its run has no due time recorded and is
+    /// therefore due immediately.
+    ///
+    /// The attempt is what is stamped here, not its outcome, which is only
+    /// known once the detached decode ends; a decode that produces nothing
+    /// takes the stamp back with [`note_snapshot_failed`](Self::note_snapshot_failed).
     fn due_snapshots(&mut self, now: Instant) -> Vec<String> {
-        let interval = self.snapshot_interval;
         let due: Vec<String> = self
             .motion_active
             .iter()
-            .filter(|camera_id| match self.last_snapshot.get(*camera_id) {
-                Some(&last) => now.saturating_duration_since(last) >= interval,
+            .filter(|camera_id| match self.next_snapshot.get(*camera_id) {
+                Some(&next) => now >= next,
                 None => true,
             })
             .cloned()
             .collect();
         for camera_id in &due {
-            self.last_snapshot.insert(camera_id.clone(), now);
+            self.next_snapshot
+                .insert(camera_id.clone(), now + self.snapshot_interval);
         }
         due
     }
@@ -1009,7 +1343,8 @@ async fn run_bridge_with<F>(
     let topics = Topics::new(&ctx.config);
     // Before the client: its queue has to be sized for the clears too.
     let mut memory = EntityMemory::load(&topics, &ctx);
-    let mut options = MqttOptions::new("camon", &ctx.config.host, ctx.config.port);
+    let client_id = client_id(&ctx);
+    let mut options = MqttOptions::new(&client_id, &ctx.config.host, ctx.config.port);
     options.set_keep_alive(Duration::from_secs(30));
     options.set_max_packet_size(10 * 1024, MAX_OUTGOING_PACKET_BYTES);
     // Set before connect: the broker publishes this on our behalf if camon dies
@@ -1039,7 +1374,7 @@ async fn run_bridge_with<F>(
         Duration::from_secs(ctx.config.snapshot_interval_secs),
         Duration::from_secs(ctx.config.occupancy_hold_secs),
     );
-    let mut snapshot_tasks: HashMap<String, tokio::task::JoinHandle<()>> = HashMap::new();
+    let mut snapshot_tasks: HashMap<String, SnapshotTask> = HashMap::new();
     let mut link = Link::default();
     let mut tick = tokio::time::interval(Duration::from_secs(1));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -1047,6 +1382,7 @@ async fn run_bridge_with<F>(
     tracing::info!(
         host = %ctx.config.host,
         port = ctx.config.port,
+        client_id = %client_id,
         cameras = ctx.camera_ids.len(),
         classes = ctx.classes.len(),
         "mqtt bridge started"
@@ -1064,9 +1400,15 @@ async fn run_bridge_with<F>(
                 Some(LinkEvent::Connected) => {
                     tracing::info!(host = %ctx.config.host, "mqtt connected, publishing discovery");
                     link.connected = true;
+                    // A new session starts owing the clears again whatever the
+                    // last one queued; the burst below is what re-queues them.
+                    memory.note_session_lost();
                     link.republish_pending = republish(&client, &topics, &state, &mut memory);
                 }
-                Some(LinkEvent::Disconnected) => link.connected = false,
+                Some(LinkEvent::Disconnected) => {
+                    link.connected = false;
+                    memory.note_session_lost();
+                }
                 // Nothing asks for a disconnect before shutdown does, and by
                 // then this loop is over.
                 Some(LinkEvent::DisconnectSent) => {}
@@ -1091,6 +1433,9 @@ async fn run_bridge_with<F>(
                 None => {
                     eventloop_gone = true;
                     link.connected = false;
+                    // Nothing is polling, so nothing queued will ever be
+                    // written — the clears included.
+                    memory.note_session_lost();
                     if !ctx.shutdown.load(Ordering::Relaxed) {
                         tracing::error!(
                             "the mqtt event loop stopped polling while camon was running; \
@@ -1170,7 +1515,7 @@ fn handle_event(
     topics: &Topics,
     state: &mut SensorState,
     ctx: &BridgeContext,
-    snapshot_tasks: &mut HashMap<String, tokio::task::JoinHandle<()>>,
+    snapshot_tasks: &mut HashMap<String, SnapshotTask>,
     link: &mut Link,
     stopping: bool,
 ) {
@@ -1185,7 +1530,8 @@ fn handle_event(
             // rather than waiting up to a full interval for the tick.
             if !stopping {
                 state.mark_snapshot(&camera_id, Instant::now());
-                spawn_snapshot(client, topics, ctx, &camera_id, snapshot_tasks, link);
+                let run = state.snapshot_run(&camera_id);
+                spawn_snapshot(client, topics, ctx, &camera_id, run, snapshot_tasks, link);
             }
         }
         MqttEvent::MotionEnd { camera_id } => {
@@ -1197,7 +1543,8 @@ fn handle_event(
             // One last frame so the camera tile shows the end of the event
             // instead of freezing wherever the cadence happened to land.
             if !stopping {
-                spawn_snapshot(client, topics, ctx, &camera_id, snapshot_tasks, link);
+                let run = state.snapshot_run(&camera_id);
+                spawn_snapshot(client, topics, ctx, &camera_id, run, snapshot_tasks, link);
             }
         }
         MqttEvent::Detections {
@@ -1228,6 +1575,11 @@ fn handle_event(
                 // while disconnected for the same reason snapshots are: it
                 // would sit in the queue until long after it mattered.
                 if let (true, Some(jpeg)) = (link.connected, sighting.frame_jpeg) {
+                    if !link.images.take(jpeg.len()) {
+                        tracing::debug!(camera = %camera_id, class = %class,
+                            bytes = jpeg.len(), "image budget spent, dropping the sighting crop");
+                        continue;
+                    }
                     let topic = topics.occupancy_snapshot(&camera_id, &class);
                     // The crop itself is gone if this is rejected — the bytes
                     // are not kept — but a rejection still says the queue is
@@ -1251,12 +1603,14 @@ fn on_tick(
     topics: &Topics,
     state: &mut SensorState,
     ctx: &BridgeContext,
-    snapshot_tasks: &mut HashMap<String, tokio::task::JoinHandle<()>>,
+    snapshot_tasks: &mut HashMap<String, SnapshotTask>,
     link: &mut Link,
     memory: &mut EntityMemory,
     stopping: bool,
 ) {
     let now = Instant::now();
+    // A new window for the images the rest of this tick may queue.
+    link.images.refill();
 
     // Rebuilt from the live state on every attempt, never replayed from the
     // failed one: a retry a few seconds later must not assert a value that has
@@ -1265,9 +1619,14 @@ fn on_tick(
         link.republish_pending = republish(client, topics, state, memory);
     }
 
+    // Before the cadence is consulted, so a decode that has just ended is
+    // accounted for in the very tick that could act on it.
+    retire_snapshots(snapshot_tasks, state, now);
+
     if !stopping {
         for camera_id in state.due_snapshots(now) {
-            spawn_snapshot(client, topics, ctx, &camera_id, snapshot_tasks, link);
+            let run = state.snapshot_run(&camera_id);
+            spawn_snapshot(client, topics, ctx, &camera_id, run, snapshot_tasks, link);
         }
     }
 
@@ -1279,8 +1638,51 @@ fn on_tick(
             "OFF",
         ));
     }
+}
 
-    snapshot_tasks.retain(|_, handle| !handle.is_finished());
+/// Retire every decode that has ended, folding its outcome into the cadence.
+///
+/// A decode that produced nothing published nothing, so the camera's tile still
+/// shows whatever it showed before — and the cadence, which exists to pace
+/// pictures, must not count the attempt as one. It is brought forward instead,
+/// and the first failure of a run is said out loud: a camera whose decodes all
+/// fail is a tile that quietly stops moving, which is the kind of fault an
+/// operator only ever finds by going to look.
+fn retire_snapshots(
+    snapshot_tasks: &mut HashMap<String, SnapshotTask>,
+    state: &mut SensorState,
+    now: Instant,
+) {
+    let ended: Vec<(String, bool, u64)> = snapshot_tasks
+        .iter()
+        .filter(|(_, task)| task.handle.is_finished())
+        .map(|(camera_id, task)| {
+            (
+                camera_id.clone(),
+                task.decoded.load(Ordering::Relaxed),
+                task.run,
+            )
+        })
+        .collect();
+    for (camera_id, decoded, run) in ended {
+        snapshot_tasks.remove(&camera_id);
+        // The run this decode was started for has closed and the camera has
+        // opened another since. Whatever this decode did or did not manage is
+        // that run's business, and that run is over.
+        if run != state.snapshot_run(&camera_id) {
+            tracing::debug!(camera = %camera_id, "a decode outlived its motion run, dropping its outcome");
+            continue;
+        }
+        if decoded {
+            if state.note_snapshot_decoded(&camera_id) {
+                tracing::info!(camera = %camera_id, "snapshots are decoding again");
+            }
+        } else if state.note_snapshot_failed(&camera_id, now) {
+            tracing::warn!(camera = %camera_id,
+                "no snapshot could be decoded for this camera; its Home Assistant tile is not \
+                 being updated");
+        }
+    }
 }
 
 /// What became of one `try_publish`.
@@ -1453,15 +1855,39 @@ fn state_payloads(
     out
 }
 
+/// One camera's detached snapshot decode, and where that decode leaves word of
+/// whether it produced anything.
+///
+/// The outcome has to come back somehow: the task is detached precisely so a
+/// slow ffmpeg cannot delay the bridge loop, so the loop cannot await it, and
+/// the cadence it belongs to lives in the loop's `SensorState`. A flag the task
+/// sets and the tick reads is the whole channel — the tick already looks at
+/// every handle to retire the finished ones.
+struct SnapshotTask {
+    handle: tokio::task::JoinHandle<()>,
+    /// Set by the task when the decode produced a frame. A task that panicked
+    /// or was aborted leaves it down, which reads as a failure and is one.
+    decoded: Arc<AtomicBool>,
+    /// The motion run this decode was started for.
+    ///
+    /// A decode outlives the run that asked for it: fifteen seconds are allowed
+    /// for one, and a run can close and the camera open a new one inside that.
+    /// Without the tag the old outcome would land on the new run — shortening a
+    /// cadence that never failed, or clearing a failure the new run is still
+    /// having — so an outcome whose run has moved on is dropped instead.
+    run: u64,
+}
+
 /// Decode and publish one snapshot, unless this camera already has a decode in
 /// flight. Detached so a slow ffmpeg never delays the event loop; the handle is
-/// kept purely as the in-flight marker.
+/// kept as the in-flight marker and as the carrier of the decode's outcome.
 fn spawn_snapshot(
     client: &AsyncClient,
     topics: &Topics,
     ctx: &BridgeContext,
     camera_id: &str,
-    snapshot_tasks: &mut HashMap<String, tokio::task::JoinHandle<()>>,
+    run: u64,
+    snapshot_tasks: &mut HashMap<String, SnapshotTask>,
     link: &Link,
 ) {
     // Nothing drains the request queue while the broker is unreachable, so a
@@ -1471,8 +1897,8 @@ fn spawn_snapshot(
         tracing::debug!(camera = %camera_id, "mqtt disconnected, skipping snapshot");
         return;
     }
-    if let Some(handle) = snapshot_tasks.get(camera_id) {
-        if !handle.is_finished() {
+    if let Some(task) = snapshot_tasks.get(camera_id) {
+        if !task.handle.is_finished() {
             tracing::debug!(camera = %camera_id, "snapshot still decoding, skipping this one");
             return;
         }
@@ -1498,9 +1924,21 @@ fn spawn_snapshot(
     let client = client.clone();
     let topic = topics.snapshot(camera_id);
     let camera = camera_id.to_string();
+    let decoded = Arc::new(AtomicBool::new(false));
+    let produced = Arc::clone(&decoded);
+    let budget = link.images.clone();
     let handle = tokio::spawn(async move {
         match snapshot_jpeg(&data).await {
             Some(jpeg) => {
+                // A frame exists, which is what the cadence asked for; whether
+                // the queue then takes it is the queue's story, told by the
+                // budget and by the reconnect burst.
+                produced.store(true, Ordering::Relaxed);
+                if !budget.take(jpeg.len()) {
+                    tracing::debug!(camera = %camera, bytes = jpeg.len(),
+                        "image budget spent, dropping the snapshot");
+                    return;
+                }
                 // QoS 0: the next snapshot is at most one interval away, so a
                 // lost frame costs nothing worth a retransmit, and this task
                 // has no `Link` to report the rejection to. Retained so the
@@ -1510,7 +1948,14 @@ fn spawn_snapshot(
             None => tracing::debug!(camera = %camera, "snapshot decode produced no frame"),
         }
     });
-    snapshot_tasks.insert(camera_id.to_string(), handle);
+    snapshot_tasks.insert(
+        camera_id.to_string(),
+        SnapshotTask {
+            handle,
+            decoded,
+            run,
+        },
+    );
 }
 
 /// Decode the first frame of an MPEG-TS segment and JPEG-encode it.
@@ -1592,16 +2037,26 @@ async fn piped_decode(
         .map_err(|e| tracing::warn!(error = %e, "failed to spawn snapshot ffmpeg"))
         .ok()?;
 
-    let mut stdin = child.stdin.take().expect("stdin piped");
+    let stdin = child.stdin.take().expect("stdin piped");
     let mut stdout = child.stdout.take().expect("stdout piped");
     let mut out = Vec::with_capacity(capacity);
 
     let piped = async {
         // ffmpeg exits after one frame and closes stdin, so the tail of the
         // write failing with EPIPE is the normal case, not an error.
-        let write = async {
+        //
+        // The handle is moved in here so that finishing the write *closes* the
+        // pipe. `shutdown` on a child's stdin flushes and returns; it does not
+        // close the descriptor, and only the close is an EOF. A demuxer reading
+        // a stream that never ends is a decode that never starts: ffmpeg probes
+        // for stream information before it will emit a frame, and against a
+        // segment far smaller than its probe size it simply waits for input
+        // that is not coming — which is the whole decode timeout, and no
+        // snapshot, for every camera, every time.
+        let write = async move {
+            let mut stdin = stdin;
             let _ = stdin.write_all(input).await;
-            let _ = stdin.shutdown().await;
+            drop(stdin);
         };
         let (_, read) = tokio::join!(write, stdout.read_to_end(&mut out));
         read
@@ -1641,24 +2096,33 @@ fn encode_jpeg(rgb: &[u8], width: u32, height: u32) -> Option<Vec<u8>> {
 /// the clears at the head of the reconnect burst were written rather than
 /// merely queued: requests go out in the order they were queued, so a
 /// disconnect on the wire puts everything queued before it on the wire too.
-/// That is where the owed clears are dropped from the record — `burst_owed`
-/// says the burst was still waiting for room, in which case they were never
-/// queued at all and stay owed.
+/// That is where the owed clears are dropped from the record, and two separate
+/// things have to be true of them first. `burst_owed` says the burst was still
+/// waiting for room, in which case the clears were never queued at all;
+/// `EntityMemory::clears_queued` says which *session* queued them, because the
+/// ordering argument only holds inside one — hence the connection edges below
+/// being applied to the record rather than merely skipped over.
 async fn shutdown_bridge(
     client: AsyncClient,
     topics: &Topics,
     mut eventloop: Eventloop,
-    snapshot_tasks: HashMap<String, tokio::task::JoinHandle<()>>,
+    snapshot_tasks: HashMap<String, SnapshotTask>,
     memory: &mut EntityMemory,
     burst_owed: bool,
 ) {
     abort_snapshots(snapshot_tasks).await;
 
     // Whatever is already queued was raised before the disconnect was even
-    // requested and says nothing about whether it reached the socket. Dropped
-    // rather than read, so that an edge left over from the loop — a connection
-    // error a moment ago, say — cannot be taken for this flush having failed.
-    while eventloop.events.try_recv().is_ok() {}
+    // requested and says nothing about whether it reached the socket. Not read
+    // as this flush's outcome, so that an edge left over from the loop — a
+    // connection error a moment ago, say — cannot be taken for it having
+    // failed. It does still say that the session which took the clears is over,
+    // and that much is kept.
+    while let Ok(event) = eventloop.events.try_recv() {
+        if event != LinkEvent::DisconnectSent {
+            memory.note_session_lost();
+        }
+    }
 
     // Nothing left to retry with, and the two are not independent: a clean
     // DISCONNECT tells the broker to *drop* the LWT, so sending one without the
@@ -1684,11 +2148,15 @@ async fn shutdown_bridge(
                 // The socket went down with the disconnect still queued, or
                 // the task is gone: either way nothing was written.
                 Some(LinkEvent::Disconnected) | None => return false,
-                Some(LinkEvent::Connected) => {}
+                // A connection came up *while this was waiting*, which means
+                // the one the clears were queued on is gone and took them with
+                // it. The disconnect that follows is this session's alone.
+                Some(LinkEvent::Connected) => memory.note_session_lost(),
             }
         }
     });
-    if flush.await == Ok(true) && !burst_owed {
+    let disconnect_written = flush.await == Ok(true);
+    if disconnect_written && !burst_owed {
         memory.note_clears_flushed();
     }
     eventloop.stop().await;
@@ -1700,8 +2168,11 @@ async fn shutdown_bridge(
 /// makes that ordering observable rather than a race with process exit. Bounded
 /// because a task inside a blocking closure cannot be cancelled at all, and
 /// shutdown must not wait on one.
-async fn abort_snapshots(snapshot_tasks: HashMap<String, tokio::task::JoinHandle<()>>) {
-    let handles: Vec<tokio::task::JoinHandle<()>> = snapshot_tasks.into_values().collect();
+async fn abort_snapshots(snapshot_tasks: HashMap<String, SnapshotTask>) {
+    let handles: Vec<tokio::task::JoinHandle<()>> = snapshot_tasks
+        .into_values()
+        .map(|task| task.handle)
+        .collect();
     for handle in &handles {
         handle.abort();
     }
@@ -2026,6 +2497,16 @@ mod tests {
             classes: classes.iter().map(|c| c.to_string()).collect(),
             entities_path: None,
             shutdown: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// An in-flight decode that has not reported anything yet, for the tests
+    /// that care about the task rather than about what it produced.
+    fn snapshot_task(handle: tokio::task::JoinHandle<()>) -> SnapshotTask {
+        SnapshotTask {
+            handle,
+            decoded: Arc::new(AtomicBool::new(false)),
+            run: 0,
         }
     }
 
@@ -2389,6 +2870,7 @@ mod tests {
         let mut link = Link {
             connected: true,
             republish_pending: true,
+            ..Link::default()
         };
         let mut tasks = HashMap::new();
         let mut s = state();
@@ -2499,6 +2981,7 @@ mod tests {
         let mut link = Link {
             connected: true,
             republish_pending: false,
+            ..Link::default()
         };
         let mut tasks = HashMap::new();
         on_tick(
@@ -2568,6 +3051,7 @@ mod tests {
         let mut link = Link {
             connected: true,
             republish_pending: true,
+            ..Link::default()
         };
 
         let (small, _small_loop) = unpolled_client(2);
@@ -2638,16 +3122,16 @@ mod tests {
         let (client, _eventloop) = unpolled_client(capacity_for(&ctx));
         let mut tasks = HashMap::new();
         let mut link = Link::default();
-        spawn_snapshot(&client, &topics, &ctx, "yard", &mut tasks, &link);
+        spawn_snapshot(&client, &topics, &ctx, "yard", 0, &mut tasks, &link);
         // Disconnected: no decode, so no JPEG parked in a queue nothing is
         // draining until long after it mattered.
         assert!(tasks.is_empty());
 
         link.connected = true;
-        spawn_snapshot(&client, &topics, &ctx, "yard", &mut tasks, &link);
+        spawn_snapshot(&client, &topics, &ctx, "yard", 0, &mut tasks, &link);
         assert_eq!(tasks.len(), 1);
-        for handle in tasks.values() {
-            handle.abort();
+        for task in tasks.values() {
+            task.handle.abort();
         }
     }
 
@@ -2700,6 +3184,28 @@ mod tests {
         panic!("child {pid} outlived the decode that owned it");
     }
 
+    /// Only a closed descriptor is an EOF. `shutdown` on a child's stdin
+    /// flushes and returns, so a decoder handed a segment it must probe before
+    /// it can emit anything waits for input that is never coming — the whole
+    /// decode timeout, no frame, for every camera, every time. `cat` says it
+    /// without needing an ffmpeg: it echoes its input and exits when the input
+    /// ends, so an answer at all is the end of the input having arrived.
+    #[tokio::test]
+    async fn a_decode_is_told_where_its_input_ends() {
+        let out = piped_decode(
+            tokio::process::Command::new("cat"),
+            b"hello",
+            16,
+            Duration::from_secs(5),
+        )
+        .await;
+        assert_eq!(
+            out.as_deref(),
+            Some(&b"hello"[..]),
+            "the child never saw the end of its input"
+        );
+    }
+
     #[tokio::test]
     async fn a_decode_that_produces_nothing_is_not_an_error() {
         let mut command = tokio::process::Command::new("sh");
@@ -2717,7 +3223,9 @@ mod tests {
         let mut tasks = HashMap::new();
         tasks.insert(
             "yard".to_string(),
-            tokio::spawn(async { std::thread::sleep(Duration::from_secs(1)) }),
+            snapshot_task(tokio::spawn(async {
+                std::thread::sleep(Duration::from_secs(1))
+            })),
         );
 
         let started = std::time::Instant::now();
@@ -2730,7 +3238,9 @@ mod tests {
         let mut tasks = HashMap::new();
         tasks.insert(
             "yard".to_string(),
-            tokio::spawn(async { tokio::time::sleep(Duration::from_secs(60)).await }),
+            snapshot_task(tokio::spawn(async {
+                tokio::time::sleep(Duration::from_secs(60)).await
+            })),
         );
 
         let started = std::time::Instant::now();
@@ -2828,6 +3338,7 @@ mod tests {
         let mut link = Link {
             connected: true,
             republish_pending: false,
+            ..Link::default()
         };
         let mut tasks = HashMap::new();
 
@@ -3036,6 +3547,648 @@ mod tests {
             supervisor.deaths().is_empty(),
             "a deliberate stop was reported as a failure: {:?}",
             supervisor.deaths()
+        );
+    }
+
+    /// Under clean sessions the broker keeps no state under the id — what
+    /// stability buys is continuity in logs, ACLs and the broker's client
+    /// list, not session custody (see [`derive_client_id`]). It is still a
+    /// property worth pinning: the same instance must derive the same id for
+    /// as long as it is the same instance — including across the config
+    /// changes it lives through.
+    #[test]
+    fn one_instance_derives_the_same_client_id_every_start() {
+        let path = PathBuf::from("/var/lib/camon/mqtt_entities.json");
+        // Pinned, not merely self-consistent: this is the identity the broker
+        // remembers between restarts, and a build that quietly computed a
+        // different one would be a build whose sessions all look new.
+        assert_eq!(
+            derive_client_id("nvr", Some(&path)),
+            "camon-c8623bcc0559",
+            "the client id derivation moved; every deployment's session did too"
+        );
+        assert_eq!(
+            derive_client_id("nvr", Some(&path)),
+            derive_client_id("nvr", Some(&path))
+        );
+
+        // What the operator changes day to day is the camera list, and none of
+        // it reaches the id.
+        let mut ctx = bridge_context(&["yard"], &["person"]);
+        ctx.entities_path = Some(path.clone());
+        let mut later = bridge_context(&["yard", "gate", "front"], &[]);
+        later.entities_path = Some(path);
+        later.config.snapshot_interval_secs += 7;
+        assert_eq!(client_id(&ctx), client_id(&later));
+
+        // Short enough that every MQTT 3.1.1 broker must accept it, and made
+        // only of characters they all take.
+        let id = client_id(&ctx);
+        assert!(id.len() <= 23, "{id} is longer than 23 characters");
+        assert!(id.starts_with("camon-"));
+        assert!(id[6..]
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_uppercase()));
+    }
+
+    /// The failure this replaced a fixed id for: a broker disconnects the older
+    /// session the moment a second one claims the same id, so two camons
+    /// sharing one would evict each other for ever and neither would finish a
+    /// reconnect burst.
+    #[test]
+    fn two_camons_against_one_broker_do_not_share_a_client_id() {
+        let here = PathBuf::from("/var/lib/camon/mqtt_entities.json");
+        let there = PathBuf::from("/srv/camon-garage/mqtt_entities.json");
+
+        // Two instances on one host: they cannot share a data dir, each owning
+        // its hot buffer state and entity record in it.
+        assert_ne!(
+            derive_client_id("nvr", Some(&here)),
+            derive_client_id("nvr", Some(&there))
+        );
+        // Two hosts publishing to one broker: same package, same data dir path,
+        // different machines.
+        assert_ne!(
+            derive_client_id("nvr", Some(&here)),
+            derive_client_id("shed", Some(&here))
+        );
+        // Neither dimension may be swallowed by the other.
+        assert_ne!(
+            derive_client_id("nvr", Some(&there)),
+            derive_client_id("shed", Some(&here))
+        );
+        // A bridge with no entity record at all still answers, and still
+        // answers for the host it runs on.
+        assert_ne!(
+            derive_client_id("nvr", None),
+            derive_client_id("shed", None)
+        );
+        assert_ne!(
+            derive_client_id("nvr", None),
+            derive_client_id("nvr", Some(&here))
+        );
+
+        // And this machine has a name to derive from in the first place.
+        assert!(hostname().is_some_and(|name| !name.is_empty()));
+    }
+
+    #[test]
+    fn the_image_budget_bounds_what_one_tick_may_queue() {
+        // Pinned: the whole point of the bound is the arithmetic in its doc
+        // comment, and a value edited without that arithmetic is a bound that
+        // says something else.
+        assert_eq!(MAX_IMAGE_BYTES_PER_TICK, 16 * 1024 * 1024);
+
+        let budget = ImageBudget::default();
+        let half = MAX_IMAGE_BYTES_PER_TICK / 2;
+        assert!(budget.take(half));
+        // Exactly at the bound is inside it...
+        assert!(budget.take(half));
+        // ...and a single byte past it is not, however small the image.
+        assert!(!budget.take(1));
+
+        // A refusal spends nothing: a 4 MiB snapshot refused must not stop the
+        // next tick from taking a whole window's worth.
+        budget.refill();
+        assert!(budget.take(MAX_IMAGE_BYTES_PER_TICK));
+        assert!(!budget.take(1));
+        budget.refill();
+        assert!(budget.take(MAX_IMAGE_BYTES_PER_TICK));
+    }
+
+    /// The bound is only a bound while something refills it, and the tick is
+    /// what does — one window per second, which is what the memory arithmetic
+    /// multiplies by.
+    #[tokio::test]
+    async fn the_tick_opens_a_new_image_window() {
+        let topics = Topics::new(&MqttConfig::default());
+        let ctx = bridge_context(&["yard"], &[]);
+        let (client, _eventloop) = unpolled_client(capacity_for(&ctx));
+        let mut link = Link {
+            connected: true,
+            republish_pending: false,
+            ..Link::default()
+        };
+        assert!(link.images.take(MAX_IMAGE_BYTES_PER_TICK));
+        assert!(!link.images.take(1));
+
+        on_tick(
+            &client,
+            &topics,
+            &mut state(),
+            &ctx,
+            &mut HashMap::new(),
+            &mut link,
+            &mut no_memory(&ctx),
+            false,
+        );
+        assert!(link.images.take(MAX_IMAGE_BYTES_PER_TICK));
+    }
+
+    /// A spent budget drops the image and nothing else: the states around it
+    /// still go out, because they are bytes the broker cannot hold in its
+    /// hands and the bound exists for the ones it can.
+    #[tokio::test]
+    async fn a_sighting_crop_past_the_budget_is_dropped_not_queued() {
+        let topics = Topics::new(&MqttConfig::default());
+        let ctx = bridge_context(&["yard"], &["person"]);
+        let sighting = || MqttEvent::Detections {
+            camera_id: "yard".to_string(),
+            sightings: vec![Sighting {
+                class: "person".to_string(),
+                frame_jpeg: Some(vec![0u8; 4096]),
+            }],
+        };
+
+        // Two slots: the occupancy ON state takes one, and whether the crop
+        // takes the other is the whole question.
+        let (client, _eventloop) = unpolled_client(2);
+        let mut link = Link {
+            connected: true,
+            republish_pending: false,
+            ..Link::default()
+        };
+        assert!(link.images.take(MAX_IMAGE_BYTES_PER_TICK));
+        handle_event(
+            sighting(),
+            &client,
+            &topics,
+            &mut state(),
+            &ctx,
+            &mut HashMap::new(),
+            &mut link,
+            false,
+        );
+        assert_eq!(publish_state(&client, "camon/filler", "x"), Published::Yes);
+
+        // The control: with the window open the crop is queued, and that same
+        // slot is gone.
+        let (client, _eventloop) = unpolled_client(2);
+        link.images.refill();
+        handle_event(
+            sighting(),
+            &client,
+            &topics,
+            &mut state(),
+            &ctx,
+            &mut HashMap::new(),
+            &mut link,
+            false,
+        );
+        assert_eq!(
+            publish_state(&client, "camon/filler", "x"),
+            Published::QueueFull
+        );
+    }
+
+    /// The cadence paces pictures, not attempts. A camera whose decodes all
+    /// fail publishes nothing at all, so counting a failure as a snapshot buys
+    /// the operator a full interval of silence for every failure — and then
+    /// another one.
+    #[test]
+    fn a_decode_that_produced_nothing_does_not_spend_the_cadence() {
+        let mut s = state();
+        let t0 = Instant::now();
+        s.motion_start("yard");
+        assert_eq!(s.due_snapshots(t0), vec!["yard".to_string()]);
+
+        // The attempt was stamped, and the failure takes it back — but only as
+        // far as the retry delay, so a camera failing for good forks one
+        // ffmpeg every couple of seconds rather than every tick.
+        assert!(s.note_snapshot_failed("yard", t0));
+        assert!(s
+            .due_snapshots(t0 + SNAPSHOT_RETRY_DELAY - Duration::from_millis(1))
+            .is_empty());
+        let t1 = t0 + SNAPSHOT_RETRY_DELAY;
+        assert_eq!(s.due_snapshots(t1), vec!["yard".to_string()]);
+
+        // The other branch: an attempt that produced a frame keeps the whole
+        // interval, or the cadence would mean nothing.
+        s.note_snapshot_decoded("yard");
+        assert!(s
+            .due_snapshots(t1 + INTERVAL - Duration::from_millis(1))
+            .is_empty());
+        assert_eq!(s.due_snapshots(t1 + INTERVAL), vec!["yard".to_string()]);
+    }
+
+    /// Silence is the failure nobody notices, so it is said out loud — once
+    /// per run of failures rather than once per retry, and again when it ends.
+    #[test]
+    fn a_failing_camera_is_reported_once_and_its_recovery_too() {
+        let mut s = state();
+        let t0 = Instant::now();
+        s.motion_start("yard");
+        assert!(s.note_snapshot_failed("yard", t0));
+        assert!(!s.note_snapshot_failed("yard", t0 + INTERVAL));
+        assert!(s.note_snapshot_decoded("yard"));
+        assert!(!s.note_snapshot_decoded("yard"));
+        // A new run of failures is news again.
+        assert!(s.note_snapshot_failed("yard", t0 + INTERVAL * 2));
+
+        // A failure reported after the run closed must not put the camera back
+        // on a schedule `motion_end` just took it off: nothing is snapshotted
+        // between runs.
+        s.motion_end("yard");
+        s.note_snapshot_failed("yard", t0 + INTERVAL * 3);
+        assert!(s.due_snapshots(t0 + INTERVAL * 100).is_empty());
+    }
+
+    /// A decode that has ended, as the tick finds it, tagged with the run it
+    /// was started for.
+    async fn ended_snapshot(decoded: bool, run: u64) -> SnapshotTask {
+        let task = SnapshotTask {
+            handle: tokio::spawn(async {}),
+            decoded: Arc::new(AtomicBool::new(decoded)),
+            run,
+        };
+        while !task.handle.is_finished() {
+            tokio::task::yield_now().await;
+        }
+        task
+    }
+
+    /// The outcome has to travel from the detached decode back to the cadence,
+    /// and the tick retiring finished tasks is the whole of that path.
+    #[tokio::test]
+    async fn the_tick_folds_a_decode_outcome_into_the_cadence() {
+        let now = Instant::now();
+        let mut s = state();
+        s.motion_start("yard");
+        s.motion_start("gate");
+        s.due_snapshots(now);
+
+        let mut tasks = HashMap::from([
+            (
+                "yard".to_string(),
+                ended_snapshot(false, s.snapshot_run("yard")).await,
+            ),
+            (
+                "gate".to_string(),
+                ended_snapshot(true, s.snapshot_run("gate")).await,
+            ),
+        ]);
+        retire_snapshots(&mut tasks, &mut s, now);
+        assert!(tasks.is_empty(), "a finished decode was not retired");
+
+        // The failed camera comes back around at the retry delay; the one that
+        // published keeps the cadence it just spent.
+        assert_eq!(
+            s.due_snapshots(now + SNAPSHOT_RETRY_DELAY),
+            vec!["yard".to_string()]
+        );
+
+        // A decode still running is left alone — its outcome is not in yet.
+        let running = SnapshotTask {
+            handle: tokio::spawn(async { tokio::time::sleep(Duration::from_secs(60)).await }),
+            decoded: Arc::new(AtomicBool::new(false)),
+            run: 0,
+        };
+        let mut tasks = HashMap::from([("front".to_string(), running)]);
+        retire_snapshots(&mut tasks, &mut s, now);
+        assert_eq!(tasks.len(), 1);
+        tasks["front"].handle.abort();
+    }
+
+    /// A decode outlives the run that asked for it — fifteen seconds are
+    /// allowed for one, and a camera can close a run and open another well
+    /// inside that. The outcome belongs to the run it was started for: folded
+    /// into a later one it would shorten a cadence that never failed, or clear
+    /// a failure the new run is still having.
+    #[tokio::test]
+    async fn a_decode_that_outlived_its_run_does_not_touch_the_next_one() {
+        let t0 = Instant::now();
+        let mut s = state();
+        s.motion_start("yard");
+        let stale = s.snapshot_run("yard");
+        s.due_snapshots(t0);
+
+        // The run closes and the camera opens another before the decode ends.
+        s.motion_end("yard");
+        let t1 = t0 + Duration::from_millis(1);
+        s.motion_start("yard");
+        assert_ne!(
+            s.snapshot_run("yard"),
+            stale,
+            "a new run is a new generation"
+        );
+        s.due_snapshots(t1);
+
+        // Now the old decode reports, having produced nothing.
+        let mut tasks = HashMap::from([("yard".to_string(), ended_snapshot(false, stale).await)]);
+        retire_snapshots(&mut tasks, &mut s, t1);
+        assert!(tasks.is_empty(), "a finished decode was not retired");
+
+        // The new run keeps the cadence it was given...
+        assert!(
+            s.due_snapshots(t1 + SNAPSHOT_RETRY_DELAY).is_empty(),
+            "a stale failure shortened the new run's cadence"
+        );
+        assert_eq!(s.due_snapshots(t1 + INTERVAL), vec!["yard".to_string()]);
+        // ...and its own first failure is still news, rather than a repeat of
+        // one the previous run had.
+        assert!(s.note_snapshot_failed("yard", t1 + INTERVAL));
+
+        // The same in the other direction: a stale success must not clear the
+        // failure the live run is having.
+        let mut tasks = HashMap::from([("yard".to_string(), ended_snapshot(true, stale).await)]);
+        retire_snapshots(&mut tasks, &mut s, t1 + INTERVAL);
+        assert!(
+            !s.note_snapshot_failed("yard", t1 + INTERVAL),
+            "a stale success cleared the live run's failure"
+        );
+    }
+
+    /// `snapshot_interval_secs` is an operator's `u64`, and every use of it is
+    /// `now + interval`: adding a duration to an `Instant` panics when the
+    /// result is not representable. A nonsense interval reads as "effectively
+    /// never", which is a config to clamp and warn about, not to die on.
+    #[test]
+    fn an_absurd_snapshot_interval_is_clamped_rather_than_panicking() {
+        let mut s = SensorState::new(Duration::from_secs(u64::MAX), HOLD);
+        assert_eq!(s.snapshot_interval, MAX_SNAPSHOT_INTERVAL);
+
+        let t0 = Instant::now();
+        s.motion_start("yard");
+        assert_eq!(s.due_snapshots(t0), vec!["yard".to_string()]);
+        assert!(!s.due_snapshots(t0 + MAX_SNAPSHOT_INTERVAL).is_empty());
+        // The retry path does its own arithmetic on the interval.
+        s.note_snapshot_failed("yard", t0);
+        assert!(!s.due_snapshots(t0 + SNAPSHOT_RETRY_DELAY).is_empty());
+
+        // A sane interval is left exactly as configured.
+        assert_eq!(SensorState::new(INTERVAL, HOLD).snapshot_interval, INTERVAL);
+    }
+
+    /// One GOP of MPEG-TS, straight out of ffmpeg's muxer — near enough what
+    /// the hot buffer holds. Muxed here rather than borrowed from the decoder's
+    /// fixtures, which live in a module this one cannot see. Needs an `ffmpeg`
+    /// binary, so only the `#[ignore]`d test below uses it.
+    fn recorded_segment() -> Vec<u8> {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("segment.ts");
+        let status = std::process::Command::new("ffmpeg")
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "quiet",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=size=640x480:rate=25",
+                "-t",
+                "1",
+                "-c:v",
+                "libx264",
+                "-g",
+                "25",
+                "-keyint_min",
+                "25",
+                "-sc_threshold",
+                "0",
+                "-f",
+                "mpegts",
+                path.to_str().unwrap(),
+            ])
+            .status()
+            .expect("ffmpeg is on PATH for the ignored tests");
+        assert!(status.success(), "ffmpeg could not mux a test segment");
+        std::fs::read(&path).unwrap()
+    }
+
+    /// The budget site the memory arithmetic is actually about: the detached
+    /// decode, which holds the only copy of a few hundred KiB and is the thing
+    /// that can queue them fifteen at a time.
+    ///
+    /// Two orderings matter and neither is visible from the pure-state tests.
+    /// The charge must happen before the publish, or the bound is decoration;
+    /// and the decode must be recorded as having produced a frame *before* the
+    /// budget is consulted, because a refused publish is a queue problem and
+    /// not a camera problem — treating it as a decode failure would shorten the
+    /// cadence of a perfectly healthy camera exactly when the queue is least
+    /// able to take another image, and warn the operator about the wrong fault.
+    ///
+    /// Needs a real decode, so it is `#[ignore]`d like every other test that
+    /// forks ffmpeg.
+    #[tokio::test]
+    #[ignore]
+    async fn a_snapshot_charges_the_budget_before_it_publishes() {
+        // The hot buffer's newest segment is not the one snapshotted — the
+        // decode takes the one behind it, which is complete.
+        let segment = Arc::new(recorded_segment());
+        let buffer = HotBuffer::new("yard".to_string(), 60);
+        {
+            let mut buf = buffer.write_recover();
+            for i in 0..2 {
+                buf.push(crate::buffer::GopSegment {
+                    start_pts: i * 1_000_000_000,
+                    duration_ns: 1_000_000_000,
+                    data: Arc::clone(&segment),
+                    frame_count: 25,
+                });
+            }
+        }
+        let mut ctx = bridge_context(&["yard"], &[]);
+        ctx.buffers = Arc::new(HashMap::from([("yard".to_string(), buffer)]));
+        let topics = Topics::new(&ctx.config);
+
+        let decode = |link: &Link, client: &AsyncClient| {
+            let mut tasks = HashMap::new();
+            spawn_snapshot(client, &topics, &ctx, "yard", 0, &mut tasks, link);
+            tasks.remove("yard").expect("no decode was started")
+        };
+
+        // A window with room: the frame is queued, and the bytes are charged.
+        let link = Link {
+            connected: true,
+            ..Link::default()
+        };
+        let (client, _eventloop) = unpolled_client(1);
+        let task = decode(&link, &client);
+        let decoded = Arc::clone(&task.decoded);
+        task.handle.await.expect("the decode task panicked");
+        assert!(
+            decoded.load(Ordering::Relaxed),
+            "the segment did not decode"
+        );
+        assert_eq!(
+            publish_state(&client, "camon/filler", "x"),
+            Published::QueueFull,
+            "the snapshot never reached the request queue"
+        );
+        assert!(
+            !link.images.take(MAX_IMAGE_BYTES_PER_TICK),
+            "the published image was not charged against the budget"
+        );
+
+        // The same decode against a window that is already spent: the image is
+        // dropped rather than queued...
+        let link = Link {
+            connected: true,
+            ..Link::default()
+        };
+        assert!(link.images.take(MAX_IMAGE_BYTES_PER_TICK));
+        let (client, _eventloop) = unpolled_client(1);
+        let task = decode(&link, &client);
+        let decoded = Arc::clone(&task.decoded);
+        task.handle.await.expect("the decode task panicked");
+        assert_eq!(
+            publish_state(&client, "camon/filler", "x"),
+            Published::Yes,
+            "an image past the budget was queued anyway"
+        );
+        // ...and the camera is not blamed for it. This decode produced a frame;
+        // that the queue could not have it is the queue's fault, and the
+        // cadence must not hear about it as a failure.
+        assert!(
+            decoded.load(Ordering::Relaxed),
+            "a refused publish was recorded as a decode that produced nothing"
+        );
+    }
+
+    /// Two conditions, and they are not the same condition. That the queue took
+    /// a burst carrying the clears is one; that it took it on the session whose
+    /// `Disconnect` is now being proven is the other. A queued request lives
+    /// exactly as long as its connection: rumqttc moves what is left into its
+    /// pending set when the connection fails, and the next connect — camon's
+    /// sessions are clean — throws that set away unwritten.
+    #[test]
+    fn only_the_session_that_queued_the_clears_can_prove_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mqtt_entities.json");
+        let topics = Topics::new(&MqttConfig::default());
+        save_record(&path, &record("camon", &["yard", "gate"], &["person"])).unwrap();
+        let mut ctx = bridge_context(&["yard"], &["person"]);
+        ctx.entities_path = Some(path.clone());
+
+        let mut memory = EntityMemory::load(&topics, &ctx);
+        assert_eq!(memory.orphans.len(), 8);
+        memory.note_burst_accepted();
+        assert_eq!(load_record(&path).unwrap().pending_clears, memory.orphans);
+
+        // The connection that took them is gone, so what it was holding is
+        // gone with it. A `Disconnect` written on the *next* connection proves
+        // nothing about the burst queued on the last one.
+        memory.note_session_lost();
+        memory.note_clears_flushed();
+        assert_eq!(
+            load_record(&path).unwrap().pending_clears,
+            memory.orphans,
+            "clears were forgotten on the strength of another session's disconnect"
+        );
+
+        // The new session re-queues them — every reconnect burst carries them —
+        // and now the disconnect is evidence about the queue that holds them.
+        memory.note_burst_accepted();
+        memory.note_clears_flushed();
+        assert!(load_record(&path).unwrap().pending_clears.is_empty());
+        assert!(EntityMemory::load(&topics, &ctx).orphans.is_empty());
+    }
+
+    /// The same distinction where it actually bites, through the bridge: a
+    /// broker that drops out just before the stop leaves camon queueing its
+    /// `offline` marker and its `Disconnect` while down, the poller reconnects
+    /// and writes exactly those two, and the clears queued on the connection
+    /// before them were discarded by that reconnect. A bridge that took the
+    /// disconnect for proof would record them as done and never clear those
+    /// topics again — a Home Assistant entity that outlives every restart.
+    #[tokio::test]
+    async fn a_reconnect_before_the_stop_leaves_the_clears_owed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mqtt_entities.json");
+        save_record(&path, &record("camon", &["yard", "gate"], &["person"])).unwrap();
+        let mut ctx = bridge_context(&["yard"], &["person"]);
+        ctx.entities_path = Some(path.clone());
+        let shutdown = Arc::clone(&ctx.shutdown);
+
+        // A poller the test speaks for. The raw event loop comes back here
+        // rather than being dropped: dropping it closes the request queue, and
+        // every publish would then fail for a reason no live bridge has. Held
+        // by the test, it is also how the test sees what the bridge has queued.
+        let (link_tx, link_rx) = tokio::sync::mpsc::channel(1);
+        let (mqtt_tx, mqtt_rx) = tokio::sync::mpsc::channel(1);
+        let (raw_tx, raw_rx) = tokio::sync::oneshot::channel();
+        let bridge = tokio::spawn(run_bridge_with(ctx, mqtt_rx, move |raw| {
+            let _ = raw_tx.send(raw);
+            Eventloop {
+                events: link_rx,
+                stop: Arc::new(tokio::sync::Notify::new()),
+                task: tokio::spawn(std::future::pending()),
+            }
+        }));
+        let mut raw = raw_rx.await.expect("the bridge never built a poller");
+
+        // Connected: the burst goes out, clears at its head, and the record
+        // says so.
+        link_tx.send(LinkEvent::Connected).await.unwrap();
+        let mut queued = Vec::new();
+        for _ in 0..100 {
+            queued = load_record(&path).unwrap().pending_clears;
+            if !queued.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            queued.len(),
+            8,
+            "the reconnect burst never queued the clears"
+        );
+
+        // The broker drops out. The channel holds one, so the second send can
+        // only complete once the bridge has taken the first — the edge is
+        // observed, not merely posted. `DisconnectSent` is inert in the loop.
+        link_tx.send(LinkEvent::Disconnected).await.unwrap();
+        link_tx.send(LinkEvent::DisconnectSent).await.unwrap();
+
+        // Now camon stops. The marker and the disconnect are queued while the
+        // link is down, and the reconnect that writes them is the session that
+        // reports this.
+        shutdown.store(true, Ordering::Relaxed);
+        drop(mqtt_tx);
+
+        // The `DisconnectSent` below has to be the one the *flush wait* reads,
+        // not one the loop swallows on its way out — a loop that ate it would
+        // leave the flush to time out, and a test whose gate is never reached
+        // passes for the wrong reason. So it goes out only once the bridge's
+        // own `Disconnect` request is in the queue, which happens after the
+        // loop has ended and immediately before the wait begins. `clean` is
+        // what rumqttc itself does with a queue it is taking over.
+        let queued_disconnect = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                raw.clean();
+                if raw
+                    .pending
+                    .iter()
+                    .any(|request| matches!(request, rumqttc::Request::Disconnect(_)))
+                {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        });
+        queued_disconnect
+            .await
+            .expect("the bridge never asked to disconnect");
+
+        let flushing = std::time::Instant::now();
+        link_tx.send(LinkEvent::DisconnectSent).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(10), bridge)
+            .await
+            .expect("the bridge did not stop once its producers were gone")
+            .expect("bridge task panicked");
+        // Proof that the disconnect was taken as written rather than waited
+        // out: a flush that timed out would have sat here for SHUTDOWN_FLUSH,
+        // and the record below would then be unchanged for a reason that has
+        // nothing to do with which session queued the clears.
+        assert!(
+            flushing.elapsed() < SHUTDOWN_FLUSH,
+            "the flush wait never saw the disconnect, so nothing consulted the clears"
+        );
+
+        assert_eq!(
+            load_record(&path).unwrap().pending_clears,
+            queued,
+            "a disconnect from a later session was taken as proof the clears went out"
         );
     }
 
