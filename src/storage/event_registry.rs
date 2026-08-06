@@ -41,7 +41,9 @@
 //! [`EventRegistry::open`] hands out the [`PendingEvent`] handle and
 //! [`PendingEvent::commit`] is the hinge: under one write lock it takes
 //! whatever parked and moves the record on. Whichever side of the handoff a
-//! verdict arrives on, exactly one upgrade is sent, and the thread that sends
+//! verdict arrives on, at most one upgrade per covering event is sent (a
+//! verdict straddling a capped run's chunks upgrades each chunk it covers,
+//! once), and the thread that sends
 //! it is the one that can — the analyzer for a verdict that parked, because
 //! only it can queue a message behind its own write; the worker for one that
 //! arrives after. A handle dropped without committing (assembly found the
@@ -87,14 +89,32 @@
 //! have come from — the detection worker is aborted during shutdown and its
 //! queue goes with the process — so no upgrade is ever left half applied.
 //!
-//! A verdict that parked during the handoff can still lose its upgrade at
-//! shutdown, in one narrow window: the analyzer gets its write into the
-//! writer's queue, and the writer finishes and exits before the analyzer can
-//! send the upgrade behind it. The event keeps movement retention and an error
-//! line says so. It is consistent with what the stop already treats as
-//! droppable — the whole detection queue is aborted a moment later — and the
-//! footage itself is through, so the alternative (holding the drain open for a
-//! message the writer may never take) would cost more than it saves.
+//! However an upgrade this module asked for fails to reach the writer, it
+//! ends the same way — the event keeps movement retention — and none of it is
+//! repairable from here, because the record is already `Classified` by the
+//! time the send is attempted. What the log shows differs by path: the
+//! analyzer's loss is an error naming only the camera; the worker's is a
+//! warning, naming the event when the channel was merely full and only the
+//! camera when it was closed — a closed channel means that camera's writer is
+//! already dead, which supervision treats as fatal, so the process is on its
+//! way down with it.
+//!
+//! A verdict that parked during the handoff can lose its upgrade at shutdown,
+//! in one narrow window: the analyzer gets its write into the writer's queue,
+//! and the writer finishes and exits before the analyzer can send the upgrade
+//! behind it. It is consistent with what the stop already treats as droppable —
+//! the whole detection queue is aborted a moment later — and the footage itself
+//! is through, so the alternative (holding the drain open for a message the
+//! writer may never take) would cost more than it saves.
+//!
+//! A verdict that arrives after the commit loses its upgrade whenever the
+//! camera's writer channel is full, which needs no shutdown at all: the
+//! detection worker offers that message rather than waiting for room, because
+//! ONE task sends them for every camera and waiting would stop object
+//! detection site-wide while a single writer finishes an upload. That is a
+//! routine loss under a slow store, not an edge case — the trade and what it
+//! costs are set out at `analytics::detect_worker`'s
+//! `DetectionWorker::upgrade_covering_events`.
 //!
 //! An event whose store sidecar reads object while this process's index still
 //! reads movement is a different failure, from a write that committed after

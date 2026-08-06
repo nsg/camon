@@ -24,6 +24,20 @@
 //!   mutations; one the analyzer is still assembling parks the verdict and
 //!   sends that message itself. See `storage::event_registry`.
 //!
+//! The first of those two sends — this worker's, for an event already
+//! written — never waits. The channel it goes down is eight deep, shared with
+//! the analyzer, and drained by a writer that is one slow remote store away,
+//! and THIS task serves every camera: waiting on one camera's writer would
+//! stop object detection for all of them. A full channel loses the upgrade
+//! instead, which is the same trade the queue cap above already makes.
+//!
+//! The second send — the analyzer's, for a verdict that parked — blocks by
+//! design and stays that way. It runs on that camera's own analyzer thread, so
+//! the worst it can stall is the camera it belongs to, and it has just paid a
+//! blocking send for the write the upgrade refers to; giving up on the upgrade
+//! after keeping the footage would be the wrong half to drop. See
+//! `analytics::pipeline::MotionAnalyzer::emit_event`.
+//!
 //! Every job is reported back to the registry when the worker is done with
 //! it, verdict or no verdict, because a record covering its sequences is
 //! being kept alive until it is — see [`EventRegistry::verdict_settled`].
@@ -129,9 +143,12 @@ impl DetectionWorker {
 
     /// Classify one job and then tell the registry the question is answered,
     /// on every path out of the classification — a job that timed out, one the
-    /// model saw nothing in, one whose camera has no registry at all. The
-    /// records it was holding open are only released by this call, so it
-    /// wraps the work rather than living inside it.
+    /// model saw nothing in, one whose upgrade found no room on the writer's
+    /// channel, one whose camera has no registry at all. The records it was
+    /// holding open are only released by this call, so it wraps the work rather
+    /// than living inside it: whatever [`classify_job`](Self::classify_job)
+    /// does or fails to do inside, the expectation this job registered is
+    /// settled exactly once on the way out.
     async fn process_job(&self, job: DetectionJob) {
         let camera_id = job.camera_id.clone();
         let verdict_id = job.verdict_id;
@@ -199,8 +216,7 @@ impl DetectionWorker {
             );
         }
         self.store_detections(&job, &classes, &confidences, &model);
-        self.upgrade_covering_events(&job, &detections, &classes, &model)
-            .await;
+        self.upgrade_covering_events(&job, &detections, &classes, &model);
     }
 
     /// Store one detection row per (segment, class) so the event-assembly
@@ -241,7 +257,7 @@ impl DetectionWorker {
     }
 
     /// Hand this run's verdict to the registry and send the upgrades it asks
-    /// for.
+    /// for — offering them to the writer rather than waiting for room.
     ///
     /// The registry answers for every event the run covers, so the ones that
     /// come back are exactly those already in the writer's queue — an upgrade
@@ -250,7 +266,41 @@ impl DetectionWorker {
     /// verdict parks on its record, and the analyzer sends it once the write
     /// is queued, because a message this worker sent now would reach the
     /// writer first and find no file.
-    async fn upgrade_covering_events(
+    ///
+    /// The send is a try, and this function is not async, because ONE task
+    /// runs this for every camera. The channel is eight slots shared with the
+    /// analyzer, and its consumer uploads whole events to a remote store; a
+    /// single camera whose writer is mid-upload would otherwise park the
+    /// worker here and leave every other camera's motion unclassified for as
+    /// long as it lasted — a stall that also holds this job's registry
+    /// expectation open, pinning records across all cameras behind one slow
+    /// upload. Dropping is the accepted answer everywhere else on this path,
+    /// so it is the answer here too.
+    ///
+    /// What the drop costs, exactly, because it is not nothing: the record was
+    /// marked [`Classified`](crate::storage::event_registry) as the target came
+    /// back, and that state is terminal — no later verdict for the same run
+    /// produces a second target, and nothing re-drives an upgrade from disk. So
+    /// the event stays a movement event for good. Neither backend's upgrade
+    /// mechanism runs (local disk moves the files between `movements/` and
+    /// `objects/`; stathost rewrites the flat-keyed sidecar in place and moves
+    /// nothing), which leaves both in the same state: the sidecar carries no
+    /// detections and the warm index entry keeps `EventType::Movement`. The
+    /// consequence is retention class — the footage expires on
+    /// `movement_retention_days` instead of `object_retention_days` (2 against
+    /// 14 by default), and nothing revisits it.
+    ///
+    /// What survives is less than it looks. The [`DetectionStore`] row this run
+    /// wrote is RAM only and scoped to the hot buffer — the analyzer's
+    /// `cleanup_old_data` drops it as its segment is evicted, and the API
+    /// endpoint reading it is hot-buffer-scoped too. So the detections are
+    /// visible for as long as the footage is still in RAM and not one moment
+    /// longer; after that no durable record of them exists anywhere, and the
+    /// event is a movement event with nothing left to say otherwise. The MQTT
+    /// sighting was already handed to the bridge before this call and is
+    /// unaffected by the drop, but that send is best-effort as well
+    /// ([`send_event`]), so it may or may not have reached Home Assistant.
+    fn upgrade_covering_events(
         &self,
         job: &DetectionJob,
         detections: &[Detection],
@@ -282,8 +332,19 @@ impl DetectionWorker {
 
         for target in targets {
             let upgrade = EventUpgrade::for_event(target, verdict.clone());
-            if tx.send(WriterMessage::Upgrade(upgrade)).await.is_err() {
-                tracing::warn!(camera = %job.camera_id, "warm writer gone, upgrade lost");
+            match tx.try_send(WriterMessage::Upgrade(upgrade)) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(_)) => tracing::warn!(
+                    camera = %job.camera_id,
+                    start_pts_ns = target.start_pts_ns,
+                    "warm writer backlogged, dropped an object upgrade (the event stays a \
+                     movement event and expires on the shorter movement retention; its \
+                     detections are readable for as long as its footage is still in the \
+                     hot buffer, and nowhere after that)"
+                ),
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    tracing::warn!(camera = %job.camera_id, "warm writer gone, upgrade lost");
+                }
             }
         }
     }
@@ -705,6 +766,346 @@ mod tests {
             1,
             "a job that produced no verdict never released the record it was holding"
         );
+    }
+
+    // ---- The post-verdict handoff, against a writer that is not draining ----
+
+    /// An Ollama that sees a person in every frame it is shown, so a job put
+    /// through the worker reaches the upgrade instead of stopping at "the
+    /// model saw nothing". Serves `/api/tags` too, so the worker's startup
+    /// check finds its model rather than warning about it.
+    async fn ollama_that_always_sees_a_person() -> String {
+        let app = axum::Router::new()
+            .route(
+                "/api/chat",
+                axum::routing::post(|| async {
+                    axum::Json(serde_json::json!({
+                        "message": {
+                            "content": "{\"detections\":[{\"class\":\"person\",\
+                                        \"confidence\":0.9,\"x\":0.1,\"y\":0.1,\
+                                        \"w\":0.2,\"h\":0.2}]}"
+                        }
+                    }))
+                }),
+            )
+            .route(
+                "/api/tags",
+                axum::routing::get(|| async {
+                    axum::Json(serde_json::json!({"models": [{"name": "test-model"}]}))
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://{addr}")
+    }
+
+    /// A worker talking to `url`, holding a live registry, and writing to
+    /// whatever channels the test hands it.
+    fn worker_for(
+        url: &str,
+        cameras: &[&str],
+        registry: &EventRegistry,
+        event_senders: HashMap<String, mpsc::Sender<WriterMessage>>,
+    ) -> DetectionWorker {
+        let ids: Vec<String> = cameras.iter().map(|c| (*c).to_string()).collect();
+        let client = OllamaClient::new(url, "test-model", 5, 0.5, vec!["person".to_string()], None)
+            .expect("client");
+        DetectionWorker::new(
+            client,
+            DetectionStore::new(&ids),
+            None,
+            Some(registry.clone()),
+            event_senders,
+            None,
+        )
+    }
+
+    /// A message that occupies one slot of a writer channel and is never taken
+    /// out of it, holding the channel full where a writer mid-upload holds it
+    /// in production. Recognizable by its start, which no real event has.
+    fn filler() -> WriterMessage {
+        WriterMessage::Upgrade(EventUpgrade::for_event(
+            crate::storage::UpgradeTarget {
+                start_pts_ns: u64::MAX,
+                duration_ms: 0,
+                continues: false,
+            },
+            Verdict {
+                object_classes: Vec::new(),
+                detections: Vec::new(),
+                backend: String::new(),
+                model: String::new(),
+            },
+        ))
+    }
+
+    /// A channel of one slot, already full, and the receiver that keeps it open
+    /// without ever reading it.
+    fn a_writer_that_is_not_draining(
+    ) -> (mpsc::Sender<WriterMessage>, mpsc::Receiver<WriterMessage>) {
+        let (tx, rx) = mpsc::channel(1);
+        tx.try_send(filler()).expect("a fresh channel has room");
+        (tx, rx)
+    }
+
+    /// Long enough that a loaded machine is not the reason this fails, short
+    /// enough that a message which is never coming is reported rather than
+    /// hanging the suite.
+    const PATIENCE: std::time::Duration = std::time::Duration::from_secs(10);
+
+    async fn next_message(rx: &mut mpsc::Receiver<WriterMessage>, expected: &str) -> WriterMessage {
+        match tokio::time::timeout(PATIENCE, rx.recv()).await {
+            Ok(Some(message)) => message,
+            Ok(None) => panic!("the writer channel closed before {expected}"),
+            Err(_) => panic!("{expected} never arrived"),
+        }
+    }
+
+    /// ONE task classifies for every camera, and the channel it delivers
+    /// verdicts down is eight slots shared with the analyzer, drained by a
+    /// writer that can be minutes into an upload. Waiting for room there stops
+    /// object detection for the whole site until that one writer moves.
+    ///
+    /// The stall is held open rather than timed: the first camera's channel is
+    /// full for the entire test and nothing ever reads it, so the second
+    /// camera's upgrade arriving is proof the worker walked past it.
+    #[tokio::test]
+    async fn a_writer_that_is_not_draining_does_not_stall_the_camera_behind_it() {
+        let url = ollama_that_always_sees_a_person().await;
+        let registry = EventRegistry::new(&["blocked".to_string(), "next".to_string()]);
+        let (blocked_tx, mut blocked_rx) = a_writer_that_is_not_draining();
+        let (next_tx, mut next_rx) = mpsc::channel(1);
+        let worker = worker_for(
+            &url,
+            &["blocked", "next"],
+            &registry,
+            HashMap::from([
+                ("blocked".to_string(), blocked_tx),
+                ("next".to_string(), next_tx),
+            ]),
+        );
+
+        // Both cameras have a written movement event waiting for its verdict,
+        // and the stalled one is served first (round-robin, insertion order).
+        let (tx, queue) = detect_queue(Some(registry.clone()));
+        tx.send(job("blocked", vec![0]));
+        tx.send(job("next", vec![0]));
+        drop(tx);
+        registry
+            .open("blocked", 0, 0, false)
+            .commit(1000, 5000, false);
+        registry.open("next", 0, 0, false).commit(2000, 5000, false);
+
+        let worker_task = tokio::spawn(worker.run(queue));
+        match next_message(&mut next_rx, "the second camera's upgrade").await {
+            WriterMessage::Upgrade(upgrade) => assert_eq!(upgrade.start_pts_ns, 2000),
+            WriterMessage::Event(_) => panic!("the worker sent an event"),
+        }
+
+        // And the first camera's upgrade was dropped, not queued behind the
+        // message that is still sitting there.
+        match blocked_rx.try_recv() {
+            Ok(WriterMessage::Upgrade(held)) => assert_eq!(held.start_pts_ns, u64::MAX),
+            _ => panic!("the filler holding the channel full went missing"),
+        }
+        assert!(
+            blocked_rx.try_recv().is_err(),
+            "the upgrade found room after all, so nothing here was ever blocked"
+        );
+        worker_task.await.expect("the worker panicked");
+    }
+
+    /// The sharp edge of dropping it. A crop job on the queue is a verdict the
+    /// registry is waiting for, and every record covering its sequences is kept
+    /// alive until that wait ends — so an upgrade that goes nowhere still has
+    /// to end it. Leave the expectation standing and the camera accumulates a
+    /// pinned record per drop, which is the leak the registry's settle
+    /// discipline exists to prevent.
+    #[tokio::test]
+    async fn a_dropped_upgrade_still_settles_what_the_registry_expects() {
+        let url = ollama_that_always_sees_a_person().await;
+        let registry = EventRegistry::new(&["cam".to_string()]);
+        let (tx, mut rx) = a_writer_that_is_not_draining();
+        let worker = worker_for(
+            &url,
+            &["cam"],
+            &registry,
+            HashMap::from([("cam".to_string(), tx)]),
+        );
+
+        let mut job = job("cam", vec![0]);
+        job.verdict_id = registry.expect_verdict("cam", &[0]);
+        registry.open("cam", 0, 0, false).commit(1000, 5000, false);
+        worker.process_job(job).await;
+
+        // The upgrade really was dropped — without this the rest proves nothing.
+        match rx.try_recv() {
+            Ok(WriterMessage::Upgrade(held)) => assert_eq!(held.start_pts_ns, u64::MAX),
+            _ => panic!("the filler holding the channel full went missing"),
+        }
+        assert!(rx.try_recv().is_err(), "the upgrade was queued after all");
+
+        // A movement event over the same sequences, opened after the job left
+        // the system. A verdict still marked outstanding would pin it against
+        // every later event; a settled one lets the next event forget it.
+        registry.open("cam", 0, 0, false).commit(2000, 5000, false);
+        registry
+            .open("cam", 100, 100, false)
+            .commit(3000, 5000, false);
+        assert_eq!(
+            registry.held("cam"),
+            1,
+            "the dropped upgrade left its verdict outstanding, pinning records for the life \
+             of the process"
+        );
+    }
+
+    /// One captured log line, kept whole. The structured fields are kept
+    /// alongside the message because that is where the camera and the event
+    /// live — a warning whose text promises to name them and does not would
+    /// otherwise read as correct here.
+    #[derive(Clone)]
+    struct Logged {
+        level: tracing::Level,
+        message: String,
+        fields: Vec<(String, String)>,
+    }
+
+    impl Logged {
+        fn field(&self, name: &str) -> Option<&str> {
+            self.fields
+                .iter()
+                .find(|(recorded, _)| recorded == name)
+                .map(|(_, value)| value.as_str())
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct Captured(Arc<Mutex<Vec<Logged>>>);
+
+    #[derive(Default)]
+    struct Fields {
+        message: String,
+        rest: Vec<(String, String)>,
+    }
+
+    impl Fields {
+        fn put(&mut self, field: &tracing::field::Field, value: String) {
+            if field.name() == "message" {
+                self.message = value;
+            } else {
+                self.rest.push((field.name().to_string(), value));
+            }
+        }
+    }
+
+    impl tracing::field::Visit for Fields {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.put(field, format!("{value:?}"));
+        }
+
+        fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+            self.put(field, value.to_string());
+        }
+    }
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Captured {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut fields = Fields::default();
+            event.record(&mut fields);
+            self.0.lock().expect("log capture poisoned").push(Logged {
+                level: *event.metadata().level(),
+                message: fields.message,
+                fields: fields.rest,
+            });
+        }
+    }
+
+    /// Everything logged inside `body`, so the level and the fields asserted
+    /// are the ones the drop really emits rather than the ones its wording
+    /// implies.
+    fn capture(body: impl FnOnce()) -> Vec<Logged> {
+        use tracing_subscriber::layer::SubscriberExt;
+        let captured = Captured::default();
+        let subscriber = tracing_subscriber::registry().with(captured.clone());
+        tracing::subscriber::with_default(subscriber, body);
+        let logs = captured.0.lock().expect("log capture poisoned").clone();
+        logs
+    }
+
+    /// A drop is a recording that will expire on the shorter retention, so it
+    /// is reported exactly as this file's other accepted drops are: one
+    /// warning, carrying the camera and the event that lost the upgrade as
+    /// fields an operator can grep on. The two ways to lose one — no room, and
+    /// no writer at all — are told apart, because only the first is transient.
+    #[test]
+    fn a_dropped_upgrade_is_reported_the_way_this_file_reports_its_other_drops() {
+        let registry = EventRegistry::new(&["cam".to_string()]);
+        let (tx, rx) = a_writer_that_is_not_draining();
+        let worker = worker_for(
+            "http://127.0.0.1:1",
+            &["cam"],
+            &registry,
+            HashMap::from([("cam".to_string(), tx)]),
+        );
+        let seen = [detection("person", 0.9)];
+        let classes = ["person".to_string()];
+
+        registry.open("cam", 0, 0, false).commit(1000, 5000, false);
+        let backlogged = capture(|| {
+            worker.upgrade_covering_events(&job("cam", vec![0]), &seen, &classes, "test-model");
+        });
+        let [warning] = &backlogged[..] else {
+            panic!(
+                "a lost object upgrade was reported {} times, not once",
+                backlogged.len()
+            );
+        };
+        assert_eq!(
+            warning.level,
+            tracing::Level::WARN,
+            "a lost object upgrade was reported below the production log level"
+        );
+        assert!(
+            warning.message.contains("dropped an object upgrade"),
+            "the backlogged writer was not named as the reason: {}",
+            warning.message
+        );
+        assert_eq!(
+            warning.field("camera"),
+            Some("cam"),
+            "the warning does not carry the camera that lost the upgrade"
+        );
+        assert_eq!(
+            warning.field("start_pts_ns"),
+            Some("1000"),
+            "the warning does not carry the event that lost the upgrade"
+        );
+
+        // The writer being gone outright still says so in its own words.
+        drop(rx);
+        registry.open("cam", 1, 1, false).commit(2000, 5000, false);
+        let gone = capture(|| {
+            worker.upgrade_covering_events(&job("cam", vec![1]), &seen, &classes, "test-model");
+        });
+        let [warning] = &gone[..] else {
+            panic!(
+                "a vanished writer was reported {} times, not once",
+                gone.len()
+            );
+        };
+        assert_eq!(warning.level, tracing::Level::WARN);
+        assert!(
+            warning.message.contains("warm writer gone"),
+            "a vanished writer was reported as a backlogged one: {}",
+            warning.message
+        );
+        assert_eq!(warning.field("camera"), Some("cam"));
     }
 
     /// A worker whose only job in these tests is to publish debug entries; the
