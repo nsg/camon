@@ -215,17 +215,24 @@ port = 8080
 # Address to bind to (default: "0.0.0.0" = every interface, reachable from the
 # LAN). "127.0.0.1" keeps the server on this machine only.
 bind = "0.0.0.0"
-# Access token for the API (default: none = anyone who can reach the port can
-# watch all footage and change motion settings). When set, every request under
-# /api must present it as an "Authorization: Bearer <token>" header; GET and
-# HEAD may instead use a "?token=<token>" query parameter, which is how image
-# and video URLs that cannot set headers authenticate. The web UI prompts for
-# it once and keeps it in the browser's local storage; the UI shell itself
-# stays unauthenticated so that prompt can load.
+# Access token for the API. When set, every request under /api must present it
+# as an "Authorization: Bearer <token>" header — reading footage included; GET
+# and HEAD may instead use a "?token=<token>" query parameter, which is how
+# image and video URLs that cannot set headers authenticate. That query form
+# puts the token in URLs, where proxies log it and browsers cache it, so treat
+# a token that has been used this way as exposed to anything on the path. The
+# web UI prompts for it once and keeps it in the browser's local storage; the
+# UI shell itself stays unauthenticated so that prompt can load.
+#
+# Unset does not mean open: on any bind that is not loopback (127.0.0.0/8 or
+# ::1) camon generates a token on first start, writes it to an "api-token" file
+# beside config.toml (mode 0600), and requires it for everything that changes
+# state — motion settings and ignore masks. Reading stays open in that case;
+# setting a token here is what closes reading too.
 # token = "s3cr3t-token"
-# Silence the startup warning about an unauthenticated API on a non-loopback
-# bind (default: false). Set true only when something in front of camon already
-# authenticates — e.g. the Home Assistant add-on, where ingress does.
+# Declare that something in front of camon authenticates (default: false).
+# Camon then asks for nothing itself — no generated token, no warning. The Home
+# Assistant add-on forces this on, because ingress does the authenticating.
 allow_open = false
 
 [analytics]
@@ -426,6 +433,10 @@ url = "rtsp://admin:password@192.168.1.100:554/stream1"
 | `GET` | `/api/cameras/{id}/detection-debug/{id}/full-frame` | Detection debug full frame JPEG |
 
 Every route above sits behind `[http] token` when one is set: a request without it answers `401` with `WWW-Authenticate: Bearer`. Only `/api` is covered — the UI shell (`/`) and its assets stay open so the token prompt can load. A GET may carry the token as `?token=` instead of the header; a `PUT` may not.
+
+With no token set, what the API asks for depends on where it is bound, and the default `0.0.0.0` is not open. On any bind that is not loopback (`127.0.0.0/8` or `::1`), camon generates a token on first start, writes it to `api-token` beside `config.toml` (mode 0600), and requires it for every request that is not a GET or HEAD — today the single `PUT`, and by construction anything added later. That is the route that matters: an all-blocking ignore mask stops a camera recording, and the resulting silence looks like nothing at all afterwards. The web UI needs no setup for this — the first refused save raises its usual token prompt; paste in the contents of `api-token` and it is stored and **the page reloads**, so that one refused change has to be made again, and nothing after it asks. **Reads are deliberately left open in this mode**, so an unattended self-update never comes back with the live view behind a secret nobody has yet; setting `[http] token` is what closes reading as well, and camon says so on every start until it is set. On a loopback bind, or with `[http] allow_open = true` (the Home Assistant add-on, where ingress authenticates), camon asks for nothing.
+
+Reads being open is a wider hole than "somebody on the LAN". A page on a domain an attacker controls can re-point that name at camon's address after the browser has loaded it (DNS rebinding); the browser then treats that page and camon as the *same origin* — an origin is scheme, host and port, and which address the name resolved to is no part of it — so the page can read the API, footage included. It cannot write: the token lives in local storage under the origin the operator actually browses camon at, which the attacker's origin cannot read, and a 192-bit random token is not guessed. Camon does not check the `Host` header, because a default-on allowlist would break both supported deployments (an operator reaching camon at `http://nvr.lan:8080`, and the add-on, which is proxied with Home Assistant's own `Host`) and a default-off one protects nobody. `[http] token` closes reads and rebinding together, and is the only thing that does.
 
 `{stage}` on the motion-map route names one of the detector's pipeline stages: `stability` (the final motion mask, after component filtering), `raw` (the raw MOG2 foreground mask), `no-shadow` (an alias of the raw mask, kept from when a shadow stage existed), `morph` (after morphological opening) and `background` (the learned background model). A stage that has not been published yet, or a name that is not one of these, answers `404`. Each stage costs a JPEG encode per camera on every analysis pass, so they are only produced while they are being asked for: a stage that has not been requested for half a minute stops being encoded, and the view left behind expires with it rather than being served as if it were live. The first request after such a pause therefore answers `404`, and is also what starts production again — polling, which the debug UI does every five seconds, fills the view in on the next pass.
 

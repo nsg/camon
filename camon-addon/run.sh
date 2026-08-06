@@ -17,8 +17,10 @@
 #     volume, so recordings survive restarts/updates.
 #   * http.allow_open = true — ingress IS the authentication layer here (Home
 #     Assistant authenticates the user before proxying), and the internal port
-#     is only reachable from the container network, so Camon's warning about an
-#     unauthenticated API does not apply.
+#     is only reachable from the container network. Without this, Camon would
+#     see a 0.0.0.0 bind with no [http] token and generate a token of its own
+#     to guard its write endpoints — a secret ingress could never present, so
+#     the add-on's motion settings and mask editor would stop saving.
 #
 # These are applied with `--set` at startup, overriding whatever the file says.
 #

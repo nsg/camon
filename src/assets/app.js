@@ -167,11 +167,15 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
 
     // === API Auth ===
-    // Optional server-side ([http] token in config.toml). When the server
-    // requires one, every fetch and hls.js request carries it as a bearer
-    // header; <img> and native <video> sources, which cannot set headers, fall
-    // back to ?token=. A 401 means what we have is missing or stale, so we ask
-    // for a new one and reload — every request then starts out authenticated.
+    // Either the operator's own [http] token, which the server asks for on
+    // every request, or the one camon generates for a LAN deployment, which it
+    // asks for only when something is being changed — so on a default install
+    // this view loads and the prompt appears the first time a setting is saved.
+    // The UI does not know or care which: every fetch and hls.js request
+    // carries whatever token it has as a bearer header; <img> and native
+    // <video> sources, which cannot set headers, fall back to ?token=. A 401
+    // means what we have is missing or stale, so we ask for a new one and
+    // reload — every request then starts out authenticated.
     const TOKEN_STORAGE_KEY = 'camon.token';
     let apiToken = localStorage.getItem(TOKEN_STORAGE_KEY) || '';
 

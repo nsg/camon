@@ -70,19 +70,34 @@ port = 8080
 # the whole LAN). Use "127.0.0.1" to keep the server on this machine only —
 # right when a reverse proxy on the same host is the only client.
 bind = "0.0.0.0"
-# Access token for the API (default: none = anyone who can reach the port can
-# watch all footage and change motion settings). When set, every request under
-# /api must present it as an "Authorization: Bearer <token>" header. GET and
-# HEAD requests may instead use a "?token=<token>" query parameter, which is
+# Access token for the API. When set, EVERY request under /api must present it
+# as an "Authorization: Bearer <token>" header — reading footage included. GET
+# and HEAD requests may instead use a "?token=<token>" query parameter, which is
 # how image and video URLs that cannot set headers authenticate; requests that
-# change anything always need the header. The web UI asks for it once and
+# change anything always need the header. Note what that fallback costs: the
+# web UI puts the token in those URLs, and URLs are logged by proxies and cached
+# by browsers in a way headers are not, so a token used this way should be
+# assumed known to anything on the network path. The web UI asks for it once and
 # remembers it in the browser's local storage; the UI shell itself stays
 # unauthenticated so that prompt can load. An empty value is rejected at
 # startup — use a long random one, e.g. `openssl rand -hex 32`.
+#
+# Leaving it unset does NOT mean "open". On any bind that is not loopback
+# (127.0.0.0/8 or ::1), camon generates a token of its own on first start,
+# writes it to an "api-token" file next to this one (mode 0600) and requires it
+# for everything that changes state — motion settings and ignore masks; the web
+# UI asks for it the first time you save, then reloads, so that one change has
+# to be made again. Reading is left open in that case, so an install that
+# updates itself never comes back with its live view locked; setting a token
+# here is what closes reading too, and camon says so at every start until you
+# do. The generated token goes through the same "?token=" URLs once the UI has
+# it, with the same caveat.
 # token = "s3cr3t-token"
-# Silence the startup warning about an unauthenticated API on a non-loopback
-# bind (default: false). Set true only when something in front of camon already
-# authenticates — e.g. the Home Assistant add-on, where ingress does.
+# Declare that something in front of camon does the authenticating (default:
+# false). Camon then asks for nothing itself: no generated token, no warning.
+# The Home Assistant add-on forces this on, because ingress authenticates the
+# user and reaches camon over the container network. Do not set it because the
+# warning is annoying — it turns the write protection off with it.
 allow_open = false
 
 [analytics]

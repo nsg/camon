@@ -1,4 +1,6 @@
+mod auth;
 mod hls;
 mod server;
 
-pub use server::{bind, serve, warn_if_open, AppState};
+pub use auth::ApiAuth;
+pub use server::{bind, serve, AppState};

@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- **Camon now protects its own settings when it is reached over a network,
+  and the add-on is unaffected.** Outside Home Assistant, a camon with no
+  `[http] token` used to accept a motion-settings change — including an
+  ignore mask that blanks a camera and silently stops it recording — from
+  anyone who could reach the port; it now generates a token for those
+  requests on first start. Nothing changes here: `run.sh` has always forced
+  `http.allow_open = true`, which tells camon that Home Assistant is the
+  authentication layer, so ingress reaches the add-on's UI and its settings
+  editor exactly as before, with no token to find or enter.
+
 - **Stopping the add-on no longer cuts recordings off after ten seconds.**
   The Supervisor's default stop timeout is 10 seconds, but camon's shutdown
   finishes what it is doing first — the motion run in progress, any pending

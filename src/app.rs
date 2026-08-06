@@ -45,6 +45,11 @@ pub enum RunError {
         addr: std::net::SocketAddr,
         source: std::io::Error,
     },
+    /// Camon needed an API token of its own — a network-reachable bind with no
+    /// `[http] token` and no `allow_open` — and could not get the randomness to
+    /// make one. Startup ends rather than serving the writes unguarded.
+    #[error("cannot generate an API token: {source}")]
+    ApiToken { source: std::io::Error },
     /// A supervised task the process cannot run without died. The drain has
     /// already run by the time this is returned — see [`crate::supervise`].
     ///
@@ -1132,11 +1137,16 @@ where
             addr: http_addr,
             source,
         })?;
-    api::warn_if_open(
+    // Decided here, once, and before any of it is served: what the API asks of
+    // a request, and — for a deployment that would otherwise be open — the
+    // token it will ask for, generated and persisted on the way through.
+    let api_auth = api::ApiAuth::resolve(
         http_addr.ip(),
         config.http.token.as_deref(),
         config.http.allow_open,
-    );
+        config.token_file_path().as_deref(),
+    )
+    .map_err(|source| RunError::ApiToken { source })?;
 
     check_for_updates(&config, &shutdown, &supervisor, check_update).await;
 
@@ -1288,13 +1298,12 @@ where
         storage,
         motion_settings,
     );
-    let http_token = config.http.token.clone();
     // Serving on the socket startup already took. Any return is a failure —
     // there is no version of "camon is running" that does not answer here — so
     // the supervisor takes the process down and the service manager brings it
     // back with a fresh listener.
     let server_handle = supervisor.critical("http-server", async move {
-        if let Err(e) = api::serve(listener, app_state, http_token).await {
+        if let Err(e) = api::serve(listener, app_state, api_auth).await {
             tracing::error!(error = %e, "the API server stopped serving");
         }
     });

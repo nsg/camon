@@ -238,7 +238,9 @@
     <div id="token-prompt" hidden>
         <div class="token-card">
             <h2>Access token required</h2>
-            <p>This server is protected by a token (<code>[http] token</code> in config.toml).</p>
+            <p>Paste the <code>[http] token</code> from config.toml — or, if you have not set one,
+               the contents of the <code>api-token</code> file camon generated next to it.
+               Unlocking reloads the page, so a change that was just refused has to be made again.</p>
             <input type="password" id="token-input" placeholder="Token" autocomplete="current-password" spellcheck="false">
             <button id="token-submit" class="settings-action-btn">Unlock</button>
         </div>

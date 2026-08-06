@@ -1,17 +1,16 @@
 use std::collections::HashMap;
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 use std::sync::{Arc, RwLock};
 
 use axum::body::Body;
-use axum::extract::{Path, Query, Request, State};
-use axum::http::{header, HeaderMap, Method, StatusCode};
-use axum::middleware::{self, Next};
+use axum::extract::{Path, Query, State};
+use axum::http::{header, HeaderMap, StatusCode};
+use axum::middleware;
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use rust_embed::Embed;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
 use crate::analytics::motion_settings::{
     MotionSettings, MASK_COLS, MASK_ROWS, MIN_CONTOUR_AREA_MAX, MIN_CONTOUR_AREA_MIN,
@@ -25,6 +24,7 @@ use crate::storage::{
     ThumbnailError, VideoStream, WarmEventEntry, WarmStorageBackend,
 };
 
+use super::auth::{require_token, ApiAuth};
 use super::hls;
 
 #[derive(Embed)]
@@ -96,85 +96,12 @@ struct PlaylistQuery {
     live: Option<bool>,
 }
 
-/// SHA-256 of the configured `[http] token`. The presented token is hashed the
-/// same way before comparison: `==` on `[u8; 32]` is not guaranteed to be
-/// constant-time, but it runs over two fixed-width digests, so how far it gets
-/// says nothing usable about the secret's length or content.
-#[derive(Clone)]
-struct TokenAuth(Arc<[u8; 32]>);
-
-fn token_digest(token: &str) -> [u8; 32] {
-    Sha256::digest(token.as_bytes()).into()
-}
-
-/// The `?token=` fallback, for requests that cannot carry headers: `<img>`
-/// sources (thumbnails, filmstrips, debug maps) and native video elements.
-/// Those are reads, so the fallback is confined to GET and HEAD — anything
-/// that changes state must present the header.
-#[derive(Deserialize)]
-struct TokenQuery {
-    token: Option<String>,
-}
-
-fn bearer_token(headers: &HeaderMap) -> Option<&str> {
-    headers
-        .get(header::AUTHORIZATION)?
-        .to_str()
-        .ok()?
-        .strip_prefix("Bearer ")
-}
-
-async fn require_token(State(auth): State<TokenAuth>, request: Request, next: Next) -> Response {
-    let query_fallback_allowed = matches!(*request.method(), Method::GET | Method::HEAD);
-    let presented = match bearer_token(request.headers()) {
-        Some(token) => Some(token.to_string()),
-        None if query_fallback_allowed => Query::<TokenQuery>::try_from_uri(request.uri())
-            .ok()
-            .and_then(|q| q.0.token),
-        None => None,
-    };
-
-    match presented {
-        Some(token) if token_digest(&token) == *auth.0 => next.run(request).await,
-        _ => (
-            StatusCode::UNAUTHORIZED,
-            [(header::WWW_AUTHENTICATE, "Bearer")],
-            "unauthorized",
-        )
-            .into_response(),
-    }
-}
-
-/// True when the API can be reached from another machine with no token — the
-/// configuration [`warn_if_open`] shouts about.
-fn is_open_to_network(bind: IpAddr, token: Option<&str>) -> bool {
-    token.is_none() && !bind.is_loopback()
-}
-
-/// Warn loudly at startup when the API is reachable off-box without a token.
-/// `allow_open` silences it for deployments that authenticate one layer out.
-pub fn warn_if_open(bind: IpAddr, token: Option<&str>, allow_open: bool) {
-    if allow_open || !is_open_to_network(bind, token) {
-        return;
-    }
-    tracing::warn!(
-        %bind,
-        "THE API IS OPEN: anyone who can reach this address can watch all footage and \
-         change motion settings. Set [http] token to require a token, or [http] bind to \
-         \"127.0.0.1\" to keep it on this machine. Set [http] allow_open = true to silence \
-         this if something in front of camon already authenticates."
-    );
-}
-
 /// The UI shell (`/` and `/assets/*`) stays unauthenticated so the token prompt
-/// can load; everything under `/api` needs the token once one is configured.
-pub fn build_router(state: AppState, token: Option<&str>) -> Router {
+/// can load; what the routes under `/api` ask for is [`ApiAuth`]'s to say.
+pub fn build_router(state: AppState, auth: &ApiAuth) -> Router {
     let mut api = api_routes().with_state(state);
-    if let Some(token) = token {
-        api = api.route_layer(middleware::from_fn_with_state(
-            TokenAuth(Arc::new(token_digest(token))),
-            require_token,
-        ));
+    if let Some(token_auth) = auth.layer() {
+        api = api.route_layer(middleware::from_fn_with_state(token_auth, require_token));
     }
 
     Router::new()
@@ -204,9 +131,9 @@ pub async fn bind(addr: SocketAddr) -> Result<tokio::net::TcpListener, std::io::
 pub async fn serve(
     listener: tokio::net::TcpListener,
     state: AppState,
-    token: Option<String>,
+    auth: ApiAuth,
 ) -> Result<(), std::io::Error> {
-    axum::serve(listener, build_router(state, token.as_deref())).await
+    axum::serve(listener, build_router(state, &auth)).await
 }
 
 fn api_routes() -> Router<AppState> {
@@ -1042,7 +969,7 @@ mod tests {
     /// Bind the router to an ephemeral loopback port and return its base URL.
     /// Requests go over real HTTP so the middleware is exercised exactly as it
     /// is in production, headers and query string included.
-    async fn serve(token: Option<&str>) -> String {
+    async fn serve(auth: &ApiAuth) -> String {
         let ids = vec!["cam".to_string()];
         let buffers = HashMap::from([("cam".to_string(), HotBuffer::new("cam".to_string(), 60))]);
         let state = AppState::new(
@@ -1053,7 +980,7 @@ mod tests {
             None,
             None,
         );
-        let app = build_router(state, token);
+        let app = build_router(state, auth);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -1074,7 +1001,7 @@ mod tests {
             None,
             None,
         );
-        let app = build_router(state, None);
+        let app = build_router(state, &ApiAuth::Open);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -1095,7 +1022,7 @@ mod tests {
             None,
             None,
         );
-        let app = build_router(state, None);
+        let app = build_router(state, &ApiAuth::Open);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -1273,7 +1200,7 @@ mod tests {
             Some(storage),
             None,
         );
-        let app = build_router(state, None);
+        let app = build_router(state, &ApiAuth::Open);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -1376,7 +1303,7 @@ mod tests {
             Some(storage),
             None,
         );
-        let app = build_router(state, None);
+        let app = build_router(state, &ApiAuth::Open);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -1399,7 +1326,7 @@ mod tests {
 
     /// Serve with motion settings backed by `data_dir`.
     async fn serve_with_motion_settings(data_dir: &std::path::Path) -> String {
-        let app = build_router(motion_settings_state(data_dir), None);
+        let app = build_router(motion_settings_state(data_dir), &ApiAuth::Open);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -1547,7 +1474,7 @@ mod tests {
 
     #[tokio::test]
     async fn api_rejects_requests_without_the_token() {
-        let base = serve(Some(TOKEN)).await;
+        let base = serve(&ApiAuth::Everything(TOKEN.to_string())).await;
         let client = reqwest::Client::new();
 
         let status = client
@@ -1570,7 +1497,7 @@ mod tests {
 
     #[tokio::test]
     async fn bearer_header_carries_the_token() {
-        let base = serve(Some(TOKEN)).await;
+        let base = serve(&ApiAuth::Everything(TOKEN.to_string())).await;
         let response = reqwest::Client::new()
             .get(format!("{base}/api/cameras"))
             .bearer_auth(TOKEN)
@@ -1583,7 +1510,7 @@ mod tests {
 
     #[tokio::test]
     async fn query_token_carries_it_where_headers_cannot() {
-        let base = serve(Some(TOKEN)).await;
+        let base = serve(&ApiAuth::Everything(TOKEN.to_string())).await;
         // Media route with a query parameter of its own: the token must coexist
         // with it, and arrive percent-decoded.
         let response = reqwest::get(format!(
@@ -1597,7 +1524,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_wrong_query_token_is_rejected() {
-        let base = serve(Some(TOKEN)).await;
+        let base = serve(&ApiAuth::Everything(TOKEN.to_string())).await;
         let status = reqwest::get(format!("{base}/api/cameras?token=wrong"))
             .await
             .unwrap()
@@ -1610,7 +1537,7 @@ mod tests {
     /// does not reach them: a write must present the header.
     #[tokio::test]
     async fn writes_require_the_header_and_never_the_query_token() {
-        let base = serve(Some(TOKEN)).await;
+        let base = serve(&ApiAuth::Everything(TOKEN.to_string())).await;
         let url = format!("{base}/api/cameras/cam/motion/settings");
         let client = reqwest::Client::new();
 
@@ -1648,7 +1575,7 @@ mod tests {
 
     #[tokio::test]
     async fn ui_shell_loads_without_a_token() {
-        let base = serve(Some(TOKEN)).await;
+        let base = serve(&ApiAuth::Everything(TOKEN.to_string())).await;
         let client = reqwest::Client::new();
 
         let response = client.get(&base).send().await.unwrap();
@@ -1664,24 +1591,175 @@ mod tests {
         assert_eq!(status, reqwest::StatusCode::OK);
     }
 
+    /// The loopback and Home Assistant deployments: nothing is asked of
+    /// anybody, reads and writes alike, because the boundary is somewhere else.
     #[tokio::test]
-    async fn no_configured_token_leaves_the_api_open() {
-        let base = serve(None).await;
+    async fn an_open_policy_asks_for_nothing_at_all() {
+        let base = serve(&ApiAuth::Open).await;
         let status = reqwest::get(format!("{base}/api/cameras"))
             .await
             .unwrap()
             .status();
         assert_eq!(status, reqwest::StatusCode::OK);
+
+        let status = reqwest::Client::new()
+            .put(format!("{base}/api/cameras/cam/motion/settings"))
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .unwrap()
+            .status();
+        // 404 because motion settings are off in this state — what matters is
+        // that the request reached the handler at all.
+        assert_eq!(status, reqwest::StatusCode::NOT_FOUND);
     }
 
-    #[test]
-    fn open_api_warning_covers_exactly_the_unprotected_network_case() {
-        let all = IpAddr::from([0, 0, 0, 0]);
-        let loopback = IpAddr::from([127, 0, 0, 1]);
-        assert!(is_open_to_network(all, None));
-        assert!(!is_open_to_network(all, Some(TOKEN)));
-        assert!(!is_open_to_network(loopback, None));
-        assert!(!is_open_to_network("::1".parse().unwrap(), None));
+    /// The default LAN deployment, and the reason this layer exists. The mask
+    /// editor is the sharp end: a PUT that blanks a camera's motion mask stops
+    /// it recording, and nothing about the resulting silence looks like an
+    /// attack afterwards. Without the generated token it does not happen.
+    #[tokio::test]
+    async fn a_generated_token_refuses_a_write_that_does_not_carry_it() {
+        let base = serve(&ApiAuth::Writes(TOKEN.to_string())).await;
+        let url = format!("{base}/api/cameras/cam/motion/settings");
+        let client = reqwest::Client::new();
+
+        let response = client
+            .put(&url)
+            .json(&serde_json::json!({ "mask": [true, true] }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::UNAUTHORIZED);
+        // 401, not 403: the caller may retry with a credential, and this header
+        // is what says so — the web UI's own 401 handler raises its prompt.
+        assert_eq!(
+            response.headers()[reqwest::header::WWW_AUTHENTICATE],
+            "Bearer"
+        );
+
+        // Nor does the `?token=` fallback reach a write: it exists for <img>
+        // and native video, which only ever GET.
+        let status = client
+            .put(format!("{url}?token=s3cr3t%20token"))
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(status, reqwest::StatusCode::UNAUTHORIZED);
+
+        let status = client
+            .put(&url)
+            .bearer_auth("wrong")
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(status, reqwest::StatusCode::UNAUTHORIZED);
+    }
+
+    /// And with the token the operator got from the file, the same write goes
+    /// through — a scheme the UI cannot satisfy is a regression wearing a
+    /// security badge. 404 is this build's answer past the layer (motion
+    /// settings are off in the test state); the point is that it is not a 401.
+    #[tokio::test]
+    async fn a_generated_token_lets_the_write_through() {
+        let base = serve(&ApiAuth::Writes(TOKEN.to_string())).await;
+        let status = reqwest::Client::new()
+            .put(format!("{base}/api/cameras/cam/motion/settings"))
+            .bearer_auth(TOKEN)
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(status, reqwest::StatusCode::NOT_FOUND);
+    }
+
+    /// The documented residual, pinned so it cannot change by accident: a
+    /// generated token does not gate reading. An install that upgrades itself
+    /// overnight must not come back with the live view behind a secret nobody
+    /// has yet — `[http] token` is the setting that closes this, and the
+    /// startup warning names it.
+    #[tokio::test]
+    async fn a_generated_token_deliberately_leaves_reading_open() {
+        let base = serve(&ApiAuth::Writes(TOKEN.to_string())).await;
+        for url in [
+            format!("{base}/api/cameras"),
+            format!("{base}/api/stream/cam/playlist.m3u8?live=true"),
+        ] {
+            let status = reqwest::get(&url).await.unwrap().status();
+            assert_eq!(status, reqwest::StatusCode::OK, "{url}");
+        }
+
+        // A configured token is the one that does gate them.
+        let base = serve(&ApiAuth::Everything(TOKEN.to_string())).await;
+        let status = reqwest::get(format!("{base}/api/cameras"))
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(status, reqwest::StatusCode::UNAUTHORIZED);
+    }
+
+    /// A config file written before any of this existed — no `token`, no
+    /// `allow_open`, the default `0.0.0.0` bind — still starts, still serves
+    /// its UI and its footage, and has its writes guarded by a token that
+    /// appeared beside the config file. That is the whole upgrade story for
+    /// every deployment already in the field.
+    #[tokio::test]
+    async fn a_config_from_before_this_existed_keeps_its_ui_and_gains_a_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[http]\nport = 8080\n\n[[cameras]]\nid = \"cam\"\nurl = \"rtsp://10.0.0.5:554/s0\"\n",
+        )
+        .unwrap();
+        let config = crate::config::Config::load_from_with_overrides(&path, &[]).unwrap();
+        assert_eq!(config.http.bind, "0.0.0.0");
+
+        let auth = ApiAuth::resolve(
+            config.http.bind_addr(),
+            config.http.token.as_deref(),
+            config.http.allow_open,
+            config.token_file_path().as_deref(),
+        )
+        .unwrap();
+        let ApiAuth::Writes(token) = &auth else {
+            panic!("an old config did not gain a generated token: {auth:?}");
+        };
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("api-token"))
+                .unwrap()
+                .trim(),
+            token
+        );
+
+        let base = serve(&auth).await;
+        // The UI shell and the reads it opens with are untouched...
+        assert_eq!(
+            reqwest::get(&base).await.unwrap().status(),
+            reqwest::StatusCode::OK
+        );
+        assert_eq!(
+            reqwest::get(format!("{base}/api/cameras"))
+                .await
+                .unwrap()
+                .status(),
+            reqwest::StatusCode::OK
+        );
+        // ...and the settings editor works with the token from that file.
+        let status = reqwest::Client::new()
+            .put(format!("{base}/api/cameras/cam/motion/settings"))
+            .bearer_auth(token)
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .unwrap()
+            .status();
+        assert_ne!(status, reqwest::StatusCode::UNAUTHORIZED);
     }
 
     #[test]

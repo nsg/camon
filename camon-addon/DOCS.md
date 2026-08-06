@@ -116,12 +116,19 @@ Five values are **forced by `run.sh`** via `camon --set`, overriding whatever
 - **`http.bind = 0.0.0.0`.** Ingress reaches the add-on over the container
   network, so the listener has to accept connections from it. A `bind` of
   `127.0.0.1` in `camon.toml` would silently break ingress, hence the pin.
-- **`http.allow_open = true`.** Standalone camon warns loudly at startup when
-  its API is reachable over the network without an `[http] token`. In the
-  add-on that warning does not apply: nothing outside the container can reach
-  port 22666, and Home Assistant authenticates every user before proxying them
-  through ingress — HA *is* the authentication layer here. Setting an `[http]
-  token` as well is supported and harmless, but not needed.
+- **`http.allow_open = true`.** This is camon's way of being told that
+  something in front of it does the authenticating, and in the add-on that is
+  simply true: no host port is published, so nothing outside the container
+  network can reach port 22666, and Home Assistant authenticates every user
+  (an admin, per `panel_admin: true`) before proxying them through ingress —
+  HA *is* the authentication layer here. Without the pin, camon would see a
+  `0.0.0.0` bind with no token and protect its own write endpoints with a
+  token it generated — a secret the ingress proxy has no way to present, which
+  would leave the add-on's motion settings and mask editor permanently
+  refusing to save. Setting an `[http] token` as well is supported and
+  harmless, but not needed. What this does *not* cover is another container on
+  the same Docker network: it can reach port 22666 directly, and nothing in
+  the add-on stands between it and the API.
 - **`storage.data_dir = /data/storage`.** `/data` is the add-on's own
   persistent volume — always mounted and preserved across restarts/updates — so
   recordings survive there automatically. Camon marks the directory at startup

@@ -1,7 +1,7 @@
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use thiserror::Error;
 
 /// The ranges the motion sliders are held to. Read from the module that owns
@@ -357,12 +357,17 @@ pub struct HttpConfig {
     /// Address the listener binds to. Validated as an [`IpAddr`] at load time.
     #[serde(default = "default_http_bind")]
     pub bind: String,
-    /// Shared secret required on every `/api` request. `None` (the default)
-    /// leaves the API open to anyone who can reach the port.
+    /// Shared secret required on every `/api` request, reads included. `None`
+    /// (the default) does *not* mean "open": on a non-loopback bind camon
+    /// generates a token of its own and requires it for anything that changes
+    /// state. See [`crate::api::ApiAuth`] for the full table.
     #[serde(default)]
     pub token: Option<String>,
-    /// Suppresses the open-API startup warning for deployments where an outer
-    /// layer authenticates (e.g. Home Assistant ingress).
+    /// Declares that something in front of camon is the authentication boundary
+    /// (Home Assistant ingress, an authenticating reverse proxy). Camon then
+    /// asks for nothing itself: no generated token, no startup warning. The
+    /// add-on forces this on, because ingress reaches camon over the container
+    /// network and could never present a token camon invented.
     #[serde(default)]
     pub allow_open: bool,
 }
@@ -792,9 +797,41 @@ pub struct Config {
     pub mqtt: MqttConfig,
     #[serde(default)]
     pub cameras: Vec<CameraConfig>,
+    /// The file this config was read from, kept so camon can put things beside
+    /// it — today only the API token it generates for an otherwise-open
+    /// deployment, which belongs where the operator already looks for camon's
+    /// settings. `None` for a config that did not come from a file (tests, and
+    /// `toml::from_str`), which costs that config a *persisted* token, never
+    /// the protection itself.
+    ///
+    /// Not a setting: `deny_unknown_fields` plus `serde(skip)` means a
+    /// `source_path` key in the TOML is refused like any other typo.
+    #[serde(skip)]
+    source_path: Option<PathBuf>,
 }
 
+/// Where a generated API token is kept, relative to the config file that did
+/// not name one. See [`crate::api::ApiAuth`].
+const API_TOKEN_FILE: &str = "api-token";
+
 impl Config {
+    /// The file a generated API token is read from and written to: beside the
+    /// config file, so `/etc/camon/config.toml` puts it at
+    /// `/etc/camon/api-token`. `None` when the config did not come from a file
+    /// and there is therefore nowhere obvious to keep it.
+    pub fn token_file_path(&self) -> Option<PathBuf> {
+        let source = self.source_path.as_ref()?;
+        // A bare `config.toml` has an empty parent, which joins to a plain
+        // relative name — resolved against the working directory the service
+        // unit sets, exactly as the config path itself was.
+        Some(
+            source
+                .parent()
+                .unwrap_or_else(|| Path::new(""))
+                .join(API_TOKEN_FILE),
+        )
+    }
+
     /// Load from the default `config.toml` in the current working directory.
     pub fn load(overrides: &[Override]) -> Result<Self, ConfigError> {
         Self::load_from_with_overrides(DEFAULT_CONFIG_PATH, overrides)
@@ -824,6 +861,7 @@ impl Config {
         path: P,
         overrides: &[Override],
     ) -> Result<Self, ConfigError> {
+        let path = path.as_ref();
         let content = std::fs::read_to_string(path)?;
         let mut value: toml::Value = toml::from_str(&content)?;
 
@@ -867,6 +905,7 @@ impl Config {
         }
 
         let mut config: Config = value.try_into()?;
+        config.source_path = Some(path.to_path_buf());
         config.normalize();
         // Corrections before checks, so a value `repair` has already put right
         // is never also refused, and the operator gets one line about it.
@@ -1819,14 +1858,40 @@ url = "rtsp://user:pass@10.0.0.6:554/stream1"
         assert!(config.update.enabled);
     }
 
+    /// Both shipped deployments are reached from another machine, so the bind
+    /// stays on every interface and neither the token nor the opt-out is set by
+    /// default. What that combination *means* is [`crate::api::ApiAuth`]'s to
+    /// say — writes end up behind a token camon makes for itself.
     #[test]
-    fn http_defaults_to_open_on_all_interfaces() {
+    fn http_defaults_to_all_interfaces_with_nothing_configured() {
         let dir = write_temp("config.toml", TOML_SAMPLE);
         let config = Config::load_from_with_overrides(dir.path().join("config.toml"), &[]).unwrap();
         assert_eq!(config.http.bind, "0.0.0.0");
         assert_eq!(config.http.bind_addr(), IpAddr::from([0, 0, 0, 0]));
         assert!(config.http.token.is_none());
         assert!(!config.http.allow_open);
+    }
+
+    /// A generated token goes beside the config file, wherever that turned out
+    /// to be — `/etc/camon/config.toml` puts it in `/etc/camon`, the same
+    /// directory the operator already goes to when camon needs something. A
+    /// config that came from no file at all has nowhere to put it and says so
+    /// rather than guessing at the working directory.
+    #[test]
+    fn a_generated_token_is_kept_beside_the_config_file() {
+        let dir = write_temp("config.toml", TOML_SAMPLE);
+        let path = dir.path().join("config.toml");
+        let config = Config::load_from_with_overrides(&path, &[]).unwrap();
+        assert_eq!(config.token_file_path(), Some(dir.path().join("api-token")));
+
+        // A bare relative config path keeps the token relative too, resolved
+        // against the same working directory the config path was.
+        let mut relative = config.clone();
+        relative.source_path = Some(PathBuf::from(DEFAULT_CONFIG_PATH));
+        assert_eq!(relative.token_file_path(), Some(PathBuf::from("api-token")));
+
+        let from_text: Config = toml::from_str(TOML_SAMPLE).unwrap();
+        assert_eq!(from_text.token_file_path(), None);
     }
 
     /// The updater installs an unsigned binary into a service that runs as
