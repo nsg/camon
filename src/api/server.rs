@@ -252,16 +252,20 @@ async fn segment_handler(
 ) -> Response {
     match state.buffers.get(&id) {
         Some(buffer) => {
-            // Clone the Arc under the lock; copy bytes for the response only
-            // after the guard is dropped so the ingest thread isn't blocked.
+            // Look the segment up under the lock and take nothing but its Arc,
+            // so the ingest thread waits on a map index rather than on a
+            // response body. The body is then built over that same allocation:
+            // see hls::segment_body for why it is never copied.
             let data = {
                 let buf = buffer.read_recover();
                 hls::generate_segment(&buf, n)
             };
             match data {
-                Some(data) => {
-                    ([(header::CONTENT_TYPE, "video/mp2t")], (*data).clone()).into_response()
-                }
+                Some(data) => (
+                    [(header::CONTENT_TYPE, "video/mp2t")],
+                    hls::segment_body(data),
+                )
+                    .into_response(),
                 None => (StatusCode::NOT_FOUND, "segment not found").into_response(),
             }
         }

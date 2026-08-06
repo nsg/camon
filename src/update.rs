@@ -549,6 +549,24 @@ fn oversize(what: &str, size: u64, limit: u64, verb: &str) -> String {
 /// A failed write takes the staging file with it. It is a multi-megabyte file
 /// named after this process's pid, so nothing — not even the next update from
 /// this same installation — would ever clean it up.
+///
+/// The mode is *all* this carries over, and that is a documented limitation
+/// rather than an oversight. The file is created fresh and published by rename,
+/// so anything else the old binary's inode carried — file capabilities, other
+/// extended attributes, a non-default SELinux label — is not on the new one.
+/// Nothing camon installs puts them there: [`crate::install`] writes a systemd
+/// unit and an OpenRC script that both run camon as root with no capability
+/// set of their own, the Home Assistant
+/// add-on runs as root in a container and disables the updater outright, and no
+/// shipped path calls `setcap`. So this is only ever felt by an operator who
+/// hardened the install by hand — dropped camon to an unprivileged user and
+/// granted, say, `cap_net_bind_service` so it could serve on port 80 — for whom
+/// the first successful self-update silently produces a binary that no longer
+/// starts. Copying the attributes across would mean either an xattr crate or
+/// raw `libc` calls, which is out of proportion to a case camon never creates;
+/// the workaround is to re-apply the hardening after an update, or to pin
+/// `update.enabled = false` and update through whatever put the capabilities
+/// there in the first place.
 fn stage_binary(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let staged = camon::durable::write_synced(path, bytes).and_then(|()| {
         let file = std::fs::File::open(path)?;

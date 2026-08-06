@@ -1,5 +1,7 @@
 use std::sync::Arc;
 
+use bytes::Bytes;
+
 use crate::buffer::HotBuffer;
 
 const NANOS_PER_SEC: f64 = 1_000_000_000.0;
@@ -126,6 +128,43 @@ pub fn generate_segment(buffer: &HotBuffer, sequence: u64) -> Option<Arc<Vec<u8>
     Some(Arc::clone(&segment.data))
 }
 
+/// A stored segment, borrowed as a byte slice so it can *be* a response body
+/// rather than be copied into one.
+///
+/// [`Bytes::from_owner`] asks its owner to borrow as `[u8]`, and `Arc<Vec<u8>>`
+/// only borrows as `Vec<u8>` — no impl bridges the two, so the bridge is this
+/// newtype and nothing more.
+struct SegmentBody(Arc<Vec<u8>>);
+
+impl AsRef<[u8]> for SegmentBody {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+/// Hand a stored segment to the HTTP layer as a body over the hot buffer's own
+/// allocation, with no copy at any point.
+///
+/// The [`Arc`] rides along inside the body and is released when the response
+/// is, which is what makes the no-copy version *correct* rather than merely
+/// cheap: the hot buffer evicts on a duration window driven by the ingest
+/// thread, so a segment can age out while a client is still pulling it down.
+/// The reference held here keeps those bytes alive until the last one is
+/// written, so an eviction mid-download costs the buffer its slot but never
+/// truncates the transfer.
+///
+/// Pinning a segment for a slow client's sake is strictly cheaper than the
+/// copy it replaces, not a trade: the copy pinned memory for exactly as long —
+/// the response held it either way — but pinned a *private* few megabytes per
+/// request, plus the allocation and the memcpy to fill it. N clients dragging
+/// the same segment now share one allocation where they used to hold N. The
+/// only memory this can hold that the copy would not is a segment the buffer
+/// has already evicted, and that is bounded by the same thing that bounded the
+/// copies: one segment's worth per in-flight response, at most.
+pub fn segment_body(data: Arc<Vec<u8>>) -> Bytes {
+    Bytes::from_owner(SegmentBody(data))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -203,5 +242,59 @@ mod tests {
         let out = generate_segment(&buffer.read().unwrap(), 0).expect("segment present");
         assert!(Arc::ptr_eq(&out, &stored));
         assert_eq!(&*out, &[1, 2, 3, 4]);
+    }
+
+    /// The response body has to *be* the buffer's allocation, not a copy of it:
+    /// every live viewer pulls a segment of a few megabytes every couple of
+    /// seconds, and a per-request copy is memory and a memcpy spent for nothing
+    /// on a box that has neither to spare.
+    #[test]
+    fn the_served_body_is_the_buffers_own_allocation() {
+        let buffer = HotBuffer::new("cam".to_string(), 60);
+        let mut segment = GopSegment::new(0);
+        segment.data = Arc::new(vec![0x47; 4096]);
+        segment.frame_count = 1;
+        segment.duration_ns = SEC;
+        let stored = Arc::clone(&segment.data);
+        buffer.write_recover().push(segment);
+
+        let data = generate_segment(&buffer.read_recover(), 0).expect("segment present");
+        let body = segment_body(data);
+
+        assert_eq!(
+            body.as_ptr(),
+            stored.as_ptr(),
+            "body was copied out of the buffer"
+        );
+        assert_eq!(body.len(), stored.len());
+    }
+
+    /// Eviction is driven by the ingest thread and takes no notice of who is
+    /// still downloading, so a segment can age out of the window while a slow
+    /// client is halfway through it. The body owns a reference to the bytes, so
+    /// what the client gets is the whole segment rather than a truncated one.
+    #[test]
+    fn a_segment_evicted_while_it_is_being_served_still_arrives_whole() {
+        let buffer = HotBuffer::new("cam".to_string(), 2);
+        let mut first = GopSegment::new(0);
+        first.data = Arc::new(vec![0xA5; 4096]);
+        first.frame_count = 1;
+        first.duration_ns = 2 * SEC;
+        buffer.write_recover().push(first);
+
+        let body = segment_body(generate_segment(&buffer.read_recover(), 0).expect("segment 0"));
+
+        let mut second = GopSegment::new(2 * SEC);
+        second.data = Arc::new(vec![0x5A; 4096]);
+        second.frame_count = 1;
+        second.duration_ns = 2 * SEC;
+        buffer.write_recover().push(second);
+
+        assert!(
+            generate_segment(&buffer.read_recover(), 0).is_none(),
+            "segment 0 should have aged out of the window"
+        );
+        assert_eq!(body.len(), 4096);
+        assert!(body.iter().all(|&b| b == 0xA5));
     }
 }
