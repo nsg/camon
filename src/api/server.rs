@@ -20,8 +20,8 @@ use crate::analytics::{MotionSettingsStore, SettingsUpdate, UpdateError};
 use crate::buffer::HotBuffer;
 use crate::locks::LockExt;
 use crate::storage::{
-    DetectionDebugStore, DetectionStore, EventRef, MapKind, MotionStore, RangeRequest, ServedRange,
-    ThumbnailError, VideoStream, WarmEventEntry, WarmStorageBackend,
+    DetectionDebugStore, DetectionStore, EventCursor, EventPage, EventRef, MapKind, MotionStore,
+    RangeRequest, ServedRange, ThumbnailError, VideoStream, WarmEventEntry, WarmStorageBackend,
 };
 
 use super::auth::{require_token, ApiAuth};
@@ -562,10 +562,58 @@ async fn hot_events_handler(State(state): State<AppState>, Path(id): Path<String
 
 // Warm event types and handlers
 
+/// How many events one listing answers with, and the most a caller may ask
+/// for: `limit` can ask for a smaller page, never a larger one.
+///
+/// A listing used to answer with the whole archive, which is unbounded in the
+/// only direction that matters — a box that has been recording for years holds
+/// years of events, and every one of them was cloned out of the index under the
+/// lock each camera's warm writer takes to index what it has just committed. So
+/// the cost of a request was set by the archive rather than by the request, and
+/// (reads being open on a non-loopback bind unless `[http] token` is set) it was
+/// set by anyone who could reach the port.
+///
+/// A thousand is chosen to be past what any single view of an archive wants at
+/// once and far short of what a deep one holds: a day of continuous recording
+/// at the default 120-second chunk is 720 events, so the first page still
+/// carries more than a day of the densest recording mode there is.
+///
+/// Free to lower. The one client that walks the whole archive — the web UI's
+/// event list, in `src/assets/app.js` — sends no `limit` and ends its walk on
+/// an empty page rather than on a short one, precisely so that it cannot read a
+/// page clamped by this number as the end of the archive.
+const MAX_EVENTS_PER_PAGE: usize = 1000;
+
 #[derive(Deserialize)]
 struct EventsQuery {
     from: Option<u64>,
     to: Option<u64>,
+    /// Where to resume: a start PTS, or a whole event key. See
+    /// [`parse_cursor`].
+    before: Option<String>,
+    limit: Option<usize>,
+}
+
+/// Read a `before=` cursor, in either of the two forms it takes.
+///
+/// A bare start PTS asks for everything that began earlier, which is all a
+/// walker needs while the starts it walks are distinct. A whole event key —
+/// `{start}_{duration}_{type}`, the same key every other event route takes and
+/// the same one the listing's own answer is made of — asks for everything
+/// ordered below *that event*, which can name a position inside a run of events
+/// sharing one start. A walker that resumes with the key of the oldest event in
+/// the page it just received never skips anything; one that resumes with a bare
+/// start skips the rest of a run its page ended inside, and on a box whose
+/// clock never started that is the whole archive (see
+/// [`page_key`](crate::storage::EventPage)).
+///
+/// `None` for anything that is neither, which the caller answers `400`: a
+/// cursor that half-parsed would silently resume in the wrong place.
+fn parse_cursor(before: &str) -> Option<EventCursor> {
+    match before.parse::<u64>() {
+        Ok(start_pts_ns) => Some(EventCursor::Start(start_pts_ns)),
+        Err(_) => EventRef::parse(before).map(EventCursor::Event),
+    }
 }
 
 #[derive(Serialize)]
@@ -601,6 +649,48 @@ struct WarmEventResponse {
     recovered: bool,
 }
 
+/// One page of a camera's stored events, oldest first.
+///
+/// The page holds the *newest* events of the window asked about, never more
+/// than [`MAX_EVENTS_PER_PAGE`] of them — newest because that is what a viewer
+/// opening an event list wants, and because it is the end of the archive that
+/// grows, so a page taken from the old end would answer the same thing forever.
+///
+/// Older events are reached by walking backwards: `before` resumes beneath the
+/// oldest event of the page just received, and is best sent as that event's
+/// whole key (see [`parse_cursor`] for the shorter form and what it cannot
+/// express). A page shorter than the `limit` asked for is the end of the
+/// archive; a walk that asks for no `limit` at all learns it from an empty
+/// page, which is one extra request and no assumption about the server's cap.
+///
+/// The walk is stable in the senses a live NVR can offer, and no further:
+///
+/// * Nothing is ever served twice, and on an archive nothing is inserted into
+///   or deleted from, nothing is missed either: the cursor is a position in a
+///   total order over `(start, duration, type)`, so a page can end anywhere,
+///   including inside a run of events that share a start PTS.
+/// * Events recorded while the walk is in progress are missed by that walk and
+///   picked up by the next poll. Usually because they are appended above the
+///   cursor; but an event recorded at the cursor's *own* start PTS is also
+///   missed whenever it sorts above it, which on a box with no working clock —
+///   where every event starts at zero — is the ordinary case rather than the
+///   corner one.
+/// * That much rests on wall-clock time moving forward. It usually does, and
+///   nothing here requires it to: after a backward correction (an NTP step, an
+///   RTC-less box learning the time) a newly recorded event can sort *below*
+///   the cursor and turn up mid-walk. It is still served once — the walk is
+///   not a snapshot, and does not claim to be one.
+/// * Events deleted while the walk is in progress (retention prunes from the
+///   oldest end) are absent from later pages. They no longer exist; a walk that
+///   showed them would be describing footage nobody can play. The cursor is a
+///   position rather than a reference to an entry, so it keeps working when the
+///   event it was taken from is one of the deleted ones — and equally when the
+///   deletion falls inside the run it was taken from.
+///
+/// The bound is also what a listing costs an unauthenticated caller: reads stay
+/// open on a non-loopback bind unless `[http] token` is set, so the events this
+/// endpoint copies per request is a property of the request and not of how long
+/// the box has been recording.
 async fn warm_events_handler(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -620,7 +710,24 @@ async fn warm_events_handler(
     if from > to {
         return (StatusCode::BAD_REQUEST, "from must not be greater than to").into_response();
     }
-    let events = backend.query(&id, from, to);
+    // Clamped rather than refused, for every value that is a count at all: a
+    // client asking for more than the cap gets the cap, and a client asking for
+    // none gets one event, since a page walk that reads a zero-length page as
+    // "the end" would stop before it started. A `limit` that is not a count —
+    // negative, fractional, or not a number — never reaches here: the query
+    // extractor fails it, which is a `400`.
+    let limit = query
+        .limit
+        .unwrap_or(MAX_EVENTS_PER_PAGE)
+        .clamp(1, MAX_EVENTS_PER_PAGE);
+    let mut page = EventPage::new(from, to, limit);
+    if let Some(before) = &query.before {
+        match parse_cursor(before) {
+            Some(cursor) => page = page.before(cursor),
+            None => return (StatusCode::BAD_REQUEST, "invalid before cursor").into_response(),
+        }
+    }
+    let events = backend.query(&id, page);
 
     let response: Vec<WarmEventResponse> = events
         .iter()
@@ -1187,7 +1294,7 @@ mod tests {
         ));
         storage.write_event("cam", &movement).await;
         storage.write_event("cam", &chunk).await;
-        let events = storage.query("cam", 0, u64::MAX);
+        let events = storage.query("cam", EventPage::unbounded(0, u64::MAX));
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].start_pts_ns, events[1].start_pts_ns);
 
@@ -1449,6 +1556,251 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), reqwest::StatusCode::OK);
+    }
+
+    /// One indexed event. Nothing here is on disk: the listing routes answer
+    /// from the index alone, so this is the whole of what a listing sees.
+    fn indexed_entry(start_pts_ns: u64, duration_ms: u32) -> WarmEventEntry {
+        WarmEventEntry {
+            start_pts_ns,
+            duration_ms,
+            event_type: crate::storage::EventType::Movement,
+            file_size: 0,
+            sidecar_bytes: 0,
+            thumbnail_bytes: 0,
+            object_classes: Vec::new(),
+            backend: None,
+            model: None,
+            detections: Vec::new(),
+            filmstrip_frames: 0,
+            continues: false,
+            recovered: false,
+            delete_failed: false,
+        }
+    }
+
+    /// A server whose camera has `count` indexed events, one second apart and
+    /// one second long — the deep archive the page bound exists for.
+    async fn serve_with_deep_archive(count: u64) -> (String, tempfile::TempDir) {
+        serve_with_archive((1..=count).map(|i| indexed_entry(i * 1_000_000_000, 1000))).await
+    }
+
+    /// A server whose camera has `count` events all stamped zero: the archive a
+    /// box with no working clock builds, where distinct durations are the only
+    /// thing separating one event from another and nothing can age out.
+    async fn serve_with_zero_stamped_archive(count: u32) -> (String, tempfile::TempDir) {
+        serve_with_archive((1..=count).map(|duration_ms| indexed_entry(0, duration_ms))).await
+    }
+
+    async fn serve_with_archive(
+        entries: impl Iterator<Item = WarmEventEntry>,
+    ) -> (String, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let ids = vec!["cam".to_string()];
+        let buffers = HashMap::from([("cam".to_string(), HotBuffer::new("cam".to_string(), 60))]);
+        let storage = Arc::new(crate::storage::LocalDiskBackend::new(
+            dir.path().to_path_buf(),
+            &ids,
+        ));
+        for entry in entries {
+            storage.index_for_tests().insert("cam", entry);
+        }
+        let state = AppState::new(
+            buffers,
+            MotionStore::new(&ids),
+            DetectionStore::new(&ids),
+            DetectionDebugStore::new(&ids),
+            Some(storage),
+            None,
+        );
+        let app = build_router(state, &ApiAuth::Open);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{addr}"), dir)
+    }
+
+    /// The start PTS of each listed event, in the order the response gives
+    /// them. A string on the wire, because nanoseconds since the epoch are past
+    /// what a JSON number holds exactly.
+    fn listed_starts(events: &[serde_json::Value]) -> Vec<u64> {
+        events
+            .iter()
+            .map(|e| e["start_pts_ns"].as_str().unwrap().parse().unwrap())
+            .collect()
+    }
+
+    async fn list_events(url: String) -> Vec<serde_json::Value> {
+        let response = reqwest::get(url).await.unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        response.json().await.unwrap()
+    }
+
+    /// A listing answers with one page, however deep the archive is — and with
+    /// the *newest* page of it, since that is the end a viewer opens on and the
+    /// end that grows. Every clone under the read lock is bounded by this
+    /// number (the scan itself can still be archive-long, at heap-replacement
+    /// cost per entry); before it, a listing cloned the whole index out from
+    /// under the lock every warm writer needs.
+    #[tokio::test]
+    async fn a_listing_answers_with_one_page_of_the_newest_events() {
+        let (base, _dir) = serve_with_deep_archive(2500).await;
+
+        let events = list_events(format!("{base}/api/cameras/cam/events")).await;
+        assert_eq!(events.len(), MAX_EVENTS_PER_PAGE);
+
+        // Oldest first within the page, as the listing has always answered.
+        let starts = listed_starts(&events);
+        assert!(starts.windows(2).all(|w| w[0] < w[1]), "not in start order");
+        assert_eq!(*starts.last().unwrap(), 2500 * 1_000_000_000);
+        assert_eq!(starts[0], 1501 * 1_000_000_000);
+
+        // A caller may ask for less, never for more.
+        let smaller = list_events(format!("{base}/api/cameras/cam/events?limit=7")).await;
+        assert_eq!(smaller.len(), 7);
+        let capped = list_events(format!("{base}/api/cameras/cam/events?limit=99999")).await;
+        assert_eq!(capped.len(), MAX_EVENTS_PER_PAGE);
+    }
+
+    /// The key each listed event is named by — the cursor a walker resumes on,
+    /// and the same string the UI's `eventKey` builds.
+    fn listed_key(event: &serde_json::Value) -> String {
+        format!(
+            "{}_{}_{}",
+            event["start_pts_ns"].as_str().unwrap(),
+            event["duration_ms"].as_u64().unwrap(),
+            event["event_type"].as_str().unwrap()
+        )
+    }
+
+    /// Walking `before` backwards reaches the whole archive: every event once,
+    /// none twice, none skipped between two pages. The walk the web UI does,
+    /// including how it learns it has finished — an empty page rather than an
+    /// assumption about the server's cap.
+    #[tokio::test]
+    async fn a_page_walk_reaches_every_older_event_exactly_once() {
+        let (base, _dir) = serve_with_deep_archive(1000).await;
+
+        let mut seen: Vec<u64> = Vec::new();
+        let mut cursor: Option<String> = None;
+        let mut requests = 0;
+        for _ in 0..10 {
+            let url = match &cursor {
+                None => format!("{base}/api/cameras/cam/events?limit=300"),
+                Some(c) => format!("{base}/api/cameras/cam/events?limit=300&before={c}"),
+            };
+            requests += 1;
+            let page = list_events(url).await;
+            if page.is_empty() {
+                break;
+            }
+            cursor = Some(listed_key(&page[0]));
+            seen.splice(0..0, listed_starts(&page));
+        }
+
+        let every: Vec<u64> = (1..=1000).map(|i| i * 1_000_000_000).collect();
+        assert_eq!(seen, every);
+        // Four pages of events and the empty one that ends the walk.
+        assert_eq!(requests, 5);
+    }
+
+    /// A page of a single-start archive — the no-RTC box, where every event is
+    /// stamped zero and none of them can age out — is exactly the size asked
+    /// for, and the walk still reaches every event once. A page that finished
+    /// the run its limit landed in would answer this request with the whole
+    /// archive, which is the unbounded copy the limit exists to stop.
+    #[tokio::test]
+    async fn a_single_start_archive_pages_at_exactly_its_limit() {
+        let (base, _dir) = serve_with_zero_stamped_archive(3000).await;
+
+        let mut seen: Vec<u64> = Vec::new();
+        let mut cursor: Option<String> = None;
+        for _ in 0..8 {
+            let url = match &cursor {
+                None => format!("{base}/api/cameras/cam/events"),
+                Some(c) => format!("{base}/api/cameras/cam/events?before={c}"),
+            };
+            let page = list_events(url).await;
+            if page.is_empty() {
+                break;
+            }
+            assert!(
+                page.len() <= MAX_EVENTS_PER_PAGE,
+                "a page of {} events",
+                page.len()
+            );
+            cursor = Some(listed_key(&page[0]));
+            seen.splice(
+                0..0,
+                page.iter().map(|e| e["duration_ms"].as_u64().unwrap()),
+            );
+        }
+
+        assert_eq!(seen, (1..=3000u64).collect::<Vec<_>>());
+    }
+
+    /// The shape the web UI reads, field by field: a bare JSON array of events,
+    /// each with a string start PTS, a numeric duration, and the wire type name
+    /// its key is built from. Pagination is carried by the events themselves —
+    /// the cursor is the oldest one's key — precisely so this shape did not
+    /// have to change under the UI.
+    #[tokio::test]
+    async fn a_listing_keeps_the_shape_the_ui_reads() {
+        let (base, _dir, _events) = serve_with_same_start_events().await;
+
+        let events = list_events(format!("{base}/api/cameras/cam/events?limit=1")).await;
+        // One asked for, one served, even though a second event shares its
+        // start: the key that comes back names a position inside that run, so
+        // the next page picks up its sibling.
+        assert_eq!(events.len(), 1);
+        let next = list_events(format!(
+            "{base}/api/cameras/cam/events?limit=1&before={}",
+            listed_key(&events[0])
+        ))
+        .await;
+        assert_eq!(next.len(), 1);
+        assert_eq!(
+            next[0]["start_pts_ns"], events[0]["start_pts_ns"],
+            "the run's other member"
+        );
+
+        let event = &events[0];
+        assert!(event["start_pts_ns"].is_string());
+        assert!(event["duration_ms"].is_u64());
+        assert!(event["event_type"].is_string());
+        assert!(event["filmstrip_frames"].is_u64());
+        // The key the UI builds from those three fields resolves to a video.
+        let key = listed_key(event);
+        let playlist = reqwest::get(format!("{base}/api/cameras/cam/events/{key}/playlist.m3u8"))
+            .await
+            .unwrap();
+        assert_eq!(playlist.status(), reqwest::StatusCode::OK);
+    }
+
+    /// A cursor that half-parsed would resume in the wrong place silently, so
+    /// anything that is neither a start PTS nor a whole event key is refused.
+    #[tokio::test]
+    async fn a_cursor_that_is_neither_form_is_rejected() {
+        let (base, _dir) = serve_with_deep_archive(3).await;
+
+        for bad in ["nonsense", "12_34", "12_34_banana", "12_34_movement_5"] {
+            let response = reqwest::get(format!("{base}/api/cameras/cam/events?before={bad}"))
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                reqwest::StatusCode::BAD_REQUEST,
+                "before={bad}"
+            );
+        }
+
+        // Both forms that are a cursor still answer.
+        for good in ["3000000000", "3000000000_1000_movement"] {
+            let response = reqwest::get(format!("{base}/api/cameras/cam/events?before={good}"))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), reqwest::StatusCode::OK, "before={good}");
+        }
     }
 
     #[tokio::test]

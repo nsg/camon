@@ -349,6 +349,214 @@ fn position<K: EventIdentity>(entries: &[WarmEventEntry], key: K) -> Option<usiz
         .map(|i| from + i)
 }
 
+/// The total order a listing is cut into pages on: start PTS, then duration,
+/// then the event type's wire name.
+///
+/// Start alone will not do, and the reason is not exotic. A box with no working
+/// clock stamps every event `0` ([`wall_clock_ns`](crate::buffer::wall_clock_ns)
+/// reads a pre-1970 clock as zero rather than taking the recording pipeline
+/// down with it), and age expiry is inert there — `now - start` saturates to
+/// zero for everything, so nothing ages out. A no-RTC box therefore holds its
+/// *whole archive* under one start, as many entries as the identity space
+/// allows, and any page boundary expressible only as a start PTS lands either
+/// before all of them or after all of them.
+///
+/// The three fields are exactly [`EventRef`] — what a URL already names an
+/// event by and what the listing already hands the client back — and the two
+/// backends' identities are each a permutation of them, so no two entries can
+/// tie here that either store could tell apart.
+fn page_key(entry: &WarmEventEntry) -> (u64, u32, &'static str) {
+    (
+        entry.start_pts_ns,
+        entry.duration_ms,
+        entry.event_type.as_str(),
+    )
+}
+
+/// Where a page resumes: an exclusive upper bound in [`page_key`]'s order.
+///
+/// Separate from `to_ns` because that one matches by overlap, and an event that
+/// began before a window and reaches into it belongs to that window — so a
+/// walker that moved `to_ns` down to the oldest event it had seen would be
+/// handed the long chunks it had already been given, page after page. A bound
+/// that only descends cannot repeat itself.
+#[derive(Debug, Clone, Copy)]
+pub enum EventCursor {
+    /// Everything that starts before this moment. All a walker needs while the
+    /// starts it is walking are distinct — but a page it cut inside a run of
+    /// equal starts cannot be resumed with one of these without skipping the
+    /// rest of that run.
+    Start(u64),
+    /// Everything ordered below this event, which can name a position *inside*
+    /// a run of equal starts. What the listing's own answer supports: the key
+    /// of the oldest event in a page resumes exactly beneath it.
+    Event(EventRef),
+}
+
+impl EventCursor {
+    /// Whether an entry with this key is below the cursor.
+    fn admits(self, key: (u64, u32, &'static str)) -> bool {
+        match self {
+            EventCursor::Start(start_pts_ns) => key.0 < start_pts_ns,
+            EventCursor::Event(event) => {
+                key < (
+                    event.start_pts_ns,
+                    event.duration_ms,
+                    event.event_type.as_str(),
+                )
+            }
+        }
+    }
+
+    /// The largest start PTS a page under this cursor can still hold, and
+    /// whether entries starting exactly there are candidates. Lets the walk
+    /// binary-search past everything newer instead of rejecting it one entry at
+    /// a time.
+    fn newest_start(self) -> (u64, bool) {
+        match self {
+            EventCursor::Start(start_pts_ns) => (start_pts_ns, false),
+            EventCursor::Event(event) => (event.start_pts_ns, true),
+        }
+    }
+}
+
+/// What one listing request may read: the window it asks about, where it
+/// resumes from, and the ceiling on how much of the archive it may copy.
+///
+/// The ceiling is the point, and it is a hard one. An archive is years deep on
+/// a box that has been recording for years — and on a box with no clock it is
+/// all under one start PTS — and a listing that copied all of it did so under
+/// the lock the camera's warm writer needs to index the event it has just
+/// committed. So any client, and under the open-read policy any client at all,
+/// could stall recording by asking. A page is bounded work: bounded to copy,
+/// bounded to serialize, bounded to send, whatever the archive looks like.
+#[derive(Debug, Clone, Copy)]
+pub struct EventPage {
+    /// Events are matched by overlap with `[from_ns, to_ns]`, not by start.
+    pub from_ns: u64,
+    pub to_ns: u64,
+    /// Where the previous page ended, if this is not the first.
+    pub before: Option<EventCursor>,
+    /// The most entries this page may copy. Never exceeded — not by a boundary
+    /// run, not by anything.
+    pub limit: usize,
+}
+
+impl EventPage {
+    /// The newest `limit` events overlapping `[from_ns, to_ns]`.
+    pub fn new(from_ns: u64, to_ns: u64, limit: usize) -> Self {
+        Self {
+            from_ns,
+            to_ns,
+            before: None,
+            limit,
+        }
+    }
+
+    /// Resume beneath this cursor — for a walker, the key of the oldest event
+    /// in the page it just received.
+    pub fn before(self, cursor: EventCursor) -> Self {
+        Self {
+            before: Some(cursor),
+            ..self
+        }
+    }
+
+    /// The whole window, however deep the archive is. Tests only: production
+    /// callers must name a limit, which is the entire point of this type.
+    #[cfg(test)]
+    pub(crate) fn unbounded(from_ns: u64, to_ns: u64) -> Self {
+        Self::new(from_ns, to_ns, usize::MAX)
+    }
+}
+
+/// A candidate entry beside the key it is ranked by, so the selection below can
+/// hold a page's worth of *references* and clone only what it keeps.
+struct Ranked<'a> {
+    key: (u64, u32, &'static str),
+    entry: &'a WarmEventEntry,
+}
+
+impl Ord for Ranked<'_> {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.key.cmp(&other.key)
+    }
+}
+
+impl PartialOrd for Ranked<'_> {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for Ranked<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.key == other.key
+    }
+}
+
+impl Eq for Ranked<'_> {}
+
+/// The greatest `limit` entries of `newest_first` that are below `before` and
+/// reach into the window, returned in ascending [`page_key`] order.
+///
+/// Takes an iterator rather than a slice so the walk itself is the seam: what
+/// this pulls is what the caller's read lock is held across, and a test can
+/// count it (see `a_page_walks_only_as_far_as_its_limit`).
+///
+/// `limit` is a hard cap on the *clones*, which is what the lock is really paid
+/// in. Scanning past it is not: entries sharing a start PTS lie in the list in
+/// insertion order, which is no order at all, so the greatest `limit` of a run
+/// cannot be found without looking at the run — and on a no-RTC box the run is
+/// the archive (see [`page_key`]). The selection is therefore a bounded heap of
+/// references: up to log-of-`limit` comparisons per entry scanned (each entry
+/// that beats the heap's minimum costs a replacement), one clone per entry
+/// actually served. The walk still stops early wherever the ordering allows it
+/// — as soon as an entry starts before everything already selected, nothing
+/// after it can reach the page, and starts only descend from here.
+fn page_of<'a>(
+    newest_first: impl Iterator<Item = &'a WarmEventEntry>,
+    from_ns: u64,
+    before: Option<EventCursor>,
+    limit: usize,
+) -> Vec<WarmEventEntry> {
+    if limit == 0 {
+        return Vec::new();
+    }
+    // Never sized from `limit`: that number comes from a request, and a
+    // reservation the archive cannot fill is a hostile allocation.
+    let mut selected: std::collections::BinaryHeap<std::cmp::Reverse<Ranked<'a>>> =
+        std::collections::BinaryHeap::new();
+    for entry in newest_first {
+        let key = page_key(entry);
+        let full = selected.len() >= limit;
+        if full {
+            let smallest = selected.peek().expect("a full page has a smallest").0.key;
+            if key.0 < smallest.0 {
+                break;
+            }
+            if key <= smallest {
+                continue;
+            }
+        }
+        if before.is_some_and(|cursor| !cursor.admits(key)) {
+            continue;
+        }
+        if entry.end_pts_ns() < from_ns {
+            continue;
+        }
+        if full {
+            selected.pop();
+        }
+        selected.push(std::cmp::Reverse(Ranked { key, entry }));
+    }
+    let mut page: Vec<Ranked> = selected.into_iter().map(|ranked| ranked.0).collect();
+    page.sort();
+    page.into_iter()
+        .map(|ranked| ranked.entry.clone())
+        .collect()
+}
+
 /// The per-camera event lists both backends index into, keyed by `K`.
 ///
 /// Every list is sorted by `start_pts_ns` and every entry is unique under `K`;
@@ -611,26 +819,58 @@ impl<K: EventIdentity> EventIndex<K> {
         self.update(camera_id, key, |entry| entry.delete_failed = true);
     }
 
-    /// Every event overlapping `[from_ns, to_ns]`. An inverted range is empty.
+    /// One page of the events overlapping [`EventPage`]'s window, in ascending
+    /// [`page_key`] order. An inverted range is empty.
     ///
     /// Entries are ordered by start PTS only, so the upper bound binary-searches
     /// but the lower one cannot: a long event (a continuous chunk) can start
     /// far before the window and still reach into it, and "ends after `from_ns`"
-    /// is not monotone in start order. The candidate prefix is filtered instead.
-    pub(crate) fn query(&self, camera_id: &str, from_ns: u64, to_ns: u64) -> Vec<WarmEventEntry> {
-        if from_ns > to_ns {
+    /// is not monotone in start order. The candidate prefix is walked instead —
+    /// newest first, so that the walk *stops* at the page's limit rather than
+    /// running the archive's whole length.
+    ///
+    /// This is what the read lock is held for, and it is deliberately all it is
+    /// held for: at most `limit` entries are cloned here, and everything a
+    /// response is then made of — mapping to the wire type, serializing,
+    /// writing the socket — happens on the copy, after this has returned and
+    /// dropped the guard with it. That last part holds by construction rather
+    /// than by test: the guard is a local of this function and no caller can be
+    /// handed one. The lock it shares is the one every warm writer takes to
+    /// index the event it has just committed, so a listing that copied a
+    /// years-deep archive under it stalled recording for as long as the copy
+    /// took.
+    ///
+    /// What the page bounds is the copying, and not in every case the walking.
+    /// Two things can still make a walk long, and both are comparisons against
+    /// entries already in RAM — no clone, no allocation — where the old
+    /// behaviour did the same walk *and* cloned every hit: a request naming a
+    /// narrow `from_ns` high up a deep archive walks past everything below the
+    /// window without filling its page, and a run of equal starts has to be
+    /// looked at whole, because the list holds a run in insertion order and the
+    /// greatest `limit` of it cannot be found any other way. The second is the
+    /// no-RTC box of [`page_key`], where the run is the whole archive.
+    pub(crate) fn query(&self, camera_id: &str, page: EventPage) -> Vec<WarmEventEntry> {
+        if page.from_ns > page.to_ns {
             return Vec::new();
         }
         let Some(lock) = self.cameras.get(camera_id) else {
             return Vec::new();
         };
         let entries = lock.read_recover();
-        let end = entries.partition_point(|e| e.start_pts_ns <= to_ns);
-        entries[..end]
-            .iter()
-            .filter(|e| e.end_pts_ns() >= from_ns)
-            .cloned()
-            .collect()
+        let mut end = entries.partition_point(|e| e.start_pts_ns <= page.to_ns);
+        if let Some(cursor) = page.before {
+            let (newest_start, its_own_start_too) = cursor.newest_start();
+            end = end.min(entries.partition_point(|e| {
+                e.start_pts_ns < newest_start
+                    || (its_own_start_too && e.start_pts_ns == newest_start)
+            }));
+        }
+        page_of(
+            entries[..end].iter().rev(),
+            page.from_ns,
+            page.before,
+            page.limit,
+        )
     }
 
     /// The entry with this key, for the API read path.
@@ -1178,6 +1418,288 @@ mod tests {
         EventIndex::new(&["cam".to_string()])
     }
 
+    /// An iterator that reports how far it was pulled, so a test can measure
+    /// the walk the read lock is held across rather than guess at it from a
+    /// clock.
+    struct Counted<I> {
+        inner: I,
+        visited: std::rc::Rc<std::cell::Cell<usize>>,
+    }
+
+    impl<I: Iterator> Iterator for Counted<I> {
+        type Item = I::Item;
+
+        fn next(&mut self) -> Option<I::Item> {
+            let next = self.inner.next();
+            if next.is_some() {
+                self.visited.set(self.visited.get() + 1);
+            }
+            next
+        }
+    }
+
+    /// Walk every page of `index` with the cursor a client would carry — the
+    /// key of each page's oldest event — and return what the walk saw, in the
+    /// order it assembled. `pages` caps the walk so a cursor that stops
+    /// advancing fails the test instead of hanging the run.
+    fn walk_pages(
+        index: &EventIndex<(u64, EventType, u32)>,
+        limit: usize,
+        pages: usize,
+    ) -> (Vec<WarmEventEntry>, Vec<usize>) {
+        let mut seen: Vec<WarmEventEntry> = Vec::new();
+        let mut sizes: Vec<usize> = Vec::new();
+        let mut cursor: Option<EventCursor> = None;
+        for _ in 0..pages {
+            let mut page = EventPage::new(0, u64::MAX, limit);
+            if let Some(c) = cursor {
+                page = page.before(c);
+            }
+            let events = index.query("cam", page);
+            if events.is_empty() {
+                break;
+            }
+            sizes.push(events.len());
+            cursor = Some(EventCursor::Event(EventRef::of(&events[0])));
+            seen.splice(0..0, events);
+        }
+        (seen, sizes)
+    }
+
+    /// The whole point of a page: the *cloning* done while the lock is held is
+    /// set by the page, not by the archive. The scan is not — a run of equal
+    /// starts is still looked at whole, at up to log-of-limit comparisons per
+    /// entry — but nothing past the limit is cloned, which is what used to
+    /// stall every camera's warm writer for as long as a listing took to copy.
+    ///
+    /// Measured on the walk itself, since that walk is exactly the body of
+    /// [`EventIndex::query`]'s locked section. That the *guard* falls with it
+    /// is structural — it is a local of `query` and no caller is handed one —
+    /// so there is nothing here for a test to hold open.
+    #[test]
+    fn a_page_walks_only_as_far_as_its_limit() {
+        let archive: Vec<WarmEventEntry> = (1..=100_000)
+            .map(|i| entry(i * 1000, EventType::Movement, 1))
+            .collect();
+
+        let visited = std::rc::Rc::new(std::cell::Cell::new(0));
+        let page = page_of(
+            Counted {
+                inner: archive.iter().rev(),
+                visited: std::rc::Rc::clone(&visited),
+            },
+            0,
+            None,
+            50,
+        );
+
+        assert_eq!(page.len(), 50);
+        // One past the page: the walk has to look at the next entry to learn it
+        // starts before everything selected.
+        assert_eq!(visited.get(), 51);
+        // And it is the newest 50, oldest first.
+        assert_eq!(page[0].start_pts_ns, 99_951 * 1000);
+        assert_eq!(page[49].start_pts_ns, 100_000 * 1000);
+    }
+
+    /// A page ends exactly where its limit says, run of equal starts or not,
+    /// and hands back a cursor that resumes inside that run.
+    ///
+    /// Completing the run instead — which reads as a rounding error on an
+    /// archive where a run is a keyframe's worth of events — is unbounded where
+    /// it matters: a box whose clock never started stamps every event zero, and
+    /// age expiry cannot drain what it stamped, so the run *is* the archive and
+    /// "finish the run" is "copy everything" wearing a limit.
+    #[test]
+    fn a_page_ends_inside_a_run_of_equal_starts_rather_than_finishing_it() {
+        let archive = [
+            entry(1000, EventType::Movement, 1),
+            entry(2000, EventType::Movement, 1),
+            entry(2000, EventType::Object, 1),
+            entry(2000, EventType::Continuous, 1),
+            entry(3000, EventType::Movement, 1),
+        ];
+
+        let page = page_of(archive.iter().rev(), 0, None, 2);
+
+        // Two asked for, two served, both from the top of the order: 3000, then
+        // the greatest member of the run at 2000 — which is by the type's wire
+        // name, "object" being the last of the three.
+        assert_eq!(page.len(), 2);
+        assert_eq!(page_key(&page[0]), (2000, 1, "object"));
+        assert_eq!(page_key(&page[1]), (3000, 1, "movement"));
+
+        // A page of nothing is nothing, rather than a walk with no floor to
+        // stop against.
+        assert!(page_of(archive.iter().rev(), 0, None, 0).is_empty());
+
+        // And the rest of that run is what the next page opens with.
+        let next = page_of(
+            archive.iter().rev(),
+            0,
+            Some(EventCursor::Event(EventRef::of(&page[0]))),
+            2,
+        );
+        assert_eq!(page_key(&next[0]), (2000, 1, "continuous"));
+        assert_eq!(page_key(&next[1]), (2000, 1, "movement"));
+    }
+
+    /// The regime the compound cursor exists for: a box with no working clock
+    /// stamps every event `0` and cannot age any of them out, so one run is the
+    /// whole archive. Pages are exactly the size asked for, and the walk still
+    /// reaches every event once.
+    ///
+    /// The entries are inserted in an order that is not their page order, since
+    /// the list keeps a run in insertion order and a page that took the run's
+    /// tail rather than its greatest members would walk a different archive
+    /// than it served.
+    #[test]
+    fn a_single_start_archive_pages_at_exactly_its_limit() {
+        let index = index_with_cam();
+        // 3000 distinct identities under one start, distinguished by duration
+        // alone. Mixed-type runs are covered by the two tests below this one.
+        let mut durations: Vec<u32> = (1..=3000).collect();
+        durations.rotate_left(1499);
+        for duration_ms in durations {
+            index.insert("cam", entry(0, EventType::Movement, duration_ms));
+        }
+
+        let (seen, sizes) = walk_pages(&index, 1000, 6);
+
+        assert_eq!(
+            sizes,
+            vec![1000, 1000, 1000],
+            "pages are the size asked for"
+        );
+        let keys: Vec<(u64, u32, &str)> = seen.iter().map(page_key).collect();
+        let every: Vec<(u64, u32, &str)> =
+            (1..=3000).map(|d| (0u64, d as u32, "movement")).collect();
+        assert_eq!(keys, every, "every event once, in page order, no holes");
+    }
+
+    /// Every event once, in start order, across a walk of the whole index.
+    #[test]
+    fn a_page_walk_reaches_the_oldest_event_without_repeating_any() {
+        let index = index_with_cam();
+        for i in 1..=25u64 {
+            index.insert("cam", entry(i * 1000, EventType::Movement, 1));
+        }
+
+        // Four pages of seven cover twenty-five events; the fifth is the empty
+        // one that says so.
+        let (seen, sizes) = walk_pages(&index, 7, 5);
+
+        assert_eq!(sizes, vec![7, 7, 7, 4]);
+        let starts: Vec<u64> = seen.iter().map(|e| e.start_pts_ns).collect();
+        assert_eq!(starts, (1..=25u64).map(|i| i * 1000).collect::<Vec<_>>());
+    }
+
+    /// The simple cursor still works where the starts are distinct — which is
+    /// every box with a clock — so a client that only knows how to send a
+    /// timestamp is not left without a way to page.
+    #[test]
+    fn a_bare_start_cursor_resumes_a_walk_of_distinct_starts() {
+        let index = index_with_cam();
+        for i in 1..=10u64 {
+            index.insert("cam", entry(i * 1000, EventType::Movement, 1));
+        }
+
+        let first = index.query("cam", EventPage::new(0, u64::MAX, 4));
+        let cursor = EventCursor::Start(first[0].start_pts_ns);
+        let second = index.query("cam", EventPage::new(0, u64::MAX, 4).before(cursor));
+
+        assert_eq!(
+            first.iter().map(|e| e.start_pts_ns).collect::<Vec<_>>(),
+            vec![7000, 8000, 9000, 10_000]
+        );
+        assert_eq!(
+            second.iter().map(|e| e.start_pts_ns).collect::<Vec<_>>(),
+            vec![3000, 4000, 5000, 6000]
+        );
+
+        // Exclusive at the walk itself, and not only by the binary search that
+        // skips past the newer tail: an event starting exactly at the cursor is
+        // one the previous page has already served.
+        let archive = [
+            entry(1000, EventType::Movement, 1),
+            entry(2000, EventType::Movement, 1),
+        ];
+        let page = page_of(archive.iter().rev(), 0, Some(EventCursor::Start(2000)), 10);
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].start_pts_ns, 1000);
+    }
+
+    /// What a walk of a live archive is stable against, pinned: the writer
+    /// appends above the cursor and retention deletes below it, and neither can
+    /// make the walk repeat an event or skip one that is still stored.
+    #[test]
+    fn a_page_walk_survives_the_archive_changing_under_it() {
+        let index = index_with_cam();
+        for i in 1..=20u64 {
+            index.insert("cam", entry(i * 1000, EventType::Movement, 1));
+        }
+
+        let first = index.query("cam", EventPage::new(0, u64::MAX, 10));
+        assert_eq!(first.len(), 10);
+        assert_eq!(first[0].start_pts_ns, 11_000);
+        let cursor = EventCursor::Event(EventRef::of(&first[0]));
+
+        // A camera records while the walk is between pages, and retention takes
+        // the oldest event and the very one the cursor was read from.
+        index.insert("cam", entry(21_000, EventType::Movement, 1));
+        index.remove("cam", (1000, EventType::Movement, 1));
+        index.remove("cam", (11_000, EventType::Movement, 1));
+
+        let second = index.query("cam", EventPage::new(0, u64::MAX, 10).before(cursor));
+        let starts: Vec<u64> = second.iter().map(|e| e.start_pts_ns).collect();
+
+        // The new event is above the cursor: this walk does not see it, and the
+        // next poll starts again from the top.
+        assert!(!starts.contains(&21_000));
+        // What retention took is gone; everything still stored is here, once.
+        assert_eq!(starts, (2..=10u64).map(|i| i * 1000).collect::<Vec<_>>());
+    }
+
+    /// The same story one level down, inside a run of equal starts: the cursor
+    /// is a position in an order, not a reference to an entry, so a page
+    /// resumes correctly when the event it was cut at has been deleted — and
+    /// when other members of that run have gone with it.
+    #[test]
+    fn a_mid_run_cursor_survives_the_run_changing_under_it() {
+        let index = index_with_cam();
+        for duration_ms in 1..=10u32 {
+            index.insert("cam", entry(0, EventType::Movement, duration_ms));
+        }
+
+        let first = index.query("cam", EventPage::new(0, u64::MAX, 4));
+        let durations: Vec<u32> = first.iter().map(|e| e.duration_ms).collect();
+        assert_eq!(durations, vec![7, 8, 9, 10]);
+        let cursor = EventCursor::Event(EventRef::of(&first[0]));
+
+        // The entry the cursor was cut at goes, one still-unread member of the
+        // run goes with it, and a new one lands below the cursor.
+        index.remove("cam", (0, EventType::Movement, 7));
+        index.remove("cam", (0, EventType::Movement, 5));
+        index.insert("cam", entry(0, EventType::Object, 3));
+
+        let second = index.query("cam", EventPage::new(0, u64::MAX, 4).before(cursor));
+        let keys: Vec<(u64, u32, &str)> = second.iter().map(page_key).collect();
+
+        // Resumes exactly beneath a cursor whose entry no longer exists, skips
+        // nothing that is still stored, and repeats nothing already served. The
+        // late arrival sorts below the cursor, so this walk does see it — an
+        // honest read of an archive that changed, not a snapshot.
+        assert_eq!(
+            keys,
+            vec![
+                (0, 3, "movement"),
+                (0, 3, "object"),
+                (0, 4, "movement"),
+                (0, 6, "movement"),
+            ]
+        );
+    }
+
     /// A `reidentify` onto an identity another entry already holds. The store
     /// wrote one event over the other, so the index keeps one entry — the
     /// re-placed one — and the displaced entry's bytes come back.
@@ -1195,7 +1717,7 @@ mod tests {
             })
         );
 
-        let entries = index.query("cam", 0, u64::MAX);
+        let entries = index.query("cam", EventPage::unbounded(0, u64::MAX));
         assert_eq!(entries.len(), 1);
         // The survivor is the entry that moved, not the one it landed on.
         assert_eq!(entries[0].file_size, 300);
@@ -1213,7 +1735,7 @@ mod tests {
         assert_eq!(index.used_bytes(), 300);
 
         assert!(!index.insert_absent("cam", sized(entry(1000, EventType::Movement, 500), 70)));
-        let entries = index.query("cam", 0, u64::MAX);
+        let entries = index.query("cam", EventPage::unbounded(0, u64::MAX));
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].file_size, 300, "overwrote the indexed entry");
         assert_eq!(
@@ -1224,7 +1746,10 @@ mod tests {
 
         // A different identity is not the same event, whatever it shares.
         assert!(index.insert_absent("cam", sized(entry(1000, EventType::Object, 500), 70)));
-        assert_eq!(index.query("cam", 0, u64::MAX).len(), 2);
+        assert_eq!(
+            index.query("cam", EventPage::unbounded(0, u64::MAX)).len(),
+            2
+        );
         assert_eq!(index.used_bytes(), 370);
         assert!(!index.insert_absent("other", sized(entry(1000, EventType::Movement, 500), 5)));
     }
@@ -1238,7 +1763,10 @@ mod tests {
 
         assert!(index.reidentify("cam", (1000, EventType::Movement, 500), |_| {}));
 
-        assert_eq!(index.query("cam", 0, u64::MAX).len(), 1);
+        assert_eq!(
+            index.query("cam", EventPage::unbounded(0, u64::MAX)).len(),
+            1
+        );
         assert_eq!(index.used_bytes(), 300);
         assert!(!index.reidentify("cam", (2000, EventType::Movement, 500), |_| {}));
         assert!(!index.reidentify("other", (1000, EventType::Movement, 500), |_| {}));
@@ -1261,7 +1789,7 @@ mod tests {
             })
         );
 
-        let entries = index.query("cam", 0, u64::MAX);
+        let entries = index.query("cam", EventPage::unbounded(0, u64::MAX));
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].file_size, 500);
         assert_eq!(index.used_bytes(), 500);
@@ -1297,7 +1825,10 @@ mod tests {
         .await;
 
         assert_eq!(outcome.deleted, 1);
-        assert_eq!(index.query("cam", 0, u64::MAX).len(), 3);
+        assert_eq!(
+            index.query("cam", EventPage::unbounded(0, u64::MAX)).len(),
+            3
+        );
     }
 
     /// The same for the eviction pass, which runs ahead of a write on a
@@ -1329,7 +1860,10 @@ mod tests {
         .await;
 
         assert_eq!(outcome.deleted, 1);
-        assert_eq!(index.query("cam", 0, u64::MAX).len(), 3);
+        assert_eq!(
+            index.query("cam", EventPage::unbounded(0, u64::MAX)).len(),
+            3
+        );
     }
 
     /// A panic in the closure leaves the index exactly as it was: the entry is
@@ -1349,7 +1883,7 @@ mod tests {
         }));
         assert!(panicked.is_err());
 
-        let entries = index.query("cam", 0, u64::MAX);
+        let entries = index.query("cam", EventPage::unbounded(0, u64::MAX));
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].event_type, EventType::Movement);
         assert_eq!(entries[0].file_size, 300);

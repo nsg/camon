@@ -1202,7 +1202,7 @@ mod tests {
             None
         }
 
-        fn query(&self, _camera_id: &str, _from_ns: u64, _to_ns: u64) -> Vec<WarmEventEntry> {
+        fn query(&self, _camera_id: &str, _page: crate::storage::EventPage) -> Vec<WarmEventEntry> {
             unimplemented!("read path unused in writer tests")
         }
 

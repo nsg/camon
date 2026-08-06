@@ -369,7 +369,7 @@ pub(crate) mod contract_tests {
     use crate::buffer::GopSegment;
     use crate::storage::backend::WriteOutcome;
     use crate::storage::event_index::DetectionDetail;
-    use crate::storage::{EventType, WarmStorageBackend};
+    use crate::storage::{EventPage, EventType, WarmStorageBackend};
 
     /// A one-second movement event at `first_pts`, `size` bytes of video, with
     /// two filmstrip frames — the same shape on either backend, because a
@@ -423,7 +423,7 @@ pub(crate) mod contract_tests {
             WriteOutcome::Written
         );
 
-        let entries = backend.query("cam", 0, u64::MAX);
+        let entries = backend.query("cam", EventPage::unbounded(0, u64::MAX));
         assert_eq!(entries.len(), 1);
         let video = backend
             .read_video("cam", &entries[0], None)
@@ -471,7 +471,9 @@ pub(crate) mod contract_tests {
         backend.prune(1, 1, 1, &AtomicBool::new(false)).await;
 
         assert!(
-            backend.query("cam", 0, u64::MAX).is_empty(),
+            backend
+                .query("cam", EventPage::unbounded(0, u64::MAX))
+                .is_empty(),
             "the sweep did not delete the event this is about"
         );
         assert_eq!(
@@ -490,13 +492,20 @@ pub(crate) mod contract_tests {
     ) {
         let old = 1_000_000_000;
         backend.write_event("cam", &event(old, 40)).await;
-        assert_eq!(backend.query("cam", 0, u64::MAX).len(), 1);
+        assert_eq!(
+            backend
+                .query("cam", EventPage::unbounded(0, u64::MAX))
+                .len(),
+            1
+        );
 
         // Everything is expired by a retention of one nanosecond.
         backend.prune(1, 1, 1, &AtomicBool::new(true)).await;
 
         assert_eq!(
-            backend.query("cam", 0, u64::MAX).len(),
+            backend
+                .query("cam", EventPage::unbounded(0, u64::MAX))
+                .len(),
             1,
             "a sweep that started stopped deleted an event anyway"
         );
@@ -510,7 +519,7 @@ pub(crate) mod contract_tests {
         backend.write_event("cam", &event(1_000, 40)).await;
         backend.write_event("cam", &event(1_000, 25)).await;
 
-        let entries = backend.query("cam", 0, u64::MAX);
+        let entries = backend.query("cam", EventPage::unbounded(0, u64::MAX));
         assert_eq!(entries.len(), 1, "a rewrite added a second entry");
         assert_eq!(
             entries[0].file_size, 25,
@@ -528,7 +537,7 @@ pub(crate) mod contract_tests {
         backend.write_event("cam", &event(1_000, 40)).await;
         backend.upgrade_event("cam", &upgrade(1_000)).await;
 
-        let entries = backend.query("cam", 0, u64::MAX);
+        let entries = backend.query("cam", EventPage::unbounded(0, u64::MAX));
         assert_eq!(entries.len(), 1, "the upgrade left two entries behind");
         assert_eq!(entries[0].event_type, EventType::Object);
         assert_eq!(entries[0].object_classes, vec!["person".to_string()]);
@@ -556,14 +565,18 @@ pub(crate) mod contract_tests {
         backend.write_event("cam", &event(old, 40)).await;
         backend.prune(1, 1, 1, &AtomicBool::new(false)).await;
         assert!(
-            backend.query("cam", 0, u64::MAX).is_empty(),
+            backend
+                .query("cam", EventPage::unbounded(0, u64::MAX))
+                .is_empty(),
             "the sweep did not delete the event this is about"
         );
 
         backend.upgrade_event("cam", &upgrade(old)).await;
 
         assert!(
-            backend.query("cam", 0, u64::MAX).is_empty(),
+            backend
+                .query("cam", EventPage::unbounded(0, u64::MAX))
+                .is_empty(),
             "an upgrade re-indexed an event whose footage retention had deleted"
         );
     }

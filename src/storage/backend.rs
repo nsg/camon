@@ -37,7 +37,7 @@ use tokio_util::io::ReaderStream;
 
 use crate::buffer::warm::{EventUpgrade, FinishedEvent};
 use crate::locks::SingleFlight;
-use crate::storage::event_index::EmergencyOutcome;
+use crate::storage::event_index::{EmergencyOutcome, EventPage};
 use crate::storage::warm_index::{free_space_bytes, should_emergency_prune, sidecar_json};
 use crate::storage::{EventRef, EventType, StorageAnchor, WarmEventEntry, WarmEventIndex};
 
@@ -265,8 +265,9 @@ pub trait WarmStorageBackend: Send + Sync {
 
     // ---- API read path ----
 
-    /// Events overlapping `[from_ns, to_ns]`, oldest first.
-    fn query(&self, camera_id: &str, from_ns: u64, to_ns: u64) -> Vec<WarmEventEntry>;
+    /// One page of the events overlapping the request's window, oldest first
+    /// and never more than the page's limit (see [`EventPage`]).
+    fn query(&self, camera_id: &str, page: EventPage) -> Vec<WarmEventEntry>;
 
     /// The one indexed event this key names, if it is still there.
     ///
@@ -342,6 +343,16 @@ impl LocalDiskBackend {
             anchor,
             thumbnails: SingleFlight::new(),
         }
+    }
+}
+
+#[cfg(test)]
+impl LocalDiskBackend {
+    /// The index the listing routes read, and read exclusively — so a test can
+    /// stock an archive of any depth without writing a byte, which is what a
+    /// test about the *cost* of a listing needs.
+    pub(crate) fn index_for_tests(&self) -> &WarmEventIndex {
+        &self.index
     }
 }
 
@@ -508,8 +519,8 @@ impl WarmStorageBackend for LocalDiskBackend {
         Some(&self.anchor)
     }
 
-    fn query(&self, camera_id: &str, from_ns: u64, to_ns: u64) -> Vec<WarmEventEntry> {
-        self.index.query(camera_id, from_ns, to_ns)
+    fn query(&self, camera_id: &str, page: EventPage) -> Vec<WarmEventEntry> {
+        self.index.query(camera_id, page)
     }
 
     /// Resolved by the whole key: here the event type is a directory and the
@@ -1559,7 +1570,7 @@ mod tests {
     /// *type* is the thing under test and so cannot be part of the lookup.
     fn sibling(index: &WarmEventIndex, duration_ms: u32) -> Option<WarmEventEntry> {
         index
-            .query("cam", 0, u64::MAX)
+            .query("cam", EventPage::unbounded(0, u64::MAX))
             .into_iter()
             .find(|e| e.duration_ms == duration_ms)
     }
@@ -1592,7 +1603,10 @@ mod tests {
         let index = WarmEventIndex::new(&["cam".to_string()], dir.path().to_path_buf());
         write_event(dir.path(), "cam", &short, Some(&index)).await;
         write_event(dir.path(), "cam", &long, Some(&index)).await;
-        assert_eq!(index.query("cam", 0, u64::MAX).len(), 2);
+        assert_eq!(
+            index.query("cam", EventPage::unbounded(0, u64::MAX)).len(),
+            2
+        );
 
         // Upgrade one named sibling. Which of the two it is does not matter now
         // that every path into the index carries a whole key; the start-only
@@ -1674,7 +1688,12 @@ mod tests {
         let backend = LocalDiskBackend::new(dir.path().to_path_buf(), &["cam".to_string()]);
         backend.write_event("cam", &movement).await;
         backend.write_event("cam", &chunk).await;
-        assert_eq!(backend.query("cam", 0, u64::MAX).len(), 2);
+        assert_eq!(
+            backend
+                .query("cam", EventPage::unbounded(0, u64::MAX))
+                .len(),
+            2
+        );
 
         let mut posters = Vec::new();
         for event_type in [EventType::Movement, EventType::Continuous] {
@@ -1974,7 +1993,7 @@ mod tests {
         // A fresh index scanning the same dir must recover type + continues.
         let scanned = WarmEventIndex::new(&["cam".to_string()], dir.path().to_path_buf());
         scanned.scan();
-        let events = scanned.query("cam", 0, u64::MAX);
+        let events = scanned.query("cam", EventPage::unbounded(0, u64::MAX));
         assert_eq!(events.len(), 2);
         assert!(events.iter().all(|e| e.event_type == EventType::Continuous));
         assert!(!events[0].continues);
@@ -2007,7 +2026,12 @@ mod tests {
             .find_event("cam", EventRef::new(first_pts, 4000, EventType::Movement))
             .unwrap();
         assert_eq!(entry.event_type, EventType::Movement);
-        assert_eq!(backend.query("cam", 0, u64::MAX).len(), 1);
+        assert_eq!(
+            backend
+                .query("cam", EventPage::unbounded(0, u64::MAX))
+                .len(),
+            1
+        );
 
         // Video comes back as a stream, not a path or a Vec.
         let video = drain(backend.read_video("cam", &entry, None).await.unwrap()).await;

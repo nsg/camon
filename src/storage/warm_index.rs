@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use crate::buffer::wall_clock_ns;
 use crate::storage::event_index::{
     deduplicate_detections, evict_tiers, sweep_expired, DetectionDetail, EmergencyOutcome,
-    EventIndex, EventRef, EventType, EvictionPolicy, Removal, WarmEventEntry,
+    EventIndex, EventPage, EventRef, EventType, EvictionPolicy, Removal, WarmEventEntry,
 };
 
 /// Local disk's event identity: `{data_dir}/{camera}/{event_type}/{start_pts_ns}_{duration_ms}.ts`
@@ -283,8 +283,8 @@ impl WarmEventIndex {
         self.events.insert(camera_id, entry);
     }
 
-    pub fn query(&self, camera_id: &str, from_ns: u64, to_ns: u64) -> Vec<WarmEventEntry> {
-        self.events.query(camera_id, from_ns, to_ns)
+    pub fn query(&self, camera_id: &str, page: EventPage) -> Vec<WarmEventEntry> {
+        self.events.query(camera_id, page)
     }
 
     pub fn newest_event_end_ns(&self, camera_id: &str) -> Option<u64> {
@@ -531,7 +531,7 @@ mod tests {
     }
 
     fn entries(index: &WarmEventIndex) -> Vec<WarmEventEntry> {
-        index.query("cam", 0, u64::MAX)
+        index.query("cam", EventPage::unbounded(0, u64::MAX))
     }
 
     /// Seeds the recording watchdog, so it has to be the END of the newest
@@ -593,7 +593,7 @@ mod tests {
         // the window: sorted by start, "ends before from" is false-then-true,
         // so a binary search on it skips right past the chunk that does overlap.
         let index = indexed(&[(0, 100_000), (10 * SEC, 1_000), (20 * SEC, 1_000)]);
-        let hits = index.query("cam", 50 * SEC, 60 * SEC);
+        let hits = index.query("cam", EventPage::unbounded(50 * SEC, 60 * SEC));
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].start_pts_ns, 0);
     }
@@ -602,30 +602,51 @@ mod tests {
     fn query_returns_every_overlapping_event_in_start_order() {
         let index = indexed(&[(0, 100_000), (10 * SEC, 1_000), (20 * SEC, 1_000)]);
         let starts: Vec<u64> = index
-            .query("cam", 0, u64::MAX)
+            .query("cam", EventPage::unbounded(0, u64::MAX))
             .iter()
             .map(|e| e.start_pts_ns)
             .collect();
         assert_eq!(starts, vec![0, 10 * SEC, 20 * SEC]);
-        assert!(index.query("unknown", 0, u64::MAX).is_empty());
+        assert!(index
+            .query("unknown", EventPage::unbounded(0, u64::MAX))
+            .is_empty());
     }
 
     #[test]
     fn zero_duration_events_are_found_at_their_start() {
         let index = indexed(&[(10 * SEC, 0)]);
-        assert_eq!(index.query("cam", 10 * SEC, 10 * SEC).len(), 1);
-        assert!(index.query("cam", 10 * SEC + 1, 20 * SEC).is_empty());
+        assert_eq!(
+            index
+                .query("cam", EventPage::unbounded(10 * SEC, 10 * SEC))
+                .len(),
+            1
+        );
+        assert!(index
+            .query("cam", EventPage::unbounded(10 * SEC + 1, 20 * SEC))
+            .is_empty());
     }
 
     #[test]
     fn query_bounds_include_events_that_only_touch_them() {
         let index = indexed(&[(10 * SEC, 5_000)]);
         // Ends exactly at from_ns.
-        assert_eq!(index.query("cam", 15 * SEC, 20 * SEC).len(), 1);
-        assert!(index.query("cam", 15 * SEC + 1, 20 * SEC).is_empty());
+        assert_eq!(
+            index
+                .query("cam", EventPage::unbounded(15 * SEC, 20 * SEC))
+                .len(),
+            1
+        );
+        assert!(index
+            .query("cam", EventPage::unbounded(15 * SEC + 1, 20 * SEC))
+            .is_empty());
         // Starts exactly at to_ns.
-        assert_eq!(index.query("cam", 0, 10 * SEC).len(), 1);
-        assert!(index.query("cam", 0, 10 * SEC - 1).is_empty());
+        assert_eq!(
+            index.query("cam", EventPage::unbounded(0, 10 * SEC)).len(),
+            1
+        );
+        assert!(index
+            .query("cam", EventPage::unbounded(0, 10 * SEC - 1))
+            .is_empty());
     }
 
     #[test]
@@ -633,8 +654,12 @@ mod tests {
         // These bounds used to be computed independently and sliced, which
         // panicked here with start > end.
         let index = indexed(&[(0, 100_000), (10 * SEC, 1_000)]);
-        assert!(index.query("cam", u64::MAX, 0).is_empty());
-        assert!(index.query("cam", 20 * SEC, 5 * SEC).is_empty());
+        assert!(index
+            .query("cam", EventPage::unbounded(u64::MAX, 0))
+            .is_empty());
+        assert!(index
+            .query("cam", EventPage::unbounded(20 * SEC, 5 * SEC))
+            .is_empty());
     }
 
     #[test]

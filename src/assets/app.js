@@ -1455,12 +1455,47 @@ document.addEventListener('DOMContentLoaded', async () => {
         return `${ev.start_pts_ns}_${ev.duration_ms}_${ev.event_type}`;
     }
 
+    // A listing answers with one bounded page of the newest events (the server
+    // used to answer with everything at once, which it did by cloning the whole
+    // index under the lock the camera's warm writer needs — on a deep archive
+    // one poll of this view stalled recording). So the archive is walked
+    // backwards: each request carries `before`, set to the key of the oldest
+    // event the previous page held, which resumes exactly beneath it even when
+    // the page ended inside a run of events sharing one start PTS.
+    //
+    // No page size is sent and none is assumed. The walk ends on an empty page,
+    // which costs one extra request per poll and — unlike reading a short page
+    // as the end — cannot be misread as the end of the archive if the server's
+    // cap is ever lowered below what this asked for. The ten-page horizon still
+    // scales with that cap either way: the panel reaches at most ten pages of
+    // whatever size the server serves. The first paint of the history panel
+    // waits on this sequential walk, one round trip per page.
+    //
+    // The walk stops after MAX_EVENT_PAGES either way, so a deep archive costs
+    // this view a bounded number of requests every poll and a bounded number of
+    // rows to render. What is dropped past that is the oldest end of a very deep
+    // archive: with continuous recording kept for a fortnight or more, the
+    // oldest days are simply absent from the history panel, silently. The event
+    // list is due a rework that will have to face this properly.
+    const MAX_EVENT_PAGES = 10;
+
     function fetchWarmEvents(cameraId) {
         if (warmEventPoller) warmEventPoller.stop();
         warmEventPoller = startPoller('warm events', 15000, async (signal) => {
-            const response = await apiFetch(`api/cameras/${encodeURIComponent(cameraId)}/events`, { signal });
-            if (currentDetailCameraId !== cameraId || !response.ok) return;
-            const raw = await response.json();
+            // Pages arrive newest-first but each is oldest-first within itself,
+            // so an older page goes in front of what is already collected.
+            let raw = [];
+            let cursor = null;
+            for (let page = 0; page < MAX_EVENT_PAGES; page++) {
+                const before = cursor === null ? '' : `?before=${encodeURIComponent(cursor)}`;
+                const url = `api/cameras/${encodeURIComponent(cameraId)}/events${before}`;
+                const response = await apiFetch(url, { signal });
+                if (currentDetailCameraId !== cameraId || !response.ok) return;
+                const events = await response.json();
+                if (events.length === 0) break;
+                raw = events.concat(raw);
+                cursor = eventKey(events[0]);
+            }
             warmEvents = raw.map(ev => ({
                 ...ev,
                 key: eventKey(ev),

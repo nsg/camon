@@ -18,7 +18,7 @@ pub use backend::{
 pub use contract::StopFlag;
 pub use debug_store::DetectionDebugStore;
 pub use detection_store::{DetectionEntry, DetectionStore};
-pub use event_index::{EventRef, EventType, WarmEventEntry};
+pub use event_index::{EventCursor, EventPage, EventRef, EventType, WarmEventEntry};
 pub use event_registry::{EventRegistry, PendingEvent, UpgradeTarget, Verdict, VerdictId};
 pub use recovery::recover_orphans;
 pub use stathost::StathostBackend;

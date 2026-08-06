@@ -156,8 +156,8 @@ use crate::storage::contract::{
     sleep_unless, Attempted, ByteBudget, Recovery, Reservation, RetryPolicy, StopFlag,
 };
 use crate::storage::event_index::{
-    evict_tiers, sweep_expired, EmergencyOutcome, EventIdentity, EventIndex, EvictionPolicy,
-    Removal,
+    evict_tiers, sweep_expired, EmergencyOutcome, EventIdentity, EventIndex, EventPage,
+    EvictionPolicy, Removal,
 };
 use crate::storage::warm_index::{
     parse_event_filename, parse_sidecar_json, sidecar_json, SidecarData,
@@ -2296,8 +2296,8 @@ impl WarmStorageBackend for StathostBackend {
         // collects during the scan — it needs the listing the scan already has.
     }
 
-    fn query(&self, camera_id: &str, from_ns: u64, to_ns: u64) -> Vec<WarmEventEntry> {
-        self.events.query(camera_id, from_ns, to_ns)
+    fn query(&self, camera_id: &str, page: EventPage) -> Vec<WarmEventEntry> {
+        self.events.query(camera_id, page)
     }
 
     fn newest_event_end_ns(&self, camera_id: &str) -> Option<u64> {
@@ -3373,7 +3373,7 @@ mod tests {
 
     fn sibling(backend: &StathostBackend, duration_ms: u32) -> Option<WarmEventEntry> {
         backend
-            .query("cam", 0, u64::MAX)
+            .query("cam", EventPage::unbounded(0, u64::MAX))
             .into_iter()
             .find(|e| e.duration_ms == duration_ms)
     }
@@ -3480,7 +3480,12 @@ mod tests {
         // Same start and duration — the same stem, and so the same objects.
         backend.write_event("cam", &movement_event(1_000, 25)).await;
 
-        assert_eq!(backend.query("cam", 0, u64::MAX).len(), 1);
+        assert_eq!(
+            backend
+                .query("cam", EventPage::unbounded(0, u64::MAX))
+                .len(),
+            1
+        );
         assert_eq!(
             backend
                 .find_event("cam", url_key(1_000, 1000))
@@ -3549,7 +3554,12 @@ mod tests {
         backend
             .write_event("cam", &longer_movement_event(OLD_PTS, 40))
             .await;
-        assert_eq!(backend.query("cam", 0, u64::MAX).len(), 2);
+        assert_eq!(
+            backend
+                .query("cam", EventPage::unbounded(0, u64::MAX))
+                .len(),
+            2
+        );
         assert_eq!(backend.used(), stub.stored_bytes());
 
         // Upgrade only the longer one.
@@ -3609,7 +3619,12 @@ mod tests {
         backend
             .write_event("cam", &longer_movement_event(30_000, 40))
             .await;
-        assert_eq!(backend.query("cam", 0, u64::MAX).len(), 2);
+        assert_eq!(
+            backend
+                .query("cam", EventPage::unbounded(0, u64::MAX))
+                .len(),
+            2
+        );
 
         for (duration_ms, file_size) in [(1000u32, 40u64), (2000, 80)] {
             let entry = backend
@@ -3795,12 +3810,22 @@ mod tests {
         backend
             .prune(1, u64::MAX, u64::MAX, &AtomicBool::new(false))
             .await;
-        assert_eq!(backend.query("cam", 0, u64::MAX).len(), 30);
+        assert_eq!(
+            backend
+                .query("cam", EventPage::unbounded(0, u64::MAX))
+                .len(),
+            30
+        );
 
         backend
             .prune(1, u64::MAX, u64::MAX, &AtomicBool::new(false))
             .await;
-        assert_eq!(backend.query("cam", 0, u64::MAX).len(), 22);
+        assert_eq!(
+            backend
+                .query("cam", EventPage::unbounded(0, u64::MAX))
+                .len(),
+            22
+        );
     }
 
     /// An event the store refuses to delete sits at the head of the sweep, so
@@ -3827,14 +3852,21 @@ mod tests {
         backend
             .prune(1, u64::MAX, u64::MAX, &AtomicBool::new(false))
             .await;
-        assert_eq!(backend.query("cam", 0, u64::MAX).len(), 12);
+        assert_eq!(
+            backend
+                .query("cam", EventPage::unbounded(0, u64::MAX))
+                .len(),
+            12
+        );
 
         // Second: retrying those is free, so it reaches four behind them.
         backend
             .prune(1, u64::MAX, u64::MAX, &AtomicBool::new(false))
             .await;
         assert_eq!(
-            backend.query("cam", 0, u64::MAX).len(),
+            backend
+                .query("cam", EventPage::unbounded(0, u64::MAX))
+                .len(),
             8,
             "a stuck head of the queue blocked the whole sweep"
         );
@@ -3928,7 +3960,9 @@ mod tests {
         backend.guard_free_space("cam", 0).await;
 
         assert_eq!(
-            backend.query("cam", 0, u64::MAX).len(),
+            backend
+                .query("cam", EventPage::unbounded(0, u64::MAX))
+                .len(),
             3,
             "evicted the only events it could see"
         );
@@ -3952,12 +3986,19 @@ mod tests {
         backend.scan().await.unwrap();
 
         assert_eq!(stub.lists(), SCAN_ATTEMPTS as usize);
-        assert_eq!(backend.query("cam", 0, u64::MAX).len(), 3);
+        assert_eq!(
+            backend
+                .query("cam", EventPage::unbounded(0, u64::MAX))
+                .len(),
+            3
+        );
         // Retention runs on it like any other scanned index.
         backend
             .prune(u64::MAX, 1, u64::MAX, &AtomicBool::new(false))
             .await;
-        assert!(backend.query("cam", 0, u64::MAX).is_empty());
+        assert!(backend
+            .query("cam", EventPage::unbounded(0, u64::MAX))
+            .is_empty());
     }
 
     /// The startup attempts are bounded, so a store that comes back a minute
@@ -3973,7 +4014,9 @@ mod tests {
         stub.fail_next_lists(usize::MAX);
         let backend = backend_for(&url, "secret", 0);
         assert!(backend.scan().await.is_err());
-        assert!(backend.query("cam", 0, u64::MAX).is_empty());
+        assert!(backend
+            .query("cam", EventPage::unbounded(0, u64::MAX))
+            .is_empty());
 
         stub.serve_lists_again();
 
@@ -3982,7 +4025,10 @@ mod tests {
             .await;
 
         assert!(
-            backend.query("cam", 0, u64::MAX).is_empty() && stub.files.lock().unwrap().is_empty(),
+            backend
+                .query("cam", EventPage::unbounded(0, u64::MAX))
+                .is_empty()
+                && stub.files.lock().unwrap().is_empty(),
             "the tick did not rebuild the index and prune what it found"
         );
 
@@ -4047,7 +4093,10 @@ mod tests {
             .await;
 
         assert!(
-            !stub.has("cam/1000000000_1000.ts") && backend.query("cam", 0, u64::MAX).is_empty(),
+            !stub.has("cam/1000000000_1000.ts")
+                && backend
+                    .query("cam", EventPage::unbounded(0, u64::MAX))
+                    .is_empty(),
             "the heal did not rebuild the index and prune what it found"
         );
         assert!(
@@ -4181,7 +4230,9 @@ mod tests {
             "an interrupted pass was taken for a rebuilt index"
         );
         assert!(
-            backend.query("cam", 0, u64::MAX).is_empty(),
+            backend
+                .query("cam", EventPage::unbounded(0, u64::MAX))
+                .is_empty(),
             "the completed heal did not prune what it found"
         );
     }
@@ -4237,7 +4288,12 @@ mod tests {
         );
         assert_eq!(entry.object_classes, vec!["person".to_string()]);
         // And it still did what it was for: the archive it could not see.
-        assert_eq!(backend.query("cam", 0, u64::MAX).len(), 3);
+        assert_eq!(
+            backend
+                .query("cam", EventPage::unbounded(0, u64::MAX))
+                .len(),
+            3
+        );
     }
 
     /// The other half of that yield. An upgrade whose sidecar `PUT` reported
@@ -4388,7 +4444,12 @@ mod tests {
 
         // First pass: the oldest refuses, and the pass stops there.
         backend.guard_free_space("cam", 0).await;
-        assert_eq!(backend.query("cam", 0, u64::MAX).len(), 3);
+        assert_eq!(
+            backend
+                .query("cam", EventPage::unbounded(0, u64::MAX))
+                .len(),
+            3
+        );
         assert!(
             backend
                 .find_event("cam", url_key(1_000, 1000))
@@ -4463,9 +4524,14 @@ mod tests {
         for _ in 0..4 {
             backend.guard_free_space("cam", 0).await;
         }
-        assert_eq!(backend.query("cam", 0, u64::MAX).len(), 4);
+        assert_eq!(
+            backend
+                .query("cam", EventPage::unbounded(0, u64::MAX))
+                .len(),
+            4
+        );
         assert!(backend
-            .query("cam", 0, u64::MAX)
+            .query("cam", EventPage::unbounded(0, u64::MAX))
             .iter()
             .all(|e| e.delete_failed));
 
@@ -4474,7 +4540,12 @@ mod tests {
         stub.fail_delete_paths.lock().unwrap().clear();
         backend.guard_free_space("cam", 0).await;
         assert!(backend.used() <= budget);
-        assert_eq!(backend.query("cam", 0, u64::MAX).len(), 1);
+        assert_eq!(
+            backend
+                .query("cam", EventPage::unbounded(0, u64::MAX))
+                .len(),
+            1
+        );
     }
 
     /// The video is deleted before the sidecar, so a refused video delete keeps
@@ -4638,7 +4709,12 @@ mod tests {
         backend.scan().await.unwrap();
         let elapsed = started.elapsed();
 
-        assert_eq!(backend.query("cam", 0, u64::MAX).len(), 64);
+        assert_eq!(
+            backend
+                .query("cam", EventPage::unbounded(0, u64::MAX))
+                .len(),
+            64
+        );
         // Serial is 3.2s of injected latency alone and measures at ~3.4s;
         // sixteen at a time is four waves, ~0.24s. The bound sits between them
         // with room for a loaded machine on either count.
@@ -4675,7 +4751,7 @@ mod tests {
         let backend = backend_for(&url, "secret", 0);
         backend.scan().await.unwrap();
 
-        let entries = backend.query("cam", 0, u64::MAX);
+        let entries = backend.query("cam", EventPage::unbounded(0, u64::MAX));
         assert_eq!(entries.len(), 40, "an event was dropped or duplicated");
         for (i, entry) in entries.iter().enumerate() {
             assert_eq!(entry.start_pts_ns, 1_000 + i as u64 * SEC);
@@ -4709,7 +4785,7 @@ mod tests {
         let backend = backend_for(&url, "secret", 0);
         backend.scan().await.unwrap();
 
-        let entries = backend.query("cam", 0, u64::MAX);
+        let entries = backend.query("cam", EventPage::unbounded(0, u64::MAX));
         assert_eq!(entries.len(), 40);
         for entry in &entries {
             let key = event_key(entry);
@@ -5368,7 +5444,9 @@ mod tests {
 
         assert_eq!(outcome, WriteOutcome::Failed);
         assert!(stub.puts.lock().unwrap().is_empty());
-        assert!(backend.query("cam", 0, u64::MAX).is_empty());
+        assert!(backend
+            .query("cam", EventPage::unbounded(0, u64::MAX))
+            .is_empty());
     }
 
     // ---- accounting: the whole cost, and room secured in advance -----------
@@ -5517,7 +5595,9 @@ mod tests {
         });
 
         assert!(
-            backend.query("cam", 0, u64::MAX).is_empty(),
+            backend
+                .query("cam", EventPage::unbounded(0, u64::MAX))
+                .is_empty(),
             "the upgrade re-indexed an event the sweep had deleted"
         );
         assert!(
@@ -5577,7 +5657,12 @@ mod tests {
             Vec::<String>::new(),
             "a stopped write evicted stored footage to make room for itself"
         );
-        assert_eq!(backend.query("cam", 0, u64::MAX).len(), 2);
+        assert_eq!(
+            backend
+                .query("cam", EventPage::unbounded(0, u64::MAX))
+                .len(),
+            2
+        );
         assert_eq!(stub.stored_bytes(), stored);
     }
 
@@ -5652,7 +5737,9 @@ mod tests {
             "the eviction kept deleting stored footage after shutdown was asked for"
         );
         assert_eq!(
-            backend.query("cam", 0, u64::MAX).len(),
+            backend
+                .query("cam", EventPage::unbounded(0, u64::MAX))
+                .len(),
             4,
             "an event was unindexed by a pass that never finished deleting it"
         );
@@ -5761,7 +5848,9 @@ mod tests {
         // taking every object with it.
         restarted.prune(1, 1, 1, &AtomicBool::new(false)).await;
         assert!(
-            restarted.query("cam", 0, u64::MAX).is_empty(),
+            restarted
+                .query("cam", EventPage::unbounded(0, u64::MAX))
+                .is_empty(),
             "the second sweep did not delete the event"
         );
         assert!(
@@ -5870,7 +5959,9 @@ mod tests {
         backend.prune(1, 1, 1, &AtomicBool::new(false)).await;
 
         assert!(
-            backend.query("cam", 0, u64::MAX).is_empty(),
+            backend
+                .query("cam", EventPage::unbounded(0, u64::MAX))
+                .is_empty(),
             "an expired recording was held back because a thumbnail resisted"
         );
         assert!(!stub.has(&format!("cam/{stem}.ts")));
@@ -5901,7 +5992,12 @@ mod tests {
         let outcome = backend.write_event("cam", &movement_event(1_000, 40)).await;
 
         assert_eq!(outcome, WriteOutcome::Written);
-        assert_eq!(backend.query("cam", 0, u64::MAX).len(), 1);
+        assert_eq!(
+            backend
+                .query("cam", EventPage::unbounded(0, u64::MAX))
+                .len(),
+            1
+        );
         assert!(
             backend.used() > budget,
             "the store is under a budget it cannot fit one event into"
@@ -5933,7 +6029,12 @@ mod tests {
         let outcome = backend.write_event("cam", &movement_event(3_000, 40)).await;
 
         assert_eq!(outcome, WriteOutcome::Written);
-        assert_eq!(backend.query("cam", 0, u64::MAX).len(), 3);
+        assert_eq!(
+            backend
+                .query("cam", EventPage::unbounded(0, u64::MAX))
+                .len(),
+            3
+        );
         assert!(backend.used() > cost * 2);
     }
 
@@ -6104,8 +6205,18 @@ mod tests {
         seed_events_for(&stub, "other", OLD_PTS, HELD, 1000, "object");
         stub.fail_gets(".json");
         let backend = scanned_backend_with_cameras(&url, &["cam", "other"]).await;
-        assert_eq!(backend.query("cam", 0, u64::MAX).len(), HELD as usize);
-        assert_eq!(backend.query("other", 0, u64::MAX).len(), HELD as usize);
+        assert_eq!(
+            backend
+                .query("cam", EventPage::unbounded(0, u64::MAX))
+                .len(),
+            HELD as usize
+        );
+        assert_eq!(
+            backend
+                .query("other", EventPage::unbounded(0, u64::MAX))
+                .len(),
+            HELD as usize
+        );
         stub.take_gets();
         // Held and never answered: every pass reads nothing back, so every
         // cursor advances by its floor of one and nothing depends on latency.
@@ -6242,7 +6353,9 @@ mod tests {
             "the upgrade left a sidecar on a store that has no video for it"
         );
         assert!(
-            backend.query("cam", 0, u64::MAX).is_empty(),
+            backend
+                .query("cam", EventPage::unbounded(0, u64::MAX))
+                .is_empty(),
             "the index still describes footage that is gone"
         );
     }
@@ -6263,7 +6376,12 @@ mod tests {
         // the prune tick has the whole archive to re-read.
         stub.fail_gets(".json");
         let backend = scanned_backend_for(&url, "secret", 0).await;
-        assert_eq!(backend.query("cam", 0, u64::MAX).len(), HELD as usize);
+        assert_eq!(
+            backend
+                .query("cam", EventPage::unbounded(0, u64::MAX))
+                .len(),
+            HELD as usize
+        );
         // Only now: the scan's own reads are not what this is measuring.
         stub.take_gets();
         stub.get_delay_ms.store(25, Ordering::SeqCst);
@@ -6287,7 +6405,9 @@ mod tests {
         // And the sweep behind them still deleted its share (a quarter of the
         // archive, per `cap_sweep_deletions`).
         assert_eq!(
-            backend.query("cam", 0, u64::MAX).len(),
+            backend
+                .query("cam", EventPage::unbounded(0, u64::MAX))
+                .len(),
             HELD as usize * 3 / 4,
             "the sweep did not get to its deletions"
         );
@@ -6425,7 +6545,7 @@ mod tests {
         // the window: sorted by start, "ends before from" is false-then-true,
         // so a binary search on it skips right past the chunk that does overlap.
         let backend = indexed(&[(0, 100_000), (10 * SEC, 1_000), (20 * SEC, 1_000)]);
-        let hits = backend.query("cam", 50 * SEC, 60 * SEC);
+        let hits = backend.query("cam", EventPage::unbounded(50 * SEC, 60 * SEC));
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].start_pts_ns, 0);
     }
@@ -6434,30 +6554,53 @@ mod tests {
     fn query_returns_every_overlapping_event_in_start_order() {
         let backend = indexed(&[(0, 100_000), (10 * SEC, 1_000), (20 * SEC, 1_000)]);
         let starts: Vec<u64> = backend
-            .query("cam", 0, u64::MAX)
+            .query("cam", EventPage::unbounded(0, u64::MAX))
             .iter()
             .map(|e| e.start_pts_ns)
             .collect();
         assert_eq!(starts, vec![0, 10 * SEC, 20 * SEC]);
-        assert!(backend.query("unknown", 0, u64::MAX).is_empty());
+        assert!(backend
+            .query("unknown", EventPage::unbounded(0, u64::MAX))
+            .is_empty());
     }
 
     #[test]
     fn zero_duration_events_are_found_at_their_start() {
         let backend = indexed(&[(10 * SEC, 0)]);
-        assert_eq!(backend.query("cam", 10 * SEC, 10 * SEC).len(), 1);
-        assert!(backend.query("cam", 10 * SEC + 1, 20 * SEC).is_empty());
+        assert_eq!(
+            backend
+                .query("cam", EventPage::unbounded(10 * SEC, 10 * SEC))
+                .len(),
+            1
+        );
+        assert!(backend
+            .query("cam", EventPage::unbounded(10 * SEC + 1, 20 * SEC))
+            .is_empty());
     }
 
     #[test]
     fn query_bounds_include_events_that_only_touch_them() {
         let backend = indexed(&[(10 * SEC, 5_000)]);
         // Ends exactly at from_ns.
-        assert_eq!(backend.query("cam", 15 * SEC, 20 * SEC).len(), 1);
-        assert!(backend.query("cam", 15 * SEC + 1, 20 * SEC).is_empty());
+        assert_eq!(
+            backend
+                .query("cam", EventPage::unbounded(15 * SEC, 20 * SEC))
+                .len(),
+            1
+        );
+        assert!(backend
+            .query("cam", EventPage::unbounded(15 * SEC + 1, 20 * SEC))
+            .is_empty());
         // Starts exactly at to_ns.
-        assert_eq!(backend.query("cam", 0, 10 * SEC).len(), 1);
-        assert!(backend.query("cam", 0, 10 * SEC - 1).is_empty());
+        assert_eq!(
+            backend
+                .query("cam", EventPage::unbounded(0, 10 * SEC))
+                .len(),
+            1
+        );
+        assert!(backend
+            .query("cam", EventPage::unbounded(0, 10 * SEC - 1))
+            .is_empty());
     }
 
     #[test]
@@ -6465,7 +6608,11 @@ mod tests {
         // These bounds used to be computed independently and sliced, which
         // panicked here with start > end.
         let backend = indexed(&[(0, 100_000), (10 * SEC, 1_000)]);
-        assert!(backend.query("cam", u64::MAX, 0).is_empty());
-        assert!(backend.query("cam", 20 * SEC, 5 * SEC).is_empty());
+        assert!(backend
+            .query("cam", EventPage::unbounded(u64::MAX, 0))
+            .is_empty());
+        assert!(backend
+            .query("cam", EventPage::unbounded(20 * SEC, 5 * SEC))
+            .is_empty());
     }
 }
