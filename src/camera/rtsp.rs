@@ -742,13 +742,30 @@ impl MpegTsSegmenter {
         }
     }
 
+    /// Take the PMT PID from the first entry the PAT lists.
+    ///
+    /// The first entry, not the first program: an entry with program_number 0
+    /// names the network information table, and its PID would be taken for a
+    /// program map here. ffmpeg's muxer emits no NIT and one program, so the
+    /// first entry is the program — this reads that stream, not the standard.
+    ///
+    /// The entry read here is only there if the section says it is: a PAT
+    /// listing no programs at all ends its five-byte header with the CRC_32,
+    /// and reading the entry regardless would take two checksum bytes for a
+    /// PID. Bounding by `section_length` refuses that section instead, and the
+    /// run then reports the PAT as naming no PMT PID — which it does not.
     fn parse_pat(&mut self, packet: &[u8]) {
         let start = match table_section_start(packet) {
             Some(s) => s,
             None => return,
         };
 
-        if start + 12 > 188 {
+        // The first program entry ends at `start + 12`; anything less and the
+        // bytes there belong to the CRC or to another packet entirely.
+        let Some(contents_end) = section_contents_end(packet, start) else {
+            return;
+        };
+        if start + 12 > contents_end {
             return;
         }
 
@@ -760,23 +777,51 @@ impl MpegTsSegmenter {
         }
     }
 
+    /// Latch the video and audio elementary PIDs from the program map.
+    ///
+    /// The elementary-stream loop stops where the section's own
+    /// `section_length` says the streams stop, four bytes short of the end so
+    /// the CRC_32 is never walked into. Running to the end of the packet
+    /// instead reads that checksum as a stream entry, and about one PMT layout
+    /// in 256 has 0x1B — H.264 — sitting in the first CRC byte: a PID no
+    /// packet ever carries, latched for the life of the connection, after
+    /// which the run blames the camera for sending no video on a PID the
+    /// camera never announced.
+    ///
+    /// A section that cannot hold its own fixed header, or that claims more
+    /// bytes than the packet carries, is refused whole rather than half-read,
+    /// and is not counted among the PMTs that parsed. The run then reports no
+    /// readable PMT on this PID, which is exactly what was observed.
+    ///
+    /// What the bound does not promise is that every PID latched here was
+    /// announced: a section whose `program_info_length` lies while staying
+    /// inside its own bounds leaves the loop misaligned, reading a stream type
+    /// out of descriptor bytes. That takes a malformed section rather than the
+    /// one-in-256 accident above, and it can only misread bytes the section
+    /// itself carries — never the CRC, never the stuffing past it.
     fn parse_pmt(&mut self, packet: &[u8]) {
         let start = match table_section_start(packet) {
             Some(s) => s,
             None => return,
         };
 
-        if start + 12 > 188 {
+        let Some(es_end) = section_contents_end(packet, start) else {
+            return;
+        };
+        // The fixed header runs to `start + 12`, `program_info_length` last.
+        if start + 12 > es_end {
             return;
         }
         self.counts.pmt_packets += 1;
 
-        let program_info_len = ((packet.get(start + 10).copied().unwrap_or(0) as usize & 0x0F)
-            << 8)
-            | packet.get(start + 11).copied().unwrap_or(0) as usize;
+        let program_info_len =
+            ((packet[start + 10] as usize & 0x0F) << 8) | packet[start + 11] as usize;
 
+        // Descriptor and stream lengths are the section's own claims: a length
+        // reaching past `es_end` walks `pos` off the end of the loop rather
+        // than off the end of the packet.
         let mut pos = start + 12 + program_info_len;
-        while pos + 5 <= 188 {
+        while pos + 5 <= es_end {
             let stream_type = packet[pos];
             let elem_pid = ((packet[pos + 1] as u16 & 0x1F) << 8) | packet[pos + 2] as u16;
             let es_info_len = ((packet[pos + 3] as usize & 0x0F) << 8) | packet[pos + 4] as usize;
@@ -802,9 +847,49 @@ impl MpegTsSegmenter {
     }
 }
 
-/// Compute the start of a PSI table section inside an MPEG-TS packet.
-/// Handles adaptation field and PUSI pointer field. Returns None if out of bounds.
+/// Where the contents of the PSI section beginning at `start` end: one past
+/// the last byte a table may be read from.
+///
+/// `section_length` counts the bytes following it, the four-byte CRC_32
+/// included, so the section spans up to `start + 3 + section_length` and its
+/// contents stop four bytes short of that. Returning that boundary is what
+/// keeps a checksum from being parsed as table data. `None` for a section too
+/// short to hold even its CRC, or one claiming more bytes than the 188-byte
+/// packet carries — nothing in either can be trusted to be what it looks like.
+///
+/// A section is only ever parsed out of the one packet that starts it. PSI
+/// sections may in principle span packets, and one that claims more bytes than
+/// its own packet holds is refused whole rather than reassembled: refusing
+/// beats guessing, since a half-read table names PIDs that were never in it,
+/// and the run then reports no readable PMT on that PID — which is literally
+/// what happened. The transport camon reads is produced by its own ffmpeg
+/// remuxing one or two elementary streams, whose program map is a single small
+/// packet, so this refusal is not expected to fire on a working camera.
+///
+/// Callers must still check that the fields they read fall before the
+/// boundary: this says where the section ends, not that it holds anything.
+fn section_contents_end(packet: &[u8], start: usize) -> Option<usize> {
+    let section_length = ((packet[start + 1] as usize & 0x0F) << 8) | packet[start + 2] as usize;
+    let end = start + 3 + section_length;
+    (section_length >= 4 && end <= 188).then_some(end - 4)
+}
+
+/// Compute the start of a PSI table section inside an MPEG-TS packet, past the
+/// adaptation field and the pointer field. `None` if the packet begins no
+/// section, or if the pointer lands outside it.
+///
+/// Only a packet flagging `payload_unit_start_indicator` begins a section, and
+/// only such a packet carries the pointer field that says where. A
+/// continuation packet is the middle of a section already in progress: its
+/// payload starts wherever the previous packet's section left off, so reading
+/// a table_id and a `section_length` from its first bytes invents a section
+/// out of another one's descriptors. Refusing it is what keeps the parsers
+/// from latching a PID that no table ever named.
 fn table_section_start(packet: &[u8]) -> Option<usize> {
+    if (packet[1] & 0x40) == 0 {
+        return None;
+    }
+
     let payload_offset = if (packet[3] & 0x20) != 0 {
         5 + packet[4] as usize
     } else {
@@ -815,11 +900,7 @@ fn table_section_start(packet: &[u8]) -> Option<usize> {
         return None;
     }
 
-    let start = if (packet[1] & 0x40) != 0 {
-        payload_offset + 1 + packet[payload_offset] as usize
-    } else {
-        payload_offset
-    };
+    let start = payload_offset + 1 + packet[payload_offset] as usize;
 
     if start + 12 > 188 {
         return None;
@@ -1138,6 +1219,219 @@ mod tests {
         assert!(summary.contains("H.265"), "{summary}");
         // The count is of parsed PMT packets, which are repeats of one table.
         assert!(summary.contains("parsed the PMT 1 times"), "{summary}");
+    }
+
+    #[test]
+    fn a_program_map_names_the_streams_its_section_actually_lists() {
+        let stats = segment_stats(&[pat(PMT_PID), pmt(H264, VIDEO_PID)]);
+
+        assert_eq!(stats.counts.pmt_pid, Some(PMT_PID));
+        assert_eq!(stats.counts.pmt_packets, 1);
+        assert_eq!(stats.counts.video_pid, Some(VIDEO_PID));
+    }
+
+    #[test]
+    fn a_crc_shaped_like_a_video_stream_entry_latches_no_video_pid() {
+        // The four bytes past the last elementary stream are the section's
+        // CRC_32, and roughly one PMT layout in 256 opens it with 0x1B. Read
+        // as a stream entry it names a PID nothing is ever sent on.
+        let mut packet = pmt(0x0F, AUDIO_PID);
+        packet[22..26].copy_from_slice(&[H264, 0xE0 | (OTHER_PID >> 8) as u8, OTHER_PID as u8, 0]);
+        let stats = segment_stats(&[pat(PMT_PID), packet]);
+
+        assert_eq!(stats.counts.video_pid, None);
+        // The section itself is well formed: it lists audio and no video.
+        assert_eq!(stats.counts.pmt_packets, 1);
+        let failure = failed(watched_for(stats, 58), RunEnd::SegmentTimeout);
+        assert_eq!(failure.fault(), Some(StreamFault::NoVideoStream));
+    }
+
+    #[test]
+    fn the_four_bytes_a_section_ends_on_are_never_a_stream_entry() {
+        // A section whose stream lengths leave a byte of slack before the
+        // CRC_32 puts a five-byte read within reach of the section's end. Only
+        // stopping four bytes short of it keeps the checksum out of the loop.
+        let mut packet = pmt(0x0F, AUDIO_PID);
+        packet[7] = 0x13; // section_length: one byte past the last stream
+        packet[22..27].copy_from_slice(&[
+            H264,
+            0xE0 | (OTHER_PID >> 8) as u8,
+            OTHER_PID as u8,
+            0xF0,
+            0x00,
+        ]);
+        let stats = segment_stats(&[pat(PMT_PID), packet]);
+
+        assert_eq!(stats.counts.video_pid, None);
+    }
+
+    #[test]
+    fn a_program_map_claiming_more_bytes_than_the_packet_holds_is_refused() {
+        let mut packet = pmt(H264, VIDEO_PID);
+        packet[6] = 0xBF;
+        packet[7] = 0xFF; // section_length 4095, twenty times the packet
+        let stats = segment_stats(&[pat(PMT_PID), packet]);
+
+        assert_eq!(stats.counts.video_pid, None);
+        // Refused, not parsed — so the run says the PMT was unreadable rather
+        // than that the camera listed no video in it.
+        assert_eq!(stats.counts.pmt_packets, 0);
+        let failure = failed(watched_for(stats, 58), RunEnd::SegmentTimeout);
+        assert_eq!(failure.fault(), Some(StreamFault::NoProgramMap));
+        let summary = failure.summary();
+        assert!(summary.contains("no readable PMT on PID 4096"), "{summary}");
+    }
+
+    #[test]
+    fn a_program_map_that_would_span_packets_is_refused_rather_than_reassembled() {
+        // A section too long for its own packet continues in the next one.
+        // camon does not reassemble; it says so rather than reading half a
+        // table, and the fault names the PID it could not read.
+        let mut packet = pmt(H264, VIDEO_PID);
+        packet[7] = 0xC8; // section_length 200, past the 188-byte packet
+        let stats = segment_stats(&[pat(PMT_PID), packet]);
+
+        assert_eq!(stats.counts.video_pid, None);
+        assert_eq!(stats.counts.pmt_packets, 0);
+        let failure = failed(watched_for(stats, 58), RunEnd::SegmentTimeout);
+        assert_eq!(failure.fault(), Some(StreamFault::NoProgramMap));
+        assert!(
+            failure.summary().contains("no readable PMT on PID 4096"),
+            "{}",
+            failure.summary()
+        );
+    }
+
+    #[test]
+    fn a_continuation_packet_is_never_read_as_a_section_of_its_own() {
+        // The rest of a spanning section carries no pointer field and no
+        // table header: its payload is descriptor bytes that happen to sit
+        // where a section's would. Laid out as a plausible PMT naming
+        // OTHER_PID, it must name nothing at all.
+        // The bytes are laid out to parse as such a section whether the
+        // payload is taken to start at the payload offset or one pointer
+        // field past it, so no accident of where the section is looked for
+        // can pass for the flag being honoured.
+        let mut continuation = [0xFFu8; TS_PACKET_SIZE];
+        continuation[0] = crate::mpegts::SYNC_BYTE;
+        continuation[1] = (PMT_PID >> 8) as u8 & 0x1F; // no payload_unit_start
+        continuation[2] = PMT_PID as u8;
+        continuation[3] = 0x10;
+        continuation[4] = 0x00; // table_id, or a pointer field of zero
+        continuation[5] = 0xB0;
+        continuation[6] = 0x30;
+        continuation[7] = 0x30; // section_length 48, read from either pair
+        continuation[14] = 0xF0;
+        continuation[15] = 0x10;
+        continuation[16] = 0x0F; // program_info_length, either pair
+        continuation[32] = H264; // where both readings put a stream entry
+        continuation[33] = 0xE0 | (OTHER_PID >> 8) as u8;
+        continuation[34] = OTHER_PID as u8;
+        continuation[35] = 0xF0;
+        continuation[36] = 0x00;
+
+        let stats = segment_stats(&[pat(PMT_PID), continuation]);
+        assert_eq!(stats.counts.video_pid, None);
+        assert_eq!(stats.counts.pmt_packets, 0);
+        let failure = failed(watched_for(stats, 58), RunEnd::SegmentTimeout);
+        assert_eq!(failure.fault(), Some(StreamFault::NoProgramMap));
+        assert!(
+            failure.summary().contains("no readable PMT on PID 4096"),
+            "{}",
+            failure.summary()
+        );
+
+        // The same bytes on the PAT's PID, where either reading takes them
+        // for a program entry and names a PMT PID that was never announced.
+        continuation[1] = 0x00;
+        continuation[2] = 0x00;
+        assert_eq!(segment_stats(&[continuation]).counts.pmt_pid, None);
+    }
+
+    #[test]
+    fn the_shortest_well_formed_program_map_is_accepted_though_it_lists_nothing() {
+        // Nine bytes of fixed header and four of CRC, listing nothing: the
+        // exact boundary between a section camon reads and one it refuses. It
+        // parsed, and it named no video — a different fault from an unreadable
+        // one, and the 0x1B the CRC opens with is still not a stream.
+        let mut packet = pmt(H264, VIDEO_PID);
+        packet[7] = 0x0D;
+        let stats = segment_stats(&[pat(PMT_PID), packet]);
+
+        assert_eq!(stats.counts.pmt_packets, 1);
+        assert_eq!(stats.counts.video_pid, None);
+        let failure = failed(watched_for(stats, 58), RunEnd::SegmentTimeout);
+        assert_eq!(failure.fault(), Some(StreamFault::NoVideoStream));
+    }
+
+    #[test]
+    fn a_program_map_section_shorter_than_its_own_header_is_refused() {
+        // Nine bytes of fixed header and four of CRC: below thirteen the
+        // section cannot reach the elementary streams at all.
+        for section_length in [0x00, 0x03, 0x04, 0x0C] {
+            let mut packet = pmt(H264, VIDEO_PID);
+            packet[7] = section_length;
+            let stats = segment_stats(&[pat(PMT_PID), packet]);
+
+            assert_eq!(
+                stats.counts.video_pid, None,
+                "section_length {section_length}"
+            );
+            assert_eq!(
+                stats.counts.pmt_packets, 0,
+                "section_length {section_length}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_program_association_table_listing_no_programs_names_no_pmt_pid() {
+        // Five bytes of header and four of CRC, no program entry: the PID read
+        // from one would be two bytes of the checksum.
+        let mut packet = pat(PMT_PID);
+        packet[7] = 0x09;
+        let stats = segment_stats(&[packet, pmt(H264, VIDEO_PID)]);
+
+        assert_eq!(stats.counts.pmt_pid, None);
+        assert_eq!(stats.counts.video_pid, None);
+    }
+
+    #[test]
+    fn malformed_table_packets_are_refused_without_panicking() {
+        let mut adaptation_only = pmt(H264, VIDEO_PID);
+        adaptation_only[3] = 0x20; // adaptation field, no payload at all
+        adaptation_only[4] = 183;
+        let mut pointer_past_end = pmt(H264, VIDEO_PID);
+        pointer_past_end[4] = 0xFF; // pointer field past the last byte
+        let mut every_bit_set = [0xFFu8; TS_PACKET_SIZE];
+        every_bit_set[0] = crate::mpegts::SYNC_BYTE;
+        every_bit_set[1] = 0x40 | ((PMT_PID >> 8) as u8 & 0x1F);
+        every_bit_set[2] = PMT_PID as u8;
+
+        for packet in [adaptation_only, pointer_past_end, every_bit_set] {
+            let stats = segment_stats(&[pat(PMT_PID), packet]);
+            assert_eq!(stats.counts.video_pid, None);
+            assert_eq!(stats.counts.pmt_packets, 0);
+        }
+
+        // Every length a twelve-bit field can claim, against a payload whose
+        // trailing bytes are all 0xFF: none of them may index past the packet.
+        for length in 0..=0x0FFFu16 {
+            let mut packet = pmt(H264, VIDEO_PID);
+            packet[6] = 0xB0 | ((length >> 8) as u8 & 0x0F);
+            packet[7] = length as u8;
+            segment_stats(&[pat(PMT_PID), packet]);
+
+            let mut packet = pmt(H264, VIDEO_PID);
+            packet[15] = 0xF0 | ((length >> 8) as u8 & 0x0F);
+            packet[16] = length as u8; // program_info_length
+            segment_stats(&[pat(PMT_PID), packet]);
+
+            let mut packet = pmt(H264, VIDEO_PID);
+            packet[20] = 0xF0 | ((length >> 8) as u8 & 0x0F);
+            packet[21] = length as u8; // ES_info_length
+            segment_stats(&[pat(PMT_PID), packet]);
+        }
     }
 
     #[test]
