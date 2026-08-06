@@ -37,7 +37,9 @@ use tokio_util::io::ReaderStream;
 
 use crate::buffer::warm::{EventUpgrade, FinishedEvent};
 use crate::locks::SingleFlight;
-use crate::storage::event_index::{EmergencyOutcome, EventPage};
+use crate::storage::event_index::{
+    filmstrip_frame_count, EmergencyOutcome, EventPage, MAX_FILMSTRIP_FRAMES,
+};
 use crate::storage::warm_index::{free_space_bytes, should_emergency_prune, sidecar_json};
 use crate::storage::{EventRef, EventType, StorageAnchor, WarmEventEntry, WarmEventIndex};
 
@@ -122,6 +124,36 @@ pub enum ServedRange {
     /// The requested range fell outside the object — respond `416`
     /// (`Content-Range: bytes */total`). The stream is empty.
     Unsatisfiable,
+}
+
+impl ServedRange {
+    /// A partial range, but only if `[start, end]` really is one of an object
+    /// of `total` bytes: bounds in order and inside the object.
+    ///
+    /// The check belongs here rather than at each caller because what is on the
+    /// other side of it is subtraction. A `Partial` is served with a
+    /// `Content-Length` of `end - start + 1`, so a reversed pair underflows —
+    /// a panic in a debug build, and camon ships debug — and an `end` past the
+    /// object promises a body longer than the stream will ever produce, which
+    /// hangs the player instead. Local disk resolves its own ranges and cannot
+    /// produce either; the remote backend is repeating a `Content-Range` a
+    /// server it does not control wrote, and that is not the same thing.
+    pub fn partial(start: u64, end: u64, total: u64) -> Option<Self> {
+        (start <= end && end < total).then_some(Self::Partial { start, end })
+    }
+
+    /// How many bytes the body of this range is, given the object's total size,
+    /// or `None` for a range that is not one of that object. Never subtracts
+    /// without having established the order first.
+    pub fn body_len(&self, total: u64) -> Option<u64> {
+        match *self {
+            ServedRange::Full => Some(total),
+            ServedRange::Unsatisfiable => Some(0),
+            ServedRange::Partial { start, end } => {
+                (start <= end && end < total).then(|| end - start + 1)
+            }
+        }
+    }
 }
 
 /// A streamed video read: the async body, the total object size, and how the
@@ -507,7 +539,11 @@ impl WarmStorageBackend for LocalDiskBackend {
         // read one by one and indexes the rest, and a data dir that is not there
         // at all is an empty store rather than an unknown one — nothing else
         // could have written to it either.
-        self.index.scan();
+        //
+        // Off the runtime, because the body of it is blocking filesystem work
+        // that a failing disk can hold for a long time — see
+        // [`WarmEventIndex::scan_off_thread`].
+        self.index.scan_off_thread().await;
         Ok(())
     }
 
@@ -554,18 +590,24 @@ impl WarmStorageBackend for LocalDiskBackend {
             });
         };
 
-        match resolve_range(req, total_size) {
-            Some((start, end)) => {
+        // `resolve_range` already keeps the bounds in order and inside the
+        // file, so the constructor never refuses here; it is what makes that a
+        // property of the type rather than of this one call site.
+        match resolve_range(req, total_size)
+            .and_then(|(start, end)| ServedRange::partial(start, end, total_size))
+        {
+            Some(served @ ServedRange::Partial { start, end }) => {
                 file.seek(std::io::SeekFrom::Start(start)).await?;
                 // `+ 1` because the range is inclusive on both ends.
                 let limited = file.take(end - start + 1);
                 Ok(VideoStream {
                     stream: Box::pin(ReaderStream::new(limited)),
                     total_size,
-                    range: ServedRange::Partial { start, end },
+                    range: served,
                 })
             }
-            None => Ok(VideoStream {
+            // `partial` builds nothing else, so this is the unsatisfiable case.
+            _ => Ok(VideoStream {
                 // Empty body: the handler answers 416 with a short text message.
                 stream: Box::pin(ReaderStream::new(tokio::io::empty())),
                 total_size,
@@ -901,7 +943,7 @@ async fn upgrade_event(
     }
 
     // Steps 3 + 4: thumbnails follow, the stale movement sidecar goes.
-    for i in 0..4 {
+    for i in 0..MAX_FILMSTRIP_FRAMES {
         let name = format!("{stem}_thumb_{i}.jpg");
         let _ = tokio::fs::rename(movements.join(&name), objects.join(&name)).await;
     }
@@ -985,13 +1027,8 @@ async fn reindexed_upgrade(
         .await
         .map(|m| m.len())
         .unwrap_or(0);
-    let mut filmstrip_frames = 0;
-    while objects
-        .join(format!("{stem}_thumb_{filmstrip_frames}.jpg"))
-        .exists()
-    {
-        filmstrip_frames += 1;
-    }
+    let filmstrip_frames =
+        filmstrip_frame_count(|i| objects.join(format!("{stem}_thumb_{i}.jpg")).exists());
     WarmEventEntry {
         start_pts_ns: upgrade.start_pts_ns,
         duration_ms: upgrade.duration_ms,

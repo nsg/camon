@@ -50,6 +50,20 @@ pub enum RunError {
     /// make one. Startup ends rather than serving the writes unguarded.
     #[error("cannot generate an API token: {source}")]
     ApiToken { source: std::io::Error },
+    /// Warm storage is configured and could not be built at all — in practice
+    /// the remote backend's HTTP client, which is where `reqwest` starts the
+    /// TLS stack, loads the system root certificates and reads the proxy
+    /// environment.
+    ///
+    /// Fatal, and it has to be. Recording *is* the product: a camon that came
+    /// up without the storage its config asks for would answer every API call,
+    /// publish every detection and persist not one second of footage, and the
+    /// only notice of it would be the recording watchdog's warning a whole day
+    /// later. Nothing takes over either — a configured stathost is the warm
+    /// backend, so there is no local disk waiting behind it. Ending here, with
+    /// the fault named, is the one outcome an operator can act on.
+    #[error("cannot start warm storage: {source}")]
+    WarmStorage { source: std::io::Error },
     /// A supervised task the process cannot run without died. The drain has
     /// already run by the time this is returned — see [`crate::supervise`].
     ///
@@ -408,6 +422,13 @@ fn log_object_detection_config(config: &Config) -> bool {
 /// and the sweep it is waiting for is the one this schedules — so that first
 /// sweep comes early instead of an hour later. `true` when there is no warm
 /// storage at all, which has nothing to heal.
+///
+/// `backend` is `None` for one reason only: `[storage] enabled = false`. That
+/// is the invariant `spawn_cameras` rests on when it unwraps the backend for a
+/// camera's warm writer, and why a backend that cannot be constructed ends
+/// startup ([`RunError::WarmStorage`]) rather than being absorbed into this
+/// `None` — which would turn "storage is off" and "storage is broken" into the
+/// same value and reach that unwrap with the wrong one.
 struct Storage {
     backend: Option<Arc<dyn WarmStorageBackend>>,
     scanned: bool,
@@ -423,12 +444,12 @@ async fn init_storage(
     config: &Config,
     camera_ids: &[String],
     stop: crate::storage::StopFlag,
-) -> Storage {
+) -> Result<Storage, RunError> {
     if !config.storage.enabled {
-        return Storage {
+        return Ok(Storage {
             backend: None,
             scanned: true,
-        };
+        });
     }
 
     // A configured (and enabled) [storage.stathost] section switches the warm
@@ -439,7 +460,15 @@ async fn init_storage(
             bucket = %stathost.bucket,
             "using remote stathost warm-storage backend"
         );
-        let backend = StathostBackend::new(stathost, camera_ids, stop);
+        // A client that cannot be built is a permanent, local fault — the TLS
+        // stack, the system root store, a malformed proxy in the environment —
+        // and every start will hit it again. It ends startup rather than being
+        // absorbed: this backend *is* the warm store when it is configured, so
+        // carrying on means a camon that serves, detects and alerts while
+        // recording nothing at all, and the first sign of that is a watchdog
+        // warning a day later. See [`RunError::WarmStorage`].
+        let backend = StathostBackend::new(stathost, camera_ids, stop)
+            .map_err(|source| RunError::WarmStorage { source })?;
         backend.recover_orphans();
         // A store that cannot be listed does not stop camon: the cameras record
         // and upload either way, and holding startup for a host that may be
@@ -460,10 +489,10 @@ async fn init_storage(
                 false
             }
         };
-        return Storage {
+        return Ok(Storage {
             backend: Some(Arc::new(backend)),
             scanned,
-        };
+        });
     }
 
     let data_dir = std::path::PathBuf::from(&config.storage.data_dir);
@@ -479,10 +508,10 @@ async fn init_storage(
     if let Err(e) = backend.scan().await {
         tracing::warn!(error = %e, "warm index scan failed; some events may not be indexed");
     }
-    Storage {
+    Ok(Storage {
         backend: Some(Arc::new(backend)),
         scanned: true,
-    }
+    })
 }
 
 fn init_motion_settings(
@@ -689,7 +718,7 @@ fn spawn_cameras(ctx: &SpawnContext, cameras: Vec<config::CameraConfig>) -> Came
             let backend = ctx
                 .storage
                 .clone()
-                .expect("storage backend present when storage enabled");
+                .expect("storage backend present when storage enabled; see init_storage");
             let writer = WarmWriter::new(
                 rx,
                 camera_id.clone(),
@@ -1316,7 +1345,7 @@ where
         &camera_ids,
         crate::storage::StopFlag::shared(Arc::clone(&shutdown.flag)),
     )
-    .await;
+    .await?;
     // The recording-silence watchdog cannot see the storage volume being
     // unmounted: writes to the bare mountpoint succeed and keep resetting it.
     // So the volume is watched directly — by the backends that have one to
@@ -1629,6 +1658,76 @@ async fn run_camera(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `spawn_cameras` unwraps the backend for every camera it starts whenever
+    /// `[storage] enabled`, so `enabled` has to imply a backend. A remote
+    /// client that will not build is the one way that could stop being true,
+    /// and absorbing it into `backend: None` would not degrade anything — it
+    /// would reach that unwrap and end the process on a message about an
+    /// invariant, pointing the operator at everything except the certificate
+    /// store or proxy that actually broke.
+    ///
+    /// So it ends startup here instead, beside the socket and the API token,
+    /// naming the fault. Recording is the product: a camon that came up
+    /// without the storage its config asks for would serve, detect and alert
+    /// while persisting nothing, and nothing else would say so for a day.
+    #[tokio::test]
+    async fn a_warm_backend_that_cannot_be_built_ends_startup_instead_of_running_storageless() {
+        let remote: Config = toml::from_str(
+            r#"
+            [storage.stathost]
+            url = "https://files.example.com"
+            bucket = "cams"
+            token = "secret"
+            "#,
+        )
+        .unwrap();
+        let cameras = ["cam".to_string()];
+
+        crate::storage::stathost::force_client_build_failure(true);
+        let refused = init_storage(&remote, &cameras, crate::storage::StopFlag::never()).await;
+        crate::storage::stathost::force_client_build_failure(false);
+
+        match refused {
+            Err(RunError::WarmStorage { source }) => {
+                let message = format!("{}", RunError::WarmStorage { source });
+                // What the operator is handed on stderr: the subsystem, and
+                // the three things that break a client build.
+                assert!(message.contains("warm storage"), "{message}");
+                assert!(message.contains("HTTP client"), "{message}");
+                assert!(message.contains("root certificate"), "{message}");
+                assert!(message.contains("proxy"), "{message}");
+            }
+            Err(other) => panic!("the wrong startup failure: {other}"),
+            Ok(storage) => panic!(
+                "startup carried on with backend present = {}, and every camera's writer \
+                 will unwrap it",
+                storage.backend.is_some()
+            ),
+        }
+
+        // The invariant itself, from both sides: storage that is enabled always
+        // arrives with a backend, and storage that is off always without one.
+        let local = tempfile::tempdir().unwrap();
+        let on: Config = toml::from_str(&format!(
+            "[storage]\ndata_dir = {:?}\n",
+            local.path().display()
+        ))
+        .unwrap();
+        let started = init_storage(&on, &cameras, crate::storage::StopFlag::never())
+            .await
+            .expect("local disk storage failed to start");
+        assert!(
+            started.backend.is_some(),
+            "enabled storage without a backend"
+        );
+
+        let off: Config = toml::from_str("[storage]\nenabled = false\n").unwrap();
+        let disabled = init_storage(&off, &cameras, crate::storage::StopFlag::never())
+            .await
+            .expect("disabled storage is not a failure");
+        assert!(disabled.backend.is_none());
+    }
 
     #[test]
     fn backoff_progression_doubles_then_caps() {

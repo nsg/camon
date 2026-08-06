@@ -7,8 +7,9 @@ use std::path::PathBuf;
 
 use crate::buffer::wall_clock_ns;
 use crate::storage::event_index::{
-    deduplicate_detections, evict_tiers, sweep_expired, DetectionDetail, EmergencyOutcome,
-    EventIndex, EventPage, EventRef, EventType, EvictionPolicy, Removal, WarmEventEntry,
+    deduplicate_detections, evict_tiers, filmstrip_frame_count, sweep_expired, DetectionDetail,
+    EmergencyOutcome, EventIndex, EventPage, EventRef, EventType, EvictionPolicy, Removal,
+    WarmEventEntry, MAX_FILMSTRIP_FRAMES,
 };
 
 /// Local disk's event identity: `{data_dir}/{camera}/{event_type}/{start_pts_ns}_{duration_ms}.ts`
@@ -168,6 +169,131 @@ fn load_sidecar(path: &std::path::Path) -> SidecarData {
     }
 }
 
+/// Walk one camera's three tier directories and build an index entry for every
+/// event file in them. Pure blocking filesystem work over a path — no index, no
+/// `self` — so it can be handed whole to a blocking thread.
+fn scan_camera_dirs(data_dir: &std::path::Path, camera_id: &str) -> Vec<WarmEventEntry> {
+    let mut entries = Vec::new();
+    for event_type in [
+        EventType::Movement,
+        EventType::Object,
+        EventType::Continuous,
+    ] {
+        let dir = data_dir.join(camera_id).join(event_type.dir_name());
+        let read_dir = match std::fs::read_dir(&dir) {
+            Ok(rd) => rd,
+            // A tier this camera has never written has no directory, which
+            // is the ordinary case and says nothing. Anything else is a
+            // storage fault that would otherwise scan back as an empty
+            // archive — indistinguishable from a camera that has recorded
+            // nothing, and the reason an unreadable data_dir used to look
+            // exactly like a fresh install.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                tracing::warn!(
+                    camera = %camera_id,
+                    dir = %dir.display(),
+                    error = %e,
+                    "cannot read a stored event directory; its events are missing from \
+                     the index and will not be served, pruned or counted"
+                );
+                continue;
+            }
+        };
+
+        scan_dir_entries(read_dir, event_type, camera_id, &dir, &mut entries);
+    }
+    entries
+}
+
+/// Index every event file a directory listing names, and report the entries
+/// the listing itself could not produce.
+///
+/// An entry can fail on its own — the directory opened, and reading this name
+/// out of it did not (EACCES, a transient I/O error on a disk on its way out).
+/// Dropping those silently is how an event disappears from the archive with
+/// nothing anywhere to say it ever existed.
+///
+/// Reported once per directory, not once per entry: the disk that produces one
+/// of these produces them by the thousand, and a warning per file in a
+/// 10k-entry directory buries the fault under itself and takes the log with
+/// it. The count is the severity and the first error is the diagnosis — a
+/// second errno from the same dying disk changes nothing an operator would do.
+///
+/// Takes the listing as an iterator rather than opening the directory itself
+/// because a `read_dir` only yields these when the kernel fails part way
+/// through a listing, which no filesystem call can be made to do on demand.
+fn scan_dir_entries(
+    listing: impl Iterator<Item = std::io::Result<std::fs::DirEntry>>,
+    event_type: EventType,
+    camera_id: &str,
+    dir: &std::path::Path,
+    entries: &mut Vec<WarmEventEntry>,
+) {
+    let mut unreadable = 0usize;
+    let mut first_error = None;
+    for entry in listing {
+        match entry {
+            Ok(entry) => {
+                if let Some(warm_entry) = scan_entry(&entry, event_type) {
+                    entries.push(warm_entry);
+                }
+            }
+            Err(e) => {
+                unreadable += 1;
+                first_error.get_or_insert(e);
+            }
+        }
+    }
+    if let Some(error) = first_error {
+        tracing::warn!(
+            camera = %camera_id,
+            dir = %dir.display(),
+            unreadable,
+            error = %error,
+            "entries in a stored event directory could not be read; any events among them \
+             are missing from the index and will not be served, pruned or counted (first \
+             error shown)"
+        );
+    }
+}
+
+/// One directory entry's index entry, or `None` when it is not an event file.
+fn scan_entry(entry: &std::fs::DirEntry, event_type: EventType) -> Option<WarmEventEntry> {
+    let path = entry.path();
+    if path.extension().and_then(|e| e.to_str()) != Some("ts") {
+        return None;
+    }
+    let stem = path.file_stem()?.to_str()?;
+    let (start_pts_ns, duration_ms) = parse_event_filename(stem)?;
+    let file_size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+    let sidecar = load_sidecar(&path.with_extension("json"));
+    let filmstrip_frames = filmstrip_frame_count(|i| {
+        path.with_file_name(format!("{stem}_thumb_{i}.jpg"))
+            .exists()
+    });
+
+    Some(WarmEventEntry {
+        start_pts_ns,
+        duration_ms,
+        event_type,
+        file_size,
+        // Zero, and deliberately: `statvfs` is this backend's accounting
+        // authority and already counts these bytes — see
+        // [`crate::storage::contract`].
+        sidecar_bytes: 0,
+        thumbnail_bytes: 0,
+        object_classes: sidecar.classes,
+        backend: sidecar.backend,
+        model: sidecar.model,
+        detections: sidecar.detections,
+        filmstrip_frames,
+        continues: sidecar.continues,
+        recovered: sidecar.recovered,
+        delete_failed: false,
+    })
+}
+
 impl WarmEventIndex {
     pub fn new(camera_ids: &[String], data_dir: PathBuf) -> Self {
         Self {
@@ -176,107 +302,99 @@ impl WarmEventIndex {
         }
     }
 
-    pub fn scan(&self) {
+    /// The same rebuild, on the calling thread — and *only* reachable from a
+    /// test, deliberately.
+    ///
+    /// Every step of the walk is blocking filesystem work: `read_dir`, a `stat`
+    /// per entry, a sidecar read per event. Production has one way to run it
+    /// ([`scan_off_thread`](Self::scan_off_thread)) because there is no async
+    /// caller for whom the other way is right, and leaving a plain `scan()` in
+    /// reach is how the runtime came to be awaiting a directory walk in the
+    /// first place. Tests are synchronous and have no runtime to wedge.
+    #[cfg(test)]
+    pub(crate) fn scan(&self) {
         let start = std::time::Instant::now();
         let mut total_events = 0;
-        // Collected first: `replace_camera` takes the write lock the iterator
-        // would otherwise be holding open across a whole directory walk.
-        let camera_ids: Vec<String> = self.events.camera_ids().map(String::from).collect();
-        for camera_id in camera_ids {
-            let entries = self.scan_camera(&camera_id);
-            let count = entries.len();
-            self.events.replace_camera(&camera_id, entries);
-            total_events += count;
-            if count > 0 {
-                tracing::info!(camera = %camera_id, events = count, "scanned warm events");
+        for camera_id in self.scan_order() {
+            let entries = scan_camera_dirs(&self.data_dir, &camera_id);
+            total_events += self.take_scanned_camera(&camera_id, entries);
+        }
+        Self::report_scan(total_events, start);
+    }
+
+    /// Rebuild the index from the directory tree, with the walk itself handed
+    /// to a blocking thread. The only way production runs it.
+    ///
+    /// A dying disk is what this is for. The walk is not slow-but-progressing
+    /// on failing hardware — a single `stat` can sit in uninterruptible sleep
+    /// for as long as the driver's error recovery takes — and awaiting it
+    /// inline parks a runtime worker there, taking the API, the cameras and the
+    /// shutdown drain down with it. Off the runtime it costs one thread of the
+    /// blocking pool instead.
+    ///
+    /// What it does *not* buy is cancellation: a `spawn_blocking` closure runs
+    /// to completion whatever happens to the handle, so the walk still cannot
+    /// be given up on and shutdown still waits for the syscall it is in. The
+    /// async side merely stops being held hostage by it. Nothing here needs
+    /// more than that — the scan runs once, before the cameras are spawned, and
+    /// what it must not do is wedge everything else that is starting with it.
+    pub async fn scan_off_thread(&self) {
+        self.scan_off_thread_with(scan_camera_dirs).await
+    }
+
+    /// The body of [`scan_off_thread`](Self::scan_off_thread), over an
+    /// injectable walk so a test can hold the walk still and watch the runtime
+    /// carry on without it.
+    async fn scan_off_thread_with<W>(&self, walk: W)
+    where
+        W: Fn(&std::path::Path, &str) -> Vec<WarmEventEntry> + Clone + Send + 'static,
+    {
+        let start = std::time::Instant::now();
+        let mut total_events = 0;
+        for camera_id in self.scan_order() {
+            let data_dir = self.data_dir.clone();
+            let walking = camera_id.clone();
+            let walk = walk.clone();
+            let walked = tokio::task::spawn_blocking(move || walk(&data_dir, &walking)).await;
+            match walked {
+                Ok(entries) => total_events += self.take_scanned_camera(&camera_id, entries),
+                // The walk panicked. One camera's events are missing from the
+                // index rather than the whole scan being abandoned, and the
+                // panic itself has already been reported by the hook.
+                Err(e) => tracing::warn!(
+                    camera = %camera_id,
+                    error = %e,
+                    "the directory walk for a camera did not finish; its events are missing \
+                     from the index and will not be served, pruned or counted"
+                ),
             }
         }
+        Self::report_scan(total_events, start);
+    }
+
+    /// The cameras to walk, as owned ids: `replace_camera` takes the write lock
+    /// the index's own iterator would otherwise hold open across a whole
+    /// directory walk.
+    fn scan_order(&self) -> Vec<String> {
+        self.events.camera_ids().map(String::from).collect()
+    }
+
+    /// Hand one camera's freshly walked events to the index, and say how many.
+    fn take_scanned_camera(&self, camera_id: &str, entries: Vec<WarmEventEntry>) -> usize {
+        let count = entries.len();
+        self.events.replace_camera(camera_id, entries);
+        if count > 0 {
+            tracing::info!(camera = %camera_id, events = count, "scanned warm events");
+        }
+        count
+    }
+
+    fn report_scan(total_events: usize, start: std::time::Instant) {
         tracing::info!(
             total_events,
             elapsed_ms = start.elapsed().as_millis() as u64,
             "warm index scan complete"
         );
-    }
-
-    fn scan_camera(&self, camera_id: &str) -> Vec<WarmEventEntry> {
-        let mut entries = Vec::new();
-        for event_type in &[
-            EventType::Movement,
-            EventType::Object,
-            EventType::Continuous,
-        ] {
-            let dir = self.data_dir.join(camera_id).join(event_type.dir_name());
-            let read_dir = match std::fs::read_dir(&dir) {
-                Ok(rd) => rd,
-                // A tier this camera has never written has no directory, which
-                // is the ordinary case and says nothing. Anything else is a
-                // storage fault that would otherwise scan back as an empty
-                // archive — indistinguishable from a camera that has recorded
-                // nothing, and the reason an unreadable data_dir used to look
-                // exactly like a fresh install.
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(e) => {
-                    tracing::warn!(
-                        camera = %camera_id,
-                        dir = %dir.display(),
-                        error = %e,
-                        "cannot read a stored event directory; its events are missing from \
-                         the index and will not be served, pruned or counted"
-                    );
-                    continue;
-                }
-            };
-            for entry in read_dir.flatten() {
-                if let Some(warm_entry) = self.scan_entry(&entry, *event_type) {
-                    entries.push(warm_entry);
-                }
-            }
-        }
-        entries
-    }
-
-    fn scan_entry(
-        &self,
-        entry: &std::fs::DirEntry,
-        event_type: EventType,
-    ) -> Option<WarmEventEntry> {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("ts") {
-            return None;
-        }
-        let stem = path.file_stem()?.to_str()?;
-        let (start_pts_ns, duration_ms) = parse_event_filename(stem)?;
-        let file_size = entry.metadata().map(|m| m.len()).unwrap_or(0);
-        let sidecar = load_sidecar(&path.with_extension("json"));
-        // Filmstrip frames are numbered contiguously from 0; count until the
-        // first gap. The pipeline writes at most 4.
-        let mut filmstrip_frames = 0;
-        while path
-            .with_file_name(format!("{}_thumb_{}.jpg", stem, filmstrip_frames))
-            .exists()
-        {
-            filmstrip_frames += 1;
-        }
-
-        Some(WarmEventEntry {
-            start_pts_ns,
-            duration_ms,
-            event_type,
-            file_size,
-            // Zero, and deliberately: `statvfs` is this backend's accounting
-            // authority and already counts these bytes — see
-            // [`crate::storage::contract`].
-            sidecar_bytes: 0,
-            thumbnail_bytes: 0,
-            object_classes: sidecar.classes,
-            backend: sidecar.backend,
-            model: sidecar.model,
-            detections: sidecar.detections,
-            filmstrip_frames,
-            continues: sidecar.continues,
-            recovered: sidecar.recovered,
-            delete_failed: false,
-        })
     }
 
     pub fn insert(&self, camera_id: &str, entry: WarmEventEntry) {
@@ -433,7 +551,7 @@ impl WarmEventIndex {
         let _ = tokio::fs::remove_file(&path.with_extension("json")).await;
         let stem = format!("{}_{}", entry.start_pts_ns, entry.duration_ms);
         let dir = path.parent().unwrap_or(&self.data_dir);
-        for i in 0..4 {
+        for i in 0..MAX_FILMSTRIP_FRAMES {
             let _ = tokio::fs::remove_file(dir.join(format!("{}_thumb_{}.jpg", stem, i))).await;
         }
 
@@ -1408,6 +1526,224 @@ mod tests {
         std::fs::write(&path, b"tsdata").unwrap();
         assert_eq!(index.prune(1, 1, 1, running()).await, 1);
         assert!(entries(&index).is_empty());
+    }
+
+    /// Everything logged at warn level while `body` runs.
+    fn warnings_from(body: impl FnOnce()) -> String {
+        #[derive(Clone, Default)]
+        struct CapturedLog(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+        impl std::io::Write for CapturedLog {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLog {
+            type Writer = Self;
+
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let logs = CapturedLog::default();
+        {
+            let _reader = tracing::subscriber::set_default(
+                tracing_subscriber::fmt()
+                    .with_writer(logs.clone())
+                    .with_max_level(tracing::Level::WARN)
+                    .with_ansi(false)
+                    .finish(),
+            );
+            body();
+        }
+        let written = logs.0.lock().unwrap().clone();
+        String::from_utf8(written).unwrap()
+    }
+
+    /// A directory entry that cannot be read is one event that will never be
+    /// served, pruned or counted, and `flatten()` used to drop it without a
+    /// word. It has to be audible — and audible *once*, because the disk that
+    /// produces one of these produces them by the thousand and a warning per
+    /// file would bury the fault it is reporting under itself.
+    #[test]
+    fn unreadable_directory_entries_cost_one_warning_and_the_scan_carries_on() {
+        let dir = tempfile::tempdir().unwrap();
+        write_event_files(dir.path(), "movements", "1000_5000", None);
+        let movements = dir.path().join("cam").join("movements");
+
+        const FAILURES: usize = 10_000;
+        let failing = std::iter::repeat_with(|| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "EACCES",
+            ))
+        })
+        .take(FAILURES);
+
+        let mut entries = Vec::new();
+        let warned = warnings_from(|| {
+            scan_dir_entries(
+                failing.chain(std::fs::read_dir(&movements).unwrap()),
+                EventType::Movement,
+                "cam",
+                &movements,
+                &mut entries,
+            );
+        });
+
+        // The readable event is still indexed...
+        assert_eq!(entries.len(), 1, "the scan gave up at the first failure");
+        assert_eq!(entries[0].start_pts_ns, 1000);
+        // ...and ten thousand failures are one line that counts them and names
+        // the fault.
+        assert_eq!(warned.matches("WARN").count(), 1, "{warned}");
+        assert!(
+            warned.contains(&format!("unreadable={FAILURES}")),
+            "{warned}"
+        );
+        assert!(warned.contains("EACCES"), "{warned}");
+    }
+
+    /// The other half of it: a scan with nothing wrong says nothing, so the
+    /// warning above means what it says when it appears in a production log.
+    #[test]
+    fn a_healthy_scan_warns_about_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        write_event_files(dir.path(), "movements", "1000_5000", None);
+        write_event_files(dir.path(), "objects", "2000_5000", Some("{}"));
+        let index = WarmEventIndex::new(&["cam".to_string()], dir.path().to_path_buf());
+        let warned = warnings_from(|| index.scan());
+        assert!(warned.is_empty(), "{warned}");
+        assert_eq!(entries(&index).len(), 2);
+    }
+
+    /// A filmstrip with a hole in it. Counting up from zero until the first
+    /// miss reads `thumb_0`'s absence as "no filmstrip", which hides the frames
+    /// that are on disk from the UI and from the delete that walks
+    /// `0..filmstrip_frames` — leaking them for the life of the installation.
+    #[test]
+    fn a_filmstrip_with_a_gap_still_counts_the_frames_that_are_there() {
+        // (frames present on disk, the count that names them all)
+        for (present, expected) in [
+            (vec![0, 1, 2, 3], 4),
+            (vec![1, 2, 3], 4), // the first frame lost to a crash
+            (vec![0, 2], 3),    // a hole in the middle
+            (vec![3], 4),       // only the last survived
+            (vec![0], 1),
+            (vec![], 0),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            write_event_files(dir.path(), "movements", "1000_5000", None);
+            let d = dir.path().join("cam").join("movements");
+            for i in &present {
+                std::fs::write(d.join(format!("1000_5000_thumb_{i}.jpg")), b"jpg").unwrap();
+            }
+
+            let index = WarmEventIndex::new(&["cam".to_string()], dir.path().to_path_buf());
+            index.scan();
+            let event = index
+                .find_event("cam", EventRef::new(1000, 5000, EventType::Movement))
+                .unwrap();
+            assert_eq!(event.filmstrip_frames, expected, "frames {present:?}");
+        }
+    }
+
+    /// A filmstrip with a hole is still deleted whole. Local disk sweeps the
+    /// full `0..MAX_FILMSTRIP_FRAMES` range rather than the entry's count, so
+    /// the gap costs it nothing — and that is the property under test, because
+    /// narrowing the sweep to `filmstrip_frames` is the obvious tidy-up and
+    /// would then leak every frame above a hole for the life of the
+    /// installation. (The remote store, which does delete by the count, is
+    /// pinned against the same shape in `stathost.rs`.)
+    #[tokio::test]
+    async fn a_delete_reaches_the_frames_above_a_gap() {
+        let dir = tempfile::tempdir().unwrap();
+        write_event_files(dir.path(), "movements", "1000_5000", None);
+        let d = dir.path().join("cam").join("movements");
+        for i in [1, 3] {
+            std::fs::write(d.join(format!("1000_5000_thumb_{i}.jpg")), b"jpg").unwrap();
+        }
+
+        let index = WarmEventIndex::new(&["cam".to_string()], dir.path().to_path_buf());
+        index.scan();
+        assert_eq!(index.prune(1, 1, 1, running()).await, 1);
+
+        let left: Vec<_> = std::fs::read_dir(&d)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert!(
+            left.is_empty(),
+            "frames above the gap were leaked: {left:?}"
+        );
+    }
+
+    /// The scan is blocking filesystem work, and on a dying disk a single
+    /// `stat` can sit in uninterruptible sleep for minutes. Awaited inline it
+    /// takes the runtime worker with it — the API, the cameras and the drain
+    /// all stop — which is why the walk goes to a blocking thread.
+    ///
+    /// Pinned by deadlock: the walk here blocks until a task *on the same
+    /// single-threaded runtime* releases it. Off the runtime that task runs and
+    /// the scan finishes; inline, nothing else can run at all and the scan
+    /// waits out its own release.
+    #[test]
+    fn a_directory_walk_that_blocks_does_not_wedge_the_runtime() {
+        let (released_tx, released_rx) = std::sync::mpsc::channel::<()>();
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel::<bool>();
+
+        // The runtime lives on its own thread so that a wedged one can be
+        // observed from here rather than hanging the test process with it.
+        let runner = std::thread::spawn(move || {
+            let dir = tempfile::tempdir().unwrap();
+            write_event_files(dir.path(), "movements", "1000_5000", None);
+            let index = WarmEventIndex::new(&["cam".to_string()], dir.path().to_path_buf());
+            let held = std::sync::Arc::new(std::sync::Mutex::new(Some(released_rx)));
+
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let walked = tokio::sync::Mutex::new(false);
+                tokio::join!(
+                    async {
+                        index
+                            .scan_off_thread_with(move |data_dir, camera_id| {
+                                // Blocks until the task below releases it —
+                                // with a ceiling, so a wedged runtime fails
+                                // this test instead of hanging it.
+                                if let Some(rx) = held.lock().unwrap().take() {
+                                    let _ = rx.recv_timeout(std::time::Duration::from_secs(10));
+                                }
+                                scan_camera_dirs(data_dir, camera_id)
+                            })
+                            .await;
+                    },
+                    async {
+                        tokio::task::yield_now().await;
+                        released_tx.send(()).unwrap();
+                        *walked.lock().await = true;
+                    }
+                );
+                let _ = finished_tx.send(*walked.lock().await);
+            });
+            // The scan still did its job.
+            assert_eq!(entries(&index).len(), 1);
+        });
+
+        let released = finished_rx
+            .recv_timeout(std::time::Duration::from_secs(20))
+            .expect("the blocking walk wedged the runtime worker it was awaited on");
+        assert!(released, "the walk finished without anything releasing it");
+        runner.join().unwrap();
     }
 
     #[test]

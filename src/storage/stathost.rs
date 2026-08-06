@@ -156,8 +156,8 @@ use crate::storage::contract::{
     sleep_unless, Attempted, ByteBudget, Recovery, Reservation, RetryPolicy, StopFlag,
 };
 use crate::storage::event_index::{
-    evict_tiers, sweep_expired, EmergencyOutcome, EventIdentity, EventIndex, EventPage,
-    EvictionPolicy, Removal,
+    evict_tiers, filmstrip_frame_count, sweep_expired, EmergencyOutcome, EventIdentity, EventIndex,
+    EventPage, EvictionPolicy, Removal,
 };
 use crate::storage::warm_index::{
     parse_event_filename, parse_sidecar_json, sidecar_json, SidecarData,
@@ -205,6 +205,61 @@ pub(crate) const UPLOAD_TIMEOUT: Duration = Duration::from_secs(300);
 /// right shape for a body a player drains at its own pace. The flat phase is
 /// harmless here because a ranged GET carries no request body.
 const STREAM_READ_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// One of the backend's two HTTP clients: the plain one, or — with a
+/// `read_timeout` — the streaming one.
+///
+/// Building a client is where `reqwest` starts the TLS backend, loads the
+/// system root certificates and parses the environment's proxy settings, so
+/// this fails on a box that has been stripped of its CA bundle or handed a
+/// malformed `HTTPS_PROXY`. Both are permanent and both are an operator's to
+/// fix — and a panic from inside a constructor names neither. The failure is
+/// returned so the caller can end startup with an error that does
+/// ([`crate::app::RunError::WarmStorage`]), not so the process can limp on.
+fn build_client(read_timeout: Option<Duration>) -> std::io::Result<reqwest::Client> {
+    #[cfg(test)]
+    if fail_client_build() {
+        return Err(client_build_error("forced by a test"));
+    }
+    let mut builder = reqwest::Client::builder().connect_timeout(CONNECT_TIMEOUT);
+    if let Some(read_timeout) = read_timeout {
+        builder = builder.read_timeout(read_timeout);
+    }
+    builder.build().map_err(client_build_error)
+}
+
+/// What a failed client build says to the operator, from wherever it came.
+/// The three causes named are the three things `reqwest` does here that can
+/// fail on a real box; the underlying error alone says none of them.
+fn client_build_error(cause: impl std::fmt::Display) -> std::io::Error {
+    std::io::Error::other(format!(
+        "the stathost HTTP client could not be built — check the TLS backend, the system \
+         root certificate store and any proxy settings in the environment: {cause}"
+    ))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Makes the next [`build_client`] fail, for the test that pins what a
+    /// backend which cannot build one does about it. Per thread rather than
+    /// global because the test harness runs every test on its own thread, and a
+    /// process-wide switch would fail whichever unrelated backend happened to
+    /// be under construction at the time.
+    static FAIL_CLIENT_BUILD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+fn fail_client_build() -> bool {
+    FAIL_CLIENT_BUILD.with(std::cell::Cell::get)
+}
+
+/// Make [`build_client`] fail on this thread, for the tests that pin what a
+/// backend which cannot build one does about it — here, and in `app`, where
+/// what matters is that the failure ends startup.
+#[cfg(test)]
+pub(crate) fn force_client_build_failure(fail: bool) {
+    FAIL_CLIENT_BUILD.with(|forced| forced.set(fail));
+}
 
 /// How long one object request waits before being sent again, and how far that
 /// wait grows. Only the first step is reachable at [`OBJECT_RETRY`]'s two
@@ -466,23 +521,31 @@ pub struct StathostBackend {
 }
 
 impl StathostBackend {
-    pub fn new(config: &StathostConfig, camera_ids: &[String], stop: StopFlag) -> Self {
+    /// Build the backend, or report why its HTTP clients could not be.
+    ///
+    /// Fallible because `reqwest` initializes the TLS stack and reads the
+    /// environment's proxy settings when a client is built: a box whose root
+    /// certificate store will not load, or whose `HTTPS_PROXY` is malformed,
+    /// fails here and fails every time it starts. That is a configuration
+    /// fault an operator has to be told about, and a panic from inside a
+    /// constructor tells them the least of any option: the error is returned
+    /// so startup can end with a line that names the fault
+    /// ([`crate::app::RunError::WarmStorage`] — fatal, because with stathost
+    /// configured there is no other place footage persists).
+    pub fn new(
+        config: &StathostConfig,
+        camera_ids: &[String],
+        stop: StopFlag,
+    ) -> std::io::Result<Self> {
         let base = format!(
             "{}/{}",
             config.url.trim_end_matches('/'),
             config.bucket.trim_matches('/')
         );
-        Self {
+        Ok(Self {
             http: Http {
-                client: reqwest::Client::builder()
-                    .connect_timeout(CONNECT_TIMEOUT)
-                    .build()
-                    .expect("stathost http client"),
-                stream_client: reqwest::Client::builder()
-                    .connect_timeout(CONNECT_TIMEOUT)
-                    .read_timeout(STREAM_READ_TIMEOUT)
-                    .build()
-                    .expect("stathost streaming http client"),
+                client: build_client(None)?,
+                stream_client: build_client(Some(STREAM_READ_TIMEOUT))?,
                 base,
                 token: config.token.clone(),
             },
@@ -500,7 +563,7 @@ impl StathostBackend {
                 .iter()
                 .map(|id| (id.clone(), std::sync::atomic::AtomicUsize::new(0)))
                 .collect(),
-        }
+        })
     }
 
     fn used(&self) -> u64 {
@@ -795,13 +858,15 @@ impl StathostBackend {
     ///
     /// Deleting **top down** is what makes a failure survivable. A delete that
     /// fails stops the trim, and everything above the frame that refused is
-    /// already gone, so what remains is exactly `0..=refused` — still
-    /// contiguous, so the entry can simply claim that many frames and agree
-    /// with both the host and the next scan. Nothing is stranded: those frames
-    /// are inside the range [`Self::delete_event_objects`] deletes, so they go
-    /// with the event. Bottom-up would leave a hole, and everything above it
-    /// invisible to the scan and to the event's own delete — a permanent leak
-    /// out of one transient failure.
+    /// already gone, so what remains is exactly `0..=refused` — a prefix, which
+    /// the entry can claim as a count and be right about against both the host
+    /// and the next scan, with no frame above it left over to account for.
+    /// Bottom-up would strand the frames above the hole instead: the entry
+    /// would claim fewer than are there, and `delete_event_objects` walks
+    /// `0..filmstrip_frames`, so the survivors would outlive the event. (A
+    /// rebuilt index would find them — the scan counts to the highest frame
+    /// there is, not to the first gap — but nothing rebuilds an index in the
+    /// life of one process, and the delete that leaks them runs long before.)
     ///
     /// The write is not failed over this. It is decoration, the footage is
     /// already stored, and the index is honest either way.
@@ -1400,6 +1465,20 @@ impl StathostBackend {
         joined
     }
 
+    /// Hand a startup pass's collected entries to the index, one camera at a
+    /// time and each list in one step — sorted once rather than n times.
+    ///
+    /// Replacing a camera's whole list is only right for a startup scan, and
+    /// only because of what that scan is: awaited before the first camera is
+    /// spawned, over an index no write path has touched yet, from a listing in
+    /// which one stored object appears once. Nothing of this process's can be
+    /// displaced because nothing of this process's is there.
+    fn take_collected(&self, collected: HashMap<String, Vec<WarmEventEntry>>) {
+        for (camera_id, entries) in collected {
+            self.events.replace_camera(&camera_id, entries);
+        }
+    }
+
     /// One pass: list the bucket, index every `.ts` belonging to a camera this
     /// process owns, and — at startup only, see [`ScanKind`] — collect metadata
     /// whose video never landed.
@@ -1449,18 +1528,22 @@ impl StathostBackend {
                 tracing::warn!(path = %item.path,
                     "zero-byte .ts on stathost (interrupted upload?)");
             }
-            let mut filmstrip_frames = 0usize;
             let sidecar_bytes = sizes
                 .get(format!("{camera_id}/{stem}.json").as_str())
                 .copied()
                 .unwrap_or(0);
-            let mut thumbnail_bytes = 0u64;
-            while let Some(frame) =
-                sizes.get(format!("{camera_id}/{stem}_thumb_{filmstrip_frames}.jpg").as_str())
-            {
-                thumbnail_bytes += frame;
-                filmstrip_frames += 1;
-            }
+            // The frame count is a high-water mark, not a tally of what is
+            // there: a filmstrip missing its first frame still has the rest,
+            // and the deletes walk `0..filmstrip_frames` — see
+            // [`filmstrip_frame_count`]. The bytes are only what the listing
+            // really named, so a hole costs the budget nothing it does not owe.
+            let frame_size = |i: usize| {
+                sizes
+                    .get(format!("{camera_id}/{stem}_thumb_{i}.jpg").as_str())
+                    .copied()
+            };
+            let filmstrip_frames = filmstrip_frame_count(|i| frame_size(i).is_some());
+            let thumbnail_bytes: u64 = (0..filmstrip_frames).filter_map(frame_size).sum();
             pending.push(ScannedEvent {
                 camera_id: camera_id.to_string(),
                 stem: stem.to_string(),
@@ -1494,12 +1577,27 @@ impl StathostBackend {
         let mut indexed = 0usize;
         let mut yielded = 0usize;
         let mut joined = 0usize;
+        // A startup pass builds each camera's list here and hands it over whole
+        // at the end (`take_collected`). Inserting event by event lands each
+        // one in the middle of a list the store gave no useful order to — stems
+        // are decimal and sort lexicographically, and a box with no RTC dates a
+        // whole archive from one start PTS — so every insertion shifts the rest
+        // and building the index costs O(n²) memory traffic in the one pass
+        // that walks the entire archive. A heal cannot do this: it runs beside
+        // the live write path and must yield to what that path has already
+        // indexed, one identity at a time.
+        let mut collected: HashMap<String, Vec<WarmEventEntry>> = HashMap::new();
 
         while let Some((event, read)) = reads.next().await {
             // One archive's worth of round trips is a long time to hold a
             // shutdown drain that is measured in one event's deletes, and an
             // index nobody is going to use is not worth finishing.
             if stop() {
+                // What was collected still goes in: it came from the store and
+                // is true, exactly as it was when each entry was inserted
+                // singly. What does not happen is `mark_scanned` below, so
+                // nothing prunes on a half-built index.
+                self.take_collected(collected);
                 tracing::info!(
                     indexed,
                     of = total,
@@ -1571,7 +1669,10 @@ impl StathostBackend {
             let key = (event.start_pts_ns, event.duration_ms);
             let landed = match kind {
                 ScanKind::Startup => {
-                    self.events.insert(&event.camera_id, entry);
+                    collected
+                        .entry(event.camera_id.clone())
+                        .or_default()
+                        .push(entry);
                     true
                 }
                 ScanKind::Heal => self.events.insert_absent(&event.camera_id, entry),
@@ -1596,6 +1697,8 @@ impl StathostBackend {
                 unknown_type += 1;
             }
         }
+
+        self.take_collected(collected);
 
         // Every event the listing named has been accounted for, so the index
         // now describes the archive rather than merely this session's writes —
@@ -1968,9 +2071,13 @@ impl WarmStorageBackend for StathostBackend {
         }
 
         // Step 3: eager filmstrip thumbnails; frame 0 doubles as the poster.
-        // Non-fatal — the UI hides frames that fail to load. The scan counts
-        // frames contiguously from 0, so a gap stops the upload: what is
-        // indexed now is what a scan would rebuild later.
+        // Non-fatal — the UI hides frames that fail to load. A failed frame
+        // still stops the upload, and the entry claims the prefix that landed:
+        // not because a later scan could not see past a gap (it counts to the
+        // highest frame there is — see [`filmstrip_frame_count`]), but because
+        // the frames are a strip. Uploading 3 after 2 failed spends requests,
+        // on the link that just refused one, to produce a filmstrip with a hole
+        // in the middle of it; stopping leaves a shorter one that is whole.
         let mut filmstrip_frames = 0usize;
         let mut stored_frame_bytes = 0u64;
         for (i, jpeg) in frames.iter().enumerate() {
@@ -2358,18 +2465,44 @@ impl WarmStorageBackend for StathostBackend {
         // 206 → a satisfied partial range; anything else (200, or a server that
         // ignored the header) degrades to streaming the full body.
         let (served, total_size) = if status == reqwest::StatusCode::PARTIAL_CONTENT {
-            match resp
+            // A 206 says the body is a *slice*, and only its `Content-Range`
+            // says which one. Without a usable header there is nothing to serve
+            // it as: passing the slice off as the whole file hands the player
+            // an object whose bytes are not at the offsets it will seek to, and
+            // relaying a range the arithmetic cannot make sense of (start past
+            // end, end past the total) is a length this process would have to
+            // subtract its way to — an underflow in a debug build, and this
+            // codebase ships debug. The read fails instead; the API turns that
+            // into one clean error rather than a corrupt playback.
+            let content_range = resp
                 .headers()
                 .get(reqwest::header::CONTENT_RANGE)
                 .and_then(|v| v.to_str().ok())
                 .and_then(parse_content_range)
-            {
-                Some((start, end, total)) => (ServedRange::Partial { start, end }, total),
-                // 206 without a parseable Content-Range: treat the body as full.
-                None => (
-                    ServedRange::Full,
-                    resp.content_length().unwrap_or(entry.file_size),
-                ),
+                .and_then(|(start, end, total)| {
+                    ServedRange::partial(start, end, total).map(|served| (served, total))
+                });
+            match content_range {
+                Some((served, total)) => (served, total),
+                None => {
+                    let header = resp
+                        .headers()
+                        .get(reqwest::header::CONTENT_RANGE)
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("(absent)")
+                        .to_string();
+                    tracing::warn!(
+                        key = %key,
+                        content_range = %header,
+                        "stathost answered a range request with a 206 whose Content-Range \
+                         is missing or does not describe a range of the object; refusing to \
+                         serve the partial body as if it were the whole event"
+                    );
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "206 without a usable Content-Range",
+                    ));
+                }
             }
         } else {
             (
@@ -2786,6 +2919,10 @@ mod tests {
         /// When set, GET ignores an incoming `Range` and answers a full `200` —
         /// a legal HTTP response the client must handle by replaying in full.
         ignore_range: Arc<AtomicBool>,
+        /// When set, a ranged GET answers `206` with this `Content-Range`
+        /// instead of the true one; an empty string omits the header
+        /// altogether. A broken or hostile store, in other words.
+        bad_content_range: Arc<Mutex<Option<String>>>,
         /// Paths that appear the instant after a listing is served: an upload
         /// committing while a scan walks the snapshot it took.
         commit_after_list: Arc<Mutex<Vec<String>>>,
@@ -3143,10 +3280,14 @@ mod tests {
                 Some((start, end)) => {
                     let slice = bytes[start as usize..=end as usize].to_vec();
                     let mut resp = (StatusCode::PARTIAL_CONTENT, slice).into_response();
-                    resp.headers_mut().insert(
-                        "content-range",
-                        format!("bytes {start}-{end}/{total}").parse().unwrap(),
-                    );
+                    let content_range = match stub.bad_content_range.lock().unwrap().clone() {
+                        // The header omitted entirely.
+                        Some(header) if header.is_empty() => return resp,
+                        Some(header) => header,
+                        None => format!("bytes {start}-{end}/{total}"),
+                    };
+                    resp.headers_mut()
+                        .insert("content-range", content_range.parse().unwrap());
                     resp.headers_mut()
                         .insert("accept-ranges", "bytes".parse().unwrap());
                     resp
@@ -3180,6 +3321,7 @@ mod tests {
             fail_get_suffix: Arc::new(Mutex::new(None)),
             fail_delete_paths: Arc::new(Mutex::new(HashSet::new())),
             ignore_range: Arc::new(AtomicBool::new(false)),
+            bad_content_range: Arc::new(Mutex::new(None)),
             commit_after_list: Arc::new(Mutex::new(Vec::new())),
             list_failures: Arc::new(AtomicUsize::new(0)),
             list_delay_ms: Arc::new(AtomicU64::new(0)),
@@ -3226,7 +3368,7 @@ mod tests {
             max_stored_bytes,
             enabled: true,
         };
-        StathostBackend::new(&config, &["cam".to_string()], stop)
+        StathostBackend::new(&config, &["cam".to_string()], stop).expect("http clients build")
     }
 
     /// A scanned backend owning more than one camera — the ordinary
@@ -3240,7 +3382,8 @@ mod tests {
             enabled: true,
         };
         let ids: Vec<String> = cameras.iter().map(|c| c.to_string()).collect();
-        let backend = StathostBackend::new(&config, &ids, StopFlag::never());
+        let backend =
+            StathostBackend::new(&config, &ids, StopFlag::never()).expect("http clients build");
         backend.scan().await.unwrap();
         backend
     }
@@ -4725,6 +4868,148 @@ mod tests {
         let peak = stub.peak_gets.load(Ordering::SeqCst);
         assert!(peak > 1, "no reads overlapped");
         assert!(peak <= SCAN_CONCURRENCY, "fan-out ran unbounded: {peak}");
+    }
+
+    /// The startup scan is the one pass that walks a whole archive, and it used
+    /// to build the index one insertion at a time. A store lists in no useful
+    /// order, so nearly every one of those landed in the middle of the list and
+    /// shifted the rest along — quadratic memory traffic in the number of
+    /// stored events, paid at startup, on the box with the least memory
+    /// bandwidth to pay it with. Building each camera's list and sorting it
+    /// once is O(n log n) and shifts nothing.
+    ///
+    /// Counted rather than timed: a clock-based bound on a quadratic term
+    /// either fails on a loaded machine or passes on a fast one.
+    #[tokio::test]
+    async fn the_startup_scan_builds_the_index_without_shifting_it_into_shape() {
+        const EVENTS: u64 = 1_000;
+        let (url, stub) = spawn_stub("secret").await;
+        seed_events(&stub, 1_000, EVENTS, 1000, "object");
+
+        let backend = backend_for(&url, "secret", 0);
+        backend.scan().await.unwrap();
+
+        // The index is right: every event, in order, charged once.
+        let entries = backend.query("cam", EventPage::unbounded(0, u64::MAX));
+        assert_eq!(entries.len() as u64, EVENTS);
+        assert!(entries
+            .windows(2)
+            .all(|w| w[0].start_pts_ns <= w[1].start_pts_ns));
+        assert_eq!(
+            backend.used(),
+            EVENTS * (10 + r#"{"event_type":"object"}"#.len() as u64)
+        );
+
+        // And it was not shifted into that shape. One insertion per event
+        // averages half a list of shifts each — a quarter of a million here,
+        // and 25 million on a box holding ten thousand events.
+        let shifted = backend.events.shifted_entries();
+        assert!(
+            shifted <= 4 * EVENTS,
+            "the scan shifted {shifted} entries to index {EVENTS} events"
+        );
+    }
+
+    /// A startup pass that stops part way through: what it had already read
+    /// came from the store and is true, so it stays indexed — collecting the
+    /// entries before handing them over must not turn an interrupted pass into
+    /// a lost one. What does not happen is the index being marked as describing
+    /// the store.
+    ///
+    /// Driven through `scan_once` because the production startup scan passes a
+    /// stop that never fires (there is no drain that early); this is the
+    /// invariant that keeps the collecting honest if that ever changes.
+    #[tokio::test]
+    async fn a_startup_pass_that_stops_part_way_keeps_what_it_had_read() {
+        let (url, stub) = spawn_stub("secret").await;
+        seed_events(&stub, 1_000_000_000, 8, 1000, "movement");
+        let backend = backend_for(&url, "secret", 0);
+
+        // Stops after the fourth event has been walked.
+        let walked = std::cell::Cell::new(0usize);
+        let stop = || {
+            walked.set(walked.get() + 1);
+            walked.get() > 4
+        };
+        let pass = backend
+            .scan_once(ScanKind::Startup, &stop, REQUEST_TIMEOUT)
+            .await
+            .unwrap();
+
+        assert!(matches!(pass, ScanPass::Interrupted));
+        assert_eq!(
+            backend
+                .query("cam", EventPage::unbounded(0, u64::MAX))
+                .len(),
+            4,
+            "what the pass had read before it stopped was thrown away"
+        );
+        assert!(
+            backend.scanned_events().is_none(),
+            "a half-walked archive was taken for a rebuilt index"
+        );
+    }
+
+    /// A filmstrip frame the store lost leaves a hole, and counting up from
+    /// zero until the first miss reads that hole as the end of the filmstrip —
+    /// which on a lost `thumb_0` means an event indexed with no frames at all,
+    /// its remaining thumbnails invisible to the UI and unreachable by the
+    /// delete that walks `0..filmstrip_frames`. They would be leaked bytes the
+    /// budget never learns to reclaim.
+    #[tokio::test]
+    async fn a_scanned_filmstrip_with_a_gap_counts_the_frames_the_store_still_has() {
+        let (url, stub) = spawn_stub("secret").await;
+        {
+            let mut files = stub.files.lock().unwrap();
+            files.insert("cam/1000_1000.ts".to_string(), vec![0u8; 10]);
+            // thumb_0 never landed; 1 and 3 did.
+            files.insert("cam/1000_1000_thumb_1.jpg".to_string(), vec![0u8; 7]);
+            files.insert("cam/1000_1000_thumb_3.jpg".to_string(), vec![0u8; 9]);
+        }
+
+        let backend = backend_for(&url, "secret", 0);
+        backend.scan().await.unwrap();
+        let entry = backend.find_event("cam", url_key(1000, 1000)).unwrap();
+
+        // Named to the highest frame that exists...
+        assert_eq!(entry.filmstrip_frames, 4);
+        // ...but charged only for the bytes the store really holds.
+        assert_eq!(entry.thumbnail_bytes, 16);
+
+        // And the delete reaches every one of them.
+        backend.prune(1, 1, 1, &AtomicBool::new(false)).await;
+        assert!(!stub.has("cam/1000_1000_thumb_1.jpg"));
+        assert!(!stub.has("cam/1000_1000_thumb_3.jpg"));
+        assert!(stub.files.lock().unwrap().is_empty());
+    }
+
+    /// `reqwest` starts the TLS stack and reads the proxy environment when a
+    /// client is built, so this can fail on a box whose CA bundle or
+    /// `HTTPS_PROXY` is broken — a permanent, operator-fixable fault that used
+    /// to take the whole process down from inside a constructor.
+    #[test]
+    fn a_backend_whose_http_client_will_not_build_is_an_error_not_a_panic() {
+        let config = StathostConfig {
+            url: "http://127.0.0.1:1".to_string(),
+            bucket: "cams".to_string(),
+            token: "secret".to_string(),
+            max_stored_bytes: 0,
+            enabled: true,
+        };
+        assert!(
+            StathostBackend::new(&config, &["cam".to_string()], StopFlag::never()).is_ok(),
+            "the ordinary case stopped building"
+        );
+
+        force_client_build_failure(true);
+        let refused = StathostBackend::new(&config, &["cam".to_string()], StopFlag::never());
+        force_client_build_failure(false);
+
+        let error = refused.err().expect("a client that will not build built");
+        assert!(
+            error.to_string().contains("HTTP client"),
+            "an error an operator cannot act on: {error}"
+        );
     }
 
     /// Overlapping the reads must not reach the index: entries stay sorted, and
@@ -6480,6 +6765,78 @@ mod tests {
         assert_eq!(vs.range, ServedRange::Unsatisfiable);
         assert_eq!(vs.total_size, 40);
         assert!(drain(vs).await.is_empty());
+    }
+
+    /// A `206` says the body is a slice and its `Content-Range` says which one.
+    /// Without a usable header there is nothing to serve it as: passing the
+    /// slice off as the whole event hands the player bytes that are not at the
+    /// offsets it seeks to — silent corruption of exactly the footage someone
+    /// is scrubbing through — and relaying a range the arithmetic cannot make
+    /// sense of ends in a subtraction that underflows. Both are refused.
+    #[tokio::test]
+    async fn a_206_without_a_usable_content_range_is_refused_rather_than_served_whole() {
+        let (url, stub) = spawn_stub("secret").await;
+        let backend = backend_for(&url, "secret", 0);
+        backend
+            .write_event("cam", &movement_event(11_000, 40))
+            .await;
+        let entry = backend.find_event("cam", url_key(11_000, 1000)).unwrap();
+        let ranged = RangeRequest::FromTo {
+            start: 10,
+            end: Some(19),
+        };
+
+        for header in [
+            "",                                // no Content-Range at all
+            "pages 10-19/40",                  // not a byte range
+            "bytes 10-19",                     // no total
+            "bytes ten-19/40",                 // unparsable bound
+            "bytes 19-10/40",                  // reversed: the underflow shape
+            "bytes 10-40/40",                  // end past the last byte
+            "bytes 40-45/40",                  // wholly past the object
+            "bytes 0-18446744073709551615/40", // an end nothing can be sliced to
+        ] {
+            *stub.bad_content_range.lock().unwrap() = Some(header.to_string());
+            let refused = backend.read_video("cam", &entry, Some(ranged)).await;
+            let error = refused
+                .err()
+                .unwrap_or_else(|| panic!("{header:?} was served as a video"));
+            assert_eq!(
+                error.kind(),
+                std::io::ErrorKind::InvalidData,
+                "{header:?} failed for the wrong reason: {error}"
+            );
+        }
+
+        // The honest header still plays, so the refusal above is about the
+        // header rather than about ranged reads.
+        *stub.bad_content_range.lock().unwrap() = None;
+        let vs = backend
+            .read_video("cam", &entry, Some(ranged))
+            .await
+            .unwrap();
+        assert_eq!(vs.range, ServedRange::Partial { start: 10, end: 19 });
+        assert_eq!(drain(vs).await, vec![0xab; 10]);
+    }
+
+    /// The bounds check itself, on the shapes a `Content-Range` can carry.
+    #[test]
+    fn a_partial_range_has_to_be_a_range_of_the_object() {
+        assert_eq!(
+            ServedRange::partial(10, 19, 40),
+            Some(ServedRange::Partial { start: 10, end: 19 })
+        );
+        // Whole object, and a single byte, are both ranges of it.
+        assert!(ServedRange::partial(0, 39, 40).is_some());
+        assert!(ServedRange::partial(39, 39, 40).is_some());
+        // Reversed — the subtraction that used to underflow.
+        assert_eq!(ServedRange::partial(19, 10, 40), None);
+        assert_eq!(ServedRange::partial(1, 0, 40), None);
+        // Past the end, and of an empty object.
+        assert_eq!(ServedRange::partial(10, 40, 40), None);
+        assert_eq!(ServedRange::partial(40, 45, 40), None);
+        assert_eq!(ServedRange::partial(0, 0, 0), None);
+        assert_eq!(ServedRange::partial(0, u64::MAX, 40), None);
     }
 
     #[tokio::test]

@@ -9,7 +9,9 @@
 //!
 //! 1. trim to the last complete 188-byte packet (a torn tail write must not
 //!    poison the file),
-//! 2. recompute the real duration from the first→last PES PTS delta,
+//! 2. recompute the real duration from the first→last PES PTS delta — both
+//!    read in one streaming pass, because the interrupted file is as large as
+//!    the event was long and this runs during startup,
 //! 3. rename to a proper `{first_pts_ns}_{duration_ms}.ts`, adopting any
 //!    sidecar/thumbnails the writer finished before the crash, and mark the
 //!    sidecar `"recovered": true`, then fsync the directory so the salvage
@@ -24,13 +26,25 @@
 
 use std::path::Path;
 
-use super::event_index::EventType;
+use super::event_index::{EventType, MAX_FILMSTRIP_FRAMES};
 use crate::mpegts;
+
+/// How a salvage reads the bytes of an orphaned `.ts.tmp`.
+///
+/// Production hands [`mpegts::scan_ts_file`], which streams the file through
+/// one fixed buffer and returns three numbers; the seam exists so a test can
+/// watch how much of a large file the salvage actually holds at once, which is
+/// the property that keeps startup off the OOM killer.
+type TmpScan = dyn Fn(&Path) -> std::io::Result<mpegts::TsScan>;
 
 /// Scan every event directory of every configured camera for `*.tmp` orphans
 /// and recover or clean them. Synchronous: runs once at startup, before the
 /// warm index scan.
 pub fn recover_orphans(data_dir: &Path, camera_ids: &[String]) {
+    recover_orphans_with(data_dir, camera_ids, &mpegts::scan_ts_file);
+}
+
+fn recover_orphans_with(data_dir: &Path, camera_ids: &[String], scan: &TmpScan) {
     for camera_id in camera_ids {
         for event_type in [
             EventType::Movement,
@@ -38,12 +52,12 @@ pub fn recover_orphans(data_dir: &Path, camera_ids: &[String]) {
             EventType::Continuous,
         ] {
             let dir = data_dir.join(camera_id).join(event_type.dir_name());
-            recover_dir(&dir, camera_id);
+            recover_dir(&dir, camera_id, scan);
         }
     }
 }
 
-fn recover_dir(dir: &Path, camera_id: &str) {
+fn recover_dir(dir: &Path, camera_id: &str, scan: &TmpScan) {
     let read_dir = match std::fs::read_dir(dir) {
         Ok(rd) => rd,
         Err(_) => return, // directory does not exist yet — nothing to recover
@@ -64,7 +78,7 @@ fn recover_dir(dir: &Path, camera_id: &str) {
     for path in tmp_paths {
         let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
         if name.ends_with(".ts.tmp") {
-            recover_video_tmp(&path, camera_id);
+            recover_video_tmp(&path, camera_id, scan);
         } else {
             // An interrupted sidecar/thumbnail staging file. Cannot be
             // reconstructed and carries no video — safe to delete.
@@ -81,31 +95,35 @@ fn recover_dir(dir: &Path, camera_id: &str) {
 }
 
 /// Salvage a single orphaned `{stem}.ts.tmp`.
-fn recover_video_tmp(path: &Path, camera_id: &str) {
-    let data = match std::fs::read(path) {
-        Ok(d) => d,
+///
+/// The file's bytes are never held: `scan` streams them and hands back where
+/// the intact packets stop and what the first and last PES PTS were, which is
+/// everything the salvage needs. The size below is the file's own length, read
+/// from its metadata rather than from a buffer.
+fn recover_video_tmp(path: &Path, camera_id: &str, scan: &TmpScan) {
+    let scanned = match scan(path) {
+        Ok(s) => s,
         Err(e) => {
             tracing::warn!(camera = %camera_id, path = %path.display(), error = %e,
                 "failed to read orphaned video temp file, leaving it in place");
             return;
         }
     };
+    let file_len = file_len(path);
+    let valid_len = scanned.valid_len;
 
-    let valid_len = mpegts::valid_prefix_len(&data);
-    let trimmed = &data[..valid_len];
     // A recoverable file needs at least one PES packet with a PTS: the writer
     // starts every file with PAT/PMT + a keyframe, so real footage always
     // carries PES timestamps. PSI-only or empty content has nothing decodable.
-    let (first_pts_90k, last_pts_90k) =
-        match (mpegts::first_pts(trimmed), mpegts::last_pts(trimmed)) {
-            (Some(f), Some(l)) => (f, l),
-            _ => {
-                tracing::warn!(camera = %camera_id, path = %path.display(), bytes = data.len(),
-                    "deleting orphaned video temp file with no decodable content");
-                let _ = std::fs::remove_file(path);
-                return;
-            }
-        };
+    let (first_pts_90k, last_pts_90k) = match (scanned.first_pts, scanned.last_pts) {
+        (Some(f), Some(l)) => (f, l),
+        _ => {
+            tracing::warn!(camera = %camera_id, path = %path.display(), bytes = file_len,
+                "deleting orphaned video temp file with no decodable content");
+            let _ = std::fs::remove_file(path);
+            return;
+        }
+    };
 
     // Real duration of what survived, from the file content (PES PTS delta,
     // 90 kHz, wrap-aware). The stem in the tmp filename may claim a longer
@@ -138,7 +156,7 @@ fn recover_video_tmp(path: &Path, camera_id: &str) {
     }
 
     // Trim in place (no copy), make it durable, then commit via rename.
-    if let Err(e) = truncate_synced(path, valid_len as u64) {
+    if let Err(e) = truncate_synced(path, valid_len) {
         tracing::warn!(camera = %camera_id, path = %path.display(), error = %e,
             "failed to trim orphaned video temp file, leaving it in place");
         return;
@@ -168,7 +186,7 @@ fn recover_video_tmp(path: &Path, camera_id: &str) {
         camera = %camera_id,
         path = %final_path.display(),
         duration_ms,
-        trimmed_bytes = data.len() - valid_len,
+        trimmed_bytes = file_len.saturating_sub(valid_len),
         "recovered orphaned event file after unclean shutdown"
     );
 }
@@ -212,12 +230,16 @@ fn write_recovered_sidecar(dir: &Path, orig_stem: &str, new_stem: &str, camera_i
 
 /// Move any finished filmstrip thumbnails over to the recovered stem.
 fn adopt_thumbnails(dir: &Path, orig_stem: &str, new_stem: &str) {
-    for i in 0..4 {
+    for i in 0..MAX_FILMSTRIP_FRAMES {
         let from = dir.join(format!("{orig_stem}_thumb_{i}.jpg"));
         if from.exists() {
             let _ = std::fs::rename(&from, dir.join(format!("{new_stem}_thumb_{i}.jpg")));
         }
     }
+}
+
+fn file_len(path: &Path) -> u64 {
+    std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
 }
 
 fn file_mtime_ns(path: &Path) -> u64 {
@@ -252,6 +274,71 @@ mod tests {
 
     fn recover(root: &Path) {
         recover_orphans(root, &[CAM.to_string()]);
+    }
+
+    /// The file a power cut leaves behind is a whole event's worth of video —
+    /// tens of megabytes of continuous recording, more if the writer was stuck
+    /// — and this runs at startup, on the box whose memory pressure is why
+    /// every other read here streams. So the salvage may hold a buffer, never
+    /// the file: what it needs from those bytes is three numbers.
+    #[test]
+    fn a_large_interrupted_recording_is_salvaged_without_being_held_in_memory() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let dir = movements_dir(tmp_dir.path());
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // 8 MiB — 128 buffers' worth — of 2s footage, then a torn tail write.
+        let mut data = video_bytes(0, 2 * 90_000);
+        while data.len() < 8 * 1024 * 1024 {
+            data.extend_from_slice(&null_packet());
+        }
+        let valid_len = data.len();
+        data.extend_from_slice(&[0x47, 0x11]);
+        std::fs::write(dir.join("4000_9000.ts.tmp"), &data).unwrap();
+
+        // Every read the salvage makes goes through this, so the largest slice
+        // it ever asks to have filled is the most of the file it can be
+        // holding at once.
+        let peak = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = std::sync::Arc::clone(&peak);
+        recover_orphans_with(tmp_dir.path(), &[CAM.to_string()], &move |path| {
+            let file = std::fs::File::open(path)?;
+            crate::mpegts::scan_ts_stream(WatchedReader {
+                inner: file,
+                peak: std::sync::Arc::clone(&observed),
+            })
+        });
+
+        let held = peak.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(held > 0, "the salvage never read through the scan at all");
+        assert!(
+            held <= crate::mpegts::SCAN_BUFFER_BYTES,
+            "held {held} bytes of an {} byte file at once",
+            data.len()
+        );
+
+        // And it is a real salvage: the tail is trimmed and the duration comes
+        // from the footage rather than from the name.
+        let final_path = dir.join("4000_2000.ts");
+        assert!(final_path.exists());
+        assert_eq!(
+            std::fs::metadata(&final_path).unwrap().len(),
+            valid_len as u64
+        );
+    }
+
+    /// Reports the largest fill it was ever asked for.
+    struct WatchedReader {
+        inner: std::fs::File,
+        peak: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl std::io::Read for WatchedReader {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.peak
+                .fetch_max(buf.len(), std::sync::atomic::Ordering::Relaxed);
+            std::io::Read::read(&mut self.inner, buf)
+        }
     }
 
     #[test]

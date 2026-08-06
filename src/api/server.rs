@@ -19,6 +19,7 @@ use crate::analytics::motion_settings::{
 use crate::analytics::{MotionSettingsStore, SettingsUpdate, UpdateError};
 use crate::buffer::HotBuffer;
 use crate::locks::LockExt;
+use crate::storage::event_index::MAX_FILMSTRIP_FRAMES;
 use crate::storage::{
     DetectionDebugStore, DetectionStore, EventCursor, EventPage, EventRef, MapKind, MotionStore,
     RangeRequest, ServedRange, ThumbnailError, VideoStream, WarmEventEntry, WarmStorageBackend,
@@ -870,8 +871,26 @@ async fn warm_segment_handler(
 
     match backend.read_video(&id, &entry, range).await {
         Ok(video) => video_stream_response(video),
-        Err(_) => (StatusCode::NOT_FOUND, "event file not found").into_response(),
+        Err(e) => video_error_response(&e),
     }
+}
+
+/// What a failed read of an indexed event answers.
+///
+/// A store that answered with something that is not this event — a `206` whose
+/// `Content-Range` describes no range of it — has not said the event is gone,
+/// and a `404` would tell a client to stop asking for footage that is still
+/// there. Every other failure keeps the not-found it has always had: the file
+/// is indexed and unreadable, which from a client's side is the same as absent.
+fn video_error_response(error: &std::io::Error) -> Response {
+    if error.kind() == std::io::ErrorKind::InvalidData {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "storage could not serve the event",
+        )
+            .into_response();
+    }
+    (StatusCode::NOT_FOUND, "event file not found").into_response()
 }
 
 /// Turn a streamed [`VideoStream`] into an HTTP response: `206` for a satisfied
@@ -899,20 +918,44 @@ fn video_stream_response(video: VideoStream) -> Response {
             Body::from_stream(stream),
         )
             .into_response(),
-        ServedRange::Partial { start, end } => (
-            StatusCode::PARTIAL_CONTENT,
-            [
-                (header::CONTENT_TYPE, "video/mp2t".to_string()),
-                (header::ACCEPT_RANGES, "bytes".to_string()),
-                (
-                    header::CONTENT_RANGE,
-                    format!("bytes {start}-{end}/{total_size}"),
-                ),
-                (header::CONTENT_LENGTH, (end - start + 1).to_string()),
-            ],
-            Body::from_stream(stream),
-        )
-            .into_response(),
+        ServedRange::Partial { start, end } => {
+            // The length of a partial body is a subtraction, and a subtraction
+            // needs its operands checked before it happens, not after: a
+            // reversed pair underflows — a panic in the debug build camon ships
+            // — and an end past the object promises bytes the stream will never
+            // produce, which hangs the player. The backend that resolved the
+            // range is supposed to have established both (see
+            // [`ServedRange::partial`]); if one ever reaches here having not,
+            // the request fails cleanly instead of serving a corrupt 206.
+            let Some(body_len) = range.body_len(total_size) else {
+                tracing::warn!(
+                    start,
+                    end,
+                    total_size,
+                    "storage returned a partial range that is not a range of the event; \
+                     refusing to serve it"
+                );
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "storage returned an invalid partial range",
+                )
+                    .into_response();
+            };
+            (
+                StatusCode::PARTIAL_CONTENT,
+                [
+                    (header::CONTENT_TYPE, "video/mp2t".to_string()),
+                    (header::ACCEPT_RANGES, "bytes".to_string()),
+                    (
+                        header::CONTENT_RANGE,
+                        format!("bytes {start}-{end}/{total_size}"),
+                    ),
+                    (header::CONTENT_LENGTH, body_len.to_string()),
+                ],
+                Body::from_stream(stream),
+            )
+                .into_response()
+        }
     }
 }
 
@@ -1044,8 +1087,12 @@ async fn warm_filmstrip_handler(
         return (StatusCode::NOT_FOUND, "camera not found").into_response();
     }
 
-    if index > 3 {
-        return (StatusCode::BAD_REQUEST, "index must be 0-3").into_response();
+    // Bounded by what the analyzer writes, from the same constant the store
+    // counts and deletes by — a third hand-written `3` here is how a filmstrip
+    // grown to five frames would come to have one nothing can ask for.
+    if usize::from(index) >= MAX_FILMSTRIP_FRAMES {
+        let last = MAX_FILMSTRIP_FRAMES - 1;
+        return (StatusCode::BAD_REQUEST, format!("index must be 0-{last}")).into_response();
     }
 
     let entry = match resolve_event(backend, &id, &event) {
@@ -2157,5 +2204,84 @@ mod tests {
         assert_eq!(parse_range_header("bytes=20-10"), None);
         // Multi-range is unsupported → decline (serve full).
         assert_eq!(parse_range_header("bytes=0-10,20-30"), None);
+    }
+
+    fn streamed(range: ServedRange, total_size: u64) -> Response {
+        video_stream_response(VideoStream {
+            stream: Box::pin(futures_util::stream::empty()),
+            total_size,
+            range,
+        })
+    }
+
+    /// The `Content-Length` of a partial body is `end - start + 1`, and camon
+    /// ships debug builds, where a reversed pair does not wrap — it panics, in
+    /// a request handler, on a range a *remote store* chose. Ends past the
+    /// object are the other half: the header would promise bytes the stream
+    /// never produces and the player waits for them for ever. Neither is
+    /// served; the request fails cleanly and says why.
+    #[test]
+    fn a_partial_range_that_is_not_a_range_of_the_event_is_refused_not_subtracted() {
+        for (start, end) in [
+            (19u64, 10u64), // reversed: the underflow
+            (1, 0),         // reversed by one, at zero
+            (10, 40),       // end is one past the last byte
+            (40, 45),       // wholly past the object
+            (0, u64::MAX),  // an end nothing can be sliced to
+        ] {
+            let response = streamed(ServedRange::Partial { start, end }, 40);
+            assert_eq!(
+                response.status(),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "bytes {start}-{end}/40 was served"
+            );
+            assert!(response.headers().get(header::CONTENT_RANGE).is_none());
+        }
+    }
+
+    /// A store whose answer was not this event is not a store saying the event
+    /// is gone — telling a client `404` for that would send it away from
+    /// footage that is still there.
+    #[test]
+    fn a_store_that_answered_with_something_else_is_not_a_missing_event() {
+        let refused = video_error_response(&std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "206 without a usable Content-Range",
+        ));
+        assert_eq!(refused.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        // A file that really is unreadable or gone stays a not-found.
+        for kind in [
+            std::io::ErrorKind::NotFound,
+            std::io::ErrorKind::PermissionDenied,
+            std::io::ErrorKind::ConnectionReset,
+        ] {
+            let missing = video_error_response(&std::io::Error::from(kind));
+            assert_eq!(missing.status(), StatusCode::NOT_FOUND, "{kind:?}");
+        }
+    }
+
+    /// And the ranges that *are* ranges still stream, with the length the
+    /// arithmetic gives.
+    #[test]
+    fn a_satisfied_range_is_served_206_with_its_own_length() {
+        let response = streamed(ServedRange::Partial { start: 10, end: 19 }, 40);
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(response.headers()[header::CONTENT_LENGTH], "10");
+        assert_eq!(response.headers()[header::CONTENT_RANGE], "bytes 10-19/40");
+
+        // The whole object as a range, and a single byte.
+        let response = streamed(ServedRange::Partial { start: 0, end: 39 }, 40);
+        assert_eq!(response.headers()[header::CONTENT_LENGTH], "40");
+        let response = streamed(ServedRange::Partial { start: 39, end: 39 }, 40);
+        assert_eq!(response.headers()[header::CONTENT_LENGTH], "1");
+
+        // The other two shapes are unchanged.
+        let response = streamed(ServedRange::Full, 40);
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CONTENT_LENGTH], "40");
+        let response = streamed(ServedRange::Unsatisfiable, 40);
+        assert_eq!(response.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+        assert_eq!(response.headers()[header::CONTENT_RANGE], "bytes */40");
     }
 }

@@ -6,7 +6,9 @@
 //!   packet while slicing the stream into GOP segments, and
 //! - startup orphan recovery ([`crate::storage`]) trims a torn `.ts.tmp` file
 //!   to its last intact packet and reads its first/last PTS to recompute the
-//!   real duration of footage that survived a crash or power cut.
+//!   real duration of footage that survived a crash or power cut — in one
+//!   streaming pass ([`scan_ts_stream`]), because the file it is handed is an
+//!   interrupted recording of unbounded size and the box it runs on is booting.
 //!
 //! Recovery is READ-ONLY reuse: nothing here may change behavior for the live
 //! path (PTS extraction, segment durations, or the filename-stem convention).
@@ -23,20 +25,87 @@ const NULL_PID: u16 = 0x1FFF;
 /// 33-bit PTS values wrap at this modulus (~26.5 hours at 90 kHz).
 const PTS_MODULUS: u64 = 1 << 33;
 
-/// Length of the longest prefix of `data` that consists of whole, plausible
-/// TS packets: a multiple of 188 bytes where every packet starts with the
-/// 0x47 sync byte.
+/// Whole TS packets one [`scan_ts_stream`] buffer holds — about 64 KiB, and a
+/// multiple of the packet size so a full buffer never splits a packet.
+const SCAN_BUFFER_PACKETS: usize = 348;
+
+/// The most of a file a [`scan_ts_stream`] ever holds in RAM: one buffer,
+/// allocated once and reused, whatever the file's size. This is the whole
+/// memory cost of recovering an orphaned recording — the pass keeps three
+/// numbers and no bytes.
+pub const SCAN_BUFFER_BYTES: usize = SCAN_BUFFER_PACKETS * TS_PACKET_SIZE;
+
+/// What one pass over a `.ts` file found in it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TsScan {
+    /// Length of the longest prefix of the file that consists of whole,
+    /// plausible TS packets: a multiple of 188 bytes where every packet starts
+    /// with the 0x47 sync byte.
+    ///
+    /// This is where a torn tail write gets trimmed off an orphaned `.ts.tmp`:
+    /// a partial final packet, or garbage after a corrupted packet, must not
+    /// poison the file. The scan stops at the first bad sync byte, so anything
+    /// after in-file corruption is discarded along with the tail.
+    pub valid_len: u64,
+    /// First and last PES PTS *within that prefix* — the bytes after it are
+    /// not part of the file being salvaged, so they may not date it either.
+    pub first_pts: Option<u64>,
+    pub last_pts: Option<u64>,
+}
+
+/// Scan a stream of TS packets for the three things recovery needs: where the
+/// intact packets stop, and the first and last PES PTS before that point.
 ///
-/// Used to trim a torn tail write off an orphaned `.ts.tmp`: a partial final
-/// packet, or garbage after a corrupted packet, must not poison the file. The
-/// scan stops at the first bad sync byte, so anything after in-file corruption
-/// is discarded along with the tail.
-pub fn valid_prefix_len(data: &[u8]) -> usize {
-    let mut end = 0;
-    while end + TS_PACKET_SIZE <= data.len() && data[end] == SYNC_BYTE {
-        end += TS_PACKET_SIZE;
+/// Streaming rather than `read`-it-all is the point. The caller's input is a
+/// recording an unclean shutdown interrupted, which is as large as the event
+/// was long — a continuous chunk is tens of megabytes and a stuck writer's
+/// leftovers can be far more — and it is read during startup on a box whose
+/// memory is the reason events are streamed everywhere else. One buffer of
+/// [`SCAN_BUFFER_BYTES`] is the whole allocation, and the prefix is walked
+/// forward exactly once, so the last PTS is the last one *seen* rather than
+/// found by a second pass from the end.
+pub fn scan_ts_stream<R: std::io::Read>(mut reader: R) -> std::io::Result<TsScan> {
+    let mut buf = vec![0u8; SCAN_BUFFER_BYTES];
+    // Bytes of a packet that straddled the end of the last fill, kept at the
+    // front of the buffer. Always under one packet, because the buffer holds a
+    // whole number of them.
+    let mut filled = 0usize;
+    let mut scan = TsScan {
+        valid_len: 0,
+        first_pts: None,
+        last_pts: None,
+    };
+    loop {
+        let read = match reader.read(&mut buf[filled..]) {
+            Ok(0) => break, // EOF: a leftover part-packet is a torn tail.
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        filled += read;
+
+        let mut offset = 0;
+        while offset + TS_PACKET_SIZE <= filled {
+            let packet = &buf[offset..offset + TS_PACKET_SIZE];
+            if packet[0] != SYNC_BYTE {
+                return Ok(scan); // the prefix ends here; the rest is not ours
+            }
+            if let Some(pts) = payload_unit_pts(packet) {
+                scan.first_pts.get_or_insert(pts);
+                scan.last_pts = Some(pts);
+            }
+            scan.valid_len += TS_PACKET_SIZE as u64;
+            offset += TS_PACKET_SIZE;
+        }
+        buf.copy_within(offset..filled, 0);
+        filled -= offset;
     }
-    end
+    Ok(scan)
+}
+
+/// [`scan_ts_stream`] over a file on disk, which is how recovery reads one.
+pub fn scan_ts_file(path: &std::path::Path) -> std::io::Result<TsScan> {
+    scan_ts_stream(std::fs::File::open(path)?)
 }
 
 /// Extract the 33-bit PTS (90 kHz units) from a TS packet that starts a PES
@@ -93,18 +162,6 @@ fn payload_unit_pts(packet: &[u8]) -> Option<u64> {
         return None; // no PUSI, cannot start a PES packet
     }
     extract_pes_pts(packet)
-}
-
-/// First PES PTS found in a buffer of whole TS packets.
-pub fn first_pts(data: &[u8]) -> Option<u64> {
-    data.chunks_exact(TS_PACKET_SIZE).find_map(payload_unit_pts)
-}
-
-/// Last PES PTS found in a buffer of whole TS packets.
-pub fn last_pts(data: &[u8]) -> Option<u64> {
-    data.chunks_exact(TS_PACKET_SIZE)
-        .rev()
-        .find_map(payload_unit_pts)
 }
 
 /// PID a TS packet belongs to. Short input yields no meaningful PID, so it maps
@@ -266,10 +323,14 @@ mod tests {
         assert_eq!(extract_pes_pts(&[0x47, 0x40, 0x00]), None);
     }
 
+    fn scan(data: &[u8]) -> TsScan {
+        scan_ts_stream(data).unwrap()
+    }
+
     #[test]
     fn valid_prefix_empty_and_garbage() {
-        assert_eq!(valid_prefix_len(&[]), 0);
-        assert_eq!(valid_prefix_len(&[0x00; 400]), 0);
+        assert_eq!(scan(&[]).valid_len, 0);
+        assert_eq!(scan(&[0x00; 400]).valid_len, 0);
     }
 
     #[test]
@@ -280,7 +341,7 @@ mod tests {
         // Torn tail: a partial packet that even starts with a sync byte.
         data.push(SYNC_BYTE);
         data.extend_from_slice(&[0xAB; 50]);
-        assert_eq!(valid_prefix_len(&data), 2 * TS_PACKET_SIZE);
+        assert_eq!(scan(&data).valid_len, 2 * TS_PACKET_SIZE as u64);
     }
 
     #[test]
@@ -288,10 +349,12 @@ mod tests {
         let mut data = Vec::new();
         data.extend_from_slice(&pes_packet(0x100, 1000));
         // A full-length "packet" of garbage: everything after it is discarded
-        // too, even a valid-looking packet.
+        // too, even a valid-looking packet — and so is its PTS.
         data.extend_from_slice(&[0x00; TS_PACKET_SIZE]);
         data.extend_from_slice(&pes_packet(0x100, 2000));
-        assert_eq!(valid_prefix_len(&data), TS_PACKET_SIZE);
+        let scanned = scan(&data);
+        assert_eq!(scanned.valid_len, TS_PACKET_SIZE as u64);
+        assert_eq!(scanned.last_pts, Some(1000));
     }
 
     #[test]
@@ -302,10 +365,97 @@ mod tests {
         data.extend_from_slice(&null_packet());
         data.extend_from_slice(&pes_packet(0x100, 95_000));
         data.extend_from_slice(&null_packet());
-        assert_eq!(first_pts(&data), Some(5_000));
-        assert_eq!(last_pts(&data), Some(95_000));
-        assert_eq!(first_pts(&null_packet()[..]), None);
-        assert_eq!(last_pts(&[]), None);
+        assert_eq!(scan(&data).first_pts, Some(5_000));
+        assert_eq!(scan(&data).last_pts, Some(95_000));
+        assert_eq!(scan(&null_packet()[..]).first_pts, None);
+        assert_eq!(scan(&[]).last_pts, None);
+    }
+
+    /// A reader that reports the largest slice it was ever asked to fill, and
+    /// hands the data back in awkward pieces so packets straddle the fills.
+    struct CountingReader<'a> {
+        data: &'a [u8],
+        chunk: usize,
+        peak_request: usize,
+        reads: usize,
+    }
+
+    impl std::io::Read for CountingReader<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.peak_request = self.peak_request.max(buf.len());
+            self.reads += 1;
+            let n = buf.len().min(self.chunk).min(self.data.len());
+            buf[..n].copy_from_slice(&self.data[..n]);
+            self.data = &self.data[n..];
+            Ok(n)
+        }
+    }
+
+    /// The whole point of the streaming scan: what it holds is one buffer, not
+    /// the file. A recording interrupted by a power cut is as large as the
+    /// event was long, and this runs while the box is booting.
+    #[test]
+    fn a_scan_of_a_large_file_never_holds_more_than_one_buffer() {
+        // 4 MiB of packets — 64× the buffer — ending in a torn tail.
+        let mut data = Vec::new();
+        data.extend_from_slice(&pes_packet(0x100, 90_000));
+        while data.len() < 4 * 1024 * 1024 {
+            data.extend_from_slice(&null_packet());
+        }
+        let packets = data.len() / TS_PACKET_SIZE;
+        data.extend_from_slice(&pes_packet(0x100, 450_000));
+        data.extend_from_slice(&[SYNC_BYTE, 0x00, 0x01]);
+
+        let mut reader = CountingReader {
+            data: &data,
+            chunk: 7_777, // never a whole number of packets
+            peak_request: 0,
+            reads: 0,
+        };
+        let scanned = scan_ts_stream(&mut reader).unwrap();
+
+        assert_eq!(
+            scanned.valid_len,
+            (packets as u64 + 1) * TS_PACKET_SIZE as u64
+        );
+        assert_eq!(scanned.first_pts, Some(90_000));
+        assert_eq!(scanned.last_pts, Some(450_000));
+        assert!(
+            reader.peak_request <= SCAN_BUFFER_BYTES,
+            "asked for {} bytes at once, buffer is {SCAN_BUFFER_BYTES}",
+            reader.peak_request
+        );
+        assert!(reader.reads > 500, "a whole-file read is not a stream");
+    }
+
+    /// Every fill boundary is a packet boundary the scan has to stitch back
+    /// together; the result may not depend on how the bytes arrived.
+    #[test]
+    fn a_scan_is_the_same_however_the_reads_are_chopped_up() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&null_packet());
+        data.extend_from_slice(&pes_packet(0x100, 7_000));
+        data.extend_from_slice(&keyframe_packet(0x100, 190_000, VIDEO));
+        data.push(SYNC_BYTE); // torn tail
+
+        let whole = scan(&data);
+        assert_eq!(whole.valid_len, 3 * TS_PACKET_SIZE as u64);
+        assert_eq!(whole.first_pts, Some(7_000));
+        assert_eq!(whole.last_pts, Some(190_000));
+        for chunk in [1, 3, 187, 188, 189, 377] {
+            let mut reader = CountingReader {
+                data: &data,
+                chunk,
+                peak_request: 0,
+                reads: 0,
+            };
+            assert_eq!(scan_ts_stream(&mut reader).unwrap(), whole, "chunk {chunk}");
+        }
+    }
+
+    #[test]
+    fn scan_of_a_missing_file_is_an_error() {
+        assert!(scan_ts_file(std::path::Path::new("/nonexistent-camon.ts")).is_err());
     }
 
     #[test]

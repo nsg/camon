@@ -576,7 +576,12 @@ struct MotionSegment {
 type Filmstrip = Arc<Vec<Vec<u8>>>;
 
 /// Frames kept per event once the run closes.
-const FILMSTRIP_FRAMES: usize = 4;
+///
+/// Visible to the crate because storage counts the frames back off the store
+/// and has to know where to stop looking: see
+/// [`MAX_FILMSTRIP_FRAMES`](crate::storage::event_index::MAX_FILMSTRIP_FRAMES),
+/// which is pinned to this number rather than agreeing with it by convention.
+pub(crate) const FILMSTRIP_FRAMES: usize = 4;
 /// Working size of an open run's accumulator. A run can last for hours, so
 /// past this the strip is halved rather than grown.
 const FILMSTRIP_ACCUMULATOR_CAP: usize = 8;

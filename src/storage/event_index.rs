@@ -32,6 +32,37 @@ use crate::locks::LockExt;
 
 const NANOS_PER_MS: u64 = 1_000_000;
 
+/// The most filmstrip frames one event ever has: `{stem}_thumb_0.jpg` …
+/// `_thumb_3.jpg` is the whole set a store can hold, which is what makes
+/// counting them a bounded probe rather than an open-ended walk.
+///
+/// Taken from the analyzer that writes them rather than agreed with by
+/// convention. Storage reads this number back off a store it does not control:
+/// every probe, every count and every delete stops here, so a producer raised
+/// to five frames while this stayed at four would upload a fifth thumbnail that
+/// nothing ever counts and no delete ever reaches — a leak on the remote store
+/// that shows up as a budget slowly drifting from the truth, on installations
+/// only, months later.
+pub(crate) const MAX_FILMSTRIP_FRAMES: usize = crate::analytics::pipeline::FILMSTRIP_FRAMES;
+
+/// How many filmstrip frames to index for an event whose frames answer
+/// `present`: one past the highest frame that exists, and never more than
+/// [`MAX_FILMSTRIP_FRAMES`].
+///
+/// Not "how many are there", and the difference is a lost frame. Counting up
+/// from zero until the first miss reads a filmstrip whose `thumb_0` a crash
+/// took as having no frames at all, hiding the three that are on disk from the
+/// UI and — worse — from the deletes, which walk `0..filmstrip_frames` and
+/// would leak every frame above the hole for the life of the installation. The
+/// count is a high-water mark instead, so a gap costs one broken frame in the
+/// filmstrip and nothing else: everything stored is still named, still served
+/// where it exists, and still reclaimed with the event.
+pub(crate) fn filmstrip_frame_count(mut present: impl FnMut(usize) -> bool) -> usize {
+    (0..MAX_FILMSTRIP_FRAMES)
+        .rfind(|&i| present(i))
+        .map_or(0, |highest| highest + 1)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum EventType {
     Movement,
@@ -104,7 +135,16 @@ pub struct WarmEventEntry {
     /// a figure maintained beside it could only ever be a second opinion that
     /// drifts.
     pub sidecar_bytes: u64,
-    /// Size of the event's filmstrip frames, all `filmstrip_frames` of them.
+    /// Size of the event's filmstrip frames — the ones that are really there.
+    ///
+    /// Not "all `filmstrip_frames` of them", and the two answer different
+    /// questions on a filmstrip with a hole in it. The count is a high-water
+    /// mark, so that everything stored is named and reached
+    /// ([`filmstrip_frame_count`]); the bytes are only what the store's listing
+    /// actually accounted for. A lost `thumb_1` therefore leaves a count of 4
+    /// and the weight of 3, which is the honest pair: the budget must not be
+    /// charged for an object that is not there, and the delete must not stop
+    /// short of one that is.
     pub thumbnail_bytes: u64,
     pub object_classes: Vec<String>,
     pub backend: Option<String>,
@@ -567,6 +607,13 @@ fn page_of<'a>(
 pub(crate) struct EventIndex<K> {
     cameras: HashMap<String, RwLock<Vec<WarmEventEntry>>>,
     used_bytes: AtomicU64,
+    /// Entries [`insert_locked`](Self::insert_locked) has had to shift along to
+    /// keep the list sorted, counted so a test can tell a scan that builds the
+    /// index one insertion at a time from one that builds it in bulk. The
+    /// difference is quadratic and invisible in every other observation of the
+    /// finished index — see `replace_camera`.
+    #[cfg(test)]
+    shifted_entries: AtomicU64,
     _key: PhantomData<fn() -> K>,
 }
 
@@ -578,8 +625,16 @@ impl<K: EventIdentity> EventIndex<K> {
                 .map(|id| (id.clone(), RwLock::new(Vec::new())))
                 .collect(),
             used_bytes: AtomicU64::new(0),
+            #[cfg(test)]
+            shifted_entries: AtomicU64::new(0),
             _key: PhantomData,
         }
+    }
+
+    /// Entries shifted so far to keep the lists sorted; see the field.
+    #[cfg(test)]
+    pub(crate) fn shifted_entries(&self) -> u64 {
+        self.shifted_entries.load(Ordering::Relaxed)
     }
 
     pub(crate) fn camera_ids(&self) -> impl Iterator<Item = &str> {
@@ -617,7 +672,23 @@ impl<K: EventIdentity> EventIndex<K> {
     }
 
     /// Replace one camera's whole list, as a startup scan does. `entries` need
-    /// not be sorted; the index's ordering invariant is restored here.
+    /// not be sorted; the index's ordering invariant is restored here, once,
+    /// by one O(n log n) sort.
+    ///
+    /// This is why a scan collects before it indexes rather than inserting each
+    /// event as it learns of it. A store lists in no useful order — decimal
+    /// stems sort lexicographically, and a no-RTC box's archive shares one
+    /// start PTS — so each of those insertions lands in the middle of the list
+    /// and shifts the rest, which is O(n²) memory traffic on the one pass that
+    /// runs at startup over the whole archive.
+    ///
+    /// One thing this does not do that [`insert`](Self::insert) does: collapse
+    /// two entries onto one identity. Nothing camon writes can produce a pair —
+    /// an identity is derived from a stored object's name, and two names cannot
+    /// be one object — so the difference is reachable only through foreign
+    /// objects in the store whose names parse to the same key, which would now
+    /// be indexed twice rather than the second silently replacing the first.
+    /// Neither is correct for them, and neither is what makes them wrong.
     pub(crate) fn replace_camera(&self, camera_id: &str, mut entries: Vec<WarmEventEntry>) {
         let Some(lock) = self.cameras.get(camera_id) else {
             return;
@@ -645,7 +716,7 @@ impl<K: EventIdentity> EventIndex<K> {
     pub(crate) fn insert(&self, camera_id: &str, entry: WarmEventEntry) -> Option<WarmEventEntry> {
         let lock = self.cameras.get(camera_id)?;
         let added = entry.stored_bytes();
-        let replaced = Self::insert_locked(&mut lock.write_recover(), entry);
+        let replaced = self.insert_locked(&mut lock.write_recover(), entry);
         self.charge(
             added,
             replaced.as_ref().map_or(0, WarmEventEntry::stored_bytes),
@@ -673,7 +744,7 @@ impl<K: EventIdentity> EventIndex<K> {
             if position(&entries, K::of(&entry)).is_some() {
                 return false;
             }
-            Self::insert_locked(&mut entries, entry);
+            self.insert_locked(&mut entries, entry);
         }
         self.charge(added, 0);
         true
@@ -682,7 +753,13 @@ impl<K: EventIdentity> EventIndex<K> {
     /// [`insert`](Self::insert)'s list surgery, without the byte accounting, so
     /// [`reidentify`](Self::reidentify) can re-place an entry under the write
     /// lock it is already holding.
+    ///
+    /// One event at a time, which is what the live write path has: an insertion
+    /// into the middle of the list shifts everything above it, so building a
+    /// whole camera's list this way costs O(n²) and a startup scan uses
+    /// [`replace_camera`](Self::replace_camera) instead.
     fn insert_locked(
+        &self,
         entries: &mut Vec<WarmEventEntry>,
         entry: WarmEventEntry,
     ) -> Option<WarmEventEntry> {
@@ -690,6 +767,9 @@ impl<K: EventIdentity> EventIndex<K> {
             Some(i) => Some(std::mem::replace(&mut entries[i], entry)),
             None => {
                 let pos = entries.partition_point(|e| e.start_pts_ns < entry.start_pts_ns);
+                #[cfg(test)]
+                self.shifted_entries
+                    .fetch_add((entries.len() - pos) as u64, Ordering::Relaxed);
                 entries.insert(pos, entry);
                 None
             }
@@ -793,7 +873,7 @@ impl<K: EventIdentity> EventIndex<K> {
             }
             let new_size = entry.stored_bytes();
             entries.remove(i);
-            (old_size, new_size, Self::insert_locked(&mut entries, entry))
+            (old_size, new_size, self.insert_locked(&mut entries, entry))
         };
         // What the entry now weighs, against what left the index: its own
         // former size — it was re-placed, not added to — plus anything it
@@ -1258,6 +1338,54 @@ mod tests {
             continues: false,
             recovered: false,
             delete_failed: false,
+        }
+    }
+
+    /// Storage stops counting exactly where the analyzer stops writing. The
+    /// two used to be separate literals agreeing by convention, and a producer
+    /// raised past the consumer would upload a frame nothing counts, serves or
+    /// deletes — a leak on the remote store that surfaces as a budget drifting
+    /// from the truth, months later, on installations only.
+    #[test]
+    fn the_frame_count_stops_where_the_analyzer_stops_writing() {
+        assert_eq!(
+            MAX_FILMSTRIP_FRAMES,
+            crate::analytics::pipeline::FILMSTRIP_FRAMES
+        );
+        assert_eq!(
+            filmstrip_frame_count(|_| true),
+            crate::analytics::pipeline::FILMSTRIP_FRAMES,
+            "a full filmstrip has a frame the store would never account for"
+        );
+    }
+
+    /// The frame count names every frame that exists, gaps and all: a store
+    /// that lost `thumb_0` still holds the three above it, and a count that
+    /// stopped at the hole would hide them from the UI and from the delete.
+    #[test]
+    fn a_filmstrip_count_names_every_frame_that_exists() {
+        let count = |present: &[usize]| {
+            let present = present.to_vec();
+            filmstrip_frame_count(move |i| present.contains(&i))
+        };
+        assert_eq!(count(&[]), 0);
+        assert_eq!(count(&[0]), 1);
+        assert_eq!(count(&[0, 1, 2, 3]), 4);
+        // Gaps: the count reaches past them rather than stopping at them.
+        assert_eq!(count(&[1, 2, 3]), 4);
+        assert_eq!(count(&[0, 2]), 3);
+        assert_eq!(count(&[3]), 4);
+        // Bounded: a probe is a `stat` or a listing lookup, so no frame beyond
+        // what the pipeline writes is ever asked about — and none twice.
+        let mut asked = Vec::new();
+        for present in [true, false] {
+            asked.clear();
+            filmstrip_frame_count(|i| {
+                asked.push(i);
+                present
+            });
+            assert!(asked.len() <= MAX_FILMSTRIP_FRAMES, "{asked:?}");
+            assert!(asked.iter().all(|&i| i < MAX_FILMSTRIP_FRAMES), "{asked:?}");
         }
     }
 
