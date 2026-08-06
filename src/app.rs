@@ -143,6 +143,45 @@ struct ShutdownSignal {
     update_installed: Arc<AtomicBool>,
 }
 
+/// The switch that tells the restart enforcement a new binary is on disk.
+///
+/// Asking for a restart is two facts, and only one of them can wait. That the
+/// drain should start is news the updater brings back when it returns. That a
+/// replacement binary now exists under the running one is true from the instant
+/// the rename returns — and between that instant and the updater's return there
+/// is a directory fsync, on the filesystem that may be exactly what is failing,
+/// synchronous and cancellable by nothing. A process wedged there has already
+/// installed the update, has an enforcement thread running, and has told it
+/// nothing; it goes on running the old code for as long as the box is up, which
+/// is the failure the enforcement exists to prevent, one call deeper than where
+/// it was first closed.
+///
+/// So the updater is handed this and flips it at the rename, before anything
+/// else it does. It carries no drain request: raising the flag alone arms the
+/// watchdog's own deadline and changes nothing else, which is exactly the
+/// property that makes it safe to do early.
+#[derive(Clone, Default)]
+pub struct InstalledMarker {
+    installed: Arc<AtomicBool>,
+}
+
+impl InstalledMarker {
+    /// A marker attached to nothing, for a caller that wants the shape without
+    /// a whole [`ShutdownSignal`] behind it.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// A new binary is in place under the name this process was started from.
+    pub fn record(&self) {
+        self.installed.store(true, Ordering::Relaxed);
+    }
+
+    pub fn recorded(&self) -> bool {
+        self.installed.load(Ordering::Relaxed)
+    }
+}
+
 impl ShutdownSignal {
     fn new() -> Self {
         Self {
@@ -179,8 +218,15 @@ impl ShutdownSignal {
     }
 
     fn request_restart(&self) {
-        self.update_installed.store(true, Ordering::Relaxed);
+        self.installed_marker().record();
         self.request_now();
+    }
+
+    /// The half of a restart request the updater cannot leave until it returns.
+    fn installed_marker(&self) -> InstalledMarker {
+        InstalledMarker {
+            installed: Arc::clone(&self.update_installed),
+        }
     }
 
     /// The supervisor that watches every long-lived task, wired so that a task
@@ -214,13 +260,37 @@ impl ShutdownSignal {
 
 const UPDATE_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(12 * 60 * 60);
 
+/// When the loop makes its first check.
+///
+/// The startup attempt checks straight away — it *is* the startup check, and a
+/// box that was off while a release was published should not run the old binary
+/// for another twelve hours; nothing waits for it, so immediate costs the
+/// cameras nothing. Every attempt after it waits a full interval first, which
+/// is not politeness: [`crate::supervise::RestartLimit::cycling_every`] judges
+/// a restarted task by whether it outlived its own cadence, so an attempt that
+/// checked immediately and died would report an uptime of nearly nothing, and
+/// four of those in a row would escalate the updater to the fatal policy in
+/// seconds rather than the two days the limit is calibrated for — taking a
+/// recording NVR down over a version check, which is the one thing the
+/// restartable policy exists to prevent.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FirstCheck {
+    Immediately,
+    AfterOneInterval,
+}
+
 /// An update installed while camon is running must not cut the recording short:
 /// it asks for the same graceful shutdown a signal does, so the analyzers,
 /// continuous recorders and warm writers drain before the process goes away.
 /// The loop is one-shot in that sense — after an install there is nothing left
 /// to check, the process is on its way out.
+///
+/// When it makes the first of those checks is [`FirstCheck`]'s question, and
+/// the answer differs between the attempt startup spawns and the ones the
+/// supervisor puts back after it.
 async fn run_update_check_loop_with<F, Fut, E>(
     interval_period: std::time::Duration,
+    first: FirstCheck,
     shutdown: ShutdownSignal,
     check: F,
 ) where
@@ -228,8 +298,12 @@ async fn run_update_check_loop_with<F, Fut, E>(
     Fut: std::future::Future<Output = Result<bool, E>>,
     E: std::fmt::Display,
 {
+    // The first tick of a tokio interval completes immediately, so delaying the
+    // first check means spending that tick rather than waiting for one.
     let mut interval = tokio::time::interval(interval_period);
-    interval.tick().await; // skip immediate tick
+    if first == FirstCheck::AfterOneInterval {
+        interval.tick().await;
+    }
     loop {
         interval.tick().await;
         // Never start an install into a process that is already shutting down.
@@ -253,41 +327,57 @@ async fn run_update_check_loop_with<F, Fut, E>(
 /// The self-updater lives in the binary, so it reaches this as a plain
 /// argument: the library orchestrates the check (and what an installed update
 /// does to the running process) without depending on the updater itself.
-async fn check_for_updates<F, Fut, E>(
+///
+/// **This does not wait for a check.** It starts one and returns, and that is
+/// the point: the startup check used to be awaited right here, between the HTTP
+/// bind and the first camera, so a release download that was slow, stalled, or
+/// deliberately trickled by whatever answered the request held every camera off
+/// the air for as long as it cared to — with no total deadline on the download
+/// to bound how long that was. An NVR that is not recording is an NVR that is
+/// failing, and no version check is worth that. The check now runs beside the
+/// cameras, where an install asks for the ordinary graceful drain instead of
+/// exiting inline, and where taking its time costs nothing but time.
+///
+/// Restartable rather than fatal: an updater that dies leaves camon running an
+/// old binary, which is a lot less bad than a recording NVR taken down over a
+/// version check. The `Arc` is what lets the same checker be handed to a second
+/// attempt, and the flag beside it is what makes only the *first* attempt check
+/// immediately — see [`FirstCheck`] for why a restarted one must not.
+///
+/// The enforcement is asked for by value it cannot be given late: taking
+/// [`RestartEnforcement`] here means the thread that guarantees the restart
+/// exists before anything can install one. That ordering used to be free —
+/// startup installed updates inline, before any of this — and is not any more.
+fn check_for_updates<F, Fut, E>(
     config: &Config,
     shutdown: &ShutdownSignal,
     supervisor: &Supervisor,
+    _enforcement: &RestartEnforcement,
     check: F,
 ) where
-    F: Fn() -> Fut + Send + Sync + 'static,
+    F: Fn(InstalledMarker) -> Fut + Send + Sync + 'static,
     Fut: std::future::Future<Output = Result<bool, E>> + Send + 'static,
     E: std::fmt::Display + 'static,
 {
     if !config.update.enabled {
         return;
     }
-    match check().await {
-        // Nothing is recording yet at this point in startup, so there is
-        // nothing to drain and exiting inline is safe.
-        Ok(true) => {
-            tracing::info!("update applied, exiting for restart");
-            std::process::exit(0);
-        }
-        Ok(false) => {}
-        Err(e) => {
-            tracing::warn!(error = %e, "update check failed, continuing startup");
-        }
-    }
-    // Restartable rather than fatal: an updater that dies leaves camon running
-    // an old binary, which is a lot less bad than a recording NVR taken down
-    // over a version check. The `Arc` is what lets the same checker be handed
-    // to a second attempt.
     let check = Arc::new(check);
+    let marker = shutdown.installed_marker();
     let shutdown = shutdown.clone();
     let limit = RestartLimit::cycling_every(UPDATE_CHECK_INTERVAL);
+    let startup = Arc::new(AtomicBool::new(true));
     supervisor.restartable("update-check", limit, move || {
         let check = Arc::clone(&check);
-        run_update_check_loop_with(UPDATE_CHECK_INTERVAL, shutdown.clone(), move || check())
+        let marker = marker.clone();
+        let first = if startup.swap(false, Ordering::Relaxed) {
+            FirstCheck::Immediately
+        } else {
+            FirstCheck::AfterOneInterval
+        };
+        run_update_check_loop_with(UPDATE_CHECK_INTERVAL, first, shutdown.clone(), move || {
+            check(marker.clone())
+        })
     });
 }
 
@@ -746,21 +836,69 @@ async fn wait_for_shutdown(shutdown: &ShutdownSignal) -> ShutdownReason {
 /// the alternative is an NVR that silently never restarts.
 ///
 /// It is also the budget the drain's own phases are sized against, and
-/// [`graceful_shutdown`] measures phase 3's deadline from it, so the drain
-/// finishes and says what it lost a moment before this thread would have taken
-/// the process out from under it without saying anything. See
-/// [`crate::shutdown`] for the arithmetic.
+/// [`graceful_shutdown`] measures phase 3's deadline from it. When the two
+/// clocks start together — a supervised death, or a signal a check installs
+/// into — that arithmetic holds exactly: the drain finishes and says what it
+/// lost a moment before this thread would have taken the process out from under
+/// it without saying anything. See [`crate::shutdown`].
+///
+/// They no longer always start together. This clock starts when a restart
+/// becomes necessary, and for an update that is the instant the new binary is
+/// renamed into place ([`InstalledMarker`]) — which can be well before the
+/// drain, since the check runs beside everything else camon does and the
+/// updater still has an fsync, a log line and a return to get through, any of
+/// which can be slow on a box whose disk is what is failing. A drain that
+/// starts late therefore gets what is left of the 360 seconds rather than all
+/// of it, and phase 3 can be cut short by this thread instead of finishing just
+/// inside it. That is the intended order of preference: the deadline exists
+/// because a process that never restarts is worse than a drain that loses its
+/// tail, and the further behind the drain is, the more likely it is that
+/// something is wedged rather than merely slow.
 pub const RESTART_DRAIN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(360);
 
-/// How often the watchdog looks for a reason to arm while the drain runs.
+/// How often the watchdog looks for a reason to arm. It polls from startup
+/// onwards, so this is also how long it can lag the flag going up.
 const WATCHDOG_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
 
-/// Spawned at the start of the drain on *every* shutdown path, then armed by
-/// the state rather than by whichever `select!` arm woke the wait: when a
-/// signal and an update land together the arm that wins is pseudo-random, and
-/// an in-flight check can install the binary — or a supervised task can die —
-/// after a signal drain has already begun. Either way the process must still
-/// end.
+/// Proof that the restart enforcement is running.
+///
+/// It exists to be a parameter. Anything that can ask for a restart camon has
+/// to enforce itself takes one of these, so the enforcement cannot be started
+/// after the thing it enforces — an ordering that is not otherwise visible in
+/// any type, and that startup got wrong for free once the update check stopped
+/// running in front of everything else.
+///
+/// It carries nothing: the whole value is having been returned by
+/// [`spawn_restart_watchdog`], which cannot happen before the thread is running.
+struct RestartEnforcement;
+
+/// Block until something has asked for a restart that nothing outside this
+/// process is bounding.
+///
+/// Split out from the thread because everything after it — a fixed sleep and an
+/// `_exit` — is not survivable in a test, while this is exactly the part worth
+/// pinning: what arms the watchdog is the *state*, not being called at the
+/// start of a drain.
+fn wait_for_a_restart_reason(update_installed: &AtomicBool, task_died: &AtomicBool) {
+    while !update_installed.load(Ordering::Relaxed) && !task_died.load(Ordering::Relaxed) {
+        std::thread::sleep(WATCHDOG_POLL_INTERVAL);
+    }
+}
+
+/// Spawned during startup, before the first thing that can ask for a restart,
+/// and armed by the state rather than by whichever `select!` arm woke the wait:
+/// when a signal and an update land together the arm that wins is
+/// pseudo-random, and an in-flight check can install the binary — or a
+/// supervised task can die — after a signal drain has already begun. Either way
+/// the process must still end.
+///
+/// Started that early because an update can now land *during* startup: the
+/// check runs beside it rather than in front of it, so the binary can be
+/// replaced while the storage scan is still running — a synchronous scan that
+/// no shutdown flag can cancel from outside. Armed only at the drain, as it
+/// used to be, a scan that never came back would leave the process running the
+/// old code for ever with the new one already on disk, and nothing anywhere
+/// would notice. It costs one thread that sleeps until it is needed.
 ///
 /// The exit status is read when the deadline trips rather than when the thread
 /// arms, so an update that installs into a stop a task's death already started
@@ -779,21 +917,23 @@ const WATCHDOG_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_mi
 /// sleeps and terminates, because whatever wedged the drain could just as
 /// easily have wedged stderr. `_exit` runs no atexit handlers and no
 /// destructors — nothing that could block on the same wedge.
-fn spawn_restart_watchdog(update_installed: Arc<AtomicBool>, task_died: Arc<AtomicBool>) {
+fn spawn_restart_watchdog(
+    update_installed: Arc<AtomicBool>,
+    task_died: Arc<AtomicBool>,
+) -> RestartEnforcement {
     std::thread::spawn(move || {
-        while !update_installed.load(Ordering::Relaxed) && !task_died.load(Ordering::Relaxed) {
-            std::thread::sleep(WATCHDOG_POLL_INTERVAL);
-        }
+        wait_for_a_restart_reason(&update_installed, &task_died);
         tracing::warn!(
             deadline_secs = RESTART_DRAIN_DEADLINE.as_secs(),
             "camon is restarting itself: the process is terminated at this deadline whether or not \
-             the shutdown drain has finished, abandoning any recording still being flushed and \
-             every queued event, so the replacement can start"
+             it has finished starting up and draining by then, abandoning any recording still \
+             being flushed and every queued event, so the replacement can start"
         );
         std::thread::sleep(RESTART_DRAIN_DEADLINE);
         let code = i32::from(task_died.load(Ordering::Relaxed));
         unsafe { libc::_exit(code) };
     });
+    RestartEnforcement
 }
 
 /// How long shutdown waits for the MQTT bridge to publish its retained
@@ -1029,10 +1169,12 @@ async fn graceful_shutdown(
 /// drain everything again when a signal or an installed update asks for it.
 ///
 /// `check_update` is the binary's self-updater, called once at startup and then
-/// every [`UPDATE_CHECK_INTERVAL`] until it installs something.
+/// every [`UPDATE_CHECK_INTERVAL`] until it installs something. It is handed an
+/// [`InstalledMarker`] because the moment a replacement binary exists cannot
+/// wait for it to return.
 pub async fn run<F, Fut, E>(check_update: F) -> Result<(), Box<dyn std::error::Error>>
 where
-    F: Fn() -> Fut + Send + Sync + 'static,
+    F: Fn(InstalledMarker) -> Fut + Send + Sync + 'static,
     Fut: std::future::Future<Output = Result<bool, E>> + Send + 'static,
     E: std::fmt::Display + 'static,
 {
@@ -1118,7 +1260,7 @@ where
 /// survive, so the parent watches for it explicitly and ends.
 async fn run_with_config<F, Fut, E>(config: Config, check_update: F) -> Result<(), RunError>
 where
-    F: Fn() -> Fut + Send + Sync + 'static,
+    F: Fn(InstalledMarker) -> Fut + Send + Sync + 'static,
     Fut: std::future::Future<Output = Result<bool, E>> + Send + 'static,
     E: std::fmt::Display + 'static,
 {
@@ -1148,7 +1290,16 @@ where
     )
     .map_err(|source| RunError::ApiToken { source })?;
 
-    check_for_updates(&config, &shutdown, &supervisor, check_update).await;
+    // Before the update check, and it has to be: from the moment that check is
+    // running, an update can be installed into a process that is still starting
+    // up, and something has to guarantee the restart even if startup itself
+    // never finishes. The thread sleeps until one of the two flags it watches
+    // goes up, so on every ordinary run it costs nothing but the thread.
+    let enforcement =
+        spawn_restart_watchdog(Arc::clone(&shutdown.update_installed), supervisor.died());
+    // Spawned, not awaited: nothing below waits for a version check. See
+    // [`check_for_updates`].
+    check_for_updates(&config, &shutdown, &supervisor, &enforcement, check_update);
 
     tracing::info!("loaded {} camera(s)", config.cameras.len());
 
@@ -1334,7 +1485,10 @@ where
         handle.abort();
     }
 
-    spawn_restart_watchdog(Arc::clone(&shutdown.update_installed), supervisor.died());
+    // Nothing to start here any more: `enforcement` has been running since
+    // before the update check, and arms itself from the flags whenever they go
+    // up — during startup, during this drain, or not at all.
+    let RestartEnforcement = enforcement;
     graceful_shutdown(
         camera_handles,
         retention_handle,
@@ -1613,12 +1767,181 @@ mod tests {
                 _ => Ok(false),
             })
         };
-        run_update_check_loop_with(Duration::from_millis(1), shutdown.clone(), check).await;
+        run_update_check_loop_with(
+            Duration::from_millis(1),
+            FirstCheck::Immediately,
+            shutdown.clone(),
+            check,
+        )
+        .await;
 
         assert_eq!(calls.load(Ordering::Relaxed), 3, "loop stopped checking");
         assert!(
             !shutdown.update_installed.load(Ordering::Relaxed),
             "a failed check asked for a restart"
+        );
+    }
+
+    /// Whether the answer arrives is not startup's business: this call starts a
+    /// check and returns, and startup only gets to the cameras because it does.
+    ///
+    /// The checker here parks and never answers, which is what a release
+    /// download from a server that accepts the connection and then trickles
+    /// looks like from the inside. What is proved is the one step this test can
+    /// see — that `check_for_updates` returns promptly and leaves the check
+    /// running — not the whole startup sequence, which is pinned by the call
+    /// site being a plain statement rather than an `await`. The `let ()` is the
+    /// other half of that: it stops compiling the moment this becomes something
+    /// with a future to await again.
+    #[tokio::test(start_paused = true)]
+    async fn check_for_updates_returns_without_waiting_for_an_answer() {
+        let config = config_from(&format!("[update]\nenabled = true\n{ONE_CAMERA}"));
+        let shutdown = ShutdownSignal::new();
+        let supervisor = shutdown.supervisor();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&calls);
+        let check = move |_: InstalledMarker| {
+            counter.fetch_add(1, Ordering::Relaxed);
+            std::future::pending::<Result<bool, std::io::Error>>()
+        };
+
+        let past_the_check = tokio::spawn(async move {
+            let enforcement =
+                spawn_restart_watchdog(Arc::clone(&shutdown.update_installed), supervisor.died());
+            check_for_updates(&config, &shutdown, &supervisor, &enforcement, check)
+        });
+        let () = tokio::time::timeout(Duration::from_secs(600), past_the_check)
+            .await
+            .expect("the call waited for a version check that never came back")
+            .expect("it panicked instead of returning");
+
+        // And the check is genuinely running, not skipped: what was given up is
+        // waiting for the answer, not asking the question.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            1,
+            "the call returned without ever starting the check"
+        );
+    }
+
+    /// The cadence from both ends. The startup attempt does not wait for the
+    /// interval — that loop *is* the startup check, and a box that was off
+    /// while a release was published must not run the old binary for another
+    /// twelve hours — and the check after it waits exactly one interval.
+    #[tokio::test(start_paused = true)]
+    async fn the_first_check_of_the_startup_loop_is_immediate() {
+        let shutdown = ShutdownSignal::new();
+        let started = tokio::time::Instant::now();
+        let when = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed = Arc::clone(&when);
+        let signalled = shutdown.clone();
+        let check = move || {
+            let mut seen = observed.lock().expect("checker poisoned");
+            seen.push(started.elapsed());
+            if seen.len() == 2 {
+                signalled.flag.store(true, Ordering::Relaxed);
+            }
+            std::future::ready(Ok::<bool, std::io::Error>(false))
+        };
+
+        run_update_check_loop_with(
+            UPDATE_CHECK_INTERVAL,
+            FirstCheck::Immediately,
+            shutdown.clone(),
+            check,
+        )
+        .await;
+
+        assert_eq!(
+            *when.lock().expect("checker poisoned"),
+            vec![Duration::ZERO, UPDATE_CHECK_INTERVAL],
+            "the first check was not immediate, or the second did not wait its turn"
+        );
+    }
+
+    /// And the half that keeps the supervisor's arithmetic honest: a *restarted*
+    /// attempt waits a whole cadence before its first check, because that is
+    /// what [`RestartLimit::cycling_every`] measures an attempt's uptime
+    /// against. An attempt that checked immediately and died would look like it
+    /// had lasted no time at all, and four such deaths in a row escalate the
+    /// updater to the fatal policy — a restarted NVR every few seconds, over a
+    /// version check that is allowed to fail.
+    ///
+    /// Driven through the real `check_for_updates`, since the flag that
+    /// distinguishes the two lives in the closure it hands the supervisor.
+    #[tokio::test(start_paused = true)]
+    async fn a_restarted_update_check_waits_a_cadence_before_checking() {
+        let config = config_from(&format!("[update]\nenabled = true\n{ONE_CAMERA}"));
+        let shutdown = ShutdownSignal::new();
+        let supervisor = shutdown.supervisor();
+        let started = tokio::time::Instant::now();
+        let when = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed = Arc::clone(&when);
+        let check = move |_: InstalledMarker| {
+            let mut seen = observed.lock().expect("checker poisoned");
+            seen.push(started.elapsed());
+            let first = seen.len() == 1;
+            drop(seen);
+            async move {
+                // The first attempt dies on its first check, which is exactly
+                // the shape whose uptime the restart limit has to judge.
+                assert!(!first, "the first attempt died, as this test intends");
+                Ok::<bool, std::io::Error>(false)
+            }
+        };
+        let enforcement =
+            spawn_restart_watchdog(Arc::clone(&shutdown.update_installed), supervisor.died());
+        check_for_updates(&config, &shutdown, &supervisor, &enforcement, check);
+
+        // Long enough for the restart backoff and one whole cadence after it.
+        tokio::time::sleep(UPDATE_CHECK_INTERVAL * 2).await;
+
+        let seen = when.lock().expect("checker poisoned");
+        assert_eq!(seen[0], Duration::ZERO, "the startup check waited");
+        assert!(
+            seen[1] >= UPDATE_CHECK_INTERVAL,
+            "a restarted attempt checked after only {:?}, so its next death would read as an \
+             attempt that never worked",
+            seen[1]
+        );
+    }
+
+    /// The enforcement is keyed to the state, not to the drain that usually
+    /// notices it. An update installed while startup is still running — which
+    /// is possible now that the check runs beside startup instead of in front
+    /// of it — has to arm this even though no drain has begun and the main task
+    /// may never reach one.
+    #[test]
+    fn the_restart_enforcement_arms_without_a_drain_to_start_it() {
+        let update_installed = Arc::new(AtomicBool::new(false));
+        let task_died = Arc::new(AtomicBool::new(false));
+        let armed = Arc::new(AtomicBool::new(false));
+
+        let (installed, died, reached) = (
+            Arc::clone(&update_installed),
+            Arc::clone(&task_died),
+            Arc::clone(&armed),
+        );
+        std::thread::spawn(move || {
+            wait_for_a_restart_reason(&installed, &died);
+            reached.store(true, Ordering::Relaxed);
+        });
+
+        std::thread::sleep(WATCHDOG_POLL_INTERVAL * 2);
+        assert!(
+            !armed.load(Ordering::Relaxed),
+            "the enforcement armed with nothing to enforce"
+        );
+
+        update_installed.store(true, Ordering::Relaxed);
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while !armed.load(Ordering::Relaxed) && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            armed.load(Ordering::Relaxed),
+            "an installed update did not arm the enforcement on its own"
         );
     }
 
@@ -1629,7 +1952,13 @@ mod tests {
         let shutdown = ShutdownSignal::new();
         shutdown.flag.store(true, Ordering::Relaxed); // as a signal would
         let (check, calls) = scripted_checker(vec![Ok(false)]);
-        run_update_check_loop_with(Duration::from_millis(1), shutdown.clone(), check).await;
+        run_update_check_loop_with(
+            Duration::from_millis(1),
+            FirstCheck::Immediately,
+            shutdown.clone(),
+            check,
+        )
+        .await;
 
         assert_eq!(calls.load(Ordering::Relaxed), 0, "checked during shutdown");
     }
@@ -2075,7 +2404,7 @@ mod tests {
         // next thing startup does — if the bind had not ended it first.
         let (check, calls) = scripted_checker(vec![Ok(false)]);
 
-        let error = run_with_config(config, check)
+        let error = run_with_config(config, move |_: InstalledMarker| check())
             .await
             .expect_err("startup carried on without the socket it is there to serve");
 
@@ -2281,6 +2610,7 @@ mod tests {
                             let check = Arc::clone(&check);
                             run_update_check_loop_with(
                                 Duration::from_millis(1),
+                                FirstCheck::Immediately,
                                 signal.clone(),
                                 move || check(),
                             )

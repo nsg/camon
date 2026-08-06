@@ -1,3 +1,73 @@
+//! The self-updater: what camon does when a newer release of itself exists.
+//!
+//! Once at startup and every twelve hours after that, camon asks GitHub for the
+//! latest release and — if its tag names a version newer than this build —
+//! downloads the binary asset, checks it, runs it to ask what it really is, and
+//! renames it over the binary this process is executing. The process then asks
+//! for the same graceful drain a SIGTERM does, and the service manager starts
+//! the replacement.
+//!
+//! None of that sits on the path that starts the cameras. The check is a
+//! supervised task ([`camon::app`]) spawned during startup and left to run
+//! beside the recording, so a release download that is slow, stalled or
+//! deliberately trickled costs no footage — it used to be awaited inline,
+//! between the HTTP bind and the first camera, where a tarpit could hold an NVR
+//! off the air indefinitely. Off that path it can still do two things to a
+//! recording process: grow it, and never finish. So every request it makes is
+//! bounded by an allocation limit and by one deadline covering the send and the
+//! body together ([`fetch_bounded`]).
+//!
+//! # What it cannot fix by itself
+//!
+//! Some conditions here never heal, and camon has nowhere to report them but
+//! the log — there is no MQTT entity, metric or API field carrying update
+//! state, so the level a line is written at is the whole of who notices.
+//!
+//! One of them is certain enough to shout about: a staged binary this
+//! installation may not execute — a `noexec` mount, a permission camon does not
+//! have. Nothing about that is the release's doing and nothing about waiting
+//! changes it, so it is retried every twelve hours for as long as the box runs
+//! and every attempt says so at `error`, because an operator has to change
+//! something before any release will ever install here.
+//!
+//! The rest are indistinguishable from bad luck and stay at `warn`, which is
+//! where the periodic check logs a failure ([`camon::app`]). A box that cannot
+//! reach GitHub at all and a box whose uplink was down for the minute the check
+//! ran produce exactly the same error, and a release that hangs when asked its
+//! version looks like a release probed on a machine that was too squeezed to
+//! hear the answer — deliberately, since that ambiguity is the whole of
+//! [`ProbeFailure`]'s asymmetry. Raising those to `error` would put a routine
+//! network blip in the same class as a broken installation twice a day, and the
+//! class would stop meaning anything. What an operator has instead is the
+//! repetition: the same warning at every check, twice a day, is the signal.
+//!
+//! # What the checksum does, and what it does not
+//!
+//! Every asset is checked against the `sha256sums.txt` published beside it in
+//! the same release. That is an integrity check and only an integrity check: it
+//! establishes that the bytes which arrived are the bytes the release names, so
+//! a truncated, corrupted, or mirror-mangled download is caught before anything
+//! is executed. It establishes nothing about *authenticity*, because the
+//! checksum document travels the same path from the same release — anything
+//! able to publish or edit a camon release publishes the hash of whatever
+//! binary it likes, and camon verifies it, installs it, and the service manager
+//! starts it as root. The trust root is therefore GitHub's release permissions,
+//! not any cryptography camon itself can check; closing that gap needs a
+//! signature over the release made with a key the binary ships (minisign), and
+//! that is a deliberate, deferred decision rather than an oversight. Until it
+//! lands, `update.enabled` defaults to false and turning it on is a statement
+//! that whoever can publish a camon release is trusted with root on this box.
+//!
+//! # Which installations run this at all
+//!
+//! Only a native install whose config says `update.enabled = true`. The default
+//! is false ([`camon::config`]), and the Home Assistant add-on forces
+//! `--set update.enabled=false` at launch because its container filesystem is
+//! ephemeral and its updates arrive through the add-on store and the Supervisor
+//! instead. So this file is opt-in on bare-metal and systemd installs, and dead
+//! code everywhere else — which is why its failures have to be loud on the few
+//! boxes that do run it.
+
 use std::cmp::Ordering;
 use std::ffi::{OsStr, OsString};
 use std::os::unix::fs::PermissionsExt;
@@ -5,22 +75,51 @@ use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use futures_util::stream::{Stream, StreamExt as _};
 use sha2::{Digest, Sha256};
 
 const GITHUB_API_URL: &str = "https://api.github.com/repos/nsg/camon/releases/latest";
 const CHECKSUMS_ASSET: &str = "sha256sums.txt";
 
-/// This runs before the cameras start, so a stalled request keeps the whole NVR
-/// offline until it gives up.
+/// How long a request may spend finding and reaching the server.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Idle budget: reqwest arms it flat until the response headers arrive, then
-/// per response frame with a reset on each. These requests carry no body, so
-/// the flat phase is only connect-and-wait, and the multi-MB binary download is
-/// bounded by stalling rather than by how long it legitimately takes.
+/// per response frame with a reset on each. It bounds a connection that stops
+/// producing, which is not the same as bounding one that never stops — a body
+/// dripped a byte at a time resets this forever, and is bounded by the
+/// deadlines below instead.
 const READ_TIMEOUT: Duration = Duration::from_secs(30);
-/// Total ceiling for the two small JSON/text requests. The binary download
-/// deliberately has none: a slow link may need minutes for it.
+/// How long each of the two small JSON/text requests gets, all in: connect,
+/// TLS, whatever redirects it follows, and reading the body to its end. Both
+/// are documents a human could read; a server that cannot finish one in half a
+/// minute is not one to take a binary from.
 const METADATA_TIMEOUT: Duration = Duration::from_secs(30);
+/// And how much of them camon will hold. A release index runs to a few tens of
+/// kilobytes and a checksum document to a few hundred bytes, so this is three
+/// orders of magnitude of headroom and still not enough to matter to the box.
+const METADATA_LIMIT: u64 = 4 * 1024 * 1024;
+
+/// How long the release binary gets to arrive, from the first packet of the
+/// request to the last of the body, redirects and all — GitHub answers an asset
+/// URL with one, so a per-body bound would leave the hop before it unbounded.
+///
+/// Derived from the other end: the download has to fit in it at a rate an NVR
+/// necessarily already has. A release asset is around 26 MB today, so ten
+/// minutes asks for about 43 kB/s sustained — a fraction of what one camera's
+/// RTSP stream costs, on a box whose entire job is carrying several of those.
+/// A link too slow for this is a link too slow for camon to be recording over.
+const DOWNLOAD_DEADLINE: Duration = Duration::from_secs(600);
+/// And how many bytes of it camon will allocate for.
+///
+/// The download is buffered whole — it has to be hashed before any of it is
+/// written where it could be executed — so this is memory taken from a process
+/// that is recording, on boxes with a history of being OOM-killed overnight.
+/// That is what sets the number, rather than any guess about how large a
+/// release may one day be: the measured asset is around 26 MB, and two and a
+/// half times that is generous without being an amount a small box would
+/// notice losing. Growth past it is not a silent failure — the update aborts
+/// naming this limit, which is a one-line change away from being raised.
+const DOWNLOAD_LIMIT: u64 = 64 * 1024 * 1024;
 
 /// How long the staged binary gets to say what version it is. It prints one
 /// short line and exits, so this is a hang detector rather than a budget.
@@ -32,11 +131,19 @@ const PROBE_REAP_TIMEOUT: Duration = Duration::from_secs(5);
 /// version line is about forty bytes; a release that writes a diagnostic dump
 /// to stdout instead must not be able to grow this process, which is recording
 /// while the probe runs and may be on a box with a history of OOM kills.
+///
+/// **A limit every deployed camon enforces on every future release.** Reaching
+/// it is a verdict, and the camon applying it is whichever one is *already
+/// installed* — so a future camon that prints four kilobytes at `version` would
+/// be refused by every older deployment there is, permanently, and no change
+/// made in that future camon could undo it. Like [`crate::version_line`], this
+/// is a contract with the installed base rather than a local choice: what
+/// `version` prints has to stay one short line.
 const PROBE_STDOUT_LIMIT: u64 = 4096;
 const PROBE_STDERR_LIMIT: u64 = 4096;
-/// How often, and how many times, the probe re-attempts an exec that failed
-/// with `ETXTBSY` — see the comment at the spawn for why that error is a
-/// moment rather than a state. Half a second total, far past any fork window.
+/// How often, and how many times, the probe re-attempts an exec that failed for
+/// a reason the machine can stop having — see [`spawn_failure_is_transient`].
+/// Half a second total, far past any fork window.
 const EXEC_RETRY_DELAY: Duration = Duration::from_millis(50);
 const EXEC_RETRIES: u32 = 10;
 
@@ -64,7 +171,9 @@ struct Asset {
     browser_download_url: String,
 }
 
-pub async fn check_and_update() -> Result<bool, Box<dyn std::error::Error>> {
+pub async fn check_and_update(
+    installed: camon::app::InstalledMarker,
+) -> Result<bool, Box<dyn std::error::Error>> {
     let current_text = env!("CARGO_PKG_VERSION");
     tracing::info!(version = %current_text, "checking for updates");
     let current = Version::parse(current_text).ok_or_else(|| {
@@ -93,22 +202,29 @@ pub async fn check_and_update() -> Result<bool, Box<dyn std::error::Error>> {
             return Ok(false);
         }
     };
+    // Under the lock, so nothing that looks abandoned is in fact another
+    // updater's working file.
+    sweep_stale_staging(&paths);
     let guard = read_guard(&paths.guard);
 
     let client = reqwest::Client::builder()
         .connect_timeout(CONNECT_TIMEOUT)
         .read_timeout(READ_TIMEOUT)
         .build()?;
-    let release: Release = client
-        .get(GITHUB_API_URL)
-        .header("User-Agent", format!("camon/{current_text}"))
-        .header("Accept", "application/vnd.github.v3+json")
-        .timeout(METADATA_TIMEOUT)
-        .send()
-        .await?
-        .error_for_status()?
-        .json()
-        .await?;
+    let agent = format!("camon/{current_text}");
+    let index = fetch_bounded(
+        open_body(
+            client
+                .get(GITHUB_API_URL)
+                .header("User-Agent", agent.as_str())
+                .header("Accept", "application/vnd.github.v3+json"),
+        ),
+        "the release index",
+        METADATA_LIMIT,
+        METADATA_TIMEOUT,
+    )
+    .await?;
+    let release: Release = serde_json::from_slice(&index)?;
 
     let latest = Version::parse(&release.tag_name).ok_or_else(|| {
         format!(
@@ -160,40 +276,50 @@ pub async fn check_and_update() -> Result<bool, Box<dyn std::error::Error>> {
         .or_else(|| release.assets.iter().find(|a| a.name == "camon"))
         .ok_or("no 'camon-linux-glibc' binary asset found in release")?;
 
-    let bytes = client
-        .get(&asset.browser_download_url)
-        .header("User-Agent", format!("camon/{current_text}"))
-        .send()
-        .await?
-        .error_for_status()?
-        .bytes()
-        .await?;
+    let bytes = fetch_bounded(
+        open_body(
+            client
+                .get(&asset.browser_download_url)
+                .header("User-Agent", agent.as_str()),
+        ),
+        &asset.name,
+        DOWNLOAD_LIMIT,
+        DOWNLOAD_DEADLINE,
+    )
+    .await?;
 
-    // Corruption protection (not a security boundary — an attacker able to swap
-    // the binary asset can swap the checksum too). A failure here is never
-    // recorded as a refusal: a mismatch is what a truncated or corrupted
-    // download looks like, and the next attempt may well succeed.
+    // Corruption protection (not a security boundary — see the trust model at
+    // the top of this file). A failure here is never recorded as a refusal: a
+    // mismatch is what a truncated or corrupted download looks like, and the
+    // next attempt may well succeed.
     let checksums = match release.assets.iter().find(|a| a.name == CHECKSUMS_ASSET) {
         Some(sums_asset) => {
-            let text = client
-                .get(&sums_asset.browser_download_url)
-                .header("User-Agent", format!("camon/{current_text}"))
-                .timeout(METADATA_TIMEOUT)
-                .send()
-                .await?
-                .error_for_status()?
-                .text()
-                .await?;
-            Some(text)
+            let text = fetch_bounded(
+                open_body(
+                    client
+                        .get(&sums_asset.browser_download_url)
+                        .header("User-Agent", agent.as_str()),
+                ),
+                CHECKSUMS_ASSET,
+                METADATA_LIMIT,
+                METADATA_TIMEOUT,
+            )
+            .await?;
+            Some(String::from_utf8_lossy(&text).into_owned())
         }
         None => None,
     };
 
     verify_download(&bytes, &asset.name, checksums.as_deref())?;
 
-    // Every path out of here takes the staging file with it — it is a complete,
-    // executable copy of a release binary sitting next to the real one, and
-    // nothing else ever cleans it up.
+    // Every path this function *returns* by takes the staging file with it — it
+    // is a complete, executable copy of a release binary sitting next to the
+    // real one. The paths that do not return leave it: a process killed here,
+    // or this future dropped by a supervised restart or a shutdown, both of
+    // which now happen while the box is doing everything else it does, since
+    // the check no longer runs alone in front of startup. That is what
+    // `sweep_stale_staging` above is for — one leftover per abandoned attempt,
+    // collected by the next check.
     stage_binary(&paths.staging, &bytes)?;
 
     // The tag is a label a human typed; what the binary says about itself is
@@ -203,15 +329,13 @@ pub async fn check_and_update() -> Result<bool, Box<dyn std::error::Error>> {
     // installed and then discovered a restart later.
     let staged = match probe_version(&paths.staging, VERSION_PROBE_TIMEOUT).await {
         Ok(version) => version,
-        Err(e) => {
+        Err(failure) => {
             let _ = std::fs::remove_file(&paths.staging);
-            return Ok(refuse(
+            return Ok(after_a_failed_probe(
                 &paths,
                 guard.as_ref(),
                 &latest_text,
-                format!(
-                    "the binary in release {latest_text} could not say what version it is: {e}"
-                ),
+                failure,
             ));
         }
     };
@@ -239,38 +363,177 @@ pub async fn check_and_update() -> Result<bool, Box<dyn std::error::Error>> {
         }
     };
 
-    // An ordinary inode swap, running executable or not: nothing opens the live
-    // binary for writing (which is what would earn ETXTBSY), only the directory
-    // entry changes, and this process goes on executing the inode it started
-    // from until it exits, which is when that inode is finally freed.
-    if let Err(e) = std::fs::rename(&paths.staging, &paths.exe) {
-        // Nothing was installed, so the attempt must not stand — three failed
-        // swaps would otherwise block a version that never ran.
-        restore_guard(&paths.guard, guard.as_ref());
-        let _ = std::fs::remove_file(&paths.staging);
-        return Err(format!(
-            "could not replace {} with the {latest_text} binary: {e}",
-            paths.exe.display()
-        )
-        .into());
-    }
-    // The swap is what the rest of this function was protecting, and it is not
-    // durable until the directory holding the name is synced. Not an error to
-    // return: the binary *is* installed, and reporting failure here would leave
-    // the process running the old one and downloading the same release again on
-    // the next check, spending the attempts the guard exists to ration.
-    if let Err(e) = sync_parent(&paths.exe) {
-        tracing::warn!(
-            path = %paths.exe.display(),
-            error = %e,
-            "installed {latest_text} but could not fsync the directory holding it: the new binary \
-             is in place and will start on the restart, but a power cut before the entry reaches \
-             the disk could resolve the name back to the old one"
-        );
+    match publish_staged(&paths, &installed, sync_parent) {
+        Err(e) => {
+            // Nothing was installed, so the attempt must not stand — three
+            // failed swaps would otherwise block a version that never ran.
+            restore_guard(&paths.guard, guard.as_ref());
+            let _ = std::fs::remove_file(&paths.staging);
+            return Err(format!(
+                "could not replace {} with the {latest_text} binary: {e}",
+                paths.exe.display()
+            )
+            .into());
+        }
+        // Not an error to return: the binary *is* installed, and reporting
+        // failure here would leave the process running the old one and
+        // downloading the same release again on the next check, spending the
+        // attempts the guard exists to ration.
+        Ok(Published::Unsynced(e)) => {
+            tracing::warn!(
+                path = %paths.exe.display(),
+                error = %e,
+                "installed {latest_text} but could not fsync the directory holding it: the new \
+                 binary is in place and will start on the restart, but a power cut before the \
+                 entry reaches the disk could resolve the name back to the old one"
+            );
+        }
+        Ok(Published::Durable) => {}
     }
 
     tracing::info!(version = %latest_text, attempt, "update applied successfully");
     Ok(true)
+}
+
+/// How far publishing the staged binary got.
+enum Published {
+    /// Renamed, and the name is on the disk to be found after a power cut.
+    Durable,
+    /// Renamed, but the directory sync did not finish. The binary is installed
+    /// either way — that is what makes this a warning rather than a failure.
+    Unsynced(std::io::Error),
+}
+
+/// Put the staged binary in place, and say so before doing anything else.
+///
+/// Three steps whose *order* is the whole point. The rename is an ordinary
+/// inode swap, running executable or not: nothing opens the live binary for
+/// writing (which is what would earn `ETXTBSY`), only the directory entry
+/// changes, and this process goes on executing the inode it started from until
+/// it exits, which is when that inode is finally freed. The moment it returns,
+/// a replacement binary exists under the name the service manager will start,
+/// and the process is committed to restarting — so that is where the marker is
+/// flipped, before the sync and before anything else on this path.
+///
+/// The sync is what makes the rename survive a power cut, and it is also the
+/// one call here that can wait forever: it opens the parent directory and
+/// `fsync`s it, synchronously, on the filesystem that may be exactly what is
+/// failing. Wedged there with the marker already up, the enforcement thread
+/// still ends the process at its deadline and the replacement still starts.
+/// Wedged there with the marker set afterwards — which is what this used to do,
+/// by way of the updater's return — nothing anywhere knows an update happened,
+/// and the box runs the old binary until someone notices. It is a parameter so
+/// a test can park in it.
+fn publish_staged<S>(
+    paths: &UpdatePaths,
+    installed: &camon::app::InstalledMarker,
+    sync: S,
+) -> std::io::Result<Published>
+where
+    S: FnOnce(&Path) -> std::io::Result<()>,
+{
+    std::fs::rename(&paths.staging, &paths.exe)?;
+    installed.record();
+    match sync(&paths.exe) {
+        Ok(()) => Ok(Published::Durable),
+        Err(e) => Ok(Published::Unsynced(e)),
+    }
+}
+
+/// Send a request and hand back the body without reading any of it: what the
+/// server says its length is, and the frames it will arrive in.
+async fn open_body(
+    request: reqwest::RequestBuilder,
+) -> Result<
+    (
+        Option<u64>,
+        impl Stream<Item = reqwest::Result<bytes::Bytes>>,
+    ),
+    String,
+> {
+    let response = request
+        .send()
+        .await
+        .map_err(|e| format!("the request failed: {e}"))?
+        .error_for_status()
+        .map_err(|e| format!("the server answered with an error: {e}"))?;
+    Ok((response.content_length(), response.bytes_stream()))
+}
+
+/// Fetch a whole response into memory under both bounds camon is able to state:
+/// how many bytes it will allocate for, and how long the request has from its
+/// first packet to the end of its body.
+///
+/// The client's connect and read timeouts bound reaching the server and any
+/// stall between frames. Neither bounds a server that never stalls and never
+/// finishes — a body dripped one byte per second resets the read timeout
+/// forever, and an asset URL that redirects can spend a fresh connect budget on
+/// every hop — and neither bounds how much it drips. Both are the same hazard
+/// here: this reads inside the process that is recording, from a release camon
+/// has not yet decided to trust, so an unbounded body is an unbounded
+/// allocation and an unbounded wait in an NVR. That is why the deadline wraps
+/// the send as well as the read, and why the limit is a limit on the
+/// *allocation*: a body that declares itself oversize is refused before a
+/// single byte of it is fetched, one that lies about its length is abandoned at
+/// the frame that crosses the limit rather than read to its end, and an honest
+/// one is allocated for exactly once instead of being doubled into by a growing
+/// `Vec` — which on a 26 MB release is 26 MB of peak rather than 52.
+///
+/// Both failures name the limit *and* what was attempted against it: a release
+/// that has legitimately outgrown the limit has to be recognisable as that from
+/// one log line.
+async fn fetch_bounded<F, S, B, E>(
+    open: F,
+    what: &str,
+    limit: u64,
+    deadline: Duration,
+) -> Result<Vec<u8>, String>
+where
+    F: std::future::Future<Output = Result<(Option<u64>, S), String>>,
+    S: Stream<Item = Result<B, E>>,
+    B: AsRef<[u8]>,
+    E: std::fmt::Display,
+{
+    let fetch = async {
+        let (declared, body) = open.await.map_err(|e| format!("{what}: {e}"))?;
+        if let Some(declared) = declared {
+            if declared > limit {
+                return Err(oversize(what, declared, limit, "says it is"));
+            }
+        }
+        tokio::pin!(body);
+        // At most the limit, so a server that declares a size it never sends
+        // cannot make camon reserve more than it was already willing to hold.
+        let mut collected: Vec<u8> = Vec::with_capacity(declared.unwrap_or(0).min(limit) as usize);
+        while let Some(chunk) = body.next().await {
+            let chunk = chunk.map_err(|e| format!("{what} could not be read: {e}"))?;
+            let chunk = chunk.as_ref();
+            let would_hold = collected.len() as u64 + chunk.len() as u64;
+            if would_hold > limit {
+                return Err(oversize(what, would_hold, limit, "would have reached"));
+            }
+            collected.extend_from_slice(chunk);
+        }
+        Ok(collected)
+    };
+    match tokio::time::timeout(deadline, fetch).await {
+        Ok(result) => result,
+        Err(_) => Err(format!(
+            "{what} had not finished downloading after {}s — abandoning it",
+            deadline.as_secs()
+        )),
+    }
+}
+
+/// The one message for both ways a body can be too big, so an operator reading
+/// it can tell a release that has honestly grown from a server feeding camon
+/// something it should not: the number that broke the rule, and the rule.
+fn oversize(what: &str, size: u64, limit: u64, verb: &str) -> String {
+    format!(
+        "{what} {verb} {size} bytes, past the {limit} bytes camon will allocate for it — \
+         abandoning the download. A release that has legitimately grown past this limit needs it \
+         raised in the updater"
+    )
 }
 
 /// Write the downloaded binary to its staging path, executable and durable.
@@ -298,11 +561,99 @@ fn stage_binary(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     staged
 }
 
+/// What a probe that produced no version costs the release.
+///
+/// The kinds are not the same fact and must not be written down as if they
+/// were. A binary that *ran* and then exited nonzero, printed nonsense, or
+/// flooded its output has told camon something about itself that no amount of
+/// retrying will change: that is a verdict, and it is worth the guard file it
+/// costs. A probe that never ran — a fork refused for want of memory or process
+/// slots, an exec that lost a race with a camera pipeline's fork — has told
+/// camon nothing about the release at all. It is a fact about the machine at
+/// that moment, on machines whose nightly OOM kill is the reason it happens,
+/// and recording it as a property of the artifact is how a transient shortage
+/// used to blacklist a version until someone deleted a file by hand.
+///
+/// The asymmetry decides every case that could be argued either way, and it is
+/// the same one [`blocked_reason`] is built on: refusing a release that would
+/// have worked costs an operator with a shell, while re-testing one that will
+/// never work costs a download every twelve hours. So the answer timeout is
+/// *not* a verdict — a squeezed box faulting in a fresh 26 MB binary off a slow
+/// card, or a starved runtime that misses the answer it was given, both look
+/// exactly like a hang, and the retry loop above deliberately waits into the
+/// worst instant of that squeeze before even starting the probe.
+#[derive(Debug)]
+enum ProbeFailure {
+    /// The binary ran, and what it did is an answer.
+    Verdict(String),
+    /// The probe could not be run or could not be heard, so there is no answer
+    /// to record.
+    ///
+    /// Usually the machine's doing and usually over by the next check. But the
+    /// bucket is defined by what camon can *tell*, not by what is true, so a
+    /// release that genuinely hangs when asked its version — or leaves a child
+    /// holding the pipe the probe is reading — lands here too, and is fetched
+    /// and probed again every twelve hours for as long as it is the latest
+    /// release, without ever being written down. That is the side of the
+    /// asymmetry this file chose: a download twice a day on a box that is
+    /// otherwise fine, rather than a permanent refusal on a box that was
+    /// briefly short of memory.
+    Unrun(String),
+    /// The same, except that nothing about waiting will change it: this
+    /// installation cannot execute the file it just staged. Recorded against
+    /// the release no more than an [`Self::Unrun`] is — the next release would
+    /// meet the same wall — but said louder, because it needs a person.
+    Impeded(String),
+}
+
+/// Deal with a probe that produced no version.
+///
+/// Returns `false` every way — nothing was installed — but only the verdict
+/// leaves anything behind on disk. The other two differ in volume only: an
+/// impediment is at `error` because it will still be there in twelve hours and
+/// the log is the only place camon can say so.
+fn after_a_failed_probe(
+    paths: &UpdatePaths,
+    previous: Option<&InstallGuard>,
+    version: &str,
+    failure: ProbeFailure,
+) -> bool {
+    match failure {
+        ProbeFailure::Verdict(reason) => refuse(
+            paths,
+            previous,
+            version,
+            format!("the binary in release {version} could not say what version it is: {reason}"),
+        ),
+        ProbeFailure::Unrun(reason) => {
+            tracing::warn!(
+                version,
+                "the binary in release {version} could not be probed on this machine: {reason} — \
+                 this says nothing about the release, so nothing is recorded against it and the \
+                 next check will try it again"
+            );
+            false
+        }
+        ProbeFailure::Impeded(reason) => {
+            tracing::error!(
+                version,
+                staging = %paths.staging.display(),
+                "camon cannot execute the update it staged beside its own binary: {reason} — this \
+                 is not the release's doing and nothing is recorded against it, and nothing camon \
+                 can do will change it: until this installation can run a binary it writes there, \
+                 no release installs"
+            );
+            false
+        }
+    }
+}
+
 /// Refuse this release for good: say why, and write it down so the asset is not
 /// downloaded again every twelve hours to reach the same verdict. Everything
 /// recorded here is a property of the artifact, which only a new release can
 /// change — unlike a checksum mismatch, which is what a corrupt download looks
-/// like and is always retried.
+/// like and is always retried, or a probe that could not run, which is a
+/// property of the machine ([`ProbeFailure`]).
 ///
 /// Returns `false` for the caller to hand on: nothing was installed.
 fn refuse(
@@ -352,14 +703,93 @@ fn assess_staged(staged: &Version, tag: &Version, current: &Version) -> Result<(
     Ok(())
 }
 
+/// Is this a spawn failure the machine can stop having?
+///
+/// Every one of these is about the state of the box at the instant of the fork
+/// or exec, and none of them is about the file being started:
+///
+/// * `EAGAIN`/`ENOMEM` — the kernel would not give this process another task or
+///   the memory to hold it. Routine on a small box under pressure, which is
+///   exactly the box this runs on.
+/// * `EMFILE`/`ENFILE` — no descriptor for the pipes, here or system-wide.
+/// * `ETXTBSY` — the file is open for writing somewhere. The download finished
+///   and closed its own fd, but any thread that forked while it was open — and
+///   the camera pipelines fork ffmpeg all day — handed a copy to a child, and
+///   the file counts as written-to until that child execs or exits. A moment,
+///   not a state.
+/// * `EINTR` — a signal landed in the middle of the call.
+///
+/// `ENOEXEC` is deliberately not here: "this kernel has nothing that can run
+/// this file" is a statement about the artifact — a release built for another
+/// architecture, say — and it will be just as true after every retry, on this
+/// box, forever. That one is a verdict, and what makes it a safe one is that
+/// the guard is keyed by version: a corrected release published tomorrow is a
+/// different key and is fetched and tried as if nothing had happened, so the
+/// worst this can do is stop camon re-downloading the one build that cannot
+/// run here.
+fn spawn_failure_is_transient(error: &std::io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(
+            libc::EAGAIN | libc::ENOMEM | libc::EMFILE | libc::ENFILE | libc::ETXTBSY | libc::EINTR
+        )
+    )
+}
+
+/// Start the probe, retrying the failures that are moments rather than states.
+///
+/// Retrying comes first because most of these last less than one sleep: the
+/// fork window that produces `ETXTBSY` closes as soon as the child that
+/// inherited the descriptor execs, and a memory or task shortage on a box that
+/// is otherwise working is usually over just as quickly. Only one that outlives
+/// half a second of retrying is reported, and even then as something about this
+/// machine rather than about the release.
+async fn spawn_probe<F>(mut attempt: F) -> Result<tokio::process::Child, ProbeFailure>
+where
+    F: FnMut() -> std::io::Result<tokio::process::Child>,
+{
+    let mut retries = EXEC_RETRIES;
+    loop {
+        match attempt() {
+            Ok(child) => return Ok(child),
+            Err(e) if spawn_failure_is_transient(&e) => {
+                if retries == 0 {
+                    return Err(ProbeFailure::Unrun(format!(
+                        "it still could not be started {EXEC_RETRIES} retries later: {e}"
+                    )));
+                }
+                retries -= 1;
+                tokio::time::sleep(EXEC_RETRY_DELAY).await;
+            }
+            Err(e) if e.raw_os_error() == Some(libc::ENOEXEC) => {
+                return Err(ProbeFailure::Verdict(format!(
+                    "this kernel cannot run it at all: {e}"
+                )))
+            }
+            // Anything left is about the staging file or the filesystem holding
+            // it — a directory mounted `noexec`, a permission camon does not
+            // have, a file something else removed — and the next release would
+            // fail here in exactly the same way. Not the artifact's doing, and
+            // not recorded against it; but not something that passes on its own
+            // either, which is the difference `Impeded` carries.
+            Err(e) => {
+                return Err(ProbeFailure::Impeded(format!(
+                    "it could not be started here: {e}"
+                )))
+            }
+        }
+    }
+}
+
 /// Ask a binary what version it is, by running it.
 ///
 /// The bare `version` subcommand rather than `--version`: a camon from before
 /// either existed rejects an unknown subcommand and exits immediately, while it
 /// ignores an unknown flag and would start a second NVR out of the staging
-/// file. Being unable to answer is a refusal, not a fallback — a binary that
-/// cannot state its version cannot be checked against the tag, and it is also
-/// one that may not run at all on this machine.
+/// file. A binary that runs and cannot state its version is refused, not
+/// retried — it cannot be checked against the tag, and only a new release can
+/// change that. A binary that could not be started is a different answer
+/// entirely; [`ProbeFailure`] is where the two are kept apart.
 ///
 /// What this bounds: how long the binary runs, how much of its output is kept,
 /// and its process group, which is killed once it has had its say so anything
@@ -368,19 +798,11 @@ fn assess_staged(staged: &Version, tag: &Version, current: &Version) -> Result<(
 /// accidents, not a hostile binary. What runs here has passed the release
 /// checksum, and if it installs, the service manager starts it as root moments
 /// later anyway.
-async fn probe_version(binary: &Path, timeout: Duration) -> Result<Version, String> {
+async fn probe_version(binary: &Path, timeout: Duration) -> Result<Version, ProbeFailure> {
     use tokio::io::AsyncReadExt as _;
 
-    // The exec can fail with ETXTBSY even though the download finished and its
-    // file was closed: any thread that forks in the window where the writing
-    // fd was open — and the camera pipelines fork ffmpeg all day — hands a
-    // copy of that fd to its child, and the file stays "open for writing"
-    // until the child execs or exits. That is a moment, not a state, so a
-    // short bounded retry outlives it; anything still busy after that is
-    // genuinely being written.
-    let mut retries = EXEC_RETRIES;
-    let mut child = loop {
-        match tokio::process::Command::new(binary)
+    let mut child = spawn_probe(|| {
+        tokio::process::Command::new(binary)
             .arg("version")
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
@@ -389,17 +811,17 @@ async fn probe_version(binary: &Path, timeout: Duration) -> Result<Version, Stri
             .process_group(0)
             .kill_on_drop(true)
             .spawn()
-        {
-            Ok(child) => break child,
-            Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) && retries > 0 => {
-                retries -= 1;
-                tokio::time::sleep(EXEC_RETRY_DELAY).await;
-            }
-            Err(e) => return Err(format!("it could not be run: {e}")),
+    })
+    .await?;
+
+    let group = match child.id() {
+        Some(group) => group,
+        None => {
+            return Err(ProbeFailure::Unrun(
+                "it was gone before it could be probed".to_string(),
+            ))
         }
     };
-
-    let group = child.id().ok_or("it exited before it could be probed")?;
     let mut stdout = child.stdout.take().expect("stdout is piped");
     let mut stderr = child.stderr.take().expect("stderr is piped");
     let mut out = Vec::new();
@@ -424,29 +846,55 @@ async fn probe_version(binary: &Path, timeout: Duration) -> Result<Version, Stri
     kill_group(group);
     let status = tokio::time::timeout(PROBE_REAP_TIMEOUT, child.wait()).await;
 
+    // What the binary said is a verdict; what it did not manage to say in time
+    // is not. The probe reads a process that was started moments after the
+    // exec-retry loop gave the machine every chance to find the resources for
+    // it: on the box this classification exists for, faulting in and linking a
+    // fresh 26 MB binary off a squeezed card can outlast this budget, and a
+    // starved runtime can miss an answer that did arrive. Both would be
+    // recorded as a permanent property of a release that is fine.
     if out.len() as u64 >= PROBE_STDOUT_LIMIT || err.len() as u64 >= PROBE_STDERR_LIMIT {
-        return Err(format!(
-            "it printed more than {PROBE_STDOUT_LIMIT} bytes instead of one version line"
-        ));
+        return Err(ProbeFailure::Verdict(format!(
+            "it printed at least {PROBE_STDOUT_LIMIT} bytes instead of one version line"
+        )));
     }
     if timed_out {
-        return Err(format!("it did not answer within {}s", timeout.as_secs()));
+        return Err(ProbeFailure::Unrun(format!(
+            "it did not answer within {}s",
+            timeout.as_secs()
+        )));
     }
     match status {
         Ok(Ok(status)) if status.success() => {}
         Ok(Ok(status)) => {
-            return Err(format!(
+            return Err(ProbeFailure::Verdict(format!(
                 "it exited with {status}: {}",
                 String::from_utf8_lossy(&err).trim()
+            )))
+        }
+        // Neither of these two is an answer about the binary: the first is this
+        // process losing track of a child it started, the second a process that
+        // will not die even for `SIGKILL`, which on Linux means it is stuck in
+        // the kernel — a machine in trouble, not a release to give up on.
+        Ok(Err(e)) => {
+            return Err(ProbeFailure::Unrun(format!(
+                "it could not be waited for: {e}"
+            )))
+        }
+        Err(_) => {
+            return Err(ProbeFailure::Unrun(
+                "it could not be stopped afterwards".to_string(),
             ))
         }
-        Ok(Err(e)) => return Err(format!("it could not be waited for: {e}")),
-        Err(_) => return Err("it could not be stopped".to_string()),
     }
 
     let stdout = String::from_utf8_lossy(&out);
-    parse_version_output(&stdout)
-        .ok_or_else(|| format!("its output was not a version line: {:?}", stdout.trim()))
+    parse_version_output(&stdout).ok_or_else(|| {
+        ProbeFailure::Verdict(format!(
+            "its output was not a version line: {:?}",
+            stdout.trim()
+        ))
+    })
 }
 
 /// SIGKILL whatever is left of a probe. The usual outcome is `ESRCH` — the
@@ -619,6 +1067,12 @@ struct UpdatePaths {
     lock: PathBuf,
 }
 
+/// What every staging file's name is built from: `<exe>.update.<pid>.tmp`. Kept
+/// as constants because the sweep recognises leftovers by exactly this shape,
+/// and a name that drifted from it would leave them lying there for good.
+const STAGING_PREFIX: &str = ".update.";
+const STAGING_SUFFIX: &str = ".tmp";
+
 impl UpdatePaths {
     fn for_exe(exe: &Path) -> Self {
         Self {
@@ -626,9 +1080,71 @@ impl UpdatePaths {
             // Process-unique: two updaters must not write one staging file, and
             // a leftover whose inode is still being executed cannot be written
             // over at all (ETXTBSY).
-            staging: sibling(exe, &format!(".update.{}.tmp", std::process::id())),
+            staging: sibling(
+                exe,
+                &format!("{STAGING_PREFIX}{}{STAGING_SUFFIX}", std::process::id()),
+            ),
             guard: sibling(exe, ".update-guard"),
             lock: sibling(exe, ".update-lock"),
+        }
+    }
+}
+
+/// Delete staging files left behind by attempts that never got to clean up
+/// after themselves.
+///
+/// Every path that *returns* from [`check_and_update`] removes its own staging
+/// file. The paths that do not return cannot: the process is killed, or the
+/// future is dropped where it was awaiting — by a supervised restart, by the
+/// drain, by the deadline on a download. Each of those leaves a multi-megabyte
+/// file named after a pid that will not come round again, and nothing else in
+/// camon has any reason to look at it. Left alone they accumulate, one per
+/// abandoned attempt, in the directory holding the binary.
+///
+/// Safe under the update lock and only there: the lock is exclusive per
+/// installation, so no other updater has a staging file open, and every
+/// `<exe>.update.*.tmp` beside it is therefore finished with. This process's
+/// own name is skipped anyway — it has not written it yet at this point, and
+/// skipping it costs nothing and removes the one way this could delete a file
+/// still in use. The guard's temporary (`<exe>.update-guard.<pid>.tmp`) does
+/// not match the prefix, which ends in the dot that separates it.
+fn sweep_stale_staging(paths: &UpdatePaths) {
+    let Some(dir) = camon::durable::parent_dir(&paths.exe) else {
+        return;
+    };
+    let Some(prefix) = paths
+        .exe
+        .file_name()
+        .map(|name| format!("{}{STAGING_PREFIX}", name.to_string_lossy()))
+    else {
+        return;
+    };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path == paths.staging {
+            continue;
+        }
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !name.starts_with(&prefix) || !name.ends_with(STAGING_SUFFIX) {
+            continue;
+        }
+        let size = entry.metadata().map(|m| m.len()).unwrap_or_default();
+        match std::fs::remove_file(&path) {
+            Ok(()) => tracing::warn!(
+                path = %path.display(),
+                bytes = size,
+                "removed a staging file from an update that was interrupted before it could clean \
+                 up after itself"
+            ),
+            Err(e) => tracing::warn!(
+                path = %path.display(),
+                error = %e,
+                "could not remove the staging file left by an interrupted update"
+            ),
         }
     }
 }
@@ -696,6 +1212,17 @@ struct InstallGuard {
     /// artifact that only a new release can change.
     #[serde(default)]
     refused: Option<String>,
+    /// Whether the refusal above was reached by a camon that can tell a binary
+    /// which ran and failed from a probe that never ran ([`ProbeFailure`]).
+    ///
+    /// Absent — and so false — in every record written before that distinction
+    /// existed, which is what makes this the migration. Those refusals may have
+    /// been nothing but a fork the kernel refused during a memory squeeze, and
+    /// a box that upgraded mid-quarantine would otherwise stay bricked on one
+    /// forever, so they are not believed: see [`blocked_reason`] for the three
+    /// ways that plays out.
+    #[serde(default)]
+    refusal_classified: bool,
     /// When this record was last written, so a repeated verdict can say how old
     /// it is rather than reading as news.
     last_attempt_unix: u64,
@@ -724,6 +1251,26 @@ fn read_guard(path: &Path) -> Option<InstallGuard> {
 }
 
 /// Why this version must not be fetched and installed again, if it must not.
+///
+/// An unclassified refusal — one written by a camon from before a probe that
+/// could not run was told apart from a binary that ran and failed — is the one
+/// record here that is not believed. It is re-tested, and there are three ways
+/// that ends:
+///
+/// * the re-test reaches a verdict, which is written down classified, and the
+///   release is refused from then on — one extra download, once, ever;
+/// * the re-test succeeds, and a release that was never broken installs — which
+///   is the whole reason for not believing the record;
+/// * the re-test *also* fails to run, which records nothing, so the
+///   unclassified record is still there and grants another re-test on the next
+///   check. On a box that is permanently short of memory that repeats every
+///   twelve hours indefinitely.
+///
+/// The third is the accepted cost, and it is the same steady state a release
+/// with no guard at all would have: a download every twelve hours, bounded by
+/// the cadence, on a box that is already failing at something more important.
+/// It is bought with the asymmetry this whole file is built on — a mistaken
+/// refusal costs an operator with a shell, and there may not be one.
 fn blocked_reason(
     guard: Option<&InstallGuard>,
     version: &str,
@@ -732,11 +1279,21 @@ fn blocked_reason(
 ) -> Option<String> {
     let guard = guard.filter(|guard| guard.version == version)?;
     let ago = describe_age(now.saturating_sub(guard.last_attempt_unix));
-    if let Some(refused) = &guard.refused {
-        return Some(format!(
-            "release {version} was refused {ago} and nothing about it can have changed since: \
-             {refused}"
-        ));
+    match &guard.refused {
+        Some(refused) if guard.refusal_classified => {
+            return Some(format!(
+                "release {version} was refused {ago} and nothing about it can have changed since: \
+                 {refused}"
+            ))
+        }
+        Some(refused) => tracing::warn!(
+            version,
+            "release {version} was refused {ago} by a camon that could not tell a probe which \
+             failed to run from a binary which ran and failed ({refused}) — trying it again. A \
+             verdict this time is recorded and final; a probe that again cannot run records \
+             nothing, and this same line follows every check until one of the other two happens"
+        ),
+        None => {}
     }
     if guard.attempts >= MAX_INSTALL_ATTEMPTS {
         return Some(format!(
@@ -766,6 +1323,7 @@ fn record_attempt(
             version: version.to_string(),
             attempts,
             refused: None,
+            refusal_classified: false,
             last_attempt_unix: unix_now(),
         },
     )?;
@@ -788,6 +1346,9 @@ fn record_refusal(
             version: version.to_string(),
             attempts,
             refused: Some(reason.to_string()),
+            // Written by this camon, which only refuses what a running binary
+            // actually did.
+            refusal_classified: true,
             last_attempt_unix: unix_now(),
         },
     )
@@ -1261,6 +1822,33 @@ mod tests {
         path
     }
 
+    /// What a probe failure was, when the test expects the binary to have run
+    /// and answered badly. Panics on the other kind rather than letting it pass
+    /// as a matching string: the whole point of the distinction is that these
+    /// two are not interchangeable.
+    fn verdict(failure: ProbeFailure) -> String {
+        match failure {
+            ProbeFailure::Verdict(reason) => reason,
+            other => panic!("a binary that answered was written off as unheard: {other:?}"),
+        }
+    }
+
+    fn unrun(failure: ProbeFailure) -> String {
+        match failure {
+            ProbeFailure::Unrun(reason) => reason,
+            other => panic!("a probe with no answer was classified as {other:?}"),
+        }
+    }
+
+    /// The never-healing kind: not recorded against the release either, but
+    /// nothing about waiting fixes it.
+    fn impeded(failure: ProbeFailure) -> String {
+        match failure {
+            ProbeFailure::Impeded(reason) => reason,
+            other => panic!("an installation camon cannot execute in was classified as {other:?}"),
+        }
+    }
+
     /// Also pins the argument: the script answers only to the bare `version`
     /// subcommand, which is the spelling an older camon rejects instead of
     /// starting a second NVR out of the staging file.
@@ -1274,13 +1862,16 @@ mod tests {
              echo 'camon 9.9.9 (v9.9.9)'",
         );
         assert_eq!(
-            probe_version(&bin, VERSION_PROBE_TIMEOUT).await,
-            Ok(version("9.9.9"))
+            probe_version(&bin, VERSION_PROBE_TIMEOUT)
+                .await
+                .expect("a healthy binary was not probed"),
+            version("9.9.9")
         );
     }
 
-    /// Every way a staged binary can fail to identify itself is a refusal: it
-    /// cannot be checked against the tag, and it may not even run here.
+    /// Every way a staged binary that *ran* can fail to identify itself is a
+    /// verdict on the release: it cannot be checked against the tag, and no
+    /// number of retries will change what it printed.
     #[tokio::test]
     async fn test_probe_version_refuses_a_binary_that_cannot_identify_itself() {
         let dir = tempfile::tempdir().unwrap();
@@ -1292,45 +1883,72 @@ mod tests {
             "old",
             "echo 'unknown command: version' >&2\nexit 1",
         );
-        let err = probe_version(&old, VERSION_PROBE_TIMEOUT)
-            .await
-            .unwrap_err();
+        let err = verdict(
+            probe_version(&old, VERSION_PROBE_TIMEOUT)
+                .await
+                .unwrap_err(),
+        );
         assert!(err.contains("exited with"), "got: {err}");
         assert!(err.contains("unknown command: version"), "got: {err}");
 
         let mute = fake_binary(dir.path(), "mute", "echo 'not a version at all'");
-        let err = probe_version(&mute, VERSION_PROBE_TIMEOUT)
-            .await
-            .unwrap_err();
+        let err = verdict(
+            probe_version(&mute, VERSION_PROBE_TIMEOUT)
+                .await
+                .unwrap_err(),
+        );
         assert!(err.contains("not a version line"), "got: {err}");
-
-        let absent = dir.path().join("absent");
-        let err = probe_version(&absent, VERSION_PROBE_TIMEOUT)
-            .await
-            .unwrap_err();
-        assert!(err.contains("could not be run"), "got: {err}");
     }
 
+    /// A binary camon could not start is not a binary camon has judged. The
+    /// staging file being gone is a fault of this installation — a `noexec`
+    /// mount, a permission, a stray cleanup — and would meet the next release
+    /// in exactly the same way, so it is never held against this one; it is the
+    /// kind that does not pass on its own, which is what earns the louder log.
     #[tokio::test]
-    async fn test_probe_version_gives_up_on_a_binary_that_hangs() {
+    async fn a_binary_that_could_not_be_started_is_not_judged_by_the_probe() {
+        let dir = tempfile::tempdir().unwrap();
+        let absent = dir.path().join("absent");
+        let err = impeded(
+            probe_version(&absent, VERSION_PROBE_TIMEOUT)
+                .await
+                .unwrap_err(),
+        );
+        assert!(err.contains("could not be started here"), "got: {err}");
+    }
+
+    /// The probe's own budget is a fact about this box, not about the release.
+    /// Ten seconds is long enough for a binary to print one line and short
+    /// enough to be missed by a box that is being squeezed — faulting in and
+    /// linking a fresh 26 MB binary off a slow card, or a runtime too starved
+    /// to notice the answer — and that squeeze is precisely the state the
+    /// exec-retry loop just finished waiting through.
+    #[tokio::test]
+    async fn a_probe_that_ran_out_of_time_is_not_held_against_the_release() {
         let dir = tempfile::tempdir().unwrap();
         let bin = fake_binary(dir.path(), "hangs", "sleep 30");
-        let err = probe_version(&bin, Duration::from_millis(300))
-            .await
-            .unwrap_err();
+        let err = unrun(
+            probe_version(&bin, Duration::from_millis(300))
+                .await
+                .unwrap_err(),
+        );
         assert!(err.contains("did not answer within"), "got: {err}");
     }
 
     /// An unbounded read here is a memory bomb inside a process that is
-    /// recording: the probe stops reading long before that, and says so.
+    /// recording: the probe stops reading long before that, and says so. What
+    /// it says is a verdict — this is output the binary produced, not an
+    /// answer camon failed to hear.
     #[tokio::test]
     async fn test_probe_version_refuses_a_binary_that_floods_stdout() {
         let dir = tempfile::tempdir().unwrap();
         let bin = fake_binary(dir.path(), "loud", "head -c 1000000 /dev/zero | tr '\\0' x");
-        let err = probe_version(&bin, Duration::from_millis(500))
-            .await
-            .unwrap_err();
-        assert!(err.contains("printed more than"), "got: {err}");
+        let err = verdict(
+            probe_version(&bin, Duration::from_millis(500))
+                .await
+                .unwrap_err(),
+        );
+        assert!(err.contains("printed at least"), "got: {err}");
     }
 
     /// A binary that forks leaves nothing behind: the probe kills its process
@@ -1347,9 +1965,11 @@ mod tests {
                 marker.display()
             ),
         );
-        let err = probe_version(&bin, Duration::from_millis(300))
-            .await
-            .unwrap_err();
+        let err = unrun(
+            probe_version(&bin, Duration::from_millis(300))
+                .await
+                .unwrap_err(),
+        );
         assert!(err.contains("did not answer within"), "got: {err}");
 
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -1357,6 +1977,516 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(300)).await;
         let later = std::fs::metadata(&marker).map(|m| m.len()).unwrap_or(0);
         assert_eq!(after_kill, later, "a forked descendant outlived the probe");
+    }
+
+    /// The failure this classification exists for. A fork the kernel refuses
+    /// for want of memory or task slots is a fact about the box at that instant
+    /// — routine on one that gets OOM-killed overnight, which is the kind of
+    /// box that runs this — and used to be written down as a permanent property
+    /// of the release, blacklisting a version until an operator deleted a file
+    /// by hand. It is retried on the spot instead, and if it is still failing
+    /// afterwards it defers.
+    #[tokio::test(start_paused = true)]
+    async fn a_fork_the_kernel_refused_is_retried_and_then_deferred() {
+        let attempts = std::cell::Cell::new(0u32);
+        let started = tokio::time::Instant::now();
+
+        let failure = spawn_probe(|| {
+            attempts.set(attempts.get() + 1);
+            Err(std::io::Error::from_raw_os_error(libc::EAGAIN))
+        })
+        .await
+        .expect_err("a fork the kernel refused looked like a running binary");
+
+        let reason = unrun(failure);
+        assert!(reason.contains("still could not be started"), "{reason}");
+        assert_eq!(
+            attempts.get(),
+            EXEC_RETRIES + 1,
+            "the transient class did not get the retry policy"
+        );
+        assert_eq!(
+            started.elapsed(),
+            EXEC_RETRY_DELAY * EXEC_RETRIES,
+            "the retries did not wait between attempts"
+        );
+    }
+
+    /// And what the retry is *for*: the window closes and the probe goes ahead
+    /// as if nothing had happened. This is M3's ETXTBSY case — a camera
+    /// pipeline's fork holding a copy of the descriptor the download wrote
+    /// through — which lasts until that child execs and is gone long before the
+    /// retries are.
+    #[tokio::test(start_paused = true)]
+    async fn a_fork_window_that_closes_costs_the_probe_nothing_but_the_wait() {
+        let attempts = std::cell::Cell::new(0u32);
+        let started = tokio::time::Instant::now();
+
+        let child = spawn_probe(|| {
+            attempts.set(attempts.get() + 1);
+            if attempts.get() <= 2 {
+                return Err(std::io::Error::from_raw_os_error(libc::ETXTBSY));
+            }
+            tokio::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg("exit 0")
+                .spawn()
+        })
+        .await;
+
+        let mut child = child.expect("a window that had already closed still refused the probe");
+        assert_eq!(attempts.get(), 3);
+        assert_eq!(
+            started.elapsed(),
+            EXEC_RETRY_DELAY * 2,
+            "the probe waited for more windows than it hit"
+        );
+        // Reaped, so this test leaves no child behind for the next one to find.
+        child.wait().await.expect("the probe's child never exited");
+    }
+
+    /// One attempt each, no retry, for the two that retrying cannot help — and
+    /// they land on opposite sides of the line: a file this kernel has no way
+    /// to execute is a property of the artifact, while one this installation
+    /// may not execute is a property of the installation and would meet every
+    /// future release the same way.
+    #[tokio::test(start_paused = true)]
+    async fn a_binary_this_kernel_cannot_run_is_the_only_start_failure_held_against_it() {
+        for (errno, expected) in [(libc::ENOEXEC, true), (libc::EACCES, false)] {
+            let attempts = std::cell::Cell::new(0u32);
+            let failure = spawn_probe(|| {
+                attempts.set(attempts.get() + 1);
+                Err(std::io::Error::from_raw_os_error(errno))
+            })
+            .await
+            .expect_err("a spawn that failed looked like a running binary");
+
+            assert_eq!(attempts.get(), 1, "errno {errno} was retried");
+            assert_eq!(
+                matches!(failure, ProbeFailure::Verdict(_)),
+                expected,
+                "errno {errno} was classified the wrong way: {failure:?}"
+            );
+        }
+    }
+
+    /// The transient set, named one by one, because the cost of getting a
+    /// member of it wrong is an installation that stops updating until someone
+    /// with a shell notices.
+    #[test]
+    fn every_way_the_machine_can_refuse_a_fork_is_transient() {
+        for errno in [
+            libc::EAGAIN,
+            libc::ENOMEM,
+            libc::EMFILE,
+            libc::ENFILE,
+            libc::ETXTBSY,
+            libc::EINTR,
+        ] {
+            assert!(
+                spawn_failure_is_transient(&std::io::Error::from_raw_os_error(errno)),
+                "errno {errno} is not treated as a moment"
+            );
+        }
+        // And the ones that are not about the machine's state.
+        for errno in [libc::ENOEXEC, libc::EACCES, libc::ENOENT] {
+            assert!(
+                !spawn_failure_is_transient(&std::io::Error::from_raw_os_error(errno)),
+                "errno {errno} is treated as a moment"
+            );
+        }
+    }
+
+    /// The two halves at the seam where they cost something: only one of them
+    /// leaves a guard file behind, and only that one stops the next check.
+    #[test]
+    fn only_a_binary_that_ran_is_written_down_against_the_release() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = UpdatePaths::for_exe(&dir.path().join("camon"));
+
+        for failure in [
+            ProbeFailure::Unrun("no memory for a fork".to_string()),
+            ProbeFailure::Impeded("the directory is mounted noexec".to_string()),
+        ] {
+            assert!(!after_a_failed_probe(&paths, None, "0.6.0", failure));
+            assert_eq!(
+                read_guard(&paths.guard),
+                None,
+                "a probe that produced no answer was recorded as a property of the release"
+            );
+            assert!(
+                blocked_reason(None, "0.6.0", "0.5.0", unix_now()).is_none(),
+                "the next check would not even try again"
+            );
+        }
+
+        assert!(!after_a_failed_probe(
+            &paths,
+            None,
+            "0.6.0",
+            ProbeFailure::Verdict("it exited with signal 11".to_string()),
+        ));
+        let guard = read_guard(&paths.guard).expect("a crashing binary was not written down");
+        assert!(guard.refused.unwrap().contains("signal 11"));
+        assert!(
+            guard.refusal_classified,
+            "this camon's own verdict was recorded as one it could not classify"
+        );
+        let reason = blocked_reason(
+            read_guard(&paths.guard).as_ref(),
+            "0.6.0",
+            "0.5.0",
+            unix_now(),
+        )
+        .expect("a crashing binary would be downloaded again");
+        assert!(reason.contains("signal 11"), "{reason}");
+
+        // The other direction of the same upgrade: the record an older camon
+        // knows how to read is still all there, with the new field added
+        // beside it rather than in place of anything. A downgrade — or a
+        // rollback to the binary that wrote the guard before this one — reads
+        // its own fields and ignores what it does not know.
+        let written = std::fs::read_to_string(&paths.guard).unwrap();
+        for field in [
+            "\"version\"",
+            "\"attempts\"",
+            "\"refused\"",
+            "\"last_attempt_unix\"",
+        ] {
+            assert!(written.contains(field), "{field} is gone from {written}");
+        }
+    }
+
+    /// The upgrade story, in the two endings that settle. A guard written by a
+    /// camon that could not tell the two apart may be recording nothing worse
+    /// than a fork that failed once during a memory squeeze, so it is not
+    /// believed — it is tried again, and a verdict *that* attempt reaches is
+    /// recorded in the new form and is believed forever after. A box that
+    /// upgraded mid-quarantine therefore neither stays bricked on a transient
+    /// failure nor re-downloads a genuinely broken release more than once. What
+    /// the old record still decides unchanged is the attempt count: that half
+    /// never confused the two. The third ending — a re-test that cannot run
+    /// either — is in
+    /// [`a_re_test_that_cannot_run_leaves_the_old_record_where_it_was`].
+    #[test]
+    fn a_refusal_from_a_camon_that_could_not_classify_it_is_tried_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = UpdatePaths::for_exe(&dir.path().join("camon"));
+        std::fs::write(
+            &paths.guard,
+            "{\"version\":\"0.6.0\",\"attempts\":0,\"refused\":\"it could not be run: \
+             Resource temporarily unavailable (os error 11)\",\"last_attempt_unix\":1753600000}",
+        )
+        .unwrap();
+
+        let guard = read_guard(&paths.guard).expect("an older guard was discarded");
+        assert!(guard.refused.is_some());
+        assert!(!guard.refusal_classified);
+        assert!(
+            blocked_reason(Some(&guard), "0.6.0", "0.5.0", unix_now()).is_none(),
+            "a box that upgraded mid-quarantine stays bricked"
+        );
+
+        // Whatever this attempt finds is recorded in the new form — and if it
+        // is a verdict, that is the end of it.
+        after_a_failed_probe(
+            &paths,
+            Some(&guard),
+            "0.6.0",
+            ProbeFailure::Verdict("it exited with signal 11".to_string()),
+        );
+        let guard = read_guard(&paths.guard).expect("the re-test recorded nothing");
+        assert!(guard.refusal_classified);
+        assert!(blocked_reason(Some(&guard), "0.6.0", "0.5.0", unix_now()).is_some());
+
+        // The other half of an old record is untouched: a restart loop counted
+        // by an older camon still stops this one.
+        std::fs::write(
+            &paths.guard,
+            "{\"version\":\"0.7.0\",\"attempts\":3,\"last_attempt_unix\":1753600000}",
+        )
+        .unwrap();
+        let reason = blocked_reason(
+            read_guard(&paths.guard).as_ref(),
+            "0.7.0",
+            "0.5.0",
+            unix_now(),
+        )
+        .expect("an older camon's attempt count stopped counting");
+        assert!(reason.contains("restart is not taking effect"), "{reason}");
+    }
+
+    /// The third way the migration ends, and the one the cost model has to own:
+    /// the re-test cannot run either, so there is nothing to record, so the
+    /// unclassified record is still there and grants another re-test on the
+    /// next check — every twelve hours, indefinitely, on a box that never stops
+    /// being short of memory. That is the accepted price. It is the same steady
+    /// state as a release with no guard at all, it is bounded by the check
+    /// cadence, and the alternative — believing a verdict that may have been
+    /// nothing but a squeezed fork — needs an operator with a shell to undo.
+    #[test]
+    fn a_re_test_that_cannot_run_leaves_the_old_record_where_it_was() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = UpdatePaths::for_exe(&dir.path().join("camon"));
+        let record = "{\"version\":\"0.6.0\",\"attempts\":0,\"refused\":\"it could not be run: \
+                      Resource temporarily unavailable (os error 11)\",\
+                      \"last_attempt_unix\":1753600000}";
+        std::fs::write(&paths.guard, record).unwrap();
+
+        let guard = read_guard(&paths.guard).expect("an older guard was discarded");
+        assert!(blocked_reason(Some(&guard), "0.6.0", "0.5.0", unix_now()).is_none());
+
+        after_a_failed_probe(
+            &paths,
+            Some(&guard),
+            "0.6.0",
+            ProbeFailure::Unrun("no memory for a fork".to_string()),
+        );
+
+        assert_eq!(
+            std::fs::read_to_string(&paths.guard).unwrap(),
+            record,
+            "a re-test that produced no answer rewrote the record anyway"
+        );
+        assert!(
+            blocked_reason(
+                read_guard(&paths.guard).as_ref(),
+                "0.6.0",
+                "0.5.0",
+                unix_now()
+            )
+            .is_none(),
+            "the next check would not try again, so nothing could ever settle this"
+        );
+    }
+
+    /// The instant a replacement binary exists under the running name, the
+    /// thread that guarantees the restart has to know — not when the updater
+    /// gets round to returning, because between those two moments is a
+    /// directory `fsync` on the filesystem that may be exactly what is failing.
+    /// Parked in that sync, this process has the update installed, the
+    /// enforcement running, and — if the flag came later — nothing connecting
+    /// the two, which is the old binary running until someone notices.
+    #[test]
+    fn an_installed_binary_is_recorded_before_the_sync_it_could_wedge_in() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = UpdatePaths::for_exe(&dir.path().join("camon"));
+        let exe = paths.exe.clone();
+        std::fs::write(&exe, b"the old binary").unwrap();
+        std::fs::write(&paths.staging, b"the new binary").unwrap();
+
+        let marker = camon::app::InstalledMarker::new();
+        let (reached_sync, in_sync) = std::sync::mpsc::channel();
+        let (release, held) = std::sync::mpsc::channel();
+        let publisher = {
+            let marker = marker.clone();
+            std::thread::spawn(move || {
+                publish_staged(&paths, &marker, |_| {
+                    reached_sync.send(()).unwrap();
+                    held.recv().unwrap();
+                    Ok(())
+                })
+            })
+        };
+
+        in_sync
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the sync was never reached");
+        assert!(
+            marker.recorded(),
+            "a wedge in the sync would leave the installed update unrecorded"
+        );
+        assert_eq!(
+            std::fs::read(&exe).unwrap(),
+            b"the new binary",
+            "the swap had not happened when the install was recorded"
+        );
+
+        release.send(()).unwrap();
+        assert!(matches!(
+            publisher.join().expect("the publisher panicked"),
+            Ok(Published::Durable)
+        ));
+    }
+
+    /// And nothing is recorded when nothing was installed: a rename that fails
+    /// leaves the old binary in place, so arming the enforcement would end a
+    /// perfectly healthy process for no reason.
+    #[test]
+    fn a_swap_that_never_happened_records_no_install() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = UpdatePaths::for_exe(&dir.path().join("camon"));
+        let marker = camon::app::InstalledMarker::new();
+
+        // No staging file to rename.
+        let published = publish_staged(&paths, &marker, |_| Ok(()));
+
+        assert!(published.is_err());
+        assert!(
+            !marker.recorded(),
+            "a failed swap armed the restart enforcement"
+        );
+    }
+
+    /// Interrupted attempts leave a complete release binary beside the real
+    /// one, and only the next check can collect it: the paths that leak are the
+    /// ones that never return — a killed process, a future dropped by a
+    /// supervised restart or by the drain — and those are ordinary events now
+    /// that the check runs beside everything else camon does.
+    #[test]
+    fn staging_files_from_interrupted_updates_are_collected_by_the_next_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = UpdatePaths::for_exe(&dir.path().join("camon"));
+        let stale = dir.path().join("camon.update.424242.tmp");
+        std::fs::write(&stale, b"a whole release binary").unwrap();
+        std::fs::write(&paths.staging, b"this process's own, not yet written").unwrap();
+
+        // None of these is a staging file, and every one of them is something
+        // an update needs to survive the sweep.
+        let keep = [
+            paths.guard.clone(),
+            paths.lock.clone(),
+            sibling(&paths.guard, ".424242.tmp"),
+            dir.path().join("camon"),
+            dir.path().join("camon-other.update.424242.tmp"),
+        ];
+        for path in &keep {
+            std::fs::write(path, b"x").unwrap();
+        }
+
+        sweep_stale_staging(&paths);
+
+        assert!(!stale.exists(), "a leftover staging file was left to rot");
+        assert!(
+            paths.staging.exists(),
+            "the sweep took the staging file of the process running it"
+        );
+        for path in &keep {
+            assert!(path.exists(), "the sweep took {}", path.display());
+        }
+    }
+
+    /// A body already open, with whatever length the server declared for it.
+    fn declared<I>(length: Option<u64>, chunks: I) -> std::future::Ready<BodyResult<I::IntoIter>>
+    where
+        I: IntoIterator<Item = Result<Vec<u8>, String>>,
+    {
+        std::future::ready(Ok((length, futures_util::stream::iter(chunks))))
+    }
+
+    type BodyResult<S> = Result<(Option<u64>, futures_util::stream::Iter<S>), String>;
+
+    /// A body camon has not decided to trust is read into the memory of a
+    /// process that is recording, on boxes that get OOM-killed as it is. A
+    /// server that says nothing about the length is held to the limit frame by
+    /// frame: this one stops at the limit rather than at the end of the body —
+    /// the stream never ends — and says both numbers, because a release that
+    /// has honestly grown past the limit has to be told apart from a server
+    /// feeding camon something else from one log line.
+    #[tokio::test]
+    async fn a_body_larger_than_the_limit_is_abandoned_by_name() {
+        let body = std::future::ready(Ok((
+            None,
+            futures_util::stream::repeat(Ok::<Vec<u8>, String>(vec![0u8; 4096])),
+        )));
+        let err = fetch_bounded(
+            body,
+            "camon-linux-glibc",
+            64 * 1024,
+            Duration::from_secs(600),
+        )
+        .await
+        .expect_err("an endless body was read to its end");
+
+        assert!(err.contains("camon-linux-glibc"), "{err}");
+        assert!(err.contains("would have reached 69632 bytes"), "{err}");
+        assert!(err.contains("past the 65536 bytes"), "{err}");
+        assert!(err.contains("raised in the updater"), "{err}");
+    }
+
+    /// And a server that *does* say how long the body is is taken at its word
+    /// before a byte of it is fetched — the cheapest possible refusal, and the
+    /// one that keeps the allocation honest: what is reserved up front is what
+    /// the body claims, never more than the limit.
+    #[tokio::test]
+    async fn a_body_that_declares_itself_oversize_is_refused_before_it_is_read() {
+        let body = declared(Some(70_000), [Ok(vec![0u8; 8])]);
+        let err = fetch_bounded(
+            body,
+            "camon-linux-glibc",
+            64 * 1024,
+            Duration::from_secs(600),
+        )
+        .await
+        .expect_err("a body that announced it was too big was downloaded anyway");
+
+        assert!(err.contains("says it is 70000 bytes"), "{err}");
+        assert!(err.contains("past the 65536 bytes"), "{err}");
+    }
+
+    /// The bound neither the read timeout nor a per-body one can provide: a
+    /// server that never stalls and never finishes. The deadline covers the
+    /// request from its first packet, because an asset URL answers with a
+    /// redirect and the hop after it would otherwise start a fresh budget of
+    /// its own. Driven by the paused clock rather than by waiting, so what it
+    /// measures is the deadline and not the machine it runs on.
+    #[tokio::test(start_paused = true)]
+    async fn a_request_that_never_finishes_is_abandoned_at_the_deadline() {
+        let deadline = Duration::from_secs(600);
+
+        // Stalled in the body, one chunk in: the connection is live and every
+        // per-frame timeout is being reset.
+        let started = tokio::time::Instant::now();
+        let body = std::future::ready(Ok((
+            None,
+            futures_util::stream::once(async { Ok::<Vec<u8>, String>(vec![0u8; 8]) })
+                .chain(futures_util::stream::pending()),
+        )));
+        let err = fetch_bounded(body, "camon-linux-glibc", DOWNLOAD_LIMIT, deadline)
+            .await
+            .expect_err("a body that never ended was waited for forever");
+        assert!(err.contains("had not finished downloading"), "{err}");
+        assert!(err.contains("600s"), "{err}");
+        assert_eq!(
+            started.elapsed(),
+            deadline,
+            "the deadline is not what ended the download"
+        );
+
+        // And stalled before that, in the send: connecting, handshaking, or
+        // following redirects. This one would eventually answer — twice the
+        // deadline later — which is how the assertion tells a bound that covers
+        // getting to the body from one that only starts once it is open.
+        let started = tokio::time::Instant::now();
+        let slow_to_open = async {
+            tokio::time::sleep(deadline * 2).await;
+            Ok((
+                None,
+                futures_util::stream::iter(Vec::<Result<Vec<u8>, String>>::new()),
+            ))
+        };
+        let err = fetch_bounded(slow_to_open, "camon-linux-glibc", DOWNLOAD_LIMIT, deadline)
+            .await
+            .expect_err("a request that had not reached a body yet was waited out");
+        assert!(err.contains("had not finished downloading"), "{err}");
+        assert_eq!(
+            started.elapsed(),
+            deadline,
+            "the deadline does not cover getting to the body"
+        );
+    }
+
+    /// The ordinary case, and the boundary: a body exactly the size of the
+    /// limit is not over it, declared or not.
+    #[tokio::test]
+    async fn a_body_within_the_limit_arrives_whole() {
+        for length in [None, Some(8)] {
+            let body = declared(length, [Ok(vec![1u8; 3]), Ok(vec![2u8; 5])]);
+            let collected = fetch_bounded(body, "sha256sums.txt", 8, Duration::from_secs(600))
+                .await
+                .expect("a body inside every bound was refused");
+            assert_eq!(collected, [1, 1, 1, 2, 2, 2, 2, 2], "declared {length:?}");
+        }
     }
 
     /// The case that makes the probe worth having, and the one an "is it newer
