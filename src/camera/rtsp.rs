@@ -471,7 +471,6 @@ struct MpegTsSegmenter {
     /// once at finalize time so readers share it without copying.
     current_data: Vec<u8>,
     video_pid: Option<u16>,
-    audio_pid: Option<u16>,
     pat_packet: Option<[u8; 188]>,
     pmt_packet: Option<[u8; 188]>,
     pmt_pid: Option<u16>,
@@ -496,7 +495,6 @@ impl MpegTsSegmenter {
             current_segment: None,
             current_data: Vec::new(),
             video_pid: None,
-            audio_pid: None,
             pat_packet: None,
             pmt_packet: None,
             pmt_pid: None,
@@ -869,14 +867,6 @@ impl MpegTsSegmenter {
                 self.counts.video_pid = Some(elem_pid);
                 self.video_pid_at = Some(Instant::now());
                 tracing::debug!(camera = %self.camera_id, video_pid = elem_pid, "detected H.264 video PID");
-            }
-
-            // AAC audio stream types: 0x0F (MPEG-2 AAC), 0x11 (MPEG-4 AAC), 0x81 (AC-3)
-            if (stream_type == 0x0F || stream_type == 0x11 || stream_type == 0x81)
-                && self.audio_pid.is_none()
-            {
-                self.audio_pid = Some(elem_pid);
-                tracing::debug!(camera = %self.camera_id, audio_pid = elem_pid, stream_type, "detected audio PID");
             }
 
             pos += 5 + es_info_len;
