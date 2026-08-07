@@ -391,11 +391,11 @@ impl LocalDiskBackend {
 #[async_trait]
 impl WarmStorageBackend for LocalDiskBackend {
     async fn write_event(&self, camera_id: &str, event: &FinishedEvent) -> WriteOutcome {
-        write_event(&self.data_dir, camera_id, event, Some(&self.index)).await
+        write_event(&self.data_dir, camera_id, event, &self.index).await
     }
 
     async fn upgrade_event(&self, camera_id: &str, upgrade: &EventUpgrade) {
-        upgrade_event(&self.data_dir, camera_id, upgrade, Some(&self.index)).await
+        upgrade_event(&self.data_dir, camera_id, upgrade, &self.index).await
     }
 
     async fn prune(
@@ -751,7 +751,7 @@ async fn write_event(
     data_dir: &Path,
     camera_id: &str,
     event: &FinishedEvent,
-    warm_index: Option<&WarmEventIndex>,
+    warm_index: &WarmEventIndex,
 ) -> WriteOutcome {
     let duration_ms = event.duration_ns() / NANOS_PER_MS;
     let segment_count = event.segments.len();
@@ -844,12 +844,10 @@ async fn write_event(
     // Indexed either way: the bytes are on disk under their final name, so the
     // event is served, pruned and counted like any other, and a restart's scan
     // would find it regardless. Only the *guarantee* is missing.
-    if let Some(index) = warm_index {
-        index.insert(
-            camera_id,
-            build_index_entry(event, duration_ms, file_size, filmstrip_frames),
-        );
-    }
+    warm_index.insert(
+        camera_id,
+        build_index_entry(event, duration_ms, file_size, filmstrip_frames),
+    );
     commit_outcome(synced)
 }
 
@@ -895,7 +893,7 @@ async fn upgrade_event(
     data_dir: &Path,
     camera_id: &str,
     upgrade: &EventUpgrade,
-    warm_index: Option<&WarmEventIndex>,
+    warm_index: &WarmEventIndex,
 ) {
     let stem = format!("{}_{}", upgrade.start_pts_ns, upgrade.duration_ms);
     let camera_dir = data_dir.join(camera_id);
@@ -957,32 +955,30 @@ async fn upgrade_event(
              cut could still undo it");
     }
 
-    if let Some(index) = warm_index {
-        let updated = index.update_event(
+    let updated = warm_index.update_event(
+        camera_id,
+        upgrade.start_pts_ns,
+        upgrade.duration_ms,
+        |entry| {
+            entry.event_type = EventType::Object;
+            entry.object_classes = upgrade.object_classes.clone();
+            entry.detections = upgrade.detections.clone();
+            entry.backend = Some(upgrade.backend.clone());
+            entry.model = Some(upgrade.model.clone());
+        },
+    );
+    if !updated {
+        // A retention sweep that snapshotted this event as a movement,
+        // then found `movements/{stem}.ts` already renamed away, drops the
+        // entry as vanished. The footage is fine and now lives under
+        // objects/, so re-index it here rather than leaving it invisible
+        // until the next startup scan re-reads the directory.
+        tracing::warn!(camera = %camera_id, start_pts_ns = upgrade.start_pts_ns,
+            "upgraded event was not in the warm index (pruned mid-upgrade?), re-indexing it");
+        warm_index.insert(
             camera_id,
-            upgrade.start_pts_ns,
-            upgrade.duration_ms,
-            |entry| {
-                entry.event_type = EventType::Object;
-                entry.object_classes = upgrade.object_classes.clone();
-                entry.detections = upgrade.detections.clone();
-                entry.backend = Some(upgrade.backend.clone());
-                entry.model = Some(upgrade.model.clone());
-            },
+            reindexed_upgrade(&dst_ts, &objects, &stem, upgrade).await,
         );
-        if !updated {
-            // A retention sweep that snapshotted this event as a movement,
-            // then found `movements/{stem}.ts` already renamed away, drops the
-            // entry as vanished. The footage is fine and now lives under
-            // objects/, so re-index it here rather than leaving it invisible
-            // until the next startup scan re-reads the directory.
-            tracing::warn!(camera = %camera_id, start_pts_ns = upgrade.start_pts_ns,
-                "upgraded event was not in the warm index (pruned mid-upgrade?), re-indexing it");
-            index.insert(
-                camera_id,
-                reindexed_upgrade(&dst_ts, &objects, &stem, upgrade).await,
-            );
-        }
     }
 
     tracing::info!(
@@ -1346,7 +1342,7 @@ mod tests {
 
         let index = WarmEventIndex::new(&["cam".to_string()], dir.path().to_path_buf());
         let first_pts = event.first_pts;
-        let outcome = write_event(dir.path(), "cam", &event, Some(&index)).await;
+        let outcome = write_event(dir.path(), "cam", &event, &index).await;
         assert_eq!(outcome, WriteOutcome::Written);
 
         // 4 one-second segments (seq 4..=7) => stem "{first_pts}_{4000}".
@@ -1391,7 +1387,8 @@ mod tests {
             assemble_event(&buf, None, "cam", 5, 7, 0, SEC, false, None).unwrap()
         };
 
-        let outcome = write_event(dir.path(), "cam", &event, None).await;
+        let index = WarmEventIndex::new(&["cam".to_string()], dir.path().to_path_buf());
+        let outcome = write_event(dir.path(), "cam", &event, &index).await;
         assert_eq!(outcome, WriteOutcome::Written);
 
         let expected: Vec<u8> = event
@@ -1494,7 +1491,7 @@ mod tests {
         };
 
         let index = WarmEventIndex::new(&["cam".to_string()], dir.path().to_path_buf());
-        let outcome = write_event(dir.path(), "cam", &event, Some(&index)).await;
+        let outcome = write_event(dir.path(), "cam", &event, &index).await;
         assert_eq!(outcome, WriteOutcome::Failed);
         assert!(index
             .find_event(
@@ -1519,7 +1516,7 @@ mod tests {
         let first_pts = event.first_pts;
 
         let index = WarmEventIndex::new(&["cam".to_string()], dir.path().to_path_buf());
-        write_event(dir.path(), "cam", &event, Some(&index)).await;
+        write_event(dir.path(), "cam", &event, &index).await;
 
         let duration_ms = (7 - 5 + 1) * 1000;
         let stem = format!("{}_{}", first_pts, duration_ms);
@@ -1553,7 +1550,7 @@ mod tests {
         let first_pts = event.first_pts;
 
         let index = WarmEventIndex::new(&["cam".to_string()], dir.path().to_path_buf());
-        write_event(dir.path(), "cam", &event, Some(&index)).await;
+        write_event(dir.path(), "cam", &event, &index).await;
         assert_eq!(
             index
                 .find_event("cam", EventRef::new(first_pts, 4000, EventType::Movement))
@@ -1562,7 +1559,7 @@ mod tests {
             EventType::Movement
         );
 
-        upgrade_event(dir.path(), "cam", &upgrade_for(&event), Some(&index)).await;
+        upgrade_event(dir.path(), "cam", &upgrade_for(&event), &index).await;
 
         let stem = format!("{}_4000", first_pts);
         let movements = dir.path().join("cam").join("movements");
@@ -1638,8 +1635,8 @@ mod tests {
         assert_ne!(short_ms, long_ms);
 
         let index = WarmEventIndex::new(&["cam".to_string()], dir.path().to_path_buf());
-        write_event(dir.path(), "cam", &short, Some(&index)).await;
-        write_event(dir.path(), "cam", &long, Some(&index)).await;
+        write_event(dir.path(), "cam", &short, &index).await;
+        write_event(dir.path(), "cam", &long, &index).await;
         assert_eq!(
             index.query("cam", EventPage::unbounded(0, u64::MAX)).len(),
             2
@@ -1650,7 +1647,7 @@ mod tests {
         // lookup this replaced returned an unspecified member of the run, so
         // whichever one was named, the other could be the one rewritten.
         let (target_ms, spared_ms) = (short_ms, long_ms);
-        upgrade_event(dir.path(), "cam", &upgrade_for(&short), Some(&index)).await;
+        upgrade_event(dir.path(), "cam", &upgrade_for(&short), &index).await;
 
         let movements = dir.path().join("cam").join("movements");
         let objects = dir.path().join("cam").join("objects");
@@ -1794,8 +1791,8 @@ mod tests {
         );
 
         let index = WarmEventIndex::new(&["cam".to_string()], dir.path().to_path_buf());
-        write_event(dir.path(), "cam", &event, Some(&index)).await;
-        upgrade_event(dir.path(), "cam", &upgrade_for(&event), Some(&index)).await;
+        write_event(dir.path(), "cam", &event, &index).await;
+        upgrade_event(dir.path(), "cam", &upgrade_for(&event), &index).await;
 
         let json = std::fs::read_to_string(
             dir.path()
@@ -1821,11 +1818,11 @@ mod tests {
         };
         let first_pts = event.first_pts;
         let index = WarmEventIndex::new(&["cam".to_string()], dir.path().to_path_buf());
-        write_event(dir.path(), "cam", &event, Some(&index)).await;
+        write_event(dir.path(), "cam", &event, &index).await;
 
         let mut upgrade = upgrade_for(&event);
         upgrade.continues = true;
-        upgrade_event(dir.path(), "cam", &upgrade, Some(&index)).await;
+        upgrade_event(dir.path(), "cam", &upgrade, &index).await;
 
         // A fresh scan of the directory sees an object event with the
         // continues flag preserved; no stale movement sidecar remains.
@@ -1860,15 +1857,17 @@ mod tests {
         event.filmstrip_frames = Some(std::sync::Arc::new(vec![vec![0xff], vec![0xfe]]));
         let first_pts = event.first_pts;
 
-        // Files on disk, deliberately absent from the index: exactly the state
-        // a racing sweep leaves behind when it unindexes as vanished.
+        // Files on disk, deliberately absent from the index under test:
+        // written through a throwaway index, leaving exactly the state a
+        // racing sweep leaves behind when it unindexes as vanished.
         let index = WarmEventIndex::new(&["cam".to_string()], dir.path().to_path_buf());
-        write_event(dir.path(), "cam", &event, None).await;
+        let writer_index = WarmEventIndex::new(&["cam".to_string()], dir.path().to_path_buf());
+        write_event(dir.path(), "cam", &event, &writer_index).await;
         assert!(index
             .find_event("cam", EventRef::new(first_pts, 4000, EventType::Movement))
             .is_none());
 
-        upgrade_event(dir.path(), "cam", &upgrade_for(&event), Some(&index)).await;
+        upgrade_event(dir.path(), "cam", &upgrade_for(&event), &index).await;
 
         let entry = index
             .find_event("cam", EventRef::new(first_pts, 4000, EventType::Object))
@@ -1954,7 +1953,7 @@ mod tests {
             continues: false,
         };
         // Never written (or already pruned): nothing happens, nothing panics.
-        upgrade_event(dir.path(), "cam", &upgrade, Some(&index)).await;
+        upgrade_event(dir.path(), "cam", &upgrade, &index).await;
         assert!(!dir.path().join("cam").join("objects").exists());
         assert!(index
             .find_event("cam", EventRef::new(12345, 4000, EventType::Movement))
@@ -1973,7 +1972,7 @@ mod tests {
             assemble_continuous_chunk(&buf, "cam", 0, 4, false).unwrap()
         };
         let first_pts = first.first_pts;
-        write_event(dir.path(), "cam", &first, Some(&index)).await;
+        write_event(dir.path(), "cam", &first, &index).await;
 
         // Follow-on chunk: continues == true.
         let second = {
@@ -1981,7 +1980,7 @@ mod tests {
             assemble_continuous_chunk(&buf, "cam", 5, 9, true).unwrap()
         };
         let second_pts = second.first_pts;
-        write_event(dir.path(), "cam", &second, Some(&index)).await;
+        write_event(dir.path(), "cam", &second, &index).await;
 
         let continuous = dir.path().join("cam").join("continuous");
         // Both chunks routed to continuous/.
@@ -2024,7 +2023,7 @@ mod tests {
                 let buf = buffer.read_recover();
                 assemble_continuous_chunk(&buf, "cam", start, last, continues).unwrap()
             };
-            write_event(dir.path(), "cam", &event, Some(&writer_index)).await;
+            write_event(dir.path(), "cam", &event, &writer_index).await;
         }
 
         // A fresh index scanning the same dir must recover type + continues.
