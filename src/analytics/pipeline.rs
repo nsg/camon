@@ -97,9 +97,8 @@ mod skips;
 mod tests;
 
 use decoder_slot::{
-    lend_for_batch, sleep_unless_shutdown, sleep_unless_shutdown_watching, DecoderSpawnRetry,
-    ForkWindow, KeepsDecoder, LongLived, ZeroFrameTripwire, BLIND_DECODER_STREAK,
-    DECODER_SPAWN_SCHEDULE, PRIMING_SEGMENTS,
+    ensure_long_lived, sleep_unless_shutdown, sleep_unless_shutdown_watching, DecoderSpawnRetry,
+    LongLived, ZeroFrameTripwire, BLIND_DECODER_STREAK, DECODER_SPAWN_SCHEDULE, PRIMING_SEGMENTS,
 };
 use framing::{
     apply_detection_mask, crop_frame, normalize_rect, union_rects_padded, union_two_rects,
@@ -249,16 +248,6 @@ pub struct MotionAnalyzer {
     pre_padding_ns: u64,
 }
 
-impl KeepsDecoder<CropDecoder> for MotionAnalyzer {
-    fn slot(&mut self) -> &mut LongLived<CropDecoder> {
-        &mut self.crop_decoder
-    }
-
-    fn camera(&self) -> &str {
-        &self.camera_id
-    }
-}
-
 impl MotionAnalyzer {
     fn new(ctx: AnalyzerContext) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let decoder = FrameDecoder::new()?;
@@ -375,12 +364,12 @@ impl MotionAnalyzer {
         // and nothing else — it sits directly above it. The crop decoder's fork
         // is at the far end of the pass, seconds away on a camera with a
         // backlog, so it is handed the flag rather than this reading of it; see
-        // [`ForkWindow`].
+        // [`ensure_long_lived`].
         if shutdown.load(Ordering::Relaxed) || !self.ensure_decoder_alive(shutdown) {
             return false;
         }
 
-        if let Err(e) = self.process_new_segments(ForkWindow::Open(shutdown)) {
+        if let Err(e) = self.process_new_segments(Some(shutdown)) {
             tracing::error!(
                 camera = %self.camera_id,
                 error = %e,
@@ -404,11 +393,11 @@ impl MotionAnalyzer {
     /// minute of it.
     ///
     /// Nothing forks from here on. That was already true of the frame decoder
-    /// below, which this loop declines to respawn; the passes it runs carry a
-    /// closed [`ForkWindow`] to extend it to the crop decoder, which used to
-    /// fork per batch straight through the drain. Closed is the only thing this
-    /// function can pass — it has no stop flag to offer and wants none — so the
-    /// invariant is the signature's rather than a flag's.
+    /// below, which this loop declines to respawn; the passes it runs carry no
+    /// stop flag to extend it to the crop decoder, which used to fork per batch
+    /// straight through the drain. `None` is the only thing this function can
+    /// pass — it has no stop flag to offer and wants none — so the invariant is
+    /// the signature's rather than a flag's.
     fn drain_tail(&mut self, gate: DrainGate) {
         let mut said_the_decoder_was_gone = false;
         loop {
@@ -424,7 +413,7 @@ impl MotionAnalyzer {
             // the wait is the same wait, held without decoding.
             let decoding = self.decoder.is_alive();
             if decoding {
-                if let Err(e) = self.process_new_segments(ForkWindow::Closed) {
+                if let Err(e) = self.process_new_segments(None) {
                     tracing::error!(
                         camera = %self.camera_id,
                         error = %e,
@@ -563,9 +552,11 @@ impl MotionAnalyzer {
         }
     }
 
+    /// `stop` is the crop decoder's fork window; `None` — the drain's — closes
+    /// it for good. See [`ensure_long_lived`].
     fn process_new_segments(
         &mut self,
-        window: ForkWindow,
+        stop: Option<&AtomicBool>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.sync_settings();
 
@@ -584,7 +575,7 @@ impl MotionAnalyzer {
         let (motion_segments, closed_runs) = self.run_motion_analysis(segments)?;
 
         if !motion_segments.is_empty() {
-            self.process_motion_runs(motion_segments, window);
+            self.process_motion_runs(motion_segments, stop);
         }
 
         // Emit after detection so runs that close in the same batch as their
@@ -1021,19 +1012,26 @@ impl MotionAnalyzer {
 
     // --- Phase 2: Generic frame extraction + detection ---
 
-    fn process_motion_runs(&mut self, segments: Vec<MotionSegment>, window: ForkWindow) {
+    fn process_motion_runs(&mut self, segments: Vec<MotionSegment>, stop: Option<&AtomicBool>) {
         let runs = group_contiguous_runs(segments);
         let (sample_fps, crop_size) = (self.config.sample_fps, self.frame_use.crop_size());
-        lend_for_batch(
-            self,
-            window,
+        // The slot is emptied for the length of the batch — extracting a run
+        // needs the analyzer and its decoder mutably at once — and refilled on
+        // the way out: a batch that dropped the decoder instead would kill the
+        // child and put per-batch forking back, silently.
+        let mut crop = std::mem::take(&mut self.crop_decoder);
+        if ensure_long_lived(
+            &mut crop,
+            stop,
+            &self.camera_id,
+            CropDecoder::is_alive,
             || CropDecoder::new(sample_fps, crop_size),
-            |analyzer, crop| {
-                for run in runs {
-                    analyzer.process_run(run, crop);
-                }
-            },
-        );
+        ) {
+            for run in runs {
+                self.process_run(run, &mut crop);
+            }
+        }
+        self.crop_decoder = crop;
     }
 
     /// Let go of whatever the crop decoder emitted after the last motion batch

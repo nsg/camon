@@ -1,8 +1,6 @@
 use super::*;
 
-use super::decoder_slot::{
-    ensure_long_lived, Respawnable, DECODER_RESTART_BACKOFF, DECODER_SPAWN_BACKOFF_MAX,
-};
+use super::decoder_slot::{DECODER_RESTART_BACKOFF, DECODER_SPAWN_BACKOFF_MAX};
 use super::framing::MIN_CROP_FRACTION;
 use super::sampling::{
     frames_per_segment, halve_past, sample_indices, subsample_tagged, thin_evenly,
@@ -323,28 +321,6 @@ struct CountedChild {
     generation: u32,
 }
 
-impl Respawnable for CountedChild {
-    fn is_alive(&mut self) -> bool {
-        self.alive
-    }
-}
-
-/// A camera that keeps a decoder, standing in for the analyzer so the code
-/// a real batch runs can be driven without an ffmpeg to fork.
-struct TestCamera {
-    slot: LongLived<CountedChild>,
-}
-
-impl KeepsDecoder<CountedChild> for TestCamera {
-    fn slot(&mut self) -> &mut LongLived<CountedChild> {
-        &mut self.slot
-    }
-
-    fn camera(&self) -> &str {
-        "cam"
-    }
-}
-
 /// A stop that has not been requested: what every ordinary pass runs under.
 fn running() -> AtomicBool {
     AtomicBool::new(false)
@@ -352,26 +328,16 @@ fn running() -> AtomicBool {
 
 /// What one motion batch asks of the slot, with the fork counted instead of
 /// made.
-fn ensure_counted(slot: &mut LongLived<CountedChild>, window: ForkWindow, forks: &mut u32) -> bool {
-    ensure_long_lived(slot, window, "cam", || {
-        *forks += 1;
-        Ok(CountedChild {
-            alive: true,
-            generation: *forks,
-        })
-    })
-}
-
-/// One whole motion batch, borrowed decoder and all.
-fn batch_on(
-    camera: &mut TestCamera,
-    window: ForkWindow,
+fn ensure_counted(
+    slot: &mut LongLived<CountedChild>,
+    stop: Option<&AtomicBool>,
     forks: &mut u32,
-    batch: impl FnOnce(&mut LongLived<CountedChild>),
-) {
-    lend_for_batch(
-        camera,
-        window,
+) -> bool {
+    ensure_long_lived(
+        slot,
+        stop,
+        "cam",
+        |child| child.alive,
         || {
             *forks += 1;
             Ok(CountedChild {
@@ -379,45 +345,69 @@ fn batch_on(
                 generation: *forks,
             })
         },
-        |_, crop| batch(crop),
-    );
+    )
 }
 
 /// Up to five fork/exec/kill cycles a second per camera is what a crop
 /// decoder built per batch cost, each one paying ffmpeg's stream probe
 /// again. A batch that finds a living child must use it.
-///
-/// Driven through [`lend_for_batch`] rather than the policy alone, because
-/// the half of this that no policy can state is the return: a batch that
-/// kept the decoder to itself would leave the camera empty and the next
-/// batch would fork. That is per-batch forking again, and the only thing
-/// that used to notice was a test needing a real ffmpeg and two pids.
 #[test]
 fn a_crop_decoder_is_forked_once_and_kept_across_batches() {
     let stop = running();
-    let mut camera = TestCamera {
-        slot: LongLived::default(),
-    };
+    let mut slot = LongLived::default();
     let mut forks = 0;
     let mut children = Vec::new();
-    let window = ForkWindow::Open(&stop);
     for _ in 0..5 {
-        batch_on(&mut camera, window, &mut forks, |crop| {
-            let child = crop.decoder.as_ref().expect("the batch got no decoder");
-            children.push(child.generation);
-            // What an extraction does with the child it was handed.
-            crop.primed_with = PRIMING_SEGMENTS;
-        });
+        assert!(ensure_counted(&mut slot, Some(&stop), &mut forks));
+        let child = slot.decoder.as_ref().expect("the batch got no decoder");
+        children.push(child.generation);
+        // What an extraction does with the child it was handed.
+        slot.primed_with = PRIMING_SEGMENTS;
     }
 
     assert_eq!(forks, 1, "the crop decoder was forked per batch");
     assert_eq!(children, [1; 5], "the batches ran on different children");
     assert!(
-        camera.slot.decoder.is_some(),
+        slot.primed(),
+        "the camera lost what its child had already been told"
+    );
+}
+
+/// The other half of keeping a decoder, which no fork count can state: the
+/// slot is emptied for the length of a batch and must be refilled on the
+/// way out. A batch that dropped the decoder instead would kill the child
+/// and put per-batch forking back, silently.
+///
+/// Driven through [`MotionAnalyzer::process_motion_runs`], where the
+/// take/restore lives. The detached decoder has no child, so the batch runs
+/// nothing and forks nothing — what is pinned is that the decoder, and what
+/// its child had been fed, are still the camera's afterwards.
+#[test]
+fn a_batch_hands_the_crop_decoder_back_to_its_camera() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = test_context("cam", dir.path());
+    let mut analyzer = MotionAnalyzer::with_decoder(ctx, FrameDecoder::dead());
+    let (crop, _frames) = CropDecoder::detached();
+    analyzer.crop_decoder = LongLived {
+        decoder: Some(crop),
+        primed_with: PRIMING_SEGMENTS,
+    };
+
+    analyzer.process_motion_runs(
+        vec![MotionSegment {
+            seq: 1,
+            data: Arc::new(Vec::new()),
+            duration_ns: SEC,
+        }],
+        None,
+    );
+
+    assert!(
+        analyzer.crop_decoder.decoder.is_some(),
         "the batch kept the camera's crop decoder instead of giving it back"
     );
     assert!(
-        camera.slot.primed(),
+        analyzer.crop_decoder.primed(),
         "the camera lost what its child had already been told"
     );
 }
@@ -428,7 +418,7 @@ fn a_crop_decoder_is_forked_once_and_kept_across_batches() {
 #[test]
 fn a_respawned_crop_decoder_is_primed_again_and_only_then() {
     let stop = running();
-    let window = ForkWindow::Open(&stop);
+    let window = Some(&stop);
     let mut slot = LongLived::default();
     let mut forks = 0;
 
@@ -457,7 +447,7 @@ fn the_drain_uses_a_running_crop_decoder_and_forks_no_other() {
     let mut forks = 0;
 
     let mut empty = LongLived::default();
-    assert!(!ensure_counted(&mut empty, ForkWindow::Closed, &mut forks));
+    assert!(!ensure_counted(&mut empty, None, &mut forks));
 
     let mut dead = LongLived {
         decoder: Some(CountedChild {
@@ -466,7 +456,7 @@ fn the_drain_uses_a_running_crop_decoder_and_forks_no_other() {
         }),
         primed_with: PRIMING_SEGMENTS,
     };
-    assert!(!ensure_counted(&mut dead, ForkWindow::Closed, &mut forks));
+    assert!(!ensure_counted(&mut dead, None, &mut forks));
     assert_eq!(forks, 0, "the drain forked a crop decoder");
 
     let mut running_child = LongLived {
@@ -477,7 +467,7 @@ fn the_drain_uses_a_running_crop_decoder_and_forks_no_other() {
         primed_with: PRIMING_SEGMENTS,
     };
     assert!(
-        ensure_counted(&mut running_child, ForkWindow::Closed, &mut forks),
+        ensure_counted(&mut running_child, None, &mut forks),
         "the drain refused a decoder it was already holding"
     );
     assert_eq!(forks, 0);
@@ -492,21 +482,23 @@ fn the_drain_uses_a_running_crop_decoder_and_forks_no_other() {
 fn a_stop_requested_after_the_pass_began_forks_no_crop_decoder() {
     let stop = running();
     // What the top of the pass saw, carried down the way a pass carries it.
-    let window = ForkWindow::Open(&stop);
-    assert!(window.is_open(), "nothing had been requested yet");
+    let window = Some(&stop);
+    assert!(
+        !stop.load(Ordering::Relaxed),
+        "nothing had been requested yet"
+    );
 
     // ... the batch is decoded, and the stop arrives while it is.
     stop.store(true, Ordering::Relaxed);
 
-    let mut camera = TestCamera {
-        slot: LongLived::default(),
-    };
+    let mut slot = LongLived::default();
     let mut forks = 0;
-    batch_on(&mut camera, window, &mut forks, |_| {
-        panic!("a batch ran on a decoder forked after the stop")
-    });
+    assert!(
+        !ensure_counted(&mut slot, window, &mut forks),
+        "a batch ran on a decoder forked after the stop"
+    );
     assert_eq!(forks, 0, "a stop mid-pass still forked a crop decoder");
-    assert!(camera.slot.decoder.is_none());
+    assert!(slot.decoder.is_none());
 }
 
 /// The priming loop's whole reason for this shape: the hot buffer's read
@@ -1122,10 +1114,9 @@ fn a_dead_decoder_still_stops_at_its_drain_bound_and_says_what_went_unscored() {
 /// whatever ffmpeg the box has.
 ///
 /// What carries the refusal down to here is the signature rather than any
-/// state — [`MotionAnalyzer::drain_tail`] holds no stop flag, so
-/// [`ForkWindow::Closed`] is the only window its passes can run in — which
-/// is why the drain is run first and then a batch is put through the window
-/// it leaves behind.
+/// state — [`MotionAnalyzer::drain_tail`] holds no stop flag, so `None` is
+/// the only window its passes can run in — which is why the drain is run
+/// first and then a batch is put through the window it leaves behind.
 #[test]
 fn a_batch_arriving_inside_the_drain_forks_no_crop_decoder() {
     let dir = tempfile::tempdir().unwrap();
@@ -1140,7 +1131,7 @@ fn a_batch_arriving_inside_the_drain_forks_no_crop_decoder() {
             data: Arc::new(Vec::new()),
             duration_ns: SEC,
         }],
-        ForkWindow::Closed,
+        None,
     );
     assert!(
         analyzer.crop_decoder.decoder.is_none(),
@@ -1680,7 +1671,7 @@ fn two_motion_batches_are_extracted_through_one_crop_decoder() {
     };
 
     let stop = running();
-    analyzer.process_motion_runs(batch(3), ForkWindow::Open(&stop));
+    analyzer.process_motion_runs(batch(3), Some(&stop));
     let first = analyzer
         .crop_decoder
         .decoder
@@ -1693,7 +1684,7 @@ fn two_motion_batches_are_extracted_through_one_crop_decoder() {
         "the first batch never primed the child it forked"
     );
 
-    analyzer.process_motion_runs(batch(7), ForkWindow::Open(&stop));
+    analyzer.process_motion_runs(batch(7), Some(&stop));
     let second = analyzer
         .crop_decoder
         .decoder
@@ -1771,15 +1762,15 @@ fn a_batch_leaves_frames_behind_and_the_next_pass_takes_them() {
     // the frames, and that they are there to be taken.
     let settle = || std::thread::sleep(Duration::from_millis(500));
 
-    analyzer.process_motion_runs(batch(3), ForkWindow::Open(&stop));
-    analyzer.process_motion_runs(batch(7), ForkWindow::Open(&stop));
+    analyzer.process_motion_runs(batch(3), Some(&stop));
+    analyzer.process_motion_runs(batch(7), Some(&stop));
     settle();
     assert!(
         analyzer.release_idle_crop_frames() > 0,
         "the batches left nothing behind, so there is nothing here to release"
     );
 
-    analyzer.process_motion_runs(batch(11), ForkWindow::Open(&stop));
+    analyzer.process_motion_runs(batch(11), Some(&stop));
     settle();
     // A pass, driven the way the one above the decoder gate runs: the stop
     // flag ends it immediately afterwards, which is the point — the release

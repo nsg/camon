@@ -1,11 +1,10 @@
-//! Decoder lifecycle machinery: spawn retry/backoff policy, the long-lived
-//! decoder slot kept across batches, and the fork window a shutdown closes.
+//! Decoder lifecycle machinery: spawn retry/backoff policy and the long-lived
+//! decoder slot kept across batches.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::analytics::decoder::CropDecoder;
 use crate::retry::{jittered, RetrySchedule, Streak};
 
 use super::POLL_INTERVAL;
@@ -147,51 +146,6 @@ impl ZeroFrameTripwire {
     }
 }
 
-/// Whether this analyzer may start an ffmpeg *now* — asked where a fork would
-/// happen, not remembered from where the pass began.
-///
-/// The distinction is the whole point. A pass reaches the crop decoder at its
-/// very end, after every segment of the batch has been decoded and scored,
-/// which on a camera working through a backlog is seconds after the pass
-/// started. A stop requested in between has to be seen there, so `Open` carries
-/// the stop flag itself and reads it at the fork rather than passing a copy
-/// down. (The frame decoder needs none of this: its fork sits microseconds
-/// after the check at the top of the pass, and it is left alone.)
-///
-/// `Closed` is what the shutdown drain runs in, and the reason this is an enum
-/// rather than a flag on the analyzer. [`MotionAnalyzer::drain_tail`] holds no
-/// stop flag and needs none — nothing forks from there whatever any flag says —
-/// so the variant it passes carries nothing that could later be made to say
-/// otherwise.
-#[derive(Clone, Copy)]
-pub(super) enum ForkWindow<'a> {
-    Open(&'a AtomicBool),
-    Closed,
-}
-
-impl ForkWindow<'_> {
-    pub(super) fn is_open(self) -> bool {
-        match self {
-            Self::Open(stop_requested) => !stop_requested.load(Ordering::Relaxed),
-            Self::Closed => false,
-        }
-    }
-}
-
-/// A child process the analyzer keeps rather than re-forks. One method, because
-/// one question is all the reuse policy asks of it — and because a test can
-/// answer that question from a counter where production answers it from
-/// `waitpid`.
-pub(super) trait Respawnable {
-    fn is_alive(&mut self) -> bool;
-}
-
-impl Respawnable for CropDecoder {
-    fn is_alive(&mut self) -> bool {
-        CropDecoder::is_alive(self)
-    }
-}
-
 /// A decoder that outlives the batch which first needed it, together with the
 /// one thing its current child has to be told before it is useful.
 pub(super) struct LongLived<D> {
@@ -241,22 +195,29 @@ impl<D> Default for LongLived<D> {
 /// addressed to a particular ffmpeg's stream probe and the replacement has its
 /// own.
 ///
-/// A closed [`ForkWindow`] is the one refusal. Once a stop has been requested
-/// this analyzer starts no new ffmpeg — the same promise
-/// [`MotionAnalyzer::drain_tail`] makes for the frame decoder, and now kept for
-/// this one too, which used to fork per batch straight through the drain. A
-/// decoder already running is still used, so a stop only loses the frames of a
-/// camera whose crop decoder happened to die on the way out.
-pub(super) fn ensure_long_lived<D: Respawnable>(
+/// `stop` is the fork window, read here — at the fork — rather than where the
+/// pass began, seconds earlier on a camera working through a backlog. Once a
+/// stop has been requested this analyzer starts no new ffmpeg — the same
+/// promise [`MotionAnalyzer::drain_tail`] makes for the frame decoder, and now
+/// kept for this one too, which used to fork per batch straight through the
+/// drain: the drain passes `None`, which no flag can reopen. A decoder already
+/// running is still used, so a stop only loses the frames of a camera whose
+/// crop decoder happened to die on the way out.
+///
+/// `is_alive` is a parameter for the same reason `spawn` is: the reuse policy
+/// is worth pinning and no test can fork an ffmpeg, so a test answers from a
+/// counter where production answers from `waitpid`.
+pub(super) fn ensure_long_lived<D>(
     slot: &mut LongLived<D>,
-    window: ForkWindow,
+    stop: Option<&AtomicBool>,
     camera_id: &str,
+    is_alive: impl FnOnce(&mut D) -> bool,
     spawn: impl FnOnce() -> Result<D, std::io::Error>,
 ) -> bool {
-    if slot.decoder.as_mut().is_some_and(D::is_alive) {
+    if slot.decoder.as_mut().is_some_and(is_alive) {
         return true;
     }
-    if !window.is_open() {
+    if !stop.is_some_and(|stop| !stop.load(Ordering::Relaxed)) {
         return false;
     }
     match spawn() {
@@ -275,45 +236,4 @@ pub(super) fn ensure_long_lived<D: Respawnable>(
             false
         }
     }
-}
-
-/// What keeping a decoder across batches asks of whoever keeps it: the slot it
-/// lives in, and the camera a failed fork is reported under.
-///
-/// A trait for one reason. The reuse policy is the part of this worth pinning
-/// and no test can fork an ffmpeg, so the code a camera really runs is written
-/// against a stand-in that can count forks instead of making them — including
-/// the step that is easiest to lose and hardest to see, which is giving the
-/// decoder back at the end of the batch.
-pub(super) trait KeepsDecoder<D> {
-    fn slot(&mut self) -> &mut LongLived<D>;
-    fn camera(&self) -> &str;
-}
-
-/// Lend a batch the decoder its camera keeps, and take it back.
-///
-/// The slot is emptied for the length of the batch because extracting a run
-/// needs the analyzer and its decoder mutably at the same moment, which a field
-/// cannot give. Returning it is not a separate step and must not become one: a
-/// batch that dropped the decoder instead of handing it back would kill the
-/// child on the way out and leave the next batch to fork another — per-batch
-/// forking again, silently, which is the whole thing the slot exists to
-/// prevent.
-///
-/// `batch` runs only when there is a decoder to run it with; see
-/// [`ensure_long_lived`] for when there is not.
-pub(super) fn lend_for_batch<O, D>(
-    owner: &mut O,
-    window: ForkWindow,
-    spawn: impl FnOnce() -> Result<D, std::io::Error>,
-    batch: impl FnOnce(&mut O, &mut LongLived<D>),
-) where
-    O: KeepsDecoder<D>,
-    D: Respawnable,
-{
-    let mut lent = std::mem::take(owner.slot());
-    if ensure_long_lived(&mut lent, window, owner.camera(), spawn) {
-        batch(owner, &mut lent);
-    }
-    *owner.slot() = lent;
 }
