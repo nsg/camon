@@ -65,36 +65,40 @@ impl RunFilmstrip {
         if frames.is_empty() {
             return None;
         }
-        Some(Arc::new(subsample_filmstrip(frames)))
+        Some(Arc::new(pick_four(frames)))
     }
 }
 
-fn subsample_filmstrip(frames: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
-    let n = frames.len();
-    if n <= FILMSTRIP_FRAMES {
-        return frames;
-    }
-    let picks = [0, n / 3, 2 * n / 3, n - 1];
-    frames
-        .into_iter()
-        .enumerate()
-        .filter(|(i, _)| picks.contains(i))
-        .map(|(_, frame)| frame)
-        .collect()
-}
-
+/// The positions [`pick_four`] keeps out of `len` entries: all of them up to
+/// [`FILMSTRIP_FRAMES`], then first, thirds and last.
 pub(super) fn sample_indices(len: usize) -> Vec<usize> {
-    if len <= 4 {
+    if len <= FILMSTRIP_FRAMES {
         (0..len).collect()
     } else {
         vec![0, len / 3, 2 * len / 3, len - 1]
     }
 }
 
+/// Keep at most [`FILMSTRIP_FRAMES`] items at the positions [`sample_indices`]
+/// yields. Items are moved out, not indexed and cloned: a kept frame can be a
+/// whole raw RGB image, several megabytes at the detection crop size.
+pub(super) fn pick_four<T>(items: Vec<T>) -> Vec<T> {
+    if items.len() <= FILMSTRIP_FRAMES {
+        return items;
+    }
+    let picks = sample_indices(items.len());
+    items
+        .into_iter()
+        .enumerate()
+        .filter(|(i, _)| picks.contains(i))
+        .map(|(_, item)| item)
+        .collect()
+}
+
 /// Frames kept out of one segment's decode, given how many segments the run
 /// contributes. [`sample_indices`] has already spread those segments over the
 /// run and the final pick is positional — it never compares pixels — so one
-/// frame per segment is all [`subsample_tagged`] strictly needs; the spare is
+/// frame per segment is all [`pick_four`] strictly needs; the spare is
 /// what keeps a segment that decoded short, or a pipe running a frame behind
 /// its segments, from costing the strip a picture it cannot backfill.
 pub(super) fn frames_per_segment(segments: usize) -> usize {
@@ -113,11 +117,11 @@ pub(super) const RUN_FRAME_ACCUMULATOR_CAP: usize = 9;
 /// crop tag was measured on, and the last is the furthest whatever moved has
 /// travelled by the time the next segment starts.
 ///
-/// The two picks over a whole run — [`subsample_filmstrip`] and
-/// [`subsample_tagged`] — instead space themselves at `n/3` and land on the
-/// last frame only by way of `n - 1`. They are picking moments out of an event,
-/// where the exact endpoints carry nothing in particular; this is picking
-/// frames out of one segment, where they carry the two things above.
+/// The pick over a whole run — [`pick_four`] — instead spaces itself at `n/3`
+/// and lands on the last frame only by way of `n - 1`. It is picking moments
+/// out of an event, where the exact endpoints carry nothing in particular;
+/// this is picking frames out of one segment, where they carry the two things
+/// above.
 pub(super) fn thin_evenly<T>(frames: Vec<T>, keep: usize) -> Vec<T> {
     let n = frames.len();
     if n <= keep {
@@ -187,26 +191,7 @@ pub(super) fn sample_run_frames(
         }));
     }
 
-    subsample_tagged(all_frames)
-}
-
-pub(super) fn subsample_tagged(
-    frames: Vec<(RgbFrame, Option<NormalizedRect>)>,
-) -> Vec<(RgbFrame, Option<NormalizedRect>)> {
-    if frames.len() <= 4 {
-        return frames;
-    }
-    let n = frames.len();
-    // Moved out rather than indexed and cloned, as in [`subsample_filmstrip`]:
-    // a kept frame is a whole raw RGB image, several megabytes at the detection
-    // crop size.
-    let picks = [0, n / 3, 2 * n / 3, n - 1];
-    frames
-        .into_iter()
-        .enumerate()
-        .filter(|(i, _)| picks.contains(i))
-        .map(|(_, tagged)| tagged)
-        .collect()
+    pick_four(all_frames)
 }
 
 /// JPEG quality for frames sent to the vision model and served to the UI.

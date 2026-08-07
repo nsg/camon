@@ -1181,7 +1181,7 @@ impl MotionAnalyzer {
     }
 
     /// Decode the sampled segments of one run down to the handful of frames
-    /// [`subsample_tagged`] can still use, holding no more than
+    /// [`pick_four`](sampling::pick_four) can still use, holding no more than
     /// [`RUN_FRAME_ACCUMULATOR_CAP`] of them at once.
     ///
     /// A child that is not yet past its stream probe is fed towards it first —

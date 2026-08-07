@@ -3,7 +3,7 @@ use super::*;
 use super::decoder_slot::{DECODER_RESTART_BACKOFF, DECODER_SPAWN_BACKOFF_MAX};
 use super::framing::MIN_CROP_FRACTION;
 use super::sampling::{
-    frames_per_segment, halve_past, sample_indices, subsample_tagged, thin_evenly,
+    frames_per_segment, halve_past, pick_four, sample_indices, thin_evenly,
     FILMSTRIP_ACCUMULATOR_CAP, RUN_FRAME_ACCUMULATOR_CAP,
 };
 use super::skips::SKIP_REPORT_INTERVAL;
@@ -2174,7 +2174,7 @@ fn run_filmstrip_close_does_not_steal_the_next_runs_frames() {
 /// which frames survive — and that each keeps its own crop tag — has to be
 /// pinned: taking the wrong index is invisible in a filmstrip.
 #[test]
-fn subsample_tagged_keeps_four_frames_spread_over_the_run() {
+fn pick_four_keeps_four_frames_spread_over_the_run() {
     fn tagged(n: usize) -> Vec<(RgbFrame, Option<NormalizedRect>)> {
         (0..n)
             .map(|i| {
@@ -2204,13 +2204,13 @@ fn subsample_tagged_keeps_four_frames_spread_over_the_run() {
     }
 
     // Four or fewer are all kept, untouched.
-    assert_eq!(picked(subsample_tagged(tagged(4))), vec![0, 1, 2, 3]);
+    assert_eq!(picked(pick_four(tagged(4))), vec![0, 1, 2, 3]);
     // Five is the first length past the short-circuit, and the one where
     // the four picks pack tightest — a collision would silently return
     // three frames.
-    assert_eq!(picked(subsample_tagged(tagged(5))), vec![0, 1, 3, 4]);
-    assert_eq!(picked(subsample_tagged(tagged(6))), vec![0, 2, 4, 5]);
-    assert_eq!(picked(subsample_tagged(tagged(12))), vec![0, 4, 8, 11]);
+    assert_eq!(picked(pick_four(tagged(5))), vec![0, 1, 3, 4]);
+    assert_eq!(picked(pick_four(tagged(6))), vec![0, 2, 4, 5]);
+    assert_eq!(picked(pick_four(tagged(12))), vec![0, 4, 8, 11]);
 }
 
 #[test]
