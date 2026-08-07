@@ -2,8 +2,9 @@
 //!
 //! Both storage backends — [`LocalDiskBackend`](crate::storage::LocalDiskBackend)
 //! and [`StathostBackend`](crate::storage::StathostBackend) — keep the same
-//! thing in memory: per camera, a list of [`WarmEventEntry`] sorted by start
-//! PTS, answering the API's `query`/`find_event` and driving retention. Only
+//! thing in memory: per camera, a list of [`WarmEventEntry`] sorted in
+//! [`page_key`] order, answering the API's `query`/`find_event` and driving
+//! retention. Only
 //! the *objects* differ (files in a directory tree versus keys on an HTTP
 //! store), so only the object I/O is the backends' own; everything above it
 //! lives here and is written once.
@@ -16,10 +17,10 @@
 //! trait for the argument in full.
 //!
 //! Every lookup — the read path's `find_event` included — names an entry by a
-//! whole key and walks the run of equal starts ([`position`]). There is no
-//! by-start-PTS variant to reach for: nothing makes a start unique, so a binary
-//! search on one returns an arbitrary member of its run, which on the read path
-//! meant serving the wrong recording of a same-start pair. What an API request
+//! whole key ([`position`]). There is no by-start-PTS variant to reach for:
+//! nothing makes a start unique, so a lookup on one returns an arbitrary
+//! member of its run, which on the read path meant serving the wrong recording
+//! of a same-start pair. What an API request
 //! names is an [`EventRef`], and each backend narrows that to the identity its
 //! own layout has.
 
@@ -235,9 +236,11 @@ pub(crate) fn deduplicate_detections(details: &[DetectionDetail]) -> Vec<(String
 pub(crate) trait EventIdentity: Copy + Eq {
     /// The identity of an entry already in hand.
     fn of(entry: &WarmEventEntry) -> Self;
-    /// The start PTS this key sorts and searches under. Every identity has one:
-    /// it is the index's sort key.
-    fn start_pts_ns(self) -> u64;
+    /// This key's place in [`page_key`]'s order — what every list is sorted by
+    /// — relative to an entry. `Equal` exactly where `of` would yield this
+    /// key: each identity spells enough of the full key to be unique in its
+    /// own index.
+    fn cmp_entry(self, entry: &WarmEventEntry) -> std::cmp::Ordering;
 }
 
 /// The whole identity of one event, as an API request spells it: the composite
@@ -313,20 +316,22 @@ impl EventIdentity for (u64, EventType, u32) {
         (entry.start_pts_ns, entry.event_type, entry.duration_ms)
     }
 
-    fn start_pts_ns(self) -> u64 {
-        self.0
+    fn cmp_entry(self, entry: &WarmEventEntry) -> std::cmp::Ordering {
+        (self.0, self.2, self.1.as_str()).cmp(&page_key(entry))
     }
 }
 
 /// The remote store: every object of an event is built from one stem,
-/// `{start_pts_ns}_{duration_ms}`, and the type is inside the sidecar.
+/// `{start_pts_ns}_{duration_ms}`, and the type is inside the sidecar. The
+/// key is a prefix of [`page_key`], and no two entries here share one — the
+/// type never has to break a tie this identity cannot see.
 impl EventIdentity for (u64, u32) {
     fn of(entry: &WarmEventEntry) -> Self {
         (entry.start_pts_ns, entry.duration_ms)
     }
 
-    fn start_pts_ns(self) -> u64 {
-        self.0
+    fn cmp_entry(self, entry: &WarmEventEntry) -> std::cmp::Ordering {
+        self.cmp(&(entry.start_pts_ns, entry.duration_ms))
     }
 }
 
@@ -376,21 +381,17 @@ pub struct EmergencyOutcome {
     pub missing: u64,
 }
 
-/// Position of the entry with this key. Entries are sorted by start PTS, which
-/// repeats across types and durations, so the run of equal starts is walked
-/// rather than trusting a single binary-search hit.
+/// Position of the entry with this key: a binary search in [`page_key`]'s
+/// order, which every list is kept sorted in and each identity is unique
+/// under.
 fn position<K: EventIdentity>(entries: &[WarmEventEntry], key: K) -> Option<usize> {
-    let start = key.start_pts_ns();
-    let from = entries.partition_point(|e| e.start_pts_ns < start);
-    entries[from..]
-        .iter()
-        .take_while(|e| e.start_pts_ns == start)
-        .position(|e| K::of(e) == key)
-        .map(|i| from + i)
+    entries
+        .binary_search_by(|e| key.cmp_entry(e).reverse())
+        .ok()
 }
 
-/// The total order a listing is cut into pages on: start PTS, then duration,
-/// then the event type's wire name.
+/// The total order the lists are kept sorted in and a listing is cut into
+/// pages on: start PTS, then duration, then the event type's wire name.
 ///
 /// Start alone will not do, and the reason is not exotic. A box with no working
 /// clock stamps every event `0` ([`wall_clock_ns`](crate::buffer::wall_clock_ns)
@@ -434,7 +435,8 @@ pub enum EventCursor {
 }
 
 impl EventCursor {
-    /// Whether an entry with this key is below the cursor.
+    /// Whether an entry with this key is below the cursor. Monotone in
+    /// [`page_key`]'s order, so a sorted list binary-searches on it.
     fn admits(self, key: (u64, u32, &'static str)) -> bool {
         match self {
             EventCursor::Start(start_pts_ns) => key.0 < start_pts_ns,
@@ -445,17 +447,6 @@ impl EventCursor {
                     event.event_type.as_str(),
                 )
             }
-        }
-    }
-
-    /// The largest start PTS a page under this cursor can still hold, and
-    /// whether entries starting exactly there are candidates. Lets the walk
-    /// binary-search past everything newer instead of rejecting it one entry at
-    /// a time.
-    fn newest_start(self) -> (u64, bool) {
-        match self {
-            EventCursor::Start(start_pts_ns) => (start_pts_ns, false),
-            EventCursor::Event(event) => (event.start_pts_ns, true),
         }
     }
 }
@@ -510,96 +501,32 @@ impl EventPage {
     }
 }
 
-/// A candidate entry beside the key it is ranked by, so the selection below can
-/// hold a page's worth of *references* and clone only what it keeps.
-struct Ranked<'a> {
-    key: (u64, u32, &'static str),
-    entry: &'a WarmEventEntry,
-}
-
-impl Ord for Ranked<'_> {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.key.cmp(&other.key)
-    }
-}
-
-impl PartialOrd for Ranked<'_> {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl PartialEq for Ranked<'_> {
-    fn eq(&self, other: &Self) -> bool {
-        self.key == other.key
-    }
-}
-
-impl Eq for Ranked<'_> {}
-
-/// The greatest `limit` entries of `newest_first` that are below `before` and
-/// reach into the window, returned in ascending [`page_key`] order.
+/// The greatest `limit` entries of `newest_first` that reach into the window,
+/// returned in ascending [`page_key`] order.
 ///
 /// Takes an iterator rather than a slice so the walk itself is the seam: what
 /// this pulls is what the caller's read lock is held across, and a test can
-/// count it (see `a_page_walks_only_as_far_as_its_limit`).
-///
-/// `limit` is a hard cap on the *clones*, which is what the lock is really paid
-/// in. Scanning past it is not: entries sharing a start PTS lie in the list in
-/// insertion order, which is no order at all, so the greatest `limit` of a run
-/// cannot be found without looking at the run — and on a no-RTC box the run is
-/// the archive (see [`page_key`]). The selection is therefore a bounded heap of
-/// references: up to log-of-`limit` comparisons per entry scanned (each entry
-/// that beats the heap's minimum costs a replacement), one clone per entry
-/// actually served. The walk still stops early wherever the ordering allows it
-/// — as soon as an entry starts before everything already selected, nothing
-/// after it can reach the page, and starts only descend from here.
+/// count it (see `a_page_walks_only_as_far_as_its_limit`). The `from_ns`
+/// filter is why it is a walk at all: a long event can start far before the
+/// window and still reach into it, so "ends after `from_ns`" is not monotone
+/// in the sort order and cannot be binary-searched.
 fn page_of<'a>(
     newest_first: impl Iterator<Item = &'a WarmEventEntry>,
     from_ns: u64,
-    before: Option<EventCursor>,
     limit: usize,
 ) -> Vec<WarmEventEntry> {
-    if limit == 0 {
-        return Vec::new();
-    }
-    // Never sized from `limit`: that number comes from a request, and a
-    // reservation the archive cannot fill is a hostile allocation.
-    let mut selected: std::collections::BinaryHeap<std::cmp::Reverse<Ranked<'a>>> =
-        std::collections::BinaryHeap::new();
-    for entry in newest_first {
-        let key = page_key(entry);
-        let full = selected.len() >= limit;
-        if full {
-            let smallest = selected.peek().expect("a full page has a smallest").0.key;
-            if key.0 < smallest.0 {
-                break;
-            }
-            if key <= smallest {
-                continue;
-            }
-        }
-        if before.is_some_and(|cursor| !cursor.admits(key)) {
-            continue;
-        }
-        if entry.end_pts_ns() < from_ns {
-            continue;
-        }
-        if full {
-            selected.pop();
-        }
-        selected.push(std::cmp::Reverse(Ranked { key, entry }));
-    }
-    let mut page: Vec<Ranked> = selected.into_iter().map(|ranked| ranked.0).collect();
-    page.sort();
-    page.into_iter()
-        .map(|ranked| ranked.entry.clone())
-        .collect()
+    let mut page: Vec<WarmEventEntry> = newest_first
+        .filter(|e| e.end_pts_ns() >= from_ns)
+        .take(limit)
+        .cloned()
+        .collect();
+    page.reverse();
+    page
 }
 
 /// The per-camera event lists both backends index into, keyed by `K`.
 ///
-/// Every list is sorted by `start_pts_ns` and every entry is unique under `K`;
+/// Every list is sorted in [`page_key`] order and every entry is unique under `K`;
 /// [`insert`](Self::insert) maintains both. `used_bytes` is maintained as the
 /// sum of indexed `file_size` — the remote backend measures its storage budget
 /// against it, and keeping it here rather than beside the budget is what stops
@@ -693,7 +620,7 @@ impl<K: EventIdentity> EventIndex<K> {
         let Some(lock) = self.cameras.get(camera_id) else {
             return;
         };
-        entries.sort_by_key(|e| e.start_pts_ns);
+        entries.sort_unstable_by_key(page_key);
         let added: u64 = entries.iter().map(WarmEventEntry::stored_bytes).sum();
         let removed: u64 = {
             let mut slot = lock.write_recover();
@@ -763,10 +690,10 @@ impl<K: EventIdentity> EventIndex<K> {
         entries: &mut Vec<WarmEventEntry>,
         entry: WarmEventEntry,
     ) -> Option<WarmEventEntry> {
-        match position(entries, K::of(&entry)) {
-            Some(i) => Some(std::mem::replace(&mut entries[i], entry)),
-            None => {
-                let pos = entries.partition_point(|e| e.start_pts_ns < entry.start_pts_ns);
+        let key = K::of(&entry);
+        match entries.binary_search_by(|e| key.cmp_entry(e).reverse()) {
+            Ok(i) => Some(std::mem::replace(&mut entries[i], entry)),
+            Err(pos) => {
                 #[cfg(test)]
                 self.shifted_entries
                     .fetch_add((entries.len() - pos) as u64, Ordering::Relaxed);
@@ -902,12 +829,13 @@ impl<K: EventIdentity> EventIndex<K> {
     /// One page of the events overlapping [`EventPage`]'s window, in ascending
     /// [`page_key`] order. An inverted range is empty.
     ///
-    /// Entries are ordered by start PTS only, so the upper bound binary-searches
-    /// but the lower one cannot: a long event (a continuous chunk) can start
-    /// far before the window and still reach into it, and "ends after `from_ns`"
-    /// is not monotone in start order. The candidate prefix is walked instead —
-    /// newest first, so that the walk *stops* at the page's limit rather than
-    /// running the archive's whole length.
+    /// The upper bound and the cursor both binary-search — each is a bound in
+    /// the order the list is sorted in — but the lower one cannot: a long
+    /// event (a continuous chunk) can start far before the window and still
+    /// reach into it, and "ends after `from_ns`" is not monotone in the sort
+    /// order. The candidate prefix is walked instead — newest first, so that
+    /// the walk *stops* at the page's limit rather than running the archive's
+    /// whole length.
     ///
     /// This is what the read lock is held for, and it is deliberately all it is
     /// held for: at most `limit` entries are cloned here, and everything a
@@ -920,15 +848,10 @@ impl<K: EventIdentity> EventIndex<K> {
     /// years-deep archive under it stalled recording for as long as the copy
     /// took.
     ///
-    /// What the page bounds is the copying, and not in every case the walking.
-    /// Two things can still make a walk long, and both are comparisons against
-    /// entries already in RAM — no clone, no allocation — where the old
-    /// behaviour did the same walk *and* cloned every hit: a request naming a
-    /// narrow `from_ns` high up a deep archive walks past everything below the
-    /// window without filling its page, and a run of equal starts has to be
-    /// looked at whole, because the list holds a run in insertion order and the
-    /// greatest `limit` of it cannot be found any other way. The second is the
-    /// no-RTC box of [`page_key`], where the run is the whole archive.
+    /// What the page bounds is the copying, and not in every case the walking:
+    /// a request naming a narrow `from_ns` high up a deep archive walks past
+    /// everything below the window without filling its page — comparisons
+    /// against entries already in RAM, no clone, no allocation.
     pub(crate) fn query(&self, camera_id: &str, page: EventPage) -> Vec<WarmEventEntry> {
         if page.from_ns > page.to_ns {
             return Vec::new();
@@ -939,18 +862,9 @@ impl<K: EventIdentity> EventIndex<K> {
         let entries = lock.read_recover();
         let mut end = entries.partition_point(|e| e.start_pts_ns <= page.to_ns);
         if let Some(cursor) = page.before {
-            let (newest_start, its_own_start_too) = cursor.newest_start();
-            end = end.min(entries.partition_point(|e| {
-                e.start_pts_ns < newest_start
-                    || (its_own_start_too && e.start_pts_ns == newest_start)
-            }));
+            end = end.min(entries.partition_point(|e| cursor.admits(page_key(e))));
         }
-        page_of(
-            entries[..end].iter().rev(),
-            page.from_ns,
-            page.before,
-            page.limit,
-        )
+        page_of(entries[..end].iter().rev(), page.from_ns, page.limit)
     }
 
     /// The entry with this key, for the API read path.
@@ -964,8 +878,9 @@ impl<K: EventIdentity> EventIndex<K> {
         position(&entries, key).map(|i| entries[i].clone())
     }
 
-    /// End of the newest indexed event, in wall-clock nanoseconds. Entries are
-    /// kept sorted by start, so the last one is the newest.
+    /// End of the newest indexed event, in wall-clock nanoseconds. The sort
+    /// key leads with the start, so the last entry is the newest — and of a
+    /// run of equal starts, the longest.
     pub(crate) fn newest_event_end_ns(&self, camera_id: &str) -> Option<u64> {
         let entries = self.cameras.get(camera_id)?.read_recover();
         entries.last().map(WarmEventEntry::end_pts_ns)
@@ -1389,10 +1304,11 @@ mod tests {
         }
     }
 
-    /// Entries are ordered by start PTS alone, and nothing makes that unique —
-    /// so a lookup has to walk the whole run of equal starts and compare full
-    /// keys. A binary search would land somewhere in the run and stop there,
-    /// which is how the local upgrade used to reclassify a sibling event.
+    /// A lookup compares the whole key: every member of a run of equal starts
+    /// is reachable as itself, and a near-miss — the right start with the
+    /// wrong rest of the key — is absent, not a sibling. Landing somewhere in
+    /// the run and stopping is how the local upgrade used to reclassify a
+    /// sibling event.
     #[test]
     fn position_finds_the_named_entry_within_a_run_of_equal_starts() {
         let entries = [
@@ -1594,11 +1510,9 @@ mod tests {
         (seen, sizes)
     }
 
-    /// The whole point of a page: the *cloning* done while the lock is held is
-    /// set by the page, not by the archive. The scan is not — a run of equal
-    /// starts is still looked at whole, at up to log-of-limit comparisons per
-    /// entry — but nothing past the limit is cloned, which is what used to
-    /// stall every camera's warm writer for as long as a listing took to copy.
+    /// The whole point of a page: the work done while the lock is held is set
+    /// by the page, not by the archive — which is what used to stall every
+    /// camera's warm writer for as long as a listing took to copy.
     ///
     /// Measured on the walk itself, since that walk is exactly the body of
     /// [`EventIndex::query`]'s locked section. That the *guard* falls with it
@@ -1617,14 +1531,11 @@ mod tests {
                 visited: std::rc::Rc::clone(&visited),
             },
             0,
-            None,
             50,
         );
 
         assert_eq!(page.len(), 50);
-        // One past the page: the walk has to look at the next entry to learn it
-        // starts before everything selected.
-        assert_eq!(visited.get(), 51);
+        assert_eq!(visited.get(), 50);
         // And it is the newest 50, oldest first.
         assert_eq!(page[0].start_pts_ns, 99_951 * 1000);
         assert_eq!(page[49].start_pts_ns, 100_000 * 1000);
@@ -1640,15 +1551,18 @@ mod tests {
     /// "finish the run" is "copy everything" wearing a limit.
     #[test]
     fn a_page_ends_inside_a_run_of_equal_starts_rather_than_finishing_it() {
-        let archive = [
-            entry(1000, EventType::Movement, 1),
-            entry(2000, EventType::Movement, 1),
-            entry(2000, EventType::Object, 1),
-            entry(2000, EventType::Continuous, 1),
-            entry(3000, EventType::Movement, 1),
-        ];
+        let index = index_with_cam();
+        for (start, event_type) in [
+            (1000, EventType::Movement),
+            (2000, EventType::Movement),
+            (2000, EventType::Object),
+            (2000, EventType::Continuous),
+            (3000, EventType::Movement),
+        ] {
+            index.insert("cam", entry(start, event_type, 1));
+        }
 
-        let page = page_of(archive.iter().rev(), 0, None, 2);
+        let page = index.query("cam", EventPage::new(0, u64::MAX, 2));
 
         // Two asked for, two served, both from the top of the order: 3000, then
         // the greatest member of the run at 2000 — which is by the type's wire
@@ -1659,14 +1573,14 @@ mod tests {
 
         // A page of nothing is nothing, rather than a walk with no floor to
         // stop against.
-        assert!(page_of(archive.iter().rev(), 0, None, 0).is_empty());
+        assert!(index
+            .query("cam", EventPage::new(0, u64::MAX, 0))
+            .is_empty());
 
         // And the rest of that run is what the next page opens with.
-        let next = page_of(
-            archive.iter().rev(),
-            0,
-            Some(EventCursor::Event(EventRef::of(&page[0]))),
-            2,
+        let next = index.query(
+            "cam",
+            EventPage::new(0, u64::MAX, 2).before(EventCursor::Event(EventRef::of(&page[0]))),
         );
         assert_eq!(page_key(&next[0]), (2000, 1, "continuous"));
         assert_eq!(page_key(&next[1]), (2000, 1, "movement"));
@@ -1677,10 +1591,8 @@ mod tests {
     /// whole archive. Pages are exactly the size asked for, and the walk still
     /// reaches every event once.
     ///
-    /// The entries are inserted in an order that is not their page order, since
-    /// the list keeps a run in insertion order and a page that took the run's
-    /// tail rather than its greatest members would walk a different archive
-    /// than it served.
+    /// The entries are inserted in an order that is not their page order, so
+    /// the page order is the insertion path's doing and not the sequence's.
     #[test]
     fn a_single_start_archive_pages_at_exactly_its_limit() {
         let index = index_with_cam();
@@ -1703,6 +1615,42 @@ mod tests {
         let every: Vec<(u64, u32, &str)> =
             (1..=3000).map(|d| (0u64, d as u32, "movement")).collect();
         assert_eq!(keys, every, "every event once, in page order, no holes");
+    }
+
+    /// A mixed run of equal starts — differing by duration or by type alone —
+    /// pages across a boundary in [`page_key`] order: every event once,
+    /// ascending, however the run was inserted.
+    #[test]
+    fn ties_page_across_a_boundary_in_full_key_order() {
+        let index = index_with_cam();
+        for (event_type, duration_ms) in [
+            (EventType::Object, 1),
+            (EventType::Movement, 1),
+            (EventType::Continuous, 2),
+            (EventType::Movement, 2),
+            (EventType::Continuous, 1),
+        ] {
+            index.insert("cam", entry(5000, event_type, duration_ms));
+        }
+        index.insert("cam", entry(4000, EventType::Movement, 1));
+        index.insert("cam", entry(6000, EventType::Movement, 1));
+
+        let (seen, sizes) = walk_pages(&index, 2, 5);
+
+        assert_eq!(sizes, vec![2, 2, 2, 1]);
+        let keys: Vec<(u64, u32, &str)> = seen.iter().map(page_key).collect();
+        assert_eq!(
+            keys,
+            vec![
+                (4000, 1, "movement"),
+                (5000, 1, "continuous"),
+                (5000, 1, "movement"),
+                (5000, 1, "object"),
+                (5000, 2, "continuous"),
+                (5000, 2, "movement"),
+                (6000, 1, "movement"),
+            ]
+        );
     }
 
     /// Every event once, in start order, across a walk of the whole index.
@@ -1745,16 +1693,16 @@ mod tests {
             vec![3000, 4000, 5000, 6000]
         );
 
-        // Exclusive at the walk itself, and not only by the binary search that
-        // skips past the newer tail: an event starting exactly at the cursor is
-        // one the previous page has already served.
-        let archive = [
-            entry(1000, EventType::Movement, 1),
-            entry(2000, EventType::Movement, 1),
-        ];
-        let page = page_of(archive.iter().rev(), 0, Some(EventCursor::Start(2000)), 10);
-        assert_eq!(page.len(), 1);
-        assert_eq!(page[0].start_pts_ns, 1000);
+        // Exclusive: an event starting exactly at the cursor is one the
+        // previous page has already served.
+        let third = index.query(
+            "cam",
+            EventPage::new(0, u64::MAX, 10).before(EventCursor::Start(3000)),
+        );
+        assert_eq!(
+            third.iter().map(|e| e.start_pts_ns).collect::<Vec<_>>(),
+            vec![1000, 2000]
+        );
     }
 
     /// What a walk of a live archive is stable against, pinned: the writer
