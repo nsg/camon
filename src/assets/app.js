@@ -118,7 +118,6 @@ document.addEventListener('DOMContentLoaded', async () => {
     let stabilityDrawPending = false;
     let stabilityImage = null;
     let rawMog2Image = null;
-    let noShadowImage = null;
     let morphImage = null;
     let bgOverlayEnabled = false;
     let bgImage = null;
@@ -395,7 +394,6 @@ document.addEventListener('DOMContentLoaded', async () => {
             stabilityCtx.clearRect(0, 0, stabilityOverlay.width, stabilityOverlay.height);
             stabilityImage = null;
             rawMog2Image = null;
-            noShadowImage = null;
             morphImage = null;
         } else {
             fetchStabilityMap();
@@ -772,7 +770,6 @@ document.addEventListener('DOMContentLoaded', async () => {
 
         stabilityImage = null;
         rawMog2Image = null;
-        noShadowImage = null;
         morphImage = null;
         stabilityOverlay.hidden = true;
         stabilityOverlayEnabled = false;
@@ -1114,19 +1111,18 @@ document.addEventListener('DOMContentLoaded', async () => {
         });
     }
 
-    // All four layers are swapped together once they have all arrived: they are
-    // stages of one frame, so showing them mixed across two polls would draw a
-    // mask that never existed — and it costs one redraw per poll instead of
-    // four.
+    // All three layers are swapped together once they have all arrived: they
+    // are stages of one frame, so showing them mixed across two polls would
+    // draw a mask that never existed — and it costs one redraw per poll
+    // instead of three.
     async function fetchStabilityMap() {
         if (!stabilityOverlayEnabled || !currentDetailCameraId) return;
         const cameraId = currentDetailCameraId;
         const cam = encodeURIComponent(cameraId);
         const t = Date.now();
 
-        const [raw, noShadow, morph, filtered] = await Promise.all([
+        const [raw, morph, filtered] = await Promise.all([
             loadOverlayImage(`api/cameras/${cam}/motion/maps/raw?t=${t}`),
-            loadOverlayImage(`api/cameras/${cam}/motion/maps/no-shadow?t=${t}`),
             loadOverlayImage(`api/cameras/${cam}/motion/maps/morph?t=${t}`),
             loadOverlayImage(`api/cameras/${cam}/motion/maps/stability?t=${t}`),
         ]);
@@ -1135,7 +1131,6 @@ document.addEventListener('DOMContentLoaded', async () => {
         if (!stabilityOverlayEnabled || currentDetailCameraId !== cameraId) return;
 
         rawMog2Image = raw;
-        noShadowImage = noShadow;
         morphImage = morph;
         stabilityImage = filtered;
         scheduleStabilityDraw();
@@ -1168,16 +1163,11 @@ document.addEventListener('DOMContentLoaded', async () => {
         if (rawMog2Image) {
             recolorMask(rawMog2Image, w, h, 180, 60, 60, 150, 50);
         }
-        // Layer 2: "no-shadow" stage (orange) — now an alias of the raw mask
-        // (the pure-Rust detector has no shadow class), kept for continuity
-        if (noShadowImage) {
-            recolorMask(noShadowImage, w, h, 220, 140, 0, 160, 128);
-        }
-        // Layer 3: After morphological opening (yellow)
+        // Layer 2: After morphological opening (yellow)
         if (morphImage) {
             recolorMask(morphImage, w, h, 240, 240, 0, 170, 128);
         }
-        // Layer 4: Final filtered (green) — smallest area, always on top
+        // Layer 3: Final filtered (green) — smallest area, always on top
         if (stabilityImage) {
             recolorMask(stabilityImage, w, h, 0, 255, 0, 180, 128);
         }
