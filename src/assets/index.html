@@ -246,7 +246,16 @@
         </div>
     </div>
     <footer>__VERSION__</footer>
+    <!-- Plain scripts in dependency order, sharing one global scope; app.js
+         (the startup sequence) must come last. -->
     <script src="assets/hls.min.js"></script>
+    <script src="assets/core.js"></script>
+    <script src="assets/events-data.js"></script>
+    <script src="assets/live.js"></script>
+    <script src="assets/settings.js"></script>
+    <script src="assets/events.js"></script>
+    <script src="assets/playback.js"></script>
+    <script src="assets/debug.js"></script>
     <script src="assets/app.js"></script>
 </body>
 </html>

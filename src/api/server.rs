@@ -584,9 +584,9 @@ async fn hot_events_handler(State(state): State<AppState>, Path(id): Path<String
 /// carries more than a day of the densest recording mode there is.
 ///
 /// Free to lower. The one client that walks the whole archive — the web UI's
-/// event list, in `src/assets/app.js` — sends no `limit` and ends its walk on
-/// an empty page rather than on a short one, precisely so that it cannot read a
-/// page clamped by this number as the end of the archive.
+/// event list, in `src/assets/events-data.js` — sends no `limit` and ends its
+/// walk on an empty page rather than on a short one, precisely so that it
+/// cannot read a page clamped by this number as the end of the archive.
 const MAX_EVENTS_PER_PAGE: usize = 1000;
 
 #[derive(Deserialize)]
