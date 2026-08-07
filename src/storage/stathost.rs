@@ -180,6 +180,20 @@ fn key_stem(key: EventKey) -> String {
     format!("{}_{}", key.0, key.1)
 }
 
+// The three object keys of one event. [`split_ts_key`] and
+// [`split_metadata_key`] are their inverses.
+fn ts_key(camera_id: &str, stem: &str) -> String {
+    format!("{camera_id}/{stem}.ts")
+}
+
+fn sidecar_key(camera_id: &str, stem: &str) -> String {
+    format!("{camera_id}/{stem}.json")
+}
+
+fn thumb_key(camera_id: &str, stem: &str, frame: usize) -> String {
+    format!("{camera_id}/{stem}_thumb_{frame}.jpg")
+}
+
 /// Writes, deletes and the scan are awaited inline by the serial per-camera
 /// warm writer, so an unbounded request stalls that camera's recording and its
 /// shutdown. Both clients bound the connect phase; the rest differs by call
@@ -640,7 +654,7 @@ impl StathostBackend {
     /// allowance because the alternative to a readable sidecar is a guessed
     /// retention class.
     async fn read_sidecar(&self, camera_id: &str, stem: &str) -> SidecarRead {
-        let key = format!("{camera_id}/{stem}.json");
+        let key = sidecar_key(camera_id, stem);
         let read = OBJECT_RETRY
             .run(&self.stop, recoverable, || self.http.get_optional(&key))
             .await;
@@ -703,13 +717,6 @@ impl StathostBackend {
     async fn read_sidecar_for(&self, event: ScannedEvent) -> (ScannedEvent, SidecarRead) {
         let read = self.read_sidecar(&event.camera_id, &event.stem).await;
         (event, read)
-    }
-
-    fn ts_key(camera_id: &str, entry: &WarmEventEntry) -> String {
-        format!(
-            "{camera_id}/{}_{}.ts",
-            entry.start_pts_ns, entry.duration_ms
-        )
     }
 
     /// Delete every object belonging to one event: **thumbnails, then the
@@ -808,9 +815,7 @@ impl StathostBackend {
                 return Removal::Abandoned;
             }
             if matches!(
-                self.http
-                    .delete(&format!("{camera_id}/{stem}_thumb_{i}.jpg"))
-                    .await,
+                self.http.delete(&thumb_key(camera_id, &stem, i)).await,
                 DeleteOutcome::Failed
             ) {
                 // Stop descending, but do not stop deleting the event. A frame
@@ -827,7 +832,7 @@ impl StathostBackend {
         if stopping() {
             return Removal::Abandoned;
         }
-        let removal = match self.http.delete(&format!("{camera_id}/{stem}.ts")).await {
+        let removal = match self.http.delete(&ts_key(camera_id, &stem)).await {
             DeleteOutcome::Deleted => Removal::Deleted,
             DeleteOutcome::Missing => Removal::Missing,
             DeleteOutcome::Failed => {
@@ -843,7 +848,7 @@ impl StathostBackend {
         // next: this is the one request whose omission leaves an orphan rather
         // than an inconsistency, and the startup sweep is what collects it.
         if !stopping() {
-            let _ = self.http.delete(&format!("{camera_id}/{stem}.json")).await;
+            let _ = self.http.delete(&sidecar_key(camera_id, &stem)).await;
         }
         removal
     }
@@ -884,9 +889,7 @@ impl StathostBackend {
                 return;
             }
             if matches!(
-                self.http
-                    .delete(&format!("{camera_id}/{stem}_thumb_{i}.jpg"))
-                    .await,
+                self.http.delete(&thumb_key(camera_id, &stem, i)).await,
                 DeleteOutcome::Failed
             ) {
                 tracing::warn!(camera = %camera_id, stem = %stem, frame = i,
@@ -969,7 +972,7 @@ impl StathostBackend {
             if !self.events.owns_camera(camera_id) || parse_event_filename(stem).is_none() {
                 continue;
             }
-            let ts_key = format!("{camera_id}/{stem}.ts");
+            let ts_key = ts_key(camera_id, stem);
             if sizes.contains_key(ts_key.as_str()) {
                 continue;
             }
@@ -1111,9 +1114,7 @@ impl StathostBackend {
             return false;
         }
         if !matches!(
-            self.http
-                .probe_exists(&format!("{camera_id}/{stem}.ts"))
-                .await,
+            self.http.probe_exists(&ts_key(camera_id, stem)).await,
             Ok(false)
         ) {
             return false;
@@ -1127,7 +1128,7 @@ impl StathostBackend {
         );
         self.events.remove(camera_id, key);
         if !self.stop.stopped() {
-            let _ = self.http.delete(&format!("{camera_id}/{stem}.json")).await;
+            let _ = self.http.delete(&sidecar_key(camera_id, stem)).await;
         }
         true
     }
@@ -1163,16 +1164,12 @@ impl StathostBackend {
         if self.stop.stopped() {
             return;
         }
-        match self
-            .http
-            .probe_exists(&format!("{camera_id}/{stem}.ts"))
-            .await
-        {
+        match self.http.probe_exists(&ts_key(camera_id, stem)).await {
             Ok(false) => {
                 if self.stop.stopped() {
                     return;
                 }
-                match self.http.delete(&format!("{camera_id}/{stem}.json")).await {
+                match self.http.delete(&sidecar_key(camera_id, stem)).await {
                     DeleteOutcome::Failed => tracing::warn!(camera = %camera_id, stem = %stem,
                         "could not delete the sidecar of an event whose video never landed; \
                          the next startup collects it"),
@@ -1529,7 +1526,7 @@ impl StathostBackend {
                     "zero-byte .ts on stathost (interrupted upload?)");
             }
             let sidecar_bytes = sizes
-                .get(format!("{camera_id}/{stem}.json").as_str())
+                .get(sidecar_key(camera_id, stem).as_str())
                 .copied()
                 .unwrap_or(0);
             // The frame count is a high-water mark, not a tally of what is
@@ -1537,11 +1534,7 @@ impl StathostBackend {
             // and the deletes walk `0..filmstrip_frames` — see
             // [`filmstrip_frame_count`]. The bytes are only what the listing
             // really named, so a hole costs the budget nothing it does not owe.
-            let frame_size = |i: usize| {
-                sizes
-                    .get(format!("{camera_id}/{stem}_thumb_{i}.jpg").as_str())
-                    .copied()
-            };
+            let frame_size = |i: usize| sizes.get(thumb_key(camera_id, stem, i).as_str()).copied();
             let filmstrip_frames = filmstrip_frame_count(|i| frame_size(i).is_some());
             let thumbnail_bytes: u64 = (0..filmstrip_frames).filter_map(frame_size).sum();
             pending.push(ScannedEvent {
@@ -2001,7 +1994,7 @@ impl WarmStorageBackend for StathostBackend {
         let file_size = data.len() as u64;
         let event_type = event.event_type();
 
-        let sidecar_key = format!("{camera_id}/{stem}.json");
+        let sidecar_key = sidecar_key(camera_id, &stem);
         let sidecar = Bytes::from(
             sidecar_json(
                 Some(event_type),
@@ -2056,7 +2049,7 @@ impl WarmStorageBackend for StathostBackend {
         // leave precisely the bare video this order exists to prevent. What the
         // failure does buy is the right to *ask* — see
         // [`Self::collect_orphaned_metadata`].
-        let ts_key = format!("{camera_id}/{stem}.ts");
+        let ts_key = ts_key(camera_id, &stem);
         if !self.upload(&ts_key, data).await {
             tracing::error!(
                 camera = %camera_id,
@@ -2081,7 +2074,7 @@ impl WarmStorageBackend for StathostBackend {
         let mut filmstrip_frames = 0usize;
         let mut stored_frame_bytes = 0u64;
         for (i, jpeg) in frames.iter().enumerate() {
-            let key = format!("{camera_id}/{stem}_thumb_{i}.jpg");
+            let key = thumb_key(camera_id, &stem, i);
             // Copied, not shared, because the filmstrip is typed
             // `Arc<Vec<Vec<u8>>>` where the event assembles it. Making
             // it shareable all the way here would mean retyping it at
@@ -2158,7 +2151,7 @@ impl WarmStorageBackend for StathostBackend {
             return;
         }
         let stem = key_stem(key);
-        let sidecar_key = format!("{camera_id}/{stem}.json");
+        let sidecar_key = sidecar_key(camera_id, &stem);
         let sidecar = sidecar_json(
             Some(EventType::Object),
             Some(&upgrade.backend),
@@ -2435,7 +2428,7 @@ impl WarmStorageBackend for StathostBackend {
         entry: &WarmEventEntry,
         range: Option<RangeRequest>,
     ) -> std::io::Result<VideoStream> {
-        let key = Self::ts_key(camera_id, entry);
+        let key = ts_key(camera_id, &key_stem(event_key(entry)));
         let resp = self
             .http
             .get_ranged(&key, range)
@@ -2529,9 +2522,9 @@ impl WarmStorageBackend for StathostBackend {
         if entry.filmstrip_frames == 0 {
             return Err(ThumbnailError::GenerationFailed);
         }
-        let stem = format!("{}_{}", entry.start_pts_ns, entry.duration_ms);
+        let stem = key_stem(event_key(entry));
         self.http
-            .get(&format!("{camera_id}/{stem}_thumb_0.jpg"))
+            .get(&thumb_key(camera_id, &stem, 0))
             .await
             .map_err(|_| ThumbnailError::ReadFailed)
     }
@@ -2542,9 +2535,9 @@ impl WarmStorageBackend for StathostBackend {
         entry: &WarmEventEntry,
         index: u8,
     ) -> std::io::Result<Vec<u8>> {
-        let stem = format!("{}_{}", entry.start_pts_ns, entry.duration_ms);
+        let stem = key_stem(event_key(entry));
         self.http
-            .get(&format!("{camera_id}/{stem}_thumb_{index}.jpg"))
+            .get(&thumb_key(camera_id, &stem, usize::from(index)))
             .await
             .map_err(reqwest_io)
     }
