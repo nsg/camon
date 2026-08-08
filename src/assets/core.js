@@ -1,28 +1,19 @@
-// Shared core of the Camon UI. The UI is plain <script> files loaded in
-// order by index.html; top-level declarations in this and the per-view files
-// share the page's global scope, exactly as they shared one closure when
-// everything was app.js. app.js (loaded last) runs the startup sequence.
+// Shared UI state and utilities; the assets are ordered classic scripts.
 
-// === DOM Elements ===
-
-// Grid view
 const gridView = document.getElementById('grid-view');
 const grid = document.getElementById('camera-grid');
 const noCameras = document.getElementById('no-cameras');
 
-// Token prompt (shown only when the API answers 401)
 const tokenPrompt = document.getElementById('token-prompt');
 const tokenInput = document.getElementById('token-input');
 const tokenSubmit = document.getElementById('token-submit');
 
-// === State (shared across views) ===
 let cameras = [];
 const gridHlsInstances = new Map();
 let currentView = null;
 let isFirstLoad = true;
 let currentDetailCameraId = null;
 
-// === View Transition Helper ===
 function withViewTransition(callback, isBack = false) {
     if (!isFirstLoad && document.startViewTransition) {
         document.documentElement.classList.toggle('swipe-back', isBack);
@@ -36,16 +27,8 @@ function withViewTransition(callback, isBack = false) {
     }
 }
 
-// === API Auth ===
-// Either the operator's own [http] token, which the server asks for on
-// every request, or the one camon generates for a LAN deployment, which it
-// asks for only when something is being changed — so on a default install
-// this view loads and the prompt appears the first time a setting is saved.
-// The UI does not know or care which: every fetch and hls.js request
-// carries whatever token it has as a bearer header; <img> and native
-// <video> sources, which cannot set headers, fall back to ?token=. A 401
-// means what we have is missing or stale, so we ask for a new one and
-// reload — every request then starts out authenticated.
+// Every request carries the token because the UI cannot know the server's auth mode.
+// Native media elements cannot set headers and use ?token= instead.
 const TOKEN_STORAGE_KEY = 'camon.token';
 let apiToken = localStorage.getItem(TOKEN_STORAGE_KEY) || '';
 
@@ -68,20 +51,8 @@ async function apiFetch(url, options = {}) {
     return response;
 }
 
-// === Polling ===
-
-// `setInterval` with an async callback lets a slow request still be in
-// flight when the next tick fires, and lets an older answer land after a
-// newer one and overwrite it. A poller instead runs one pass at a time and
-// arms the next timer only once the current pass has settled; `stop()`
-// aborts whatever that pass still has in flight and drops the timer, so a
-// poller that has been stopped issues nothing further. Requests started by
-// a *different* poller are not touched — each view stops its own.
-//
-// There is deliberately no watchdog: a pass that never settles holds its
-// poller until the view is torn down. Every fetch here is abortable and
-// subject to the browser's own network timeouts; the one wait with no
-// timeout of its own is an <img>, which is why loadOverlayImage caps it.
+// Passes never overlap, preventing stale responses from replacing newer state.
+// Each poller owns its abort controller so stopping one view cannot affect another.
 function startPoller(name, intervalMs, pass) {
     const controller = new AbortController();
     let timer = null;
@@ -92,7 +63,6 @@ function startPoller(name, intervalMs, pass) {
         try {
             await pass(controller.signal);
         } catch (err) {
-            // Aborts are how stopping works, not a failure to report.
             if (err && err.name === 'AbortError') return;
             console.error(`Failed to fetch ${name}:`, err);
         }
@@ -100,8 +70,6 @@ function startPoller(name, intervalMs, pass) {
     }
 
     return {
-        // Settles when the first pass is done, for callers that cannot
-        // render until the data is there.
         first: tick(),
         stop() {
             stopped = true;
@@ -139,11 +107,9 @@ function wireTokenPrompt() {
     });
 }
 
-// === Initialize ===
 async function loadCameras() {
     try {
         const response = await apiFetch('api/cameras');
-        // A 401 already raised the token prompt, which covers the view.
         cameras = response.ok ? await response.json() : [];
 
         if (cameras.length === 0) {
@@ -164,10 +130,7 @@ async function loadCameras() {
 function router() {
     const hash = window.location.hash || '#/';
 
-    // #/camera/{id}/events/{key}, where {key} is an event key (see eventKey).
-    // The type part is matched loosely, the way the event list already
-    // tolerates a type it has no label for: a newer server's spelling should
-    // still route to playback and let the server answer.
+    // Accept newer event-type spellings and let the server validate the key.
     const playbackMatch = hash.match(/^#\/camera\/(.+)\/events\/(\d+_\d+_[a-z0-9-]+)$/);
     if (playbackMatch) {
         const cameraId = decodeURIComponent(playbackMatch[1]);
@@ -183,7 +146,6 @@ function router() {
         }
     }
 
-    // #/camera/{id}/debug
     const debugMatch = hash.match(/^#\/camera\/(.+)\/debug$/);
     if (debugMatch) {
         const cameraId = decodeURIComponent(debugMatch[1]);
@@ -198,7 +160,6 @@ function router() {
         }
     }
 
-    // #/camera/{id}/events
     const eventsMatch = hash.match(/^#\/camera\/(.+)\/events$/);
     if (eventsMatch) {
         const cameraId = decodeURIComponent(eventsMatch[1]);
@@ -213,7 +174,6 @@ function router() {
         }
     }
 
-    // #/camera/{id}
     const cameraMatch = hash.match(/^#\/camera\/([^/]+)$/);
     if (cameraMatch) {
         const cameraId = decodeURIComponent(cameraMatch[1]);
@@ -229,7 +189,6 @@ function router() {
         }
     }
 
-    // Default: grid
     if (currentView !== 'grid') {
         const isBack = currentView !== null;
         withViewTransition(() => showGridView(), isBack);
@@ -244,8 +203,6 @@ function updateMuteIcon(btn, video) {
     btn.querySelector('path').setAttribute('d', video.muted ? volumeOffPath : volumeOnPath);
     btn.classList.toggle('muted', video.muted);
 }
-
-// === View Functions ===
 
 function hideAllViews() {
     gridView.hidden = true;
@@ -264,8 +221,7 @@ function showGridView() {
 
     cameras.forEach(cameraId => {
         if (!gridHlsInstances.has(cameraId)) {
-            // Matched on the property rather than through a selector, so a
-            // camera id never has to survive being spliced into one.
+            // Avoid interpolating camera ids into selectors.
             const cell = Array.from(grid.children).find(c => c.dataset.cameraId === cameraId);
             if (cell) {
                 loadGridCamera(cameraId, cell.querySelector('video'));
@@ -273,8 +229,6 @@ function showGridView() {
         }
     });
 }
-
-// === Camera Cell ===
 
 function createCameraCell(cameraId) {
     const cell = document.createElement('div');
@@ -290,8 +244,6 @@ function createCameraCell(cameraId) {
     });
     return cell;
 }
-
-// === HLS Loading ===
 
 function loadGridCamera(cameraId, video) {
     const src = `api/stream/${encodeURIComponent(cameraId)}/playlist.m3u8?live=true`;
@@ -342,13 +294,7 @@ function formatDateLabel(date) {
     return date.toLocaleDateString([], { weekday: 'short', month: 'short', day: 'numeric' });
 }
 
-// === Utility ===
-
-// Every value interpolated into an innerHTML template goes through here.
-// Camera ids, object classes and model names come from operator config and
-// from metadata camon has already filtered, not straight off the network —
-// but "trusted enough" is not something the markup can check, and one
-// escaped hole beside four raw ones is the bug regardless of who fills it.
+// Escape every value interpolated into an innerHTML template.
 function esc(value) {
     return String(value)
         .replace(/&/g, '&amp;')

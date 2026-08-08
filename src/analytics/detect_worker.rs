@@ -1,46 +1,4 @@
 //! Global object-detection worker.
-//!
-//! ONE async task serves all cameras. Analyzers flag motion, drop a crop job
-//! on the [`DetectQueue`], and continue immediately — motion detection never
-//! stalls on the vision model. The worker drains the queue strictly
-//! serially: at most ONE in-flight request to Ollama at any time, across all
-//! cameras, and the frames of a single run are sent one after another (the
-//! production GPU is old and degrades badly under parallel load).
-//!
-//! The queue holds a bounded stack of jobs per camera and serves cameras
-//! round-robin, newest job first. Fairness keeps one spammy camera from
-//! drowning the others; newest-first keeps verdicts about what is happening
-//! NOW instead of grinding through a backlog. When a camera overflows its
-//! stack, its oldest job is dropped with a warning. That is explicitly
-//! acceptable: the motion event still persists to `movements/`; only the
-//! object upgrade is lost.
-//!
-//! Verdicts are handled in two ways:
-//! - always written to the [`DetectionStore`], where the event-assembly path
-//!   and the API read them exactly as before;
-//! - delivered to the [`EventRegistry`], which decides what the covering
-//!   events still need. One whose write is already queued gets an upgrade
-//!   message on its camera's warm writer channel, which owns all file
-//!   mutations; one the analyzer is still assembling parks the verdict and
-//!   sends that message itself. See `storage::event_registry`.
-//!
-//! The first of those two sends — this worker's, for an event already
-//! written — never waits. The channel it goes down is eight deep, shared with
-//! the analyzer, and drained by a writer that is one slow remote store away,
-//! and THIS task serves every camera: waiting on one camera's writer would
-//! stop object detection for all of them. A full channel loses the upgrade
-//! instead, which is the same trade the queue cap above already makes.
-//!
-//! The second send — the analyzer's, for a verdict that parked — blocks by
-//! design and stays that way. It runs on that camera's own analyzer thread, so
-//! the worst it can stall is the camera it belongs to, and it has just paid a
-//! blocking send for the write the upgrade refers to; giving up on the upgrade
-//! after keeping the footage would be the wrong half to drop. See
-//! `analytics::pipeline::MotionAnalyzer::emit_event`.
-//!
-//! Every job is reported back to the registry when the worker is done with
-//! it, verdict or no verdict, because a record covering its sequences is
-//! being kept alive until it is — see [`EventRegistry::verdict_settled`].
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -57,12 +15,7 @@ use crate::storage::{
 
 use super::ollama::{Detection, OllamaClient};
 
-/// Jobs held per camera before the oldest is evicted. A job is up to four crop
-/// JPEGs, plus the full 1080p frame the debug view adds while somebody is
-/// watching one — roughly 1 MB with that frame and most of it without, so even
-/// every camera at its cap stays around 100–200 MB, fine on the production box.
-/// The cap exists to bound staleness, not memory: under sustained motion the
-/// oldest jobs are the ones that stopped mattering.
+/// Jobs held per camera before the oldest is evicted.
 pub const DETECT_QUEUE_PER_CAMERA_CAP: usize = 32;
 
 /// At most this many frames of a run are sent to the model.
@@ -78,20 +31,17 @@ pub struct DetectionJob {
     /// because the debug store outlives the job: it takes a share of these
     /// bytes rather than a second copy of them.
     pub crop_jpegs: Vec<Arc<Vec<u8>>>,
-    /// A full (uncropped) frame for the debug overlay, which is what reads it
-    /// — so the analyzer encodes one only while somebody is watching that
-    /// view, and this is `None` the rest of the time. The MQTT bridge names it
-    /// as a fallback picture, for a run that carried no crops at all; a run
-    /// that produced a verdict always has the crop that verdict was seen in.
+    /// A full (uncropped) frame for the debug overlay, which is what reads it — so the
+    /// analyzer encodes one only while somebody is watching that view, and this is `None` the
+    /// rest of the time.
     pub full_frame_jpeg: Option<Arc<Vec<u8>>>,
     /// Individual motion boxes in normalized full-frame coords.
     pub motion_rects: Vec<(f32, f32, f32, f32)>,
     /// The union crop region the frames were cropped to, normalized.
     pub run_crop: Option<(f32, f32, f32, f32)>,
-    /// The registry's handle on this job, stamped by [`DetectQueueSender::send`]
-    /// as the job is accepted and handed back when the job leaves the system —
-    /// answered here, or dropped at the queue cap. `None` when there is no
-    /// registry to hold records for (warm storage disabled).
+    /// The registry's handle on this job, stamped by [`DetectQueueSender::send`] as the job is
+    /// accepted and handed back when the job leaves the system — answered here, or dropped at
+    /// the queue cap.
     pub verdict_id: Option<VerdictId>,
 }
 
@@ -126,10 +76,9 @@ impl DetectionWorker {
         }
     }
 
-    /// Worker main loop. Exits when every job sender (the analyzers) is
-    /// gone and the queue is drained; at shutdown the task is aborted
-    /// instead — pending jobs and even an in-flight request are droppable
-    /// by design.
+    /// Worker main loop. Exits when every job sender (the analyzers) is gone and the queue is
+    /// drained; at shutdown the task is aborted instead — pending jobs and even an in-flight
+    /// request are droppable by design.
     pub async fn run(self, queue: Arc<DetectQueue>) {
         // Surface a typo'd model name in seconds rather than as a string of
         // silent detection failures.
@@ -141,14 +90,8 @@ impl DetectionWorker {
         tracing::info!("detection worker stopped");
     }
 
-    /// Classify one job and then tell the registry the question is answered,
-    /// on every path out of the classification — a job that timed out, one the
-    /// model saw nothing in, one whose upgrade found no room on the writer's
-    /// channel, one whose camera has no registry at all. The records it was
-    /// holding open are only released by this call, so it wraps the work rather
-    /// than living inside it: whatever [`classify_job`](Self::classify_job)
-    /// does or fails to do inside, the expectation this job registered is
-    /// settled exactly once on the way out.
+    /// Settle the registry expectation exactly once after classification, including every
+    /// failure or empty-verdict path.
     async fn process_job(&self, job: DetectionJob) {
         let camera_id = job.camera_id.clone();
         let verdict_id = job.verdict_id;
@@ -197,10 +140,8 @@ impl DetectionWorker {
         );
 
         let (classes, confidences) = deduplicate_by_class(&detections);
-        // Everything reaching here already passed the client's allowed-class
-        // and confidence-threshold filtering (`ollama::parse_detections`), so
-        // the deduped classes are exactly the verdict — the same set that goes
-        // into the detection store and the event upgrade.
+        // Parsing already applied class and confidence filters, so this deduped set is the
+        // complete verdict used by every consumer.
         if let Some(ref tx) = self.mqtt_tx {
             send_event(
                 tx,
@@ -219,8 +160,7 @@ impl DetectionWorker {
         self.upgrade_covering_events(&job, &detections, &classes, &model);
     }
 
-    /// Store one detection row per (segment, class) so the event-assembly
-    /// and API paths see exactly what they saw before the rework.
+    /// Store one detection row per segment and class for event assembly and the API.
     fn store_detections(
         &self,
         job: &DetectionJob,
@@ -256,50 +196,8 @@ impl DetectionWorker {
         }
     }
 
-    /// Hand this run's verdict to the registry and send the upgrades it asks
-    /// for — offering them to the writer rather than waiting for room.
-    ///
-    /// The registry answers for every event the run covers, so the ones that
-    /// come back are exactly those already in the writer's queue — an upgrade
-    /// for them is guaranteed to arrive behind the write it refers to. An
-    /// event the analyzer is still assembling comes back from nowhere: the
-    /// verdict parks on its record, and the analyzer sends it once the write
-    /// is queued, because a message this worker sent now would reach the
-    /// writer first and find no file.
-    ///
-    /// The send is a try, and this function is not async, because ONE task
-    /// runs this for every camera. The channel is eight slots shared with the
-    /// analyzer, and its consumer uploads whole events to a remote store; a
-    /// single camera whose writer is mid-upload would otherwise park the
-    /// worker here and leave every other camera's motion unclassified for as
-    /// long as it lasted — a stall that also holds this job's registry
-    /// expectation open, pinning records across all cameras behind one slow
-    /// upload. Dropping is the accepted answer everywhere else on this path,
-    /// so it is the answer here too.
-    ///
-    /// What the drop costs, exactly, because it is not nothing: the record was
-    /// marked [`Classified`](crate::storage::event_registry) as the target came
-    /// back, and that state is terminal — no later verdict for the same run
-    /// produces a second target, and nothing re-drives an upgrade from disk. So
-    /// the event stays a movement event for good. Neither backend's upgrade
-    /// mechanism runs (local disk moves the files between `movements/` and
-    /// `objects/`; stathost rewrites the flat-keyed sidecar in place and moves
-    /// nothing), which leaves both in the same state: the sidecar carries no
-    /// detections and the warm index entry keeps `EventType::Movement`. The
-    /// consequence is retention class — the footage expires on
-    /// `movement_retention_days` instead of `object_retention_days` (2 against
-    /// 14 by default), and nothing revisits it.
-    ///
-    /// What survives is less than it looks. The [`DetectionStore`] row this run
-    /// wrote is RAM only and scoped to the hot buffer — the analyzer's
-    /// `cleanup_old_data` drops it as its segment is evicted, and the API
-    /// endpoint reading it is hot-buffer-scoped too. So the detections are
-    /// visible for as long as the footage is still in RAM and not one moment
-    /// longer; after that no durable record of them exists anywhere, and the
-    /// event is a movement event with nothing left to say otherwise. The MQTT
-    /// sighting was already handed to the bridge before this call and is
-    /// unaffected by the drop, but that send is best-effort as well
-    /// ([`send_event`]), so it may or may not have reached Home Assistant.
+    /// Hand this run's verdict to the registry and send the upgrades it asks for — offering
+    /// them to the writer rather than waiting for room.
     fn upgrade_covering_events(
         &self,
         job: &DetectionJob,
@@ -349,15 +247,8 @@ impl DetectionWorker {
         }
     }
 
-    /// Publish this run to the detector's debug view — but only while somebody
-    /// has that view open.
-    ///
-    /// An entry is the run's full frame plus its crops, about a megabyte, and
-    /// fifty of them are retained per camera; kept for a page nobody opened
-    /// that is the largest thing the process holds. So the store is asked
-    /// first, exactly as the analyzer asks before encoding a stage overlay,
-    /// and both pictures below reach it as handles on the job's own bytes
-    /// rather than as copies of them.
+    /// Publish this run to the detector's debug view — but only while somebody has that view
+    /// open.
     fn store_debug_entry(
         &self,
         job: &DetectionJob,
@@ -441,10 +332,9 @@ fn best_frame_per_class(per_frame: &[Vec<Detection>]) -> HashMap<&str, usize> {
         .collect()
 }
 
-/// Pair every class of the verdict with the picture behind it, for the Home
-/// Assistant bridge to publish retained: the crop the model classified when
-/// picking that class, the run's full frame when the crops are gone, and
-/// nothing at all when the job carried no frame.
+/// Pair every class of the verdict with the picture behind it, for the Home Assistant bridge to
+/// publish retained: the crop the model classified when picking that class, the run's full
+/// frame when the crops are gone, and nothing at all when the job carried no frame.
 fn build_sightings(
     classes: &[String],
     per_frame: &[Vec<Detection>],
@@ -466,14 +356,9 @@ fn build_sightings(
         .collect()
 }
 
-/// Create the crop-job queue: a sender for the analyzers (clone one per
-/// camera) and the shared queue for the worker. The queue closes when the
-/// last sender is dropped, mirroring channel semantics.
-///
-/// The registry is held here because this is the one place that sees a job's
-/// whole life on the queue: accepted (a verdict is now expected, and records
-/// covering the job's sequences are kept until it comes) and, for the jobs
-/// that never reach the worker, dropped at the cap.
+/// Create the crop-job queue: a sender for the analyzers (clone one per camera) and the shared
+/// queue for the worker. The queue closes when the last sender is dropped, mirroring channel
+/// semantics.
 pub fn detect_queue(
     event_registry: Option<EventRegistry>,
 ) -> (DetectQueueSender, Arc<DetectQueue>) {
@@ -556,15 +441,9 @@ pub struct DetectQueueSender {
 }
 
 impl DetectQueueSender {
-    /// Enqueue a job without ever blocking the analyzer. The new job is
-    /// always accepted; a camera past its cap loses its OLDEST queued job
-    /// instead — the motion event still persists, only that object upgrade
-    /// is lost.
-    ///
-    /// The registry is told before the job is queued and after one is dropped,
-    /// in that order, so a record covering these sequences is never held open
-    /// by a job that has already left and never forgotten while one is still
-    /// on the queue.
+    /// Enqueue a job without ever blocking the analyzer. The new job is always accepted; a
+    /// camera past its cap loses its OLDEST queued job instead — the motion event still
+    /// persists, only that object upgrade is lost.
     pub fn send(&self, mut job: DetectionJob) {
         if let Some(ref registry) = self.queue.event_registry {
             job.verdict_id = registry.expect_verdict(&job.camera_id, &job.seqs);
@@ -646,8 +525,6 @@ mod tests {
             queue.recv().await.unwrap().seqs,
         ]
         .into();
-        // The quiet camera is not drowned out, and within a camera the
-        // newest job comes first.
         assert_eq!(order, vec![vec![3], vec![10], vec![2], vec![1]]);
         assert!(queue.recv().await.is_none());
     }
@@ -664,16 +541,10 @@ mod tests {
         while let Some(job) = queue.recv().await {
             seqs.push(job.seqs[0]);
         }
-        // Job 0 was evicted; the rest arrive newest first.
         let expected: Vec<u64> = (1..=DETECT_QUEUE_PER_CAMERA_CAP as u64).rev().collect();
         assert_eq!(seqs, expected);
     }
 
-    /// A job sitting on the queue is a verdict still to come, and the record
-    /// it will land on has to survive until then. The queue is what says so,
-    /// as it accepts the job — without that, the very next event to close
-    /// forgets the record, and a verdict arriving minutes later against a slow
-    /// model finds nothing to upgrade.
     #[tokio::test]
     async fn a_queued_job_keeps_alive_the_record_its_verdict_will_land_on() {
         let registry = EventRegistry::new(&["cam".to_string()]);
@@ -682,8 +553,6 @@ mod tests {
         tx.send(job("cam", vec![0, 1]));
         registry.open("cam", 0, 1, false).commit(1000, 5000, false);
 
-        // A later event closing is when settled records are forgotten. This
-        // one is not settled: its job has not even been served yet.
         registry
             .open("cam", 100, 100, false)
             .commit(2000, 5000, false);
@@ -694,11 +563,6 @@ mod tests {
         );
     }
 
-    /// The registry keeps an event's record alive until every crop job that
-    /// could still classify it has come back. A job dropped at the cap never
-    /// will, so the drop has to report it — otherwise the camera least able to
-    /// afford it, the one at its queue cap, accumulates a record per dropped
-    /// job for the life of the process.
     #[tokio::test]
     async fn a_job_dropped_at_the_cap_releases_the_records_it_was_holding() {
         let registry = EventRegistry::new(&["cam".to_string()]);
@@ -708,14 +572,10 @@ mod tests {
         registry.open("cam", 0, 0, false).commit(1000, 5000, false);
         assert_eq!(registry.held("cam"), 1);
 
-        // Fill the camera's stack past its cap: the oldest job — the only one
-        // that covered seq 0 — falls off.
         for seq in 1..=DETECT_QUEUE_PER_CAMERA_CAP as u64 + 1 {
             tx.send(job("cam", vec![seq]));
         }
 
-        // Nothing can classify that first event any more, so the next event to
-        // arrive forgets it instead of holding it forever.
         registry
             .open("cam", 100, 100, false)
             .commit(2000, 5000, false);
@@ -726,15 +586,9 @@ mod tests {
         );
     }
 
-    /// The same obligation on the worker's side, on the path with nothing to
-    /// report: a job whose frames all failed, or that the model saw nothing
-    /// in, leaves through the early return in `classify_job` — and still has
-    /// to release what it was holding.
     #[tokio::test]
     async fn a_job_the_model_answered_nothing_for_is_still_reported_back() {
         let registry = EventRegistry::new(&["cam".to_string()]);
-        // Nothing is listening on this port, so every frame of the job fails
-        // and it reaches the end of processing with no verdict at all.
         let client = OllamaClient::new(
             "http://127.0.0.1:1",
             "test-model",
@@ -768,12 +622,6 @@ mod tests {
         );
     }
 
-    // ---- The post-verdict handoff, against a writer that is not draining ----
-
-    /// An Ollama that sees a person in every frame it is shown, so a job put
-    /// through the worker reaches the upgrade instead of stopping at "the
-    /// model saw nothing". Serves `/api/tags` too, so the worker's startup
-    /// check finds its model rather than warning about it.
     async fn ollama_that_always_sees_a_person() -> String {
         let app = axum::Router::new()
             .route(
@@ -800,8 +648,6 @@ mod tests {
         format!("http://{addr}")
     }
 
-    /// A worker talking to `url`, holding a live registry, and writing to
-    /// whatever channels the test hands it.
     fn worker_for(
         url: &str,
         cameras: &[&str],
@@ -821,9 +667,6 @@ mod tests {
         )
     }
 
-    /// A message that occupies one slot of a writer channel and is never taken
-    /// out of it, holding the channel full where a writer mid-upload holds it
-    /// in production. Recognizable by its start, which no real event has.
     fn filler() -> WriterMessage {
         WriterMessage::Upgrade(EventUpgrade::for_event(
             crate::storage::UpgradeTarget {
@@ -840,8 +683,6 @@ mod tests {
         ))
     }
 
-    /// A channel of one slot, already full, and the receiver that keeps it open
-    /// without ever reading it.
     fn a_writer_that_is_not_draining(
     ) -> (mpsc::Sender<WriterMessage>, mpsc::Receiver<WriterMessage>) {
         let (tx, rx) = mpsc::channel(1);
@@ -849,9 +690,6 @@ mod tests {
         (tx, rx)
     }
 
-    /// Long enough that a loaded machine is not the reason this fails, short
-    /// enough that a message which is never coming is reported rather than
-    /// hanging the suite.
     const PATIENCE: std::time::Duration = std::time::Duration::from_secs(10);
 
     async fn next_message(rx: &mut mpsc::Receiver<WriterMessage>, expected: &str) -> WriterMessage {
@@ -862,14 +700,6 @@ mod tests {
         }
     }
 
-    /// ONE task classifies for every camera, and the channel it delivers
-    /// verdicts down is eight slots shared with the analyzer, drained by a
-    /// writer that can be minutes into an upload. Waiting for room there stops
-    /// object detection for the whole site until that one writer moves.
-    ///
-    /// The stall is held open rather than timed: the first camera's channel is
-    /// full for the entire test and nothing ever reads it, so the second
-    /// camera's upgrade arriving is proof the worker walked past it.
     #[tokio::test]
     async fn a_writer_that_is_not_draining_does_not_stall_the_camera_behind_it() {
         let url = ollama_that_always_sees_a_person().await;
@@ -886,8 +716,6 @@ mod tests {
             ]),
         );
 
-        // Both cameras have a written movement event waiting for its verdict,
-        // and the stalled one is served first (round-robin, insertion order).
         let (tx, queue) = detect_queue(Some(registry.clone()));
         tx.send(job("blocked", vec![0]));
         tx.send(job("next", vec![0]));
@@ -903,8 +731,6 @@ mod tests {
             WriterMessage::Event(_) => panic!("the worker sent an event"),
         }
 
-        // And the first camera's upgrade was dropped, not queued behind the
-        // message that is still sitting there.
         match blocked_rx.try_recv() {
             Ok(WriterMessage::Upgrade(held)) => assert_eq!(held.start_pts_ns, u64::MAX),
             _ => panic!("the filler holding the channel full went missing"),
@@ -916,12 +742,6 @@ mod tests {
         worker_task.await.expect("the worker panicked");
     }
 
-    /// The sharp edge of dropping it. A crop job on the queue is a verdict the
-    /// registry is waiting for, and every record covering its sequences is kept
-    /// alive until that wait ends — so an upgrade that goes nowhere still has
-    /// to end it. Leave the expectation standing and the camera accumulates a
-    /// pinned record per drop, which is the leak the registry's settle
-    /// discipline exists to prevent.
     #[tokio::test]
     async fn a_dropped_upgrade_still_settles_what_the_registry_expects() {
         let url = ollama_that_always_sees_a_person().await;
@@ -939,16 +759,12 @@ mod tests {
         registry.open("cam", 0, 0, false).commit(1000, 5000, false);
         worker.process_job(job).await;
 
-        // The upgrade really was dropped — without this the rest proves nothing.
         match rx.try_recv() {
             Ok(WriterMessage::Upgrade(held)) => assert_eq!(held.start_pts_ns, u64::MAX),
             _ => panic!("the filler holding the channel full went missing"),
         }
         assert!(rx.try_recv().is_err(), "the upgrade was queued after all");
 
-        // A movement event over the same sequences, opened after the job left
-        // the system. A verdict still marked outstanding would pin it against
-        // every later event; a settled one lets the next event forget it.
         registry.open("cam", 0, 0, false).commit(2000, 5000, false);
         registry
             .open("cam", 100, 100, false)
@@ -961,10 +777,6 @@ mod tests {
         );
     }
 
-    /// One captured log line, kept whole. The structured fields are kept
-    /// alongside the message because that is where the camera and the event
-    /// live — a warning whose text promises to name them and does not would
-    /// otherwise read as correct here.
     #[derive(Clone)]
     struct Logged {
         level: tracing::Level,
@@ -1026,9 +838,6 @@ mod tests {
         }
     }
 
-    /// Everything logged inside `body`, so the level and the fields asserted
-    /// are the ones the drop really emits rather than the ones its wording
-    /// implies.
     fn capture(body: impl FnOnce()) -> Vec<Logged> {
         use tracing_subscriber::layer::SubscriberExt;
         let captured = Captured::default();
@@ -1038,11 +847,6 @@ mod tests {
         logs
     }
 
-    /// A drop is a recording that will expire on the shorter retention, so it
-    /// is reported exactly as this file's other accepted drops are: one
-    /// warning, carrying the camera and the event that lost the upgrade as
-    /// fields an operator can grep on. The two ways to lose one — no room, and
-    /// no writer at all — are told apart, because only the first is transient.
     #[test]
     fn a_dropped_upgrade_is_reported_the_way_this_file_reports_its_other_drops() {
         let registry = EventRegistry::new(&["cam".to_string()]);
@@ -1087,7 +891,6 @@ mod tests {
             "the warning does not carry the event that lost the upgrade"
         );
 
-        // The writer being gone outright still says so in its own words.
         drop(rx);
         registry.open("cam", 1, 1, false).commit(2000, 5000, false);
         let gone = capture(|| {
@@ -1108,8 +911,6 @@ mod tests {
         assert_eq!(warning.field("camera"), Some("cam"));
     }
 
-    /// A worker whose only job in these tests is to publish debug entries; the
-    /// Ollama end is never reached.
     fn worker_with(debug_store: &DetectionDebugStore) -> DetectionWorker {
         let client = OllamaClient::new(
             "http://127.0.0.1:1",
@@ -1130,8 +931,6 @@ mod tests {
         )
     }
 
-    /// A job carrying both of the pictures the debug view shows: the crops the
-    /// model saw and the full frame the overlay is drawn on.
     fn job_with_pictures(crop: &Arc<Vec<u8>>, full: &Arc<Vec<u8>>) -> DetectionJob {
         let mut job = job("cam", vec![0]);
         job.crop_jpegs = vec![Arc::clone(crop)];
@@ -1139,9 +938,6 @@ mod tests {
         job
     }
 
-    /// The store keeps fifty entries of about a megabyte per camera, and
-    /// detection runs all night. Neither picture may be kept for a view nobody
-    /// has open — and both have to come back the moment somebody does.
     #[test]
     fn neither_debug_picture_is_kept_until_somebody_is_watching() {
         let debug_store = DetectionDebugStore::new(&["cam".to_string()]);
@@ -1169,9 +965,6 @@ mod tests {
         );
     }
 
-    /// The job owns these bytes and the store outlives the job, so the store
-    /// takes a share of them. Copying instead would double the megabyte per
-    /// entry — the very memory this gate exists to give back.
     #[test]
     fn the_debug_entry_shares_the_jobs_frames_rather_than_copying_them() {
         let debug_store = DetectionDebugStore::new(&["cam".to_string()]);
@@ -1199,7 +992,6 @@ mod tests {
         tx.send(job("cam", vec![1]));
         drop(tx);
 
-        // A sender clone still exists: the queued job is served.
         assert_eq!(queue.recv().await.unwrap().seqs, vec![1]);
 
         let recv = tokio::spawn(async move { queue.recv().await.is_none() });
@@ -1250,7 +1042,6 @@ mod tests {
         let best = best_frame_per_class(&per_frame);
         assert_eq!(best["person"], 2);
         assert_eq!(best["cat"], 0);
-        // A class nobody saw has no frame.
         assert!(!best.contains_key("car"));
     }
 
@@ -1285,11 +1076,9 @@ mod tests {
     #[test]
     fn sighting_falls_back_to_the_full_frame_then_to_nothing() {
         let classes = ["person".to_string()];
-        // No crops to point at: the full frame stands in.
         let sightings = build_sightings(&classes, &[], &[], Some(&[0xcc]));
         assert_eq!(sightings[0].frame_jpeg, Some(vec![0xcc]));
 
-        // Neither: nothing is published for this sighting.
         let sightings = build_sightings(&classes, &[], &[], None);
         assert_eq!(sightings[0].class, "person");
         assert_eq!(sightings[0].frame_jpeg, None);

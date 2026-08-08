@@ -1,169 +1,5 @@
-//! Home Assistant MQTT bridge.
-//!
-//! One async task per process owns the broker connection and publishes camon's
-//! state under a configurable topic prefix, plus the retained
-//! `homeassistant/.../config` payloads that make Home Assistant materialize the
-//! entities on its own (MQTT discovery). Nothing is ever subscribed to: the
-//! bridge is strictly outbound, so a compromised or misbehaving broker cannot
-//! drive camon.
-//!
-//! # Entities
-//!
-//! Per camera, four kinds of entity:
-//!
-//! - a **camera** fed by JPEG snapshots;
-//! - a **motion** binary sensor, ON for the lifetime of a motion run;
-//! - one **occupancy** binary sensor per configured object-detection class, ON
-//!   from the moment a verdict names that class until `occupancy_hold_secs`
-//!   pass with no new sighting;
-//! - one **occupancy snapshot** camera per configured class, holding the crop
-//!   the vision model classified — see below.
-//!
-//! # Per-class sighting snapshots
-//!
-//! A verdict carries, per named class, the JPEG the model actually looked at:
-//! the motion crop of the frame with that class's strongest detection. It is
-//! published retained, so the entity is not tied to the occupancy sensor's
-//! hold-off — it keeps showing the last sighting of that class indefinitely,
-//! long after the sensor went OFF, and is there the moment Home Assistant
-//! subscribes. "When did a cat last walk past, and what did it look like" is
-//! then one dashboard tile rather than an event search. The bytes are not held
-//! in memory, so unlike the sensor states these are not re-asserted on
-//! reconnect; a broker that loses its retained set fills the tile in again on
-//! the next sighting.
-//!
-//! # Motion-gated snapshots
-//!
-//! Snapshots are published *only while motion is open*, never on a free-running
-//! timer. This is a deliberate design decision, not a limitation. Each snapshot
-//! costs an ffmpeg decode of a whole GOP segment, and the interesting frames are
-//! by definition the ones with motion in them; a 24/7 cadence would burn CPU on
-//! every camera continuously to produce identical still frames. The camera
-//! entity therefore shows "the last thing that moved", which is what a
-//! notification or dashboard tile actually wants. A final snapshot is taken as
-//! the run closes so the tile does not freeze mid-event.
-//!
-//! # Never block the loop, and never cancel it either
-//!
-//! The event loop must be polled continuously — rumqttc does all of its I/O,
-//! including draining the client's request queue, inside `poll()`. Three
-//! consequences shape this module:
-//!
-//! - `poll()` never appears as a `select!` arm, because it is not
-//!   cancellation-safe. It runs in a plain loop on a task of its own, which
-//!   does nothing else; see [`Eventloop`]. A QoS-1 publish is booked as
-//!   in-flight *before* its bytes are written, so a `poll()` dropped
-//!   mid-write leaks that slot — no PUBACK can ever retire it — and a hundred
-//!   leaked slots wedge the request path shut for good: a bridge that still
-//!   answers keepalives, still accepts publishes and still reports `online`
-//!   while nothing it queues ever reaches the broker. Cancelling a connect
-//!   attempt is the same bug in miniature, since the handshake then restarts
-//!   from the beginning every time and a broker slower than the cancelling
-//!   arm's cadence is never reached at all.
-//! - every publish uses `try_publish`, never the awaiting `publish`. While the
-//!   broker is unreachable the request queue backs up and nothing drains it,
-//!   so an awaiting publish would park the bridge loop for the length of the
-//!   outage — no ticks, no events, and no reconnect burst to recover with.
-//!   Rejected publishes are recovered by the reconnect republish below.
-//! - snapshot decoding runs in a detached task holding a killable ffmpeg child,
-//!   with at most one in flight per camera, and is skipped entirely while
-//!   disconnected — the queue is not being drained, so a snapshot pushed into
-//!   it is memory parked for the length of the outage.
-//!
-//! # Reconnect republish
-//!
-//! On every `ConnAck` the bridge republishes the full discovery set, then an
-//! explicit state for every configured entity, then the availability marker.
-//! A broker restart loses retained messages, Home Assistant re-reads discovery
-//! when *it* restarts, and anything dropped during an outage is made good here.
-//! Republishing is idempotent, so doing it unconditionally is simpler and safer
-//! than tracking what the broker still holds.
-//!
-//! The states are enumerated from the config rather than from what happens to
-//! be ON, because the broker can be holding a retained ON that no live state
-//! corresponds to: camon dying mid-motion-run leaves one behind, the LWT only
-//! flips availability, and a fresh process would otherwise never contradict it.
-//! "Every configured entity" means every entity *this* config describes; what a
-//! previous one described is dealt with below.
-//!
-//! The burst is queued at its least favourable moment: nothing has drained the
-//! request queue for the length of the outage, so it can be rejected in full.
-//! It is therefore retried from the tick, rebuilt from the live state each
-//! time, until the whole of it is accepted — losing it would leave both a stale
-//! retained ON and the LWT's `offline` standing on a healthy connection. For
-//! that retry to be able to converge the queue is sized from the config to hold
-//! a whole burst; see [`request_queue_capacity`].
-//!
-//! Order within the burst is orphan clears, then discovery, then states, then
-//! `online`. MQTT only guarantees ordering per topic, so this is not a promise
-//! about what Home Assistant observes in what instant; it is that camon never
-//! leaves the *final* retained set inconsistent, and that the availability flip
-//! is the last thing queued rather than the first.
-//!
-//! # Forgetting an entity the config dropped
-//!
-//! Renaming or removing a camera, or dropping an object class, leaves the
-//! broker holding that entity's retained discovery document and its retained
-//! state. The burst above contradicts neither — it enumerates the current
-//! config — and since every entity shares one availability topic, publishing
-//! `online` makes those orphans available again: an entity showing whatever
-//! motion happened to be open when the camera was removed, permanently, in
-//! every restart.
-//!
-//! So the bridge remembers the entity set it announced, in
-//! `{data_dir}/mqtt_entities.json`, and clears what the current set no longer
-//! explains at the head of the next reconnect burst: an empty retained payload
-//! on the discovery topic, which is how Home Assistant is told to forget a
-//! discovered entity, and one on the topic that document pointed at, which the
-//! broker otherwise keeps holding for good — a per-class sighting crop is
-//! hundreds of KiB of it.
-//!
-//! Clearing something that was only *temporarily* absent costs the operator an
-//! entity's history and its place on a dashboard, so what counts as dropped is
-//! deliberately narrow. Cameras come from the config outright, so one that is
-//! not in it was renamed or removed. Classes do not: an empty class list means
-//! object detection is off *this run*, which is equally what a misconfigured or
-//! unreachable vision server looks like, so the remembered classes are carried
-//! forward. Carried forward *and announced* — the burst is built from the same
-//! record, so those entities keep their discovery documents and are restated
-//! OFF, rather than being left for `online` to resurrect with whatever the
-//! broker still held. No record at all — a first start, or one that cannot be
-//! read — clears nothing.
-//!
-//! Deleting is only camon's to do where camon published: the record names the
-//! broker it announced to and its format version, and a record that does not
-//! match this build and this broker is not acted on. Two camon instances
-//! sharing a broker, a discovery prefix *and* a camera id do co-own that
-//! camera's entities, and a removal in one is a removal for both; give them
-//! distinct camera ids or distinct discovery prefixes.
-//!
-//! Delivery is where the record is careful. `try_publish` only queues, so
-//! acceptance is recorded *with the clears still marked owed*: a process that
-//! dies before the eventloop writes them clears the same topics again on the
-//! next start. They are dropped from the record only when the shutdown
-//! `Disconnect` goes out, which — requests being written in queue order — puts
-//! everything queued before it on the wire. An unclean exit therefore costs one
-//! redundant round of clears, which is a no-op on a topic that no longer holds
-//! anything; the opposite trade would cost an entity that never came back.
-//!
-//! # One connection per instance
-//!
-//! The broker identifies a session by its client id, and enforces that identity
-//! by disconnecting the older session whenever a second one arrives claiming
-//! the same id. Two camon instances pointed at one broker under a shared id
-//! therefore kick each other off for ever — each reconnect ends the other's
-//! connection, and neither ever finishes a reconnect burst. So the id is
-//! derived per instance; see [`derive_client_id`]. It is camon's identity *to
-//! the broker* and nothing else: Home Assistant discovers entities by the
-//! object ids and `unique_id`s in the discovery payloads, which are built from
-//! camera ids alone, so what this id is cannot move, rename or duplicate a
-//! single entity.
-//!
-//! Coexisting is not the same as being independent. Two instances that share a
-//! `topic_prefix` share the one availability topic under it, last writer and
-//! last will included — see [`Topics::availability`]. The id makes them able to
-//! stay connected at the same time; only distinct prefixes make what they say
-//! about themselves distinguishable.
+//! Home Assistant MQTT bridge: outbound-only publisher of discovery documents, sensor states
+//! and snapshots. Nothing is ever subscribed to, so a misbehaving broker cannot drive camon.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -182,37 +18,22 @@ use crate::config::MqttConfig;
 use crate::durable::{create_dir_all_synced, parent_dir, sync_dir, tmp_path, write_synced};
 use crate::locks::LockExt;
 
-/// Depth of the analyzer/detector -> bridge event channel. Events are tiny and
-/// rare (a motion transition or a verdict), so this is far more headroom than a
-/// healthy bridge ever needs; producers `try_send` and drop on full rather than
-/// ever stalling the analysis threads.
+/// Depth of the analyzer/detector -> bridge event channel. Producers
+/// `try_send` and drop on full rather than ever stalling the analysis threads.
 pub const MQTT_EVENT_CAPACITY: usize = 64;
 
 /// Headroom above one reconnect burst: room for the transitions and snapshots
 /// raised while that burst is still being drained.
 const REQUEST_QUEUE_HEADROOM: usize = 256;
 
-/// How many publishes one reconnect burst is — one clear per orphaned topic,
-/// then per camera two discovery payloads plus two per class, one state plus
-/// one per class, then the availability marker. A test ties this to what
+/// How many publishes one reconnect burst is. A test ties this to what
 /// [`reconnect_burst`] actually produces.
 fn burst_len(cameras: usize, classes: usize, orphans: usize) -> usize {
     orphans + cameras * (3 + 3 * classes) + 1
 }
-/// Depth of the rumqttc request queue, sized from the config so that one whole
-/// reconnect burst always fits in it.
-///
-/// [`publish_burst`] is all-or-nothing and runs while `poll()` is draining
-/// nothing, so a burst longer than the queue could never be published at all:
-/// the tick would requeue the same prefix every second forever, and `online` —
-/// at the tail — would never go out, leaving Home Assistant with a permanently
-/// unavailable device. Fifteen cameras with the default five classes is already
-/// 271 publishes, so this is not a hypothetical size.
-///
-/// Sizing up is only safe because snapshots are never queued while
-/// disconnected: the slots this adds can hold nothing bigger than a few bytes
-/// of retained state each, not the hundreds of KiB a JPEG would park here for
-/// the length of an outage.
+/// Depth of the rumqttc request queue, sized from the config so that one whole reconnect burst
+/// always fits: [`publish_burst`] is all-or-nothing, so a burst longer than the queue could
+/// never be published at all.
 fn request_queue_capacity(cameras: usize, classes: usize, orphans: usize) -> usize {
     burst_len(cameras, classes, orphans) + REQUEST_QUEUE_HEADROOM
 }
@@ -222,71 +43,21 @@ fn request_queue_capacity(cameras: usize, classes: usize, orphans: usize) -> usi
 const MAX_OUTGOING_PACKET_BYTES: usize = 4 * 1024 * 1024;
 
 /// How many image bytes may be handed to the request queue between two ticks.
-///
-/// This is a bound on the *rate* at which camon can commit memory to the queue,
-/// and it is worth being exact about what that does and does not buy, because
-/// [`request_queue_capacity`] bounds the queue in slots only: fifteen cameras
-/// with five classes size it at 527 of them, and a slot holding a JPEG is worth
-/// up to [`MAX_OUTGOING_PACKET_BYTES`]. Only images come near that — every
-/// other publish this bridge makes is a discovery document or a two-byte state.
-///
-/// What camon cannot do is bound residency directly. rumqttc offers no signal
-/// for a request having left the queue, so nothing here can know how full it
-/// is; a real residency budget would need drain feedback that does not exist.
-/// That is the residual, and it leaves three regimes:
-///
-/// - **Healthy link.** rumqttc takes each request and writes it straight out,
-///   so the queue is near enough empty and this ceiling is purely a rate cap.
-///   It is set well above what a healthy second costs: fifteen cameras all
-///   opening a motion run at once is fifteen snapshots of a few hundred KiB.
-/// - **Outage.** The connection fails, whereupon rumqttc moves the queue into
-///   its pending set — and *keeps* that set across every failed reconnect,
-///   dropping it only at the first successful `ConnAck`, since camon's
-///   sessions are clean ones. What that set holds is whatever the queue held
-///   at the moment of failure. A socket that errors outright is caught within
-///   a tick, so roughly one window, 16 MiB; a flush that stalls takes up to
-///   rumqttc's five-second timeout to be declared dead, and the bridge counts
-///   as connected for all of it, so up to five refilled windows — some 80 MiB
-///   — can be admitted first; and a failure that ends the regime below
-///   inherits everything that regime accumulated. Snapshots already admitted
-///   before the disconnect also finish their publish from their detached
-///   tasks (bounded by the one-in-flight-per-camera guard); only new decodes
-///   stop, see [`spawn_snapshot`].
-/// - **A broker that answers but never acknowledges.** The bad one. rumqttc
-///   stops taking requests once 100 QoS-1 publishes are unacked, so a broker
-///   that accepts packets and answers keepalives while withholding PUBACKs
-///   holds a connection camon believes in while nothing drains — and the
-///   channel fills to the item cap. (The images themselves are QoS 0 and hold
-///   no inflight slots; it is the two-byte QoS-1 state publishes that fill
-///   the window, and the disabled request branch that strands the images
-///   behind them.) Residency is then bounded by that cap alone: 527 slots of
-///   realistic ~300 KiB snapshots is some 160 MiB, and the 4 MiB packet
-///   ceiling makes 2 GiB the theoretical worst. What this ceiling does buy is
-///   time — filling it takes at least the total divided by 16 MiB in ticks,
-///   ten seconds for the realistic figure and two minutes for the theoretical
-///   one. By this regime's own premise the keepalive path never fires, so
-///   camon does not leave it on its own: as the residual above says, it ends
-///   when an operator restarts something or the broker's behaviour changes,
-///   and only then does the outage regime inherit the accumulation.
 const MAX_IMAGE_BYTES_PER_TICK: usize = 16 * 1024 * 1024;
 
 /// The image allowance of [`MAX_IMAGE_BYTES_PER_TICK`], shared by the bridge
-/// loop and every detached snapshot task, since both queue images and the
-/// bound is on their sum.
+/// loop and every detached snapshot task, since both queue images.
 #[derive(Clone, Default)]
 struct ImageBudget {
     spent: Arc<std::sync::atomic::AtomicUsize>,
-    /// Whether this window's refusal has already been reported. A stalled
-    /// broker refuses every camera every second; the operator needs to hear
-    /// that once a second, not once per camera per second.
+    /// Whether this window's refusal has been reported: once a second, not
+    /// once per camera per second.
     reported: Arc<AtomicBool>,
 }
 
 impl ImageBudget {
-    /// Charge one image, reporting whether it may be queued. A refusal is a
-    /// dropped image and nothing more: the camera tile keeps the frame it has
-    /// until the next one is due, exactly as it does for a decode that produced
-    /// nothing.
+    /// Charge one image, reporting whether it may be queued. A refusal just
+    /// drops the image; the camera tile keeps the frame it has.
     fn take(&self, bytes: usize) -> bool {
         let taken = self
             .spent
@@ -306,10 +77,6 @@ impl ImageBudget {
         taken
     }
 
-    /// A new window: on a healthy link whatever the last one queued has had a
-    /// tick to reach the socket. On an unhealthy one the windows accumulate in
-    /// the queue instead — see [`MAX_IMAGE_BYTES_PER_TICK`] for what bounds
-    /// that.
     fn refill(&self) {
         self.spent.store(0, Ordering::Relaxed);
         self.reported.store(false, Ordering::Relaxed);
@@ -324,44 +91,7 @@ fn client_id(ctx: &BridgeContext) -> String {
     )
 }
 
-/// Derive the client id camon connects under, as
-/// `camon-<[`CLIENT_ID_HASH_BYTES`] hex>`.
-///
-/// Uniqueness is the load-bearing property: a broker disconnects the older
-/// session the moment a second one claims the same id, so two camons sharing an
-/// id spend their lives evicting each other. Stability across restarts is worth
-/// less than it looks — camon's sessions are clean ones, so the broker keeps no
-/// state under the id, retained messages belong to their topics and the last
-/// will belongs to the connection, none of it held for an id that comes back —
-/// but it is still worth having: it is what makes a broker's logs, its ACLs and
-/// its connected-clients list say the same thing about this camon tomorrow as
-/// they do today, rather than accumulating a new name per restart.
-///
-/// So it is derived from what identifies the instance rather than generated:
-///
-/// - the machine's hostname, which is what separates two camons on two hosts
-///   publishing to one broker — their data dirs are very likely the same path;
-/// - the path of the entity record, which lives in the data dir and so is what
-///   separates two camons on one host: they cannot share a data dir, each
-///   owning its own hot buffer state, warm index and entity record in it.
-///
-/// Deliberately nothing else. Not the camera list or the classes, which change
-/// whenever the operator adds a camera and would take the session identity with
-/// them; not the topic or discovery prefixes, which two instances may share —
-/// permitted, though not advisable (see [`Topics::availability`]); and not the
-/// broker address, which
-/// is by definition the same for the two instances that would collide.
-///
-/// The path is taken as configured rather than canonicalized: resolving it is
-/// I/O against a directory that need not exist yet, and a config that keeps
-/// saying the same thing keeps producing the same id, which is all stability
-/// asks for. It follows that the path separates instances only *as spelled* —
-/// two camons started from different working directories with the same relative
-/// `data_dir` are distinct instances that derive one id, and the operator who
-/// arranges that wants absolute paths (or distinct ones).
-///
-/// Both halves of the identity are handed in rather than read here, so each can
-/// be varied on its own.
+/// Derive the client id camon connects under, as `camon-<[`CLIENT_ID_HASH_BYTES`] hex>`.
 fn derive_client_id(hostname: &str, entities_path: Option<&Path>) -> String {
     use std::os::unix::ffi::OsStrExt;
     let mut hasher = Sha256::new();
@@ -381,14 +111,12 @@ fn derive_client_id(hostname: &str, entities_path: Option<&Path>) -> String {
     id
 }
 
-/// How much of the digest the client id carries. Six bytes is 48 bits against a
-/// handful of instances per broker, and keeps the whole id at 18 characters —
-/// inside the 23 that MQTT 3.1.1 requires every broker to accept, which a
-/// hostname pasted in raw would not be.
+/// How much of the digest the client id carries. Six bytes keeps the whole id
+/// at 18 characters — inside the 23 that MQTT 3.1.1 requires every broker to
+/// accept.
 const CLIENT_ID_HASH_BYTES: usize = 6;
 
-/// The kernel's hostname, or `None` when there is none to read. An unnamed host
-/// costs [`derive_client_id`] one of its two dimensions, never the id itself.
+/// The kernel's hostname, or `None` when there is none to read.
 fn hostname() -> Option<String> {
     let mut buf = [0u8; 256];
     // SAFETY: `gethostname` writes at most `buf.len()` bytes into a buffer of
@@ -408,16 +136,13 @@ fn hostname() -> Option<String> {
 /// loop.
 const RECONNECT_DELAY: Duration = Duration::from_secs(5);
 
-/// Depth of the eventloop task -> bridge notification channel. Its entries are
-/// connection edges, which [`RECONNECT_DELAY`] already paces to at most a
-/// couple per five seconds, so this is several outages' worth of headroom.
+/// Depth of the eventloop task -> bridge notification channel. Entries are
+/// connection edges, already paced by [`RECONNECT_DELAY`].
 const LINK_EVENT_CAPACITY: usize = 16;
 
-/// How long shutdown waits for the eventloop task to end once it has been told
-/// to stop. Usually far less: the broker closes the connection it was just told
-/// to disconnect from, `poll()` returns the error and the task falls out. A
-/// broker that leaves the socket open instead parks it in `poll()`, where no
-/// signal reaches, and this bound is what keeps shutdown from waiting on it.
+/// How long shutdown waits for the eventloop task to end once told to stop. A
+/// broker that leaves the socket open parks the task in `poll()`, where no
+/// signal reaches; this bound keeps shutdown from waiting on it.
 const EVENTLOOP_STOP_JOIN: Duration = Duration::from_millis(200);
 
 /// Snapshot output size. Fixed regardless of camera aspect ratio (letterboxed
@@ -432,31 +157,21 @@ const SNAPSHOT_JPEG_QUALITY: u8 = 90;
 /// to reach the socket.
 const SHUTDOWN_FLUSH: Duration = Duration::from_secs(2);
 
-/// The longest snapshot cadence camon will honour. The cadence only runs while
-/// a motion run is open, and a run that stays open a whole day paces at most
-/// one snapshot in it either way; the ceiling exists so that an operator's
-/// `u64` cannot be turned into an `Instant` that does not exist. A configured
-/// cadence above a day is honoured as "one per day", clamped with a warning.
+/// The longest snapshot cadence camon will honour, clamped with a warning:
+/// an operator's `u64` must not be turned into an `Instant` that overflows.
 const MAX_SNAPSHOT_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// How soon a snapshot that produced nothing is attempted again, instead of
-/// waiting out the whole cadence. Short enough that a camera recovering within
-/// a motion run still gets a tile out of it, long enough that a camera failing
-/// for good forks one ffmpeg every couple of seconds rather than every tick.
-/// Only ever shortens the wait: a cadence faster than this keeps its own pace.
+/// waiting out the whole cadence. Only ever shortens the wait.
 const SNAPSHOT_RETRY_DELAY: Duration = Duration::from_secs(2);
 
-/// How long one snapshot decode may run before its ffmpeg is killed. Generous
-/// for a single-GOP decode: the point is that a wedged ffmpeg cannot hold a
-/// camera's in-flight slot forever or outlive the process, not to police the
-/// timing of healthy decodes.
+/// How long one snapshot decode may run before its ffmpeg is killed — a bound
+/// on wedged ffmpegs, not a policing of healthy decodes.
 const SNAPSHOT_DECODE_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// How long shutdown waits for aborted snapshot tasks to actually end. A
-/// snapshot task is always parked on an await — the ffmpeg pipe, or the encode
-/// it hands to a blocking thread — and abort takes effect there in microseconds,
-/// so nothing is expected to reach this bound. It exists so that a task somehow
-/// blocking its worker thread cannot hold shutdown open indefinitely.
+/// How long shutdown waits for aborted snapshot tasks to actually end. Abort
+/// lands at an await in microseconds; this exists so a task blocking its
+/// worker thread cannot hold shutdown open.
 const SNAPSHOT_ABORT_JOIN: Duration = Duration::from_millis(500);
 
 /// Something the bridge should reflect to Home Assistant. Produced by the
@@ -481,18 +196,14 @@ pub enum MqttEvent {
 pub struct Sighting {
     /// The object class, as configured in `analytics.object_detection.classes`.
     pub class: String,
-    /// The JPEG the vision model classified — the motion crop of the frame
-    /// holding this class's highest-confidence detection, falling back to the
-    /// run's full frame. `None` when the job carried no frame at all, in which
-    /// case nothing is published to the snapshot topic and the entity keeps
-    /// showing the previous sighting.
+    /// The JPEG the vision model classified. `None` when the job carried no
+    /// frame; the snapshot entity then keeps showing the previous sighting.
     pub frame_jpeg: Option<Vec<u8>>,
 }
 
-/// Hand an event to the bridge without ever blocking the producer. Both
-/// analyzer and detection worker call this from paths where stalling would cost
-/// footage, so a full queue (or a bridge that is gone) drops the event with a
-/// warning: MQTT state is refreshed on the next transition and on reconnect.
+/// Hand an event to the bridge without ever blocking the producer — stalling
+/// here would cost footage. A full queue drops the event with a warning; MQTT
+/// state is refreshed on the next transition and on reconnect.
 pub fn send_event(tx: &tokio::sync::mpsc::Sender<MqttEvent>, event: MqttEvent) -> bool {
     use tokio::sync::mpsc::error::TrySendError;
     match tx.try_send(event) {
@@ -508,10 +219,9 @@ pub fn send_event(tx: &tokio::sync::mpsc::Sender<MqttEvent>, event: MqttEvent) -
     }
 }
 
-/// Lowercase slug with every non-alphanumeric character folded to `_`. Camera
-/// ids are free-form, but they end up inside MQTT topics and Home Assistant
-/// unique ids, so they are normalized once here. `Config::validate` uses the
-/// same function to reject ids that would collide once normalized.
+/// Lowercase slug with every non-alphanumeric character folded to `_`, for
+/// MQTT topics and Home Assistant unique ids. `Config::validate` uses the same
+/// function to reject ids that would collide once normalized.
 pub(crate) fn slugify(id: &str) -> String {
     id.chars()
         .map(|c| {
@@ -553,16 +263,8 @@ impl Topics {
         }
     }
 
-    /// The one topic every entity of this prefix reports its availability on —
-    /// and it is the *prefix's*, not the instance's. Two camons configured with
-    /// the same `topic_prefix` therefore share it: last writer wins, the last
-    /// will included, so a dying instance's retained `offline` sits over a
-    /// perfectly healthy sibling until that sibling next reconnects and
-    /// republishes `online`. Distinct instances want distinct prefixes for
-    /// availability to mean anything about any one of them. The per-instance
-    /// client id (see [`derive_client_id`]) makes coexistence possible at all —
-    /// before it they evicted each other's sessions — but it does not divide
-    /// this namespace, and nothing but the prefix can.
+    /// The one availability topic for every entity of this prefix — the *prefix's*, not the
+    /// instance's.
     fn availability(&self) -> String {
         format!("{}/availability", self.prefix)
     }
@@ -656,9 +358,8 @@ fn discovery_payloads(
                 "device": device,
             }),
         ));
-        // The evidence tile for that sensor. Its topic is retained, so this
-        // entity survives the occupancy hold-off expiring and keeps showing the
-        // last sighting of the class until the next one replaces it.
+        // The evidence tile for that sensor: retained, so it keeps showing the
+        // last sighting long after the occupancy hold-off expires.
         out.push((
             topics.discovery("camera", &format!("camon_{slug}_occupancy_{class_slug}")),
             serde_json::json!({
@@ -674,10 +375,9 @@ fn discovery_payloads(
     out
 }
 
-/// Every retained topic one camera's entities occupy: each discovery document
-/// and the topic that document points Home Assistant at. Read back out of the
-/// payloads rather than rebuilt alongside them, so an entity kind cannot be
-/// announced without also being clearable.
+/// Every retained topic one camera's entities occupy. Read back out of the
+/// discovery payloads rather than rebuilt alongside them, so an entity kind
+/// cannot be announced without also being clearable.
 fn retained_topics(topics: &Topics, camera_id: &str, classes: &[String]) -> Vec<String> {
     discovery_payloads(topics, camera_id, classes)
         .into_iter()
@@ -692,9 +392,8 @@ fn retained_topics(topics: &Topics, camera_id: &str, classes: &[String]) -> Vec<
 }
 
 /// Format of [`EntityRecord`]. A record that does not say exactly this is not
-/// camon's to act on: deleting a Home Assistant entity on the strength of a
-/// document this build does not fully understand is how a wrong deletion
-/// happens.
+/// camon's to act on — no deleting on the strength of a document this build
+/// does not fully understand.
 const ENTITY_RECORD_VERSION: u32 = 1;
 
 /// The broker an entity set belongs to, as the record names it.
@@ -702,16 +401,8 @@ fn broker_id(config: &MqttConfig) -> String {
     format!("{}:{}", config.host, config.port)
 }
 
-/// The entity set camon announced to a broker, remembered across restarts so
-/// the next start can tell Home Assistant to forget what the config dropped.
-///
-/// Every field is deletion authority, so every field is required and unknown
-/// ones are refused: a record that is not exactly this shape reads as no record
-/// rather than as an entity set with empty prefixes. `broker` scopes the
-/// authority to where the entities were actually published — a data dir carried
-/// to another broker, or pointed at one, must not delete entities inferred from
-/// what a different broker was told. The prefixes decide every topic, so moving
-/// one orphans that whole side of the set.
+/// The entity set camon announced to a broker, remembered across restarts so the next start can
+/// tell Home Assistant to forget what the config dropped.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct EntityRecord {
@@ -722,24 +413,14 @@ struct EntityRecord {
     discovery_prefix: String,
     cameras: Vec<String>,
     classes: Vec<String>,
-    /// Clears that were queued but are not known to have left the process. They
-    /// ride the next run's burst as well, until a clean disconnect proves the
-    /// socket took them: re-clearing a cleared topic is a no-op, while
-    /// forgetting one that never went out is a permanent ghost entity.
+    /// Clears queued but not known to have left the process. They ride the
+    /// next run's burst too, until a clean disconnect proves the socket took
+    /// them: re-clearing is a no-op, forgetting is a permanent ghost entity.
     pending_clears: Vec<String>,
 }
 
 impl EntityRecord {
     /// The set this run announces, given what the last one announced.
-    ///
-    /// Classes are carried forward when this run has none: an empty list means
-    /// object detection produced no classes *this run* — it is off, or its
-    /// vision client could not be built — which is no evidence that the
-    /// operator dropped those entities. What is carried forward is announced,
-    /// not merely remembered: the burst is built from this record, so those
-    /// occupancy entities keep their discovery documents and are restated OFF,
-    /// which is what they are while nothing is looking for them. Cameras are
-    /// taken as they are — that list is the config's own.
     fn current(previous: Option<&Self>, topics: &Topics, ctx: &BridgeContext) -> Self {
         let classes = match previous {
             Some(previous) if ctx.classes.is_empty() => previous.classes.clone(),
@@ -769,11 +450,8 @@ impl EntityRecord {
     }
 }
 
-/// Retained topics the previous record holds that the current set does not
-/// explain, plus whatever it left owed. Anything the current set does announce
-/// is filtered back out — a camera removed and then added again is live, and
-/// clearing it would delete an entity camon is publishing to. Sorted and
-/// deduplicated so the burst is the same every time it is rebuilt.
+/// Retained topics the previous record holds that the current set does not explain, plus
+/// whatever it left owed.
 fn orphaned_topics(previous: &EntityRecord, current: &EntityRecord) -> Vec<String> {
     let live = current.retained_topics();
     let mut orphans: Vec<String> = previous
@@ -782,8 +460,8 @@ fn orphaned_topics(previous: &EntityRecord, current: &EntityRecord) -> Vec<Strin
         .chain(previous.pending_clears.iter().cloned())
         .filter(|topic| !live.contains(topic))
         .collect();
-    // The availability topic belongs to no single entity — every one of them
-    // shares it — so it is only ever orphaned by the prefix itself moving.
+    // The availability topic is shared by every entity, so it is only ever
+    // orphaned by the prefix itself moving.
     if previous.topic_prefix != current.topic_prefix {
         orphans.push(previous.topics().availability());
     }
@@ -810,10 +488,9 @@ fn load_record(path: &Path) -> Option<EntityRecord> {
     Some(record)
 }
 
-/// Persist the record the way every other small camon file is written: stage,
-/// fsync, rename, fsync the directory. A torn record reads as no record, which
-/// costs a cleanup that would have happened; the rename makes even that
-/// unreachable.
+/// Persist the record: stage, fsync, rename, fsync the directory. A torn
+/// record would read as no record and cost a cleanup; the rename makes even
+/// that unreachable.
 fn save_record(path: &Path, record: &EntityRecord) -> std::io::Result<()> {
     let dir = parent_dir(path).unwrap_or(Path::new("."));
     create_dir_all_synced(dir)?;
@@ -828,12 +505,6 @@ fn save_record(path: &Path, record: &EntityRecord) -> std::io::Result<()> {
 }
 
 /// The bridge's memory of what Home Assistant has been told about.
-///
-/// The writes are small, synchronous and at most two per process (one when the
-/// burst is first accepted, one when the disconnect proves it went out). They
-/// are not handed to a blocking task because the failure has to come back here:
-/// a record that did not reach disk must stay owed, or a transient write error
-/// silently costs the operator's *next* removal its cleanup.
 struct EntityMemory {
     /// `None` disables the memory entirely: nothing is read, cleared or
     /// written.
@@ -847,16 +518,7 @@ struct EntityMemory {
     /// The record believed to be on disk, so a write is skipped when it would
     /// change nothing and retried when it failed.
     on_disk: Option<EntityRecord>,
-    /// Whether the clears are sitting in the request queue of the session that
-    /// is up *now*.
-    ///
-    /// Scoped to the session on purpose. A queued request survives exactly as
-    /// long as the connection it was queued on: when that connection fails,
-    /// rumqttc moves whatever the queue still held into its pending set, and
-    /// the next connect — camon's sessions are clean ones — throws that set
-    /// away unwritten. So a burst accepted on a connection that has since
-    /// dropped proves nothing about the broker, and only a fresh burst on the
-    /// live session can put the clears back in front of it.
+    /// Whether the clears sit in the request queue of the session up *now*.
     clears_queued: bool,
 }
 
@@ -872,11 +534,9 @@ impl EntityMemory {
             };
         };
         let previous = load_record(&path);
-        // A record is authority over one broker's entities only. One from
-        // another broker describes entities over there: acting on it here would
-        // delete entities this broker was never told about — or that another
-        // camon still serves — and it is no reason to announce that broker's
-        // classes here either.
+        // A record is authority over one broker's entities only; acting on
+        // another broker's record here would delete entities this broker was
+        // never told about.
         let broker = broker_id(&ctx.config);
         let authority = previous.as_ref().filter(|previous| {
             if previous.broker == broker {
@@ -909,41 +569,23 @@ impl EntityMemory {
     }
 
     /// Record the announced set, now that a burst carrying the clears has been
-    /// taken by the request queue. The clears stay in the record as owed: the
-    /// queue having taken them is not the socket having written them, and a
-    /// process that dies in between must clear them again rather than believe
-    /// the job done.
+    /// taken by the request queue. The clears stay recorded as owed: queued is
+    /// not written, and a process that dies in between must clear them again.
     fn note_burst_accepted(&mut self) {
         self.clears_queued = true;
         let owed = self.orphans.clone();
         self.write(owed);
     }
 
-    /// A session ended, or a new one began: whatever the old one's queue was
-    /// holding is unwritten and unreachable, so the clears are owed again.
-    ///
-    /// Called for both edges because both destroy the same evidence. It costs
-    /// nothing when the clears did in fact go out before the connection
-    /// dropped — the next start clears topics that hold nothing — while the
-    /// opposite mistake costs an entity that never goes away.
+    /// A session ended, or a new one began: whatever the old one's queue held is unwritten and
+    /// unreachable, so the clears are owed again.
     fn note_session_lost(&mut self) {
         self.clears_queued = false;
     }
 
-    /// Drop the owed clears, now that a `Disconnect` has gone out. Requests are
-    /// written in the order they were queued, so a disconnect on the wire means
-    /// every publish queued before it — the clears among them — is on the wire
-    /// too. Only ever reached from a clean shutdown; a killed camon simply
-    /// clears the same topics again next start, which is a no-op on a topic
-    /// that no longer holds anything.
-    ///
-    /// The ordering argument only holds within one session, which is what
-    /// [`clears_queued`](Self::clears_queued) tracks: a disconnect written on a
-    /// *later* connection than the burst says nothing at all about the burst,
-    /// since the reconnect in between threw its queue away. That is a real
-    /// sequence, not a hypothetical one — a broker that drops out just before
-    /// shutdown has the bridge queue its `offline` marker and its `Disconnect`
-    /// while down, and the poller reconnects and writes exactly those two.
+    /// Drop the owed clears, now that a `Disconnect` has gone out: requests are written in
+    /// queue order, so a disconnect on the wire puts every publish queued before it on the wire
+    /// too.
     fn note_clears_flushed(&mut self) {
         if self.clears_queued {
             self.write(Vec::new());
@@ -960,8 +602,8 @@ impl EntityMemory {
             return;
         }
         match save_record(&path, &record) {
-            // Only now: an unwritten record must stay owed so the next attempt
-            // — the next accepted burst, or the shutdown — tries again.
+            // Only on success: an unwritten record must stay owed so the next
+            // attempt tries again.
             Ok(()) => self.on_disk = Some(record),
             Err(e) => tracing::warn!(path = %path.display(), error = %e,
                 "failed to record the mqtt entity set; a later removal cannot be cleaned up"),
@@ -973,9 +615,8 @@ impl EntityMemory {
 /// other rumqttc event is the eventloop's own business and never gets here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LinkEvent {
-    /// A `ConnAck` arrived: the session is up. One per successful connect, and
-    /// the bridge's only cue to republish, so these must reach it whole —
-    /// neither dropped nor coalesced with a later one.
+    /// A `ConnAck` arrived: the session is up. The bridge's only cue to
+    /// republish, so these must reach it whole — neither dropped nor coalesced.
     Connected,
     /// The connection failed or dropped. The eventloop paces its own retry.
     Disconnected,
@@ -984,22 +625,9 @@ enum LinkEvent {
     DisconnectSent,
 }
 
-/// The bridge's half of the task that owns the rumqttc event loop.
-///
-/// The event loop lives on a task of its own for one reason: `poll()` is not
-/// cancellation-safe (see the module header), so it must never be raced against
-/// anything. Here it is polled in a plain loop that does nothing else, and the
-/// bridge learns about the connection through [`LinkEvent`]s instead.
-///
-/// The channel is small and the task sends into it with `send().await`, which
-/// looks like the very thing this module forbids — an await that could stop
-/// `poll()`. It cannot deadlock: the bridge loop never awaits anything but its
-/// own `select!`, so the channel is always drained within one turn of it, and
-/// the connection edges that flow here are rate-limited by [`RECONNECT_DELAY`]
-/// to a couple per five seconds against [`LINK_EVENT_CAPACITY`] slots. Waiting
-/// is chosen over dropping deliberately: a lost `Connected` is a lost republish
-/// burst, which leaves Home Assistant looking at `offline` on a live
-/// connection.
+/// The bridge's half of the task that owns the rumqttc event loop; `poll()` is not
+/// cancellation-safe, so it lives in a plain loop on its own task and the bridge learns about
+/// the connection through [`LinkEvent`]s.
 struct Eventloop {
     events: tokio::sync::mpsc::Receiver<LinkEvent>,
     /// Cuts the retry delay short at shutdown. Nothing else can hurry the task
@@ -1017,19 +645,16 @@ impl Eventloop {
         Self { events, stop, task }
     }
 
-    /// End the task: ask, wait briefly, abort. Only ever called once the
-    /// shutdown flush is over, so an aborted `poll()` costs nothing that
-    /// matters — the in-flight bookkeeping it could leak dies with the process,
-    /// and the session it belongs to has already been disconnected.
+    /// End the task: ask, wait briefly, abort. Only called once the shutdown
+    /// flush is over, so an aborted `poll()` costs nothing that matters.
     async fn stop(self) {
         let Self {
             events,
             stop,
             mut task,
         } = self;
-        // Dropped first: nothing drains the channel any more, so a task parked
-        // on `send` has to be woken by the send failing rather than by a
-        // notification it is not listening for.
+        // Dropped first: a task parked on `send` has to be woken by the send
+        // failing rather than by a notification it is not listening for.
         drop(events);
         stop.notify_one();
         if tokio::time::timeout(EVENTLOOP_STOP_JOIN, &mut task)
@@ -1041,11 +666,9 @@ impl Eventloop {
     }
 }
 
-/// Poll the event loop forever, reporting connection edges to the bridge.
-///
-/// The only awaits here are `poll()` itself and the paced retry, and the retry
-/// is the only one raced against anything: it is a sleep, so dropping it drops
-/// nothing rumqttc is keeping track of.
+/// Poll the event loop forever, reporting connection edges to the bridge. The
+/// only await raced against anything is the retry sleep, which is safe to
+/// drop.
 async fn run_eventloop(
     mut eventloop: rumqttc::EventLoop,
     tx: tokio::sync::mpsc::Sender<LinkEvent>,
@@ -1061,8 +684,7 @@ async fn run_eventloop(
                 LinkEvent::Disconnected
             }
         };
-        // The bridge is gone: there is no one left to publish, so there is
-        // nothing left to poll for either.
+        // The bridge is gone: nothing left to poll for.
         if tx.send(event).await.is_err() {
             return;
         }
@@ -1076,31 +698,18 @@ async fn run_eventloop(
 }
 
 /// What the bridge believes about the broker connection.
-///
-/// `republish_pending` is the whole recovery story for a dropped burst. The
-/// request queue is only drained while connected, so a reconnect after a real
-/// outage finds it exactly as full as the outage left it and every publish in
-/// the burst is rejected — including `online`, which would otherwise leave the
-/// LWT's `offline` standing on a healthy connection. The tick retries until the
-/// eventloop has drained enough for the burst to fit.
 #[derive(Default)]
 struct Link {
     connected: bool,
     republish_pending: bool,
-    /// What the queue may still be asked to carry in images this tick. Here
-    /// because it is a property of the same request queue the rest of this
-    /// struct is about, and because every site that queues an image already
-    /// holds a `Link` to decide whether the connection is up.
+    /// What the queue may still be asked to carry in images this tick.
     images: ImageBudget,
 }
 
 impl Link {
-    /// Record what became of a publish. A rejected one is never retried on its
-    /// own: the tick re-asserts every entity from the live `SensorState`, which
-    /// repairs this message and anything else the same full queue swallowed.
-    /// Without this a single dropped OFF — an occupancy hold expiring into a
-    /// queue with no room — would leave its retained ON standing for good,
-    /// which is the bug the reconnect burst exists to prevent.
+    /// Record what became of a publish. A rejected one is never retried on its own: the tick
+    /// re-asserts every entity from the live `SensorState`. Without this a single dropped OFF
+    /// would leave its retained ON standing for good.
     fn note(&mut self, published: Published) {
         if published == Published::QueueFull {
             self.republish_pending = true;
@@ -1108,16 +717,14 @@ impl Link {
     }
 }
 
-/// Pure sensor bookkeeping: which cameras have motion open, when each last had
-/// a snapshot taken, and which occupancy sensors are ON with their last
-/// sighting. No I/O and no clock of its own — `now` is always injected — so the
-/// hold-off and cadence rules are exercised directly in tests.
+/// Pure sensor bookkeeping. No I/O and no clock of its own — `now` is always
+/// injected — so the hold-off and cadence rules are exercised directly in
+/// tests.
 struct SensorState {
     snapshot_interval: Duration,
     occupancy_hold: Duration,
     motion_active: HashSet<String>,
-    /// When each camera's next snapshot falls due. Absent means "now": a run
-    /// that has just opened is due immediately.
+    /// When each camera's next snapshot falls due. Absent means due now.
     next_snapshot: HashMap<String, Instant>,
     /// Cameras whose last decode produced no frame, so that a failure is
     /// reported when it starts rather than once per retry.
@@ -1131,11 +738,9 @@ struct SensorState {
 }
 
 impl SensorState {
-    /// `snapshot_interval` is an operator's number and is clamped to
-    /// [`MAX_SNAPSHOT_INTERVAL`] on the way in, because everything downstream
-    /// of it is `now + interval`: an interval of `u64::MAX` seconds is a
-    /// panic on the first tick with motion open, and it is far likelier to be
-    /// a fat-fingered "effectively never" than an attack.
+    /// `snapshot_interval` is clamped to [`MAX_SNAPSHOT_INTERVAL`] because
+    /// everything downstream is `now + interval`: `u64::MAX` seconds would
+    /// panic on the first tick with motion open.
     fn new(snapshot_interval: Duration, occupancy_hold: Duration) -> Self {
         let snapshot_interval = if snapshot_interval > MAX_SNAPSHOT_INTERVAL {
             tracing::warn!(
@@ -1158,12 +763,9 @@ impl SensorState {
         }
     }
 
-    /// Open a motion run. `false` when it was already open (a duplicate start,
-    /// which must not restart the snapshot cadence).
-    ///
-    /// A fresh run is a new generation: decodes started for the run that just
-    /// closed are still out there, and their outcomes belong to that run and
-    /// not to this one.
+    /// Open a motion run. `false` when it was already open (a duplicate start, which must not
+    /// restart the snapshot cadence). A fresh run is a new generation: outcomes of decodes
+    /// started for the previous run must not land on this one.
     fn motion_start(&mut self, camera_id: &str) -> bool {
         let opened = self.motion_active.insert(camera_id.to_string());
         if opened {
@@ -1207,21 +809,7 @@ impl SensorState {
             .insert(camera_id.to_string(), now + self.snapshot_interval);
     }
 
-    /// Note that a decode produced no frame, so the camera's tile still holds
-    /// whatever it held before the attempt.
-    ///
-    /// The cadence paces *pictures*, not attempts: a camera whose decodes all
-    /// fail would otherwise sit out a full interval between failures and
-    /// publish nothing at all, so the next attempt is brought forward to
-    /// [`SNAPSHOT_RETRY_DELAY`] — never later than the cadence would have had
-    /// it, and never sooner than the cadence when that is the shorter of the
-    /// two. Only while the run is still open: a failure reported after
-    /// `MotionEnd` closed it must not put the camera back on a schedule that
-    /// [`motion_end`](Self::motion_end) just took it off.
-    ///
-    /// Reports `true` the first time a camera fails in a row, which is what the
-    /// caller says out loud — a permanently failing camera is silence on a
-    /// dashboard tile, and silence is what nobody notices.
+    /// Note that a decode produced no frame.
     fn note_snapshot_failed(&mut self, camera_id: &str, now: Instant) -> bool {
         if self.motion_active.contains(camera_id) {
             let retry = now + SNAPSHOT_RETRY_DELAY.min(self.snapshot_interval);
@@ -1255,13 +843,9 @@ impl SensorState {
         expired
     }
 
-    /// Cameras whose next motion snapshot is due, putting each on the cadence
-    /// again. A camera that just opened its run has no due time recorded and is
-    /// therefore due immediately.
-    ///
-    /// The attempt is what is stamped here, not its outcome, which is only
-    /// known once the detached decode ends; a decode that produces nothing
-    /// takes the stamp back with [`note_snapshot_failed`](Self::note_snapshot_failed).
+    /// Cameras whose next motion snapshot is due, putting each on the cadence again. The
+    /// attempt is what is stamped here; a decode that produces nothing takes the stamp back
+    /// with [`note_snapshot_failed`](Self::note_snapshot_failed).
     fn due_snapshots(&mut self, now: Instant) -> Vec<String> {
         let due: Vec<String> = self
             .motion_active
@@ -1289,34 +873,15 @@ pub struct BridgeContext {
     pub buffers: Arc<HashMap<String, Arc<RwLock<HotBuffer>>>>,
     pub camera_ids: Vec<String>,
     /// Object-detection classes to expose occupancy sensors for. Empty when
-    /// object detection is off — no occupancy entities are then created.
+    /// object detection is off.
     pub classes: Vec<String>,
-    /// Where the announced entity set is remembered between runs, so entities
-    /// a later config no longer describes can be cleared from the broker.
-    /// `None` keeps no memory: nothing is read, cleared or written.
+    /// Where the announced entity set is remembered between runs. `None` keeps
+    /// no memory: nothing is read, cleared or written.
     pub entities_path: Option<PathBuf>,
     pub shutdown: Arc<AtomicBool>,
 }
 
-/// Whether the bridge's loop has nothing left to serve. Both halves are
-/// required, and the second is the one that is easy to leave out.
-///
-/// The stop flag says a stop has *begun*. It does not say the analyzers have
-/// finished: phase 2 of the drain (see [`crate::shutdown`]) lets each of them
-/// keep working for up to `TAIL_DRAIN_BOUND` past the flag, and the last thing
-/// one does before it exits is flush its open motion run and send the
-/// `MotionEnd` that clears Home Assistant's motion sensor. A bridge that
-/// stopped receiving on the flag alone stopped one tick in and dropped that
-/// transition on the floor, leaving Home Assistant holding movement until camon
-/// came back. The producers dropping their senders is what actually says there
-/// is nothing more coming, and by the time the drain joins this task they
-/// always have.
-///
-/// If they somehow have not — an analyzer abandoned at its own bound still
-/// holds an `mqtt_tx` clone — this loop keeps running and the drain's
-/// `MQTT_SHUTDOWN_TIMEOUT` aborts it, which costs the retained `offline` marker
-/// and lets the LWT publish it instead. That is the same fallback an
-/// unreachable broker already gets.
+/// Whether the bridge's loop has nothing left to serve.
 fn bridge_is_done(producers_gone: bool, shutdown: &AtomicBool) -> bool {
     producers_gone && shutdown.load(Ordering::Relaxed)
 }
@@ -1328,11 +893,8 @@ pub async fn run_bridge(ctx: BridgeContext, rx: tokio::sync::mpsc::Receiver<Mqtt
     run_bridge_with(ctx, rx, Eventloop::spawn).await
 }
 
-/// [`run_bridge`], with the poller's construction handed in.
-///
-/// The seam exists for one test — the one that kills the poller to prove the
-/// bridge notices — because the eventloop task is created in here and a test
-/// otherwise has no way to reach it.
+/// [`run_bridge`], with the poller's construction handed in — a seam for the
+/// test that kills the poller to prove the bridge notices.
 async fn run_bridge_with<F>(
     ctx: BridgeContext,
     mut rx: tokio::sync::mpsc::Receiver<MqttEvent>,
@@ -1341,7 +903,7 @@ async fn run_bridge_with<F>(
     F: FnOnce(rumqttc::EventLoop) -> Eventloop,
 {
     let topics = Topics::new(&ctx.config);
-    // Before the client: its queue has to be sized for the clears too.
+    // Loaded before the client: its queue has to be sized for the clears too.
     let mut memory = EntityMemory::load(&topics, &ctx);
     let client_id = client_id(&ctx);
     let mut options = MqttOptions::new(&client_id, &ctx.config.host, ctx.config.port);
@@ -1367,8 +929,6 @@ async fn run_bridge_with<F>(
             memory.orphans.len(),
         ),
     );
-    // The client is a handle onto a request channel and stays usable from here;
-    // only the polling half moves away.
     let mut eventloop = poller(raw_eventloop);
     let mut state = SensorState::new(
         Duration::from_secs(ctx.config.snapshot_interval_secs),
@@ -1389,9 +949,8 @@ async fn run_bridge_with<F>(
     );
 
     // Once every producer's sender has dropped, `recv()` returns `None`
-    // immediately and forever; the branch is disabled so it cannot spin.
+    // immediately and forever; the branches are disabled so they cannot spin.
     let mut producers_gone = false;
-    // Likewise for the eventloop task, which only ends when the bridge does.
     let mut eventloop_gone = false;
 
     loop {
@@ -1412,29 +971,12 @@ async fn run_bridge_with<F>(
                 // Nothing asks for a disconnect before shutdown does, and by
                 // then this loop is over.
                 Some(LinkEvent::DisconnectSent) => {}
-                // Nothing is polling any more, so nothing can be published
-                // either. The eventloop task only ends on purpose as part of
-                // this bridge's own shutdown, so reaching here with the stop
-                // flag still down means it died — panicked, or was aborted by
-                // something that had no business doing so.
-                //
-                // That is a task death and it is fatal, exactly as the policy
-                // table says for `mqtt-bridge`: a broker that has gone away is
-                // the *poller's* problem and it reconnects through those on its
-                // own, but the poller's absence cannot be recovered from in
-                // here, because the event loop moved out of this task
-                // deliberately (`poll()` is not cancellation-safe) and cannot
-                // be moved back. Carrying on would leave a bridge ticking for
-                // ever, publishing into a queue nobody drains, with Home
-                // Assistant holding whatever it last heard and camon looking
-                // perfectly healthy — the very failure supervision exists to
-                // end. So the bridge returns; its `FatalGuard` names it, the
-                // drain runs, and the restart brings up a poller that works.
+                // The eventloop task only ends on purpose during shutdown, so reaching here
+                // with the stop flag down means it died.
                 None => {
                     eventloop_gone = true;
                     link.connected = false;
-                    // Nothing is polling, so nothing queued will ever be
-                    // written — the clears included.
+                    // Nothing queued will ever be written — clears included.
                     memory.note_session_lost();
                     if !ctx.shutdown.load(Ordering::Relaxed) {
                         tracing::error!(
@@ -1456,10 +998,9 @@ async fn run_bridge_with<F>(
                     &mut link,
                     ctx.shutdown.load(Ordering::Relaxed),
                 ),
-                // Every producer is gone: the analyzers and detection worker
-                // have exited, so shutdown is already under way. Keep serving
-                // ticks until the flag confirms it rather than exiting here
-                // with the availability marker still reading `online`.
+                // Every producer is gone: keep serving ticks until the flag
+                // confirms shutdown rather than exiting here with the
+                // availability marker still reading `online`.
                 None => {
                     producers_gone = true;
                     if bridge_is_done(producers_gone, &ctx.shutdown) {
@@ -1496,18 +1037,9 @@ async fn run_bridge_with<F>(
     .await;
 }
 
-/// `stopping` is the shutdown flag, and it means here what it means in
-/// [`on_tick`]: the state transitions still go out — they are publishes onto a
-/// queue that is still being drained, and the `MotionEnd` below is the one that
-/// clears Home Assistant's motion sensor — but no new snapshot is started,
-/// because each one forks an ffmpeg to decode a GOP and a drain is the one time
-/// this process is trying to get every child it already has to exit.
-///
-/// Both spawn sites are guarded, not just the tick's. The `MotionEnd` that
-/// arrives during phase 2 is precisely an analyzer flushing its open run on the
-/// way out, so leaving this one unguarded would fork a decode per camera at the
-/// worst possible moment — a snapshot of the very last GOP, which is also the
-/// least interesting frame anybody will ever not look at.
+/// `stopping` is the shutdown flag: state transitions still go out, but no new snapshot is
+/// started — each forks an ffmpeg, and a drain is the one time the process is trying to get
+/// every child it already has to exit.
 #[allow(clippy::too_many_arguments)]
 fn handle_event(
     event: MqttEvent,
@@ -1526,8 +1058,8 @@ fn handle_event(
             }
             tracing::debug!(camera = %camera_id, "mqtt motion ON");
             link.note(publish_state(client, &topics.motion(&camera_id), "ON"));
-            // The frame that opened the run is the interesting one: take it now
-            // rather than waiting up to a full interval for the tick.
+            // The frame that opened the run is the interesting one: take it
+            // now rather than waiting for the tick.
             if !stopping {
                 state.mark_snapshot(&camera_id, Instant::now());
                 let run = state.snapshot_run(&camera_id);
@@ -1540,8 +1072,7 @@ fn handle_event(
             }
             tracing::debug!(camera = %camera_id, "mqtt motion OFF");
             link.note(publish_state(client, &topics.motion(&camera_id), "OFF"));
-            // One last frame so the camera tile shows the end of the event
-            // instead of freezing wherever the cadence happened to land.
+            // One last frame so the tile shows the end of the event.
             if !stopping {
                 let run = state.snapshot_run(&camera_id);
                 spawn_snapshot(client, topics, ctx, &camera_id, run, snapshot_tasks, link);
@@ -1554,9 +1085,7 @@ fn handle_event(
             let now = Instant::now();
             for sighting in sightings {
                 let class = sighting.class;
-                // A verdict can only name a configured class, but the sensor
-                // set is built from the config, so anything else has no entity
-                // to publish to.
+                // An unconfigured class has no entity to publish to.
                 if !ctx.classes.contains(&class) {
                     continue;
                 }
@@ -1568,12 +1097,9 @@ fn handle_event(
                     &topics.occupancy(&camera_id, &class),
                     "ON",
                 ));
-                // No in-flight guard like `spawn_snapshot`'s: the bytes came
-                // with the event, so this is a queue push and nothing else.
-                // QoS 0 because the next verdict supersedes this one anyway;
-                // retained so the tile keeps the sighting for good. Skipped
-                // while disconnected for the same reason snapshots are: it
-                // would sit in the queue until long after it mattered.
+                // QoS 0 because the next verdict supersedes this one; retained
+                // so the tile keeps the sighting; skipped while disconnected
+                // for the same reason snapshots are.
                 if let (true, Some(jpeg)) = (link.connected, sighting.frame_jpeg) {
                     if !link.images.take(jpeg.len()) {
                         tracing::debug!(camera = %camera_id, class = %class,
@@ -1581,9 +1107,8 @@ fn handle_event(
                         continue;
                     }
                     let topic = topics.occupancy_snapshot(&camera_id, &class);
-                    // The crop itself is gone if this is rejected — the bytes
-                    // are not kept — but a rejection still says the queue is
-                    // full, so the sensor states get re-asserted.
+                    // A rejected crop is gone, but the rejection still says
+                    // the queue is full, so the sensor states get re-asserted.
                     link.note(publish_retained(client, &topic, QoS::AtMostOnce, jpeg));
                 }
             }
@@ -1591,12 +1116,8 @@ fn handle_event(
     }
 }
 
-/// `stopping` is the shutdown flag: the loop goes on serving ticks through the
-/// drain (see [`bridge_is_done`]), but a stopping camon does not start new
-/// snapshots. Each one forks an ffmpeg to decode a GOP, and a drain is the one
-/// time this process is trying to get every child it already has to exit —
-/// publishing is still welcome, forking is not. Everything else here is a
-/// publish onto a queue that is still being drained.
+/// `stopping` means here what it means in [`handle_event`]: publishing is
+/// still welcome, forking new snapshot decodes is not.
 #[allow(clippy::too_many_arguments)]
 fn on_tick(
     client: &AsyncClient,
@@ -1609,12 +1130,10 @@ fn on_tick(
     stopping: bool,
 ) {
     let now = Instant::now();
-    // A new window for the images the rest of this tick may queue.
     link.images.refill();
 
     // Rebuilt from the live state on every attempt, never replayed from the
-    // failed one: a retry a few seconds later must not assert a value that has
-    // since changed.
+    // failed one: a retry must not assert a value that has since changed.
     if link.connected && link.republish_pending {
         link.republish_pending = republish(client, topics, state, memory);
     }
@@ -1641,13 +1160,8 @@ fn on_tick(
 }
 
 /// Retire every decode that has ended, folding its outcome into the cadence.
-///
-/// A decode that produced nothing published nothing, so the camera's tile still
-/// shows whatever it showed before — and the cadence, which exists to pace
-/// pictures, must not count the attempt as one. It is brought forward instead,
-/// and the first failure of a run is said out loud: a camera whose decodes all
-/// fail is a tile that quietly stops moving, which is the kind of fault an
-/// operator only ever finds by going to look.
+/// The first failure of a run is said out loud: a camera whose decodes all
+/// fail is a tile that quietly stops moving.
 fn retire_snapshots(
     snapshot_tasks: &mut HashMap<String, SnapshotTask>,
     state: &mut SensorState,
@@ -1666,9 +1180,8 @@ fn retire_snapshots(
         .collect();
     for (camera_id, decoded, run) in ended {
         snapshot_tasks.remove(&camera_id);
-        // The run this decode was started for has closed and the camera has
-        // opened another since. Whatever this decode did or did not manage is
-        // that run's business, and that run is over.
+        // The outcome belongs to a run that has since closed, not to the one
+        // open now.
         if run != state.snapshot_run(&camera_id) {
             tracing::debug!(camera = %camera_id, "a decode outlived its motion run, dropping its outcome");
             continue;
@@ -1685,25 +1198,20 @@ fn retire_snapshots(
     }
 }
 
-/// What became of one `try_publish`.
-///
-/// rumqttc reports a full queue and an unpublishable topic as the same error,
-/// but they need opposite handling: the first is transient and the whole
-/// recovery design rests on retrying it, while the second never becomes
-/// publishable and retrying one is a 1 Hz loop that never gets past it.
+/// What became of one `try_publish`. rumqttc reports a full queue and an
+/// unpublishable topic as the same error, but they need opposite handling: the
+/// first is transient and retried, the second never becomes publishable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Published {
     Yes,
     QueueFull,
-    /// A wildcard in a camera id or class name. `Config::validate` rejects both
-    /// when the bridge is enabled, so this is a backstop against a livelock,
-    /// not a path an operator is expected to reach.
+    /// A wildcard in a camera id or class name — a backstop against a
+    /// livelock; `Config::validate` rejects both when the bridge is enabled.
     ImpossibleTopic,
 }
 
-/// Publish one retained message. Retained throughout: Home Assistant sees the
-/// current value the moment it subscribes, rather than an unknown entity until
-/// the next transition.
+/// Publish one retained message, so Home Assistant sees the current value the
+/// moment it subscribes.
 fn publish_retained(client: &AsyncClient, topic: &str, qos: QoS, payload: Vec<u8>) -> Published {
     if !rumqttc::valid_topic(topic) {
         tracing::error!(topic = %topic, "topic holds an MQTT wildcard and can never be published");
@@ -1738,21 +1246,8 @@ fn republish(
     !accepted
 }
 
-/// Everything a (re)connect owes the broker, in publish order: the retained
-/// topics of entities the announced set dropped, cleared; then every camera's
-/// discovery payloads; then every announced entity's current state; then the
-/// availability marker.
-///
-/// Built from the announced set rather than from the config, so what a run
-/// records having announced is exactly what it published — including the
-/// classes carried forward through a run that detects nothing, which are
-/// discovered and restated OFF rather than being left for `online` to bring
-/// back with whatever the broker still held.
-///
-/// One list rather than four calls so the order is a value that can be
-/// asserted, instead of an implication of how a `select!` arm happens to be
-/// written. Every payload is retained and idempotent, so republishing the whole
-/// thing on a retry costs nothing but the bytes.
+/// Everything a (re)connect owes the broker, in publish order: orphan clears, discovery
+/// payloads, every announced entity's current state, then the availability marker.
 fn reconnect_burst(
     topics: &Topics,
     state: &SensorState,
@@ -1760,10 +1255,9 @@ fn reconnect_burst(
     orphans: &[String],
 ) -> Vec<(String, Vec<u8>)> {
     let mut burst = Vec::new();
-    // First: Home Assistant is told to forget these before it is told the
-    // device is available again, which is what would otherwise resurrect them.
-    // An empty retained payload both deletes the discovery document and clears
-    // whatever state the broker was holding under it.
+    // First: Home Assistant must forget these before the device goes
+    // available again, which would otherwise resurrect them. An empty
+    // retained payload deletes both discovery document and held state.
     for topic in orphans {
         burst.push((topic.clone(), Vec::new()));
     }
@@ -1780,31 +1274,19 @@ fn reconnect_burst(
     for (topic, payload) in state_payloads(topics, state, &announced.cameras, &announced.classes) {
         burst.push((topic, payload.as_bytes().to_vec()));
     }
-    // Last: with every state already queued ahead of it, the connection Home
-    // Assistant is told about is one whose retained values are current.
+    // Last, so the retained values are current before HA hears `online`.
     burst.push((topics.availability(), b"online".to_vec()));
     burst
 }
 
 /// Hand the burst to the request queue, reporting whether all of it fit.
-///
-/// The eventloop is draining the queue from its own task while this runs, so a
-/// rejection does not mean every publish after it is rejected too: a slot
-/// freeing up mid-burst would let a later message through and leave the tail
-/// published without its head — `online` standing on top of states that were
-/// dropped. It therefore stops at the first rejection and reports the burst as
-/// a whole, and the caller retries all of it from the live state rather than
-/// treating any of it as lost. One warn line for the burst rather than one per
-/// topic, because a rejection here is the normal outcome of reconnecting after
-/// an outage.
 fn publish_burst(client: &AsyncClient, burst: Vec<(String, Vec<u8>)>) -> bool {
     let total = burst.len();
     let mut published = 0;
     for (topic, payload) in burst {
         match publish_retained(client, &topic, QoS::AtLeastOnce, payload) {
-            // An impossible topic counts as done: it will never be publishable,
-            // and stopping on it would hold up the rest of the burst — the
-            // availability marker included — for as long as the process runs.
+            // An impossible topic counts as done: it will never be
+            // publishable, and stopping on it would hold up the burst forever.
             Published::Yes | Published::ImpossibleTopic => published += 1,
             Published::QueueFull => break,
         }
@@ -1827,12 +1309,9 @@ fn on_off(on: bool) -> &'static str {
     }
 }
 
-/// The retained payload every configured sensor should currently be holding,
-/// on the same topics the discovery payloads point Home Assistant at.
-///
-/// Enumerated from the config, not from the sensors that are ON: an OFF that
-/// was dropped by a full request queue, or an ON left retained by a process
-/// that died mid-motion-run, is only corrected by saying OFF out loud.
+/// The retained payload every configured sensor should currently be holding.
+/// Enumerated from the config, not from the sensors that are ON: a stale
+/// retained ON is only corrected by saying OFF out loud.
 fn state_payloads(
     topics: &Topics,
     state: &SensorState,
@@ -1855,26 +1334,15 @@ fn state_payloads(
     out
 }
 
-/// One camera's detached snapshot decode, and where that decode leaves word of
-/// whether it produced anything.
-///
-/// The outcome has to come back somehow: the task is detached precisely so a
-/// slow ffmpeg cannot delay the bridge loop, so the loop cannot await it, and
-/// the cadence it belongs to lives in the loop's `SensorState`. A flag the task
-/// sets and the tick reads is the whole channel — the tick already looks at
-/// every handle to retire the finished ones.
+/// One camera's detached snapshot decode. The task is detached so a slow
+/// ffmpeg cannot delay the bridge loop; a flag the task sets and the tick
+/// reads carries the outcome back.
 struct SnapshotTask {
     handle: tokio::task::JoinHandle<()>,
     /// Set by the task when the decode produced a frame. A task that panicked
     /// or was aborted leaves it down, which reads as a failure and is one.
     decoded: Arc<AtomicBool>,
     /// The motion run this decode was started for.
-    ///
-    /// A decode outlives the run that asked for it: fifteen seconds are allowed
-    /// for one, and a run can close and the camera open a new one inside that.
-    /// Without the tag the old outcome would land on the new run — shortening a
-    /// cadence that never failed, or clearing a failure the new run is still
-    /// having — so an outcome whose run has moved on is dropped instead.
     run: u64,
 }
 
@@ -1939,10 +1407,7 @@ fn spawn_snapshot(
                         "image budget spent, dropping the snapshot");
                     return;
                 }
-                // QoS 0: the next snapshot is at most one interval away, so a
-                // lost frame costs nothing worth a retransmit, and this task
-                // has no `Link` to report the rejection to. Retained so the
-                // camera tile has an image right after HA subscribes.
+                // QoS 0 avoids retrying a soon-replaced frame; retained supplies new subscribers.
                 publish_retained(&client, &topic, QoS::AtMostOnce, jpeg);
             }
             None => tracing::debug!(camera = %camera, "snapshot decode produced no frame"),
@@ -1959,11 +1424,6 @@ fn spawn_snapshot(
 }
 
 /// Decode the first frame of an MPEG-TS segment and JPEG-encode it.
-///
-/// Hot-buffer segments always start on a keyframe, so a single-frame decode of
-/// one segment needs no priming. The scale/pad filter letterboxes into a fixed
-/// [`SNAPSHOT_WIDTH`]x[`SNAPSHOT_HEIGHT`] frame so the output size is the same
-/// for every camera whatever its native aspect ratio.
 async fn snapshot_jpeg(segment: &[u8]) -> Option<Vec<u8>> {
     let expected = (SNAPSHOT_WIDTH * SNAPSHOT_HEIGHT * 3) as usize;
     let mut frame = piped_decode(
@@ -2014,14 +1474,8 @@ fn snapshot_command() -> tokio::process::Command {
     command
 }
 
-/// Feed `input` to `command` on stdin and return everything it writes to
-/// stdout, killing the child if it has not finished within `timeout`.
-///
-/// stdin and stdout are driven concurrently because a whole GOP does not fit in
-/// a pipe buffer, and writing it up front would deadlock against the child's
-/// own output. `kill_on_drop` is what makes cancellation real: dropping this
-/// future — the timeout firing, or shutdown aborting the task that holds it —
-/// kills the child rather than orphaning it.
+/// Feed `input` to `command` on stdin and return everything it writes to stdout, killing the
+/// child if it has not finished within `timeout`.
 async fn piped_decode(
     mut command: tokio::process::Command,
     input: &[u8],
@@ -2042,17 +1496,8 @@ async fn piped_decode(
     let mut out = Vec::with_capacity(capacity);
 
     let piped = async {
-        // ffmpeg exits after one frame and closes stdin, so the tail of the
-        // write failing with EPIPE is the normal case, not an error.
-        //
-        // The handle is moved in here so that finishing the write *closes* the
-        // pipe. `shutdown` on a child's stdin flushes and returns; it does not
-        // close the descriptor, and only the close is an EOF. A demuxer reading
-        // a stream that never ends is a decode that never starts: ffmpeg probes
-        // for stream information before it will emit a frame, and against a
-        // segment far smaller than its probe size it simply waits for input
-        // that is not coming — which is the whole decode timeout, and no
-        // snapshot, for every camera, every time.
+        // ffmpeg exits after one frame and closes stdin, so the tail of the write failing with
+        // EPIPE is the normal case, not an error.
         let write = async move {
             let mut stdin = stdin;
             let _ = stdin.write_all(input).await;
@@ -2085,23 +1530,9 @@ fn encode_jpeg(rgb: &[u8], width: u32, height: u32) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// Publish the retained `offline` marker and, if the queue took that marker,
-/// disconnect cleanly, then wait briefly for both packets to actually reach the
-/// socket — `try_publish` only queues them, the eventloop task is what writes
-/// them. That task keeps polling
-/// throughout; all this does is watch its notifications for the
-/// [`LinkEvent::DisconnectSent`] that says the flush is over, and stop it after.
-///
-/// The `Disconnect` this waits for is also the only evidence camon gets that
-/// the clears at the head of the reconnect burst were written rather than
-/// merely queued: requests go out in the order they were queued, so a
-/// disconnect on the wire puts everything queued before it on the wire too.
-/// That is where the owed clears are dropped from the record, and two separate
-/// things have to be true of them first. `burst_owed` says the burst was still
-/// waiting for room, in which case the clears were never queued at all;
-/// `EntityMemory::clears_queued` says which *session* queued them, because the
-/// ordering argument only holds inside one — hence the connection edges below
-/// being applied to the record rather than merely skipped over.
+/// Publish the retained `offline` marker and, if the queue took that marker, disconnect
+/// cleanly, then wait briefly for both packets to actually reach the socket — `try_publish`
+/// only queues them, the eventloop task is what writes them.
 async fn shutdown_bridge(
     client: AsyncClient,
     topics: &Topics,
@@ -2112,27 +1543,16 @@ async fn shutdown_bridge(
 ) {
     abort_snapshots(snapshot_tasks).await;
 
-    // Whatever is already queued was raised before the disconnect was even
-    // requested and says nothing about whether it reached the socket. Not read
-    // as this flush's outcome, so that an edge left over from the loop — a
-    // connection error a moment ago, say — cannot be taken for it having
-    // failed. It does still say that the session which took the clears is over,
-    // and that much is kept.
+    // Whatever is already queued was raised before the disconnect was even requested and says
+    // nothing about whether it reached the socket.
     while let Ok(event) = eventloop.events.try_recv() {
         if event != LinkEvent::DisconnectSent {
             memory.note_session_lost();
         }
     }
 
-    // Nothing left to retry with, and the two are not independent: a clean
-    // DISCONNECT tells the broker to *drop* the LWT, so sending one without the
-    // `offline` marker queued ahead of it leaves the retained availability
-    // reading `online` for as long as camon stays down. The queue can take the
-    // disconnect and not the publish — it is a request like any other, and the
-    // eventloop is draining slots the whole time — so the disconnect is only
-    // asked for once the marker is actually in the queue behind it. Rejected,
-    // the connection is left to die unclean instead, which is exactly what the
-    // LWT is for: the broker publishes `offline` on camon's behalf.
+    // A clean DISCONNECT suppresses the LWT, so request it only after `offline` is queued.
+    // If the marker is rejected, an unclean close lets the broker publish the LWT instead.
     if publish_state(&client, &topics.availability(), "offline") == Published::Yes {
         if let Err(e) = client.try_disconnect() {
             tracing::debug!(error = %e, "mqtt disconnect request failed");
@@ -2163,11 +1583,7 @@ async fn shutdown_bridge(
     tracing::info!("mqtt bridge stopped");
 }
 
-/// Cancel every in-flight snapshot decode. Aborting drops the task's future,
-/// which drops its ffmpeg child and so kills it; joining afterwards is what
-/// makes that ordering observable rather than a race with process exit. Bounded
-/// because a task inside a blocking closure cannot be cancelled at all, and
-/// shutdown must not wait on one.
+/// Cancel every in-flight snapshot decode.
 async fn abort_snapshots(snapshot_tasks: HashMap<String, SnapshotTask>) {
     let handles: Vec<tokio::task::JoinHandle<()>> = snapshot_tasks
         .into_values()

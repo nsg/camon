@@ -7,13 +7,9 @@ use crate::locks::LockExt;
 /// Number of recent motion entries to retain mask JPEGs for
 const MASK_RETAIN_COUNT: usize = 60;
 
-/// How long a request for a stage keeps that stage being produced.
-///
-/// The debug UI polls the maps every 5 s and gives an image that never
-/// arrives 15 s before abandoning it, so two consecutive requests can be
-/// 20 s apart while somebody is watching. 30 s clears that with room to
-/// spare; overshooting only costs a few encodes after the view is closed,
-/// while undershooting would blank the overlay on a slow round.
+/// How long a request for a stage keeps that stage being produced. Must clear
+/// the debug UI's worst case between consecutive requests (~20 s); overshooting
+/// costs a few encodes, undershooting blanks the overlay.
 const MAP_DEMAND_WINDOW: Duration = Duration::from_secs(30);
 
 pub struct MotionEntry {
@@ -25,14 +21,8 @@ pub struct MotionEntry {
 }
 
 impl MotionEntry {
-    /// One segment's motion, spanning from the segment's own stamp for as long
-    /// as the segment ran.
-    ///
-    /// The end is saturating because the start is a wall clock stamp, and a
-    /// clock reading nonsense hands out `u64::MAX` (`wall_clock_ns` in
-    /// [`crate::buffer`]): adding to it would overflow, which is a panic in the
-    /// debug builds this daemon ships. It also holds `end >= start` for
-    /// [`MotionStore::get_motion`], which reports the difference.
+    /// One segment's motion, spanning from the segment's own stamp for as long as the segment
+    /// ran.
     pub fn spanning(
         segment_sequence: u64,
         start_time_ns: u64,
@@ -95,21 +85,17 @@ struct PublishedMap {
     at: Instant,
 }
 
-/// One stage's latest view, and when the API last had a request for it (which
-/// includes requests answered `404`). The request time is what tells the
-/// analyzer whether the stage is worth encoding at all — see
-/// [`MotionStore::map_wanted`].
+/// One stage's latest view, and when the API last had a request for it
+/// (including requests answered `404`) — see [`MotionStore::map_wanted`].
 #[derive(Default)]
 struct MapSlot {
     published: RwLock<Option<PublishedMap>>,
     last_request: RwLock<Option<Instant>>,
 }
 
-/// Stage views for one camera: an image lock and a demand lock per stage. The
-/// analyzer writes one stage at a time, and a debug-UI poll takes the demand
-/// lock for writing before it reads the image, so keeping the two apart keeps
-/// a JPEG clone in the API from standing between the analyzer and the next
-/// stage it publishes.
+/// Stage views for one camera: an image lock and a demand lock per stage, kept
+/// apart so a JPEG clone in the API cannot stand between the analyzer and the
+/// next stage it publishes.
 type CameraMaps = [MapSlot; MapKind::COUNT];
 
 #[derive(Clone)]
@@ -165,10 +151,9 @@ impl MotionStore {
             .and_then(|e| e.mask_jpeg.clone())
     }
 
-    /// Popping from the front is sound here, unlike in the detection store:
-    /// the analyzer inserts these itself, one per segment as it scores them, so
-    /// the deque is always ascending by sequence — which the mask trim below
-    /// relies on as well, taking the oldest entries by position.
+    /// Popping from the front is sound here, unlike in the detection store: the
+    /// analyzer inserts one entry per segment as it scores them, so the deque
+    /// is always ascending by sequence — which the mask trim relies on too.
     pub fn cleanup(&self, camera_id: &str, min_sequence: u64) {
         if let Some(lock) = self.cameras.get(camera_id) {
             let mut entries = lock.write_recover();
@@ -179,7 +164,6 @@ impl MotionStore {
                     break;
                 }
             }
-            // Keep mask JPEGs only for the most recent entries
             let len = entries.len();
             if len > MASK_RETAIN_COUNT {
                 for entry in entries.iter_mut().take(len - MASK_RETAIN_COUNT) {
@@ -199,16 +183,6 @@ impl MotionStore {
     }
 
     /// Read a stage's latest view, and register that somebody wants it.
-    ///
-    /// The answer is a current view or nothing at all. Production stops once
-    /// demand lapses, and the last image stays in the slot, so without the age
-    /// check a view of the scene as it was an hour ago would be served as if it
-    /// were live — and the debug overlays cannot show that difference: a frame
-    /// that has quietly stopped updating looks exactly like a scene that has
-    /// stopped changing. Anything older than [`MAP_DEMAND_WINDOW`] is therefore
-    /// withheld. The request is recorded either way, so a stage that has aged
-    /// out is put back into production and the next tick refills it, exactly as
-    /// for a stage that was never published at all.
     pub fn get_map(&self, camera_id: &str, kind: MapKind) -> Option<Vec<u8>> {
         let slot = &self.maps.get(camera_id)?[kind as usize];
         *slot.last_request.write_recover() = Some(Instant::now());
@@ -220,11 +194,6 @@ impl MotionStore {
     }
 
     /// Whether a stage was asked for recently enough to be worth producing.
-    ///
-    /// Each stage costs a greyscale JPEG encode per camera per analysis tick,
-    /// and outside the debug view nothing ever reads the result. Demand is
-    /// tracked per camera *and* per stage, so watching one camera's overlay
-    /// does not put the others back to work.
     pub fn map_wanted(&self, camera_id: &str, kind: MapKind) -> bool {
         let Some(maps) = self.maps.get(camera_id) else {
             return false;
@@ -290,10 +259,6 @@ mod tests {
         assert_eq!(motion[0].duration_ns, 2 * SEC);
     }
 
-    /// A wall clock far enough in the future saturates its stamps, and the
-    /// segments carrying them still have to be reportable: projecting an end
-    /// from such a stamp must not overflow — a panic in the debug build this
-    /// daemon ships — and the span it reports must not come out negative.
     #[test]
     fn a_motion_entry_stamped_by_a_saturated_clock_has_no_span_and_no_overflow() {
         let store = store();
@@ -330,10 +295,6 @@ mod tests {
         assert_eq!(store.get_map("no-such-camera", MapKind::Morph), None);
     }
 
-    /// The overlays claim to show what the detector sees right now, and the
-    /// client cannot tell a retained frame from a live one. Since production
-    /// stops when nobody is looking, the image left behind has to stop being
-    /// served too.
     #[test]
     fn a_view_that_stopped_being_refreshed_is_withheld() {
         let store = store();
@@ -357,9 +318,6 @@ mod tests {
         );
     }
 
-    /// A request that comes back empty because the view aged out has to arm
-    /// production just as one that finds nothing at all does — otherwise the
-    /// stage could never come back.
     #[test]
     fn a_request_that_ages_out_still_arms_production() {
         let store = store();
@@ -373,9 +331,6 @@ mod tests {
         );
     }
 
-    /// Producing a stage costs a JPEG encode per camera per analysis tick, so
-    /// the analyzer asks first — and the answer has to be "no" until somebody
-    /// looks, and "no" again once they stop.
     #[test]
     fn a_stage_is_wanted_only_while_requests_keep_arriving() {
         let store = store();
@@ -403,7 +358,6 @@ mod tests {
         );
     }
 
-    /// Watching one camera, or one stage, must not put the rest back to work.
     #[test]
     fn demand_for_a_stage_does_not_spread() {
         let store = store();
@@ -413,8 +367,6 @@ mod tests {
         assert!(!store.map_wanted("no-such-camera", MapKind::Morph));
     }
 
-    /// The stage names are URL segments: renaming one silently breaks the debug
-    /// UI, which requests them by name.
     #[test]
     fn stage_names_round_trip_and_are_distinct() {
         let mut names: Vec<&str> = MapKind::ALL.iter().map(|k| k.as_str()).collect();

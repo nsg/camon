@@ -84,45 +84,31 @@ impl HotBuffer {
         self.segments.get(index)
     }
 
-    /// Get the sequence number of the first segment in the buffer
     pub fn first_sequence(&self) -> u64 {
         self.first_sequence
     }
 
-    /// Get the sequence number of the last segment in the buffer (exclusive)
+    /// One past the last segment in the buffer (exclusive).
     pub fn last_sequence(&self) -> u64 {
         self.first_sequence + self.segments.len() as u64
     }
 
-    /// Publish this camera's terminal watermark: the camera thread has stopped,
-    /// and the sequence one past its last segment is now final. Returns it.
-    ///
-    /// This is the promise phase 2 of the stop is built on (see
-    /// [`crate::shutdown`]) — everything below the watermark is in this buffer
-    /// and a consumer that reaches it has seen everything the camera produced.
-    /// It is therefore published *after* the camera thread is joined, by the
-    /// drain rather than by the camera, so that no push can slip in behind it.
+    /// Publish this camera's terminal watermark: the sequence one past its last segment, now
+    /// final.
     pub fn seal(&mut self) -> Watermark {
         self.publish_watermark(false)
     }
 
-    /// Publish a watermark for a camera that did *not* stop — phase 1's join
-    /// bound tripped and the thread is still running. The sequence is a floor:
-    /// the camera may push past it, so consumers read the `provisional` flag
-    /// and keep draining to their own bound rather than exiting on a target
-    /// that can still move.
-    ///
-    /// Published at all, rather than left absent, because a consumer waiting
-    /// for a watermark that never comes waits out its whole bound learning
-    /// nothing, where this one at least tells it what has arrived so far.
+    /// Publish a watermark for a camera that did *not* stop. The sequence is a floor the camera
+    /// may push past, so consumers read the `provisional` flag and keep draining to their own
+    /// bound rather than exiting on a target that can still move.
     pub fn seal_provisionally(&mut self) -> Watermark {
         self.publish_watermark(true)
     }
 
-    /// Idempotent, and deliberately keeps the first value: a second stop signal
-    /// arriving mid-drain must not move a target the consumers may already have
-    /// reached, and a late push must not extend a watermark that was published
-    /// as final.
+    /// Idempotent, and deliberately keeps the first value: a second stop signal arriving
+    /// mid-drain must not move a target the consumers may already have reached, and a late push
+    /// must not extend a watermark that was published as final.
     fn publish_watermark(&mut self, provisional: bool) -> Watermark {
         let sequence = self.last_sequence();
         *self.terminal.get_or_insert(Watermark {
@@ -137,13 +123,12 @@ impl HotBuffer {
         self.terminal
     }
 
-    /// Get total duration of all segments in nanoseconds
     pub fn total_duration_ns(&self) -> u64 {
         self.segments.iter().map(|s| s.duration_ns).sum()
     }
 
-    /// Convert a segment sequence number to timeline offset in nanoseconds
-    /// Returns the cumulative duration of all segments before the given sequence
+    /// Timeline offset in nanoseconds: the cumulative duration of all
+    /// segments before the given sequence.
     pub fn sequence_to_offset_ns(&self, sequence: u64) -> Option<u64> {
         if sequence < self.first_sequence {
             return None;
@@ -204,8 +189,6 @@ mod tests {
         assert!(buf.get_segment_by_sequence(5).is_none());
     }
 
-    /// A buffer nobody has sealed has no watermark, and sealing it names the
-    /// sequence one past everything the camera pushed.
     #[test]
     fn sealing_publishes_the_sequence_one_past_the_last_segment() {
         let buffer = HotBuffer::new("cam".to_string(), 30);
@@ -222,9 +205,6 @@ mod tests {
         assert_eq!(buf.terminal_watermark(), Some(expected));
     }
 
-    /// A camera the drain gave up joining is still running, and a watermark
-    /// published on its behalf has to say so — a consumer that read it as final
-    /// would exit on a number the camera is still moving past.
     #[test]
     fn a_watermark_published_for_a_running_camera_says_it_is_provisional() {
         let buffer = HotBuffer::new("cam".to_string(), 30);
@@ -239,10 +219,6 @@ mod tests {
         );
     }
 
-    /// A second stop signal arriving mid-drain must not move a watermark the
-    /// consumers may already have drained through, and a camera that was
-    /// abandoned in phase 1 must not have its provisional watermark quietly
-    /// extended by whatever it pushed afterwards.
     #[test]
     fn sealing_twice_keeps_the_first_watermark() {
         let buffer = HotBuffer::new("cam".to_string(), 30);
@@ -252,7 +228,6 @@ mod tests {
         buf.push(segment(SEC));
         assert_eq!(buf.seal().sequence, 1, "a late push moved the watermark");
         assert_eq!(buf.terminal_watermark().unwrap().sequence, 1);
-        // Nor can a later provisional seal downgrade a final one.
         assert!(!buf.seal_provisionally().provisional);
     }
 }

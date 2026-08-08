@@ -13,11 +13,7 @@ use crate::retry::Streak;
 
 /// Reconnect if no bytes are read from ffmpeg for this long.
 const DATA_TIMEOUT_SECS: u64 = 30;
-/// Reconnect if bytes are flowing but no segment (keyframe) is produced for this
-/// long. This is also what makes a segment's span bounded, so raising it past
-/// [`MAX_SEGMENT_SPAN_NS`] would leave every real segment looking implausible —
-/// both duration instruments refused, every duration zero. The assertion below
-/// is what makes that mistake fail to compile instead of shipping.
+/// Reconnect if bytes are flowing but no segment (keyframe) is produced for this long.
 const NO_SEGMENT_TIMEOUT_SECS: u64 = 60;
 const _: () = assert!(
     MAX_SEGMENT_SPAN_NS > NO_SEGMENT_TIMEOUT_SECS * 1_000_000_000,
@@ -26,10 +22,7 @@ const _: () = assert!(
 /// Consecutive runs that recorded nothing before the diagnosis is raised from a
 /// warning about this connection to an error about the camera as a whole.
 const ESCALATE_AFTER: u32 = 4;
-/// Video must be watched for at least this long before anything is said about
-/// its keyframes. A PMT parsed just before the watchdog fires leaves too short
-/// a window for "no keyframe" to mean more than "camon did not look for long",
-/// and no stream is accused on that.
+/// Video must be watched for at least this long before anything is said about its keyframes.
 const MIN_KEYFRAME_WINDOW_SECS: u64 = 30;
 /// A run that kept going this long was a working stream that hiccupped, not a
 /// camera that never gets going, so its next stop is worth a line again.
@@ -114,11 +107,6 @@ enum StreamFault {
 }
 
 /// A finished run and the evidence it produced.
-///
-/// Every message built here reports what camon observed and the window it was
-/// observed over. These counters cannot see the camera, only ffmpeg's stdout,
-/// so none of them may be phrased as a verdict on the camera: an operator who
-/// replaces a working camera on camon's say-so was misled by this code.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StreamFailure {
     stats: StreamStats,
@@ -292,12 +280,6 @@ enum Report {
 }
 
 /// Decides how loudly a finished run is reported.
-///
-/// Each streak is cleared only by evidence that the condition it counts has
-/// gone away: a run that recorded clears the fault streak, a run that lasted
-/// clears the stall streak. Outcomes that show neither — an unrelated error, a
-/// panic — never reach this type at all, so they cannot defer a diagnosis by
-/// resetting a count they say nothing about.
 #[derive(Default)]
 pub struct NoRecordingTracker {
     fault: Streak,
@@ -363,11 +345,7 @@ impl FfmpegPipeline {
             "failed to capture stdout".to_string(),
         ))?;
 
-        // Drain stderr so the pipe never fills and blocks ffmpeg. Runs on a
-        // plain thread (this fn is inside spawn_blocking, no async runtime) and
-        // exits on EOF when the child is killed/exits below. ffmpeg echoes the
-        // full RTSP URL in its messages, so the password is scrubbed before
-        // anything reaches the log.
+        // Drain stderr so the pipe never fills and blocks ffmpeg.
         let stderr_thread = child.stderr.take().map(|stderr| {
             let camera_id = self.camera_id.clone();
             let password = crate::config::url_password(&self.url).map(str::to_owned);
@@ -448,14 +426,7 @@ impl FfmpegPipeline {
     }
 }
 
-/// The GOP being filled, paired with the monotonic instant the segmenter
-/// opened it at.
-///
-/// Two clocks, deliberately, for two different jobs: [`GopSegment::start_pts`]
-/// is the wall clock stamp the event's identity on disk is built from, while
-/// the duration is measured from this [`Instant`], which no clock adjustment
-/// can move. Held together so a segment's span can only ever be measured
-/// against its own anchor.
+/// The GOP being filled, paired with the monotonic instant the segmenter opened it at.
 struct OpenSegment {
     segment: GopSegment,
     opened_at: Instant,
@@ -533,13 +504,7 @@ impl MpegTsSegmenter {
             match poll_readable(fd, 500) {
                 Readiness::Readable => {}
                 Readiness::Timeout => continue,
-                // The descriptor hung up, errored, or is no longer a
-                // descriptor at all. Reported as the end of the stream, like
-                // the zero-length read below, because that is what it is —
-                // and it routes to the same full diagnosis. (The old code
-                // reached that diagnosis too, through the read the error bits
-                // provoked; what classification buys is the honest path there,
-                // not an escape from a spin the read already broke.)
+                // The descriptor hung up, errored, or is no longer a descriptor at all.
                 Readiness::Ended => return Err(self.failure(RunEnd::Eof)),
             }
             let n = reader.read(&mut buf)?;
@@ -556,20 +521,8 @@ impl MpegTsSegmenter {
         Ok(())
     }
 
-    /// Push the GOP that was still being filled when the stream ended, instead
-    /// of losing it with the connection.
-    ///
-    /// The cut lands mid-packet, so the segment's last frame is truncated. It is
-    /// only offered once a second frame has started, which proves the keyframe
-    /// the segment opens on arrived whole: with PAT and PMT already prepended
-    /// that segment decodes on its own like any other, a decoder discarding the
-    /// unterminated tail. Below that the segment holds a fragment of a keyframe
-    /// and nothing can be decoded from it, so it is dropped rather than left in
-    /// the buffer for the analyzer and the player to choke on.
-    ///
-    /// "A second frame started" is exactly what the open segment's frame count
-    /// reads, so it is read from there rather than tallied a second time
-    /// alongside it.
+    /// Push the GOP that was still being filled when the stream ended, instead of losing it
+    /// with the connection.
     fn flush_end_of_stream(&mut self) {
         let frames_started = self
             .current_segment
@@ -597,7 +550,6 @@ impl MpegTsSegmenter {
     fn process(&mut self, data: &[u8]) {
         self.counts.bytes += data.len() as u64;
 
-        // Handle partial packet from previous read
         let mut offset = 0;
         if !self.partial_packet.is_empty() {
             let needed = 188 - self.partial_packet.len();
@@ -617,22 +569,18 @@ impl MpegTsSegmenter {
             }
         }
 
-        // Find sync byte and process aligned packets
         while offset < data.len() {
-            // Look for sync byte
             if data[offset] != 0x47 {
                 offset += 1;
                 self.counts.skipped_bytes += 1;
                 continue;
             }
 
-            // Check if we have a complete packet
             if offset + 188 <= data.len() {
                 let packet: &[u8; 188] = data[offset..offset + 188].try_into().unwrap();
                 self.process_packet(packet);
                 offset += 188;
             } else {
-                // Save partial packet for next read
                 self.partial_packet.extend_from_slice(&data[offset..]);
                 break;
             }
@@ -682,14 +630,10 @@ impl MpegTsSegmenter {
             }
         }
 
-        // Start new segment on keyframe
         if is_keyframe {
-            // One instant for both ends, so the closing segment's span and the
-            // opening one's anchor meet exactly instead of leaving a gap
-            // between them that the durations would never account for. The
-            // wall clock is read after the close, not with it: the stamp names
-            // when this GOP begins, and closing the last one takes long enough
-            // (a shrink, a lock, a push) to be worth not backdating it by.
+            // One instant for both ends, so the closing segment's span and the opening one's
+            // anchor meet exactly instead of leaving a gap between them that the durations
+            // would never account for.
             let now = Instant::now();
             self.finalize_segment(now);
             self.start_segment(wall_clock_ns(), now);
@@ -698,11 +642,7 @@ impl MpegTsSegmenter {
         // Append packet to current segment
         if let Some(ref mut open) = self.current_segment {
             self.current_data.extend_from_slice(packet);
-            // Frames, not packets. One video frame is one PES packet spread
-            // over dozens of TS packets, and only its first carries the
-            // payload_unit_start_indicator — counting every packet on the
-            // video PID inflates the count by however many packets a frame
-            // happens to take.
+            // Count PES starts, not TS packets: one frame spans many packets.
             if Some(pid) == self.video_pid && pusi {
                 open.segment.frame_count += 1;
             }
@@ -740,35 +680,17 @@ impl MpegTsSegmenter {
                 self.prev_media_pts,
             );
             self.prev_media_pts = self.current_media_pts;
-            // Wrap the accumulated bytes once; readers share via Arc clone.
-            // Drop the Vec's growth slack first — the segment lives in the
-            // hot buffer for minutes, so excess capacity is held that long.
-            //
-            // What goes on filling is a buffer sized to the GOP just closed,
-            // not an empty one: taking the Vec leaves capacity zero behind, so
-            // every GOP regrew from nothing through some twenty reallocations,
-            // each copying everything accumulated so far. The trade is one
-            // allocation per GOP against those, at the cost of holding one
-            // GOP's worth of empty bytes per camera between GOPs — memory the
-            // buffer reaches anyway a moment later while filling. The estimate
-            // is only as good as the last GOP: the first of a connection still
-            // grows from zero, and a GOP bigger than its predecessor regrows
-            // over the gap. Nothing is pinned at a peak, though — an outsized
-            // estimate is given back at the very next finalize.
+            // Wrap the accumulated bytes once; readers share via Arc clone. Drop the Vec's
+            // growth slack first — the segment lives in the hot buffer for minutes, so excess
+            // capacity is held that long.
             let next_capacity = self.current_data.len();
             self.current_data.shrink_to_fit();
             segment.data = Arc::new(std::mem::replace(
                 &mut self.current_data,
                 Vec::with_capacity(next_capacity),
             ));
-            // At least one frame started inside it; a segment holding only the
-            // tail of a frame begun in the previous one decodes to nothing.
-            // This gate rests on RAI implying PUSI (a keyframe flag on a
-            // packet that also starts its frame) — true of ffmpeg's mpegts
-            // muxer, whose output is all camon ever reads. A stream that
-            // flagged RAI on a non-start packet would count zero frames and
-            // lose every segment here, so if that assumption ever breaks,
-            // this is the line to suspect.
+            // At least one frame started inside it; a segment holding only the tail of a frame
+            // begun in the previous one decodes to nothing.
             if segment.frame_count > 0 {
                 self.buffer.write_recover().push(segment);
                 self.last_segment_at = Instant::now();
@@ -778,17 +700,6 @@ impl MpegTsSegmenter {
     }
 
     /// Take the PMT PID from the first entry the PAT lists.
-    ///
-    /// The first entry, not the first program: an entry with program_number 0
-    /// names the network information table, and its PID would be taken for a
-    /// program map here. ffmpeg's muxer emits no NIT and one program, so the
-    /// first entry is the program — this reads that stream, not the standard.
-    ///
-    /// The entry read here is only there if the section says it is: a PAT
-    /// listing no programs at all ends its five-byte header with the CRC_32,
-    /// and reading the entry regardless would take two checksum bytes for a
-    /// PID. Bounding by `section_length` refuses that section instead, and the
-    /// run then reports the PAT as naming no PMT PID — which it does not.
     fn parse_pat(&mut self, packet: &[u8]) {
         let start = match table_section_start(packet) {
             Some(s) => s,
@@ -813,27 +724,6 @@ impl MpegTsSegmenter {
     }
 
     /// Latch the video and audio elementary PIDs from the program map.
-    ///
-    /// The elementary-stream loop stops where the section's own
-    /// `section_length` says the streams stop, four bytes short of the end so
-    /// the CRC_32 is never walked into. Running to the end of the packet
-    /// instead reads that checksum as a stream entry, and about one PMT layout
-    /// in 256 has 0x1B — H.264 — sitting in the first CRC byte: a PID no
-    /// packet ever carries, latched for the life of the connection, after
-    /// which the run blames the camera for sending no video on a PID the
-    /// camera never announced.
-    ///
-    /// A section that cannot hold its own fixed header, or that claims more
-    /// bytes than the packet carries, is refused whole rather than half-read,
-    /// and is not counted among the PMTs that parsed. The run then reports no
-    /// readable PMT on this PID, which is exactly what was observed.
-    ///
-    /// What the bound does not promise is that every PID latched here was
-    /// announced: a section whose `program_info_length` lies while staying
-    /// inside its own bounds leaves the loop misaligned, reading a stream type
-    /// out of descriptor bytes. That takes a malformed section rather than the
-    /// one-in-256 accident above, and it can only misread bytes the section
-    /// itself carries — never the CRC, never the stuffing past it.
     fn parse_pmt(&mut self, packet: &[u8]) {
         let start = match table_section_start(packet) {
             Some(s) => s,
@@ -874,44 +764,17 @@ impl MpegTsSegmenter {
     }
 }
 
-/// Where the contents of the PSI section beginning at `start` end: one past
-/// the last byte a table may be read from.
-///
-/// `section_length` counts the bytes following it, the four-byte CRC_32
-/// included, so the section spans up to `start + 3 + section_length` and its
-/// contents stop four bytes short of that. Returning that boundary is what
-/// keeps a checksum from being parsed as table data. `None` for a section too
-/// short to hold even its CRC, or one claiming more bytes than the 188-byte
-/// packet carries — nothing in either can be trusted to be what it looks like.
-///
-/// A section is only ever parsed out of the one packet that starts it. PSI
-/// sections may in principle span packets, and one that claims more bytes than
-/// its own packet holds is refused whole rather than reassembled: refusing
-/// beats guessing, since a half-read table names PIDs that were never in it,
-/// and the run then reports no readable PMT on that PID — which is literally
-/// what happened. The transport camon reads is produced by its own ffmpeg
-/// remuxing one or two elementary streams, whose program map is a single small
-/// packet, so this refusal is not expected to fire on a working camera.
-///
-/// Callers must still check that the fields they read fall before the
-/// boundary: this says where the section ends, not that it holds anything.
+/// Where the contents of the PSI section beginning at `start` end: one past the last byte a
+/// table may be read from.
 fn section_contents_end(packet: &[u8], start: usize) -> Option<usize> {
     let section_length = ((packet[start + 1] as usize & 0x0F) << 8) | packet[start + 2] as usize;
     let end = start + 3 + section_length;
     (section_length >= 4 && end <= 188).then_some(end - 4)
 }
 
-/// Compute the start of a PSI table section inside an MPEG-TS packet, past the
-/// adaptation field and the pointer field. `None` if the packet begins no
-/// section, or if the pointer lands outside it.
-///
-/// Only a packet flagging `payload_unit_start_indicator` begins a section, and
-/// only such a packet carries the pointer field that says where. A
-/// continuation packet is the middle of a section already in progress: its
-/// payload starts wherever the previous packet's section left off, so reading
-/// a table_id and a `section_length` from its first bytes invents a section
-/// out of another one's descriptors. Refusing it is what keeps the parsers
-/// from latching a PID that no table ever named.
+/// Compute the start of a PSI table section inside an MPEG-TS packet, past the adaptation field
+/// and the pointer field. `None` if the packet begins no section, or if the pointer lands
+/// outside it.
 fn table_section_start(packet: &[u8]) -> Option<usize> {
     if (packet[1] & 0x40) == 0 {
         return None;
@@ -948,14 +811,6 @@ enum Readiness {
 }
 
 /// Poll a file descriptor for readability with a timeout in milliseconds.
-///
-/// The kernel's return value alone does not say the fd is readable: `poll`
-/// reports `POLLERR`, `POLLHUP` and `POLLNVAL` whether or not they were asked
-/// for, and each of them makes the call return a positive count. Reading them
-/// as readability sends the caller into a read that fails or comes back
-/// empty, and the diagnosis then depends on which of those the kernel picked;
-/// classifying here routes every dead-descriptor shape to the one stream-end
-/// diagnosis instead.
 fn poll_readable(fd: RawFd, timeout_ms: i32) -> Readiness {
     let mut pollfd = libc::pollfd {
         fd,
@@ -973,26 +828,9 @@ fn poll_readable(fd: RawFd, timeout_ms: i32) -> Readiness {
     })
 }
 
-/// Read one completed poll: the `revents` it filled in, or the error it failed
-/// with. Split from the syscall so the decision can be tested without arranging
-/// a descriptor in each of these states.
-///
-/// `POLLIN` wins over a hangup reported beside it, because a pipe whose writer
-/// closed still hands over whatever it buffered before the close; reading it
-/// out is what turns a hangup into the ordinary zero-length read the caller
-/// already diagnoses. (Should that read itself fail — possible for descriptor
-/// kinds that raise `POLLERR` with data queued, which a pipe read end does not
-/// — it surfaces as a plain I/O error, as before this classification existed.)
-/// Only when nothing is readable do the error bits end the stream.
-///
-/// An interrupted poll is a wait that ended early and nothing more — the
-/// descriptor is untouched, so the caller simply waits again. That is a spin
-/// for as long as the signals keep arriving, which the data watchdog bounds at
-/// [`DATA_TIMEOUT_SECS`]; any other failure is treated as a poll that cannot
-/// be made to work on this fd and ends the run. (Strictly, `poll` can also
-/// fail transiently — `ENOMEM` under pressure — where the updater's taxonomy
-/// would retry; here the run's ending IS the retry, through the ordinary
-/// reconnect backoff, which beats spinning on a wait that just failed.)
+/// Read one completed poll: the `revents` it filled in, or the error it failed with. Split from
+/// the syscall so the decision can be tested without arranging a descriptor in each of these
+/// states.
 fn readiness(poll: Result<libc::c_short, std::io::ErrorKind>) -> Readiness {
     let revents = match poll {
         Ok(revents) => revents,
@@ -1079,9 +917,6 @@ mod tests {
         MpegTsSegmenter::new("cam".to_string(), HotBuffer::new("cam".to_string(), 60))
     }
 
-    /// Counters from the real segmenter. The clock is supplied by the tests
-    /// below instead of waited out, so the observation window a verdict needs
-    /// can be chosen.
     fn segment_stats(packets: &[[u8; TS_PACKET_SIZE]]) -> StreamStats {
         let mut segmenter = segmenter();
         for packet in packets {
@@ -1142,8 +977,6 @@ mod tests {
         }
     }
 
-    /// Everything logged inside `body`, so the levels asserted are the ones
-    /// `report` really emits rather than the ones its inputs imply.
     fn capture(body: impl FnOnce()) -> Vec<(Level, String)> {
         use tracing_subscriber::layer::SubscriberExt;
         let captured = Captured::default();
@@ -1157,16 +990,12 @@ mod tests {
         logs.iter().map(|(level, _)| *level).collect()
     }
 
-    /// A video packet continuing the frame already in progress: the same PID,
-    /// no payload_unit_start_indicator. Every frame is one of the builders
-    /// above followed by dozens of these.
     fn continuation(pid: u16) -> [u8; TS_PACKET_SIZE] {
         let mut p = pes_packet(pid, 0);
         p[1] &= !0x40;
         p
     }
 
-    /// A stream carrying video that never flags a random access point.
     fn no_keyframe_packets() -> Vec<[u8; TS_PACKET_SIZE]> {
         let mut packets = vec![pat(PMT_PID), pmt(H264, VIDEO_PID)];
         packets.extend((1..20).map(|i| pes_packet(VIDEO_PID, i * 3_000)));
@@ -1195,7 +1024,6 @@ mod tests {
         let summary = failure.summary();
         assert!(summary.contains("random_access_indicator"), "{summary}");
         assert!(summary.contains("in 58s"), "{summary}");
-        // Both explanations are offered; neither is asserted as the cause.
         assert!(
             summary.contains("Either this stream never sets it"),
             "{summary}"
@@ -1205,8 +1033,6 @@ mod tests {
 
     #[test]
     fn a_short_look_at_video_yields_no_keyframe_verdict() {
-        // The PMT arrives just before the watchdog fires: the same counters as
-        // above, but they say nothing about the stream yet.
         let stats = watched_for(segment_stats(&no_keyframe_packets()), 1);
         let failure = failed(stats, RunEnd::SegmentTimeout);
         assert_eq!(failure.fault(), Some(StreamFault::WindowTooShort));
@@ -1215,7 +1041,6 @@ mod tests {
         assert!(summary.contains("too short a look"), "{summary}");
         assert!(!summary.contains("random_access_indicator"), "{summary}");
 
-        // One second under the threshold is still no verdict; one over is.
         let counts = segment_stats(&no_keyframe_packets()).counts;
         for (secs, expected) in [
             (MIN_KEYFRAME_WINDOW_SECS - 1, StreamFault::WindowTooShort),
@@ -1232,8 +1057,6 @@ mod tests {
 
     #[test]
     fn one_keyframe_in_the_window_reports_only_what_arrived() {
-        // A camera whose second keyframe is not due before the watchdog fires.
-        // Only the first one was seen, so only that may be said.
         let stats = StreamStats {
             counts: StreamCounts {
                 bytes: 900_000,
@@ -1261,15 +1084,11 @@ mod tests {
             summary.contains("in the 60s of video observed"),
             "{summary}"
         );
-        // No claim about an interval that was never observed.
         assert!(!summary.contains("interval is longer"), "{summary}");
     }
 
     #[test]
     fn audio_random_access_points_are_not_keyframes() {
-        // ffmpeg flags every audio packet as a random access point. Counting
-        // those would turn a stream with no video keyframe into a stream that
-        // looks like it has plenty.
         let mut packets = vec![pat(PMT_PID), pmt(H264, VIDEO_PID)];
         for i in 1..20 {
             packets.push(pes_packet(VIDEO_PID, i * 3_000));
@@ -1287,8 +1106,6 @@ mod tests {
 
     #[test]
     fn a_late_pid_change_is_reported_as_camon_latching_the_first_pmt() {
-        // The first PMT wins for the life of the connection, so video on the
-        // PID a later PMT announces is never picked up.
         let mut packets = vec![pat(PMT_PID), pmt(H264, VIDEO_PID), pmt(H264, OTHER_PID)];
         packets.extend((1..10).map(|i| pes_packet(OTHER_PID, i * 3_000)));
         let stats = watched_for(segment_stats(&packets), 58);
@@ -1313,7 +1130,6 @@ mod tests {
         assert_eq!(failure.fault(), Some(StreamFault::NoVideoStream));
         let summary = failure.summary();
         assert!(summary.contains("H.265"), "{summary}");
-        // The count is of parsed PMT packets, which are repeats of one table.
         assert!(summary.contains("parsed the PMT 1 times"), "{summary}");
     }
 
@@ -1328,15 +1144,11 @@ mod tests {
 
     #[test]
     fn a_crc_shaped_like_a_video_stream_entry_latches_no_video_pid() {
-        // The four bytes past the last elementary stream are the section's
-        // CRC_32, and roughly one PMT layout in 256 opens it with 0x1B. Read
-        // as a stream entry it names a PID nothing is ever sent on.
         let mut packet = pmt(0x0F, AUDIO_PID);
         packet[22..26].copy_from_slice(&[H264, 0xE0 | (OTHER_PID >> 8) as u8, OTHER_PID as u8, 0]);
         let stats = segment_stats(&[pat(PMT_PID), packet]);
 
         assert_eq!(stats.counts.video_pid, None);
-        // The section itself is well formed: it lists audio and no video.
         assert_eq!(stats.counts.pmt_packets, 1);
         let failure = failed(watched_for(stats, 58), RunEnd::SegmentTimeout);
         assert_eq!(failure.fault(), Some(StreamFault::NoVideoStream));
@@ -1344,9 +1156,6 @@ mod tests {
 
     #[test]
     fn the_four_bytes_a_section_ends_on_are_never_a_stream_entry() {
-        // A section whose stream lengths leave a byte of slack before the
-        // CRC_32 puts a five-byte read within reach of the section's end. Only
-        // stopping four bytes short of it keeps the checksum out of the loop.
         let mut packet = pmt(0x0F, AUDIO_PID);
         packet[7] = 0x13; // section_length: one byte past the last stream
         packet[22..27].copy_from_slice(&[
@@ -1369,8 +1178,6 @@ mod tests {
         let stats = segment_stats(&[pat(PMT_PID), packet]);
 
         assert_eq!(stats.counts.video_pid, None);
-        // Refused, not parsed — so the run says the PMT was unreadable rather
-        // than that the camera listed no video in it.
         assert_eq!(stats.counts.pmt_packets, 0);
         let failure = failed(watched_for(stats, 58), RunEnd::SegmentTimeout);
         assert_eq!(failure.fault(), Some(StreamFault::NoProgramMap));
@@ -1380,9 +1187,6 @@ mod tests {
 
     #[test]
     fn a_program_map_that_would_span_packets_is_refused_rather_than_reassembled() {
-        // A section too long for its own packet continues in the next one.
-        // camon does not reassemble; it says so rather than reading half a
-        // table, and the fault names the PID it could not read.
         let mut packet = pmt(H264, VIDEO_PID);
         packet[7] = 0xC8; // section_length 200, past the 188-byte packet
         let stats = segment_stats(&[pat(PMT_PID), packet]);
@@ -1400,14 +1204,6 @@ mod tests {
 
     #[test]
     fn a_continuation_packet_is_never_read_as_a_section_of_its_own() {
-        // The rest of a spanning section carries no pointer field and no
-        // table header: its payload is descriptor bytes that happen to sit
-        // where a section's would. Laid out as a plausible PMT naming
-        // OTHER_PID, it must name nothing at all.
-        // The bytes are laid out to parse as such a section whether the
-        // payload is taken to start at the payload offset or one pointer
-        // field past it, so no accident of where the section is looked for
-        // can pass for the flag being honoured.
         let mut continuation = [0xFFu8; TS_PACKET_SIZE];
         continuation[0] = crate::mpegts::SYNC_BYTE;
         continuation[1] = (PMT_PID >> 8) as u8 & 0x1F; // no payload_unit_start
@@ -1437,8 +1233,6 @@ mod tests {
             failure.summary()
         );
 
-        // The same bytes on the PAT's PID, where either reading takes them
-        // for a program entry and names a PMT PID that was never announced.
         continuation[1] = 0x00;
         continuation[2] = 0x00;
         assert_eq!(segment_stats(&[continuation]).counts.pmt_pid, None);
@@ -1446,10 +1240,6 @@ mod tests {
 
     #[test]
     fn the_shortest_well_formed_program_map_is_accepted_though_it_lists_nothing() {
-        // Nine bytes of fixed header and four of CRC, listing nothing: the
-        // exact boundary between a section camon reads and one it refuses. It
-        // parsed, and it named no video — a different fault from an unreadable
-        // one, and the 0x1B the CRC opens with is still not a stream.
         let mut packet = pmt(H264, VIDEO_PID);
         packet[7] = 0x0D;
         let stats = segment_stats(&[pat(PMT_PID), packet]);
@@ -1462,8 +1252,6 @@ mod tests {
 
     #[test]
     fn a_program_map_section_shorter_than_its_own_header_is_refused() {
-        // Nine bytes of fixed header and four of CRC: below thirteen the
-        // section cannot reach the elementary streams at all.
         for section_length in [0x00, 0x03, 0x04, 0x0C] {
             let mut packet = pmt(H264, VIDEO_PID);
             packet[7] = section_length;
@@ -1482,8 +1270,6 @@ mod tests {
 
     #[test]
     fn a_program_association_table_listing_no_programs_names_no_pmt_pid() {
-        // Five bytes of header and four of CRC, no program entry: the PID read
-        // from one would be two bytes of the checksum.
         let mut packet = pat(PMT_PID);
         packet[7] = 0x09;
         let stats = segment_stats(&[packet, pmt(H264, VIDEO_PID)]);
@@ -1510,8 +1296,6 @@ mod tests {
             assert_eq!(stats.counts.pmt_packets, 0);
         }
 
-        // Every length a twelve-bit field can claim, against a payload whose
-        // trailing bytes are all 0xFF: none of them may index past the packet.
         for length in 0..=0x0FFFu16 {
             let mut packet = pmt(H264, VIDEO_PID);
             packet[6] = 0xB0 | ((length >> 8) as u8 & 0x0F);
@@ -1532,8 +1316,6 @@ mod tests {
 
     #[test]
     fn structural_faults_hold_however_the_run_ended() {
-        // What the stream is missing does not depend on which watchdog fired,
-        // so only the keyframe verdicts may be withheld from a short run.
         let no_pat = counted(StreamCounts {
             bytes: 4096,
             ts_packets: 20,
@@ -1571,7 +1353,6 @@ mod tests {
                 "{end:?}"
             );
         }
-        // A PAT that never named a PMT PID is not blamed on the PMT.
         assert!(failed(no_pat, RunEnd::SegmentTimeout)
             .summary()
             .contains("no PAT naming a PMT PID"));
@@ -1580,8 +1361,6 @@ mod tests {
             .contains("no readable PMT"));
     }
 
-    /// The GOP being filled when the connection drops is worth up to a second
-    /// of footage, and nothing else will ever finalize it.
     #[test]
     fn the_open_gop_is_flushed_when_the_stream_ends() {
         let mut segmenter = segmenter();
@@ -1594,8 +1373,6 @@ mod tests {
         for pts in [93_000, 96_000] {
             segmenter.process(&pes_packet(VIDEO_PID, pts));
         }
-        // Only the closed GOP is in the buffer; nothing else will ever close
-        // the one still being filled.
         assert_eq!(segmenter.buffer.read_recover().segment_count(), 1);
 
         segmenter.flush_end_of_stream();
@@ -1603,22 +1380,10 @@ mod tests {
         let buffer = segmenter.buffer.read_recover();
         assert_eq!(buffer.segment_count(), 2);
         let segment = buffer.segments().back().unwrap();
-        // PAT and PMT are prepended, so the flushed segment opens on its
-        // keyframe and stands alone like every other one.
         assert_eq!(crate::mpegts::keyframe_count(&segment.data), 1);
-        // Media PTS, not the wall clock: the flush closes the segment on the
-        // last frame that arrived, not on the moment the connection dropped.
         assert_eq!(segment.duration_ns, 6_000 * 1_000_000_000 / 90_000);
     }
 
-    /// A GOP is measured from the monotonic instant the segmenter opened it,
-    /// never from the wall clock stamps at its two ends. The two agree until
-    /// the clock steps between them — which on a box with no battery-backed
-    /// clock happens on every boot, the moment NTP lands.
-    ///
-    /// Aging the anchor stands in for a GOP that really did take two seconds;
-    /// the wall clock is untouched, so a duration that followed it would be the
-    /// microseconds this test actually takes.
     #[test]
     fn a_gop_is_measured_from_the_instant_it_was_opened_at() {
         let mut segmenter = segmenter();
@@ -1626,10 +1391,6 @@ mod tests {
             segmenter.process(&packet);
         }
         segmenter.process(&keyframe_packet(VIDEO_PID, 0, VIDEO_STREAM_ID));
-        // No predecessor to subtract a media PTS from, so this first segment is
-        // the one the monotonic span has to carry. Checked, because the
-        // monotonic clock starts at boot and subtracting from it is only
-        // representable once the box has been up that long.
         let open = segmenter.current_segment.as_mut().unwrap();
         open.opened_at = open
             .opened_at
@@ -1647,9 +1408,6 @@ mod tests {
         );
     }
 
-    /// A segment cut before its second frame started holds a fragment of a
-    /// keyframe and decodes to nothing. Publishing it would put a broken
-    /// segment in the buffer for the sake of no picture at all.
     #[test]
     fn a_keyframe_fragment_is_dropped_rather_than_flushed() {
         let mut segmenter = segmenter();
@@ -1665,16 +1423,12 @@ mod tests {
         assert_eq!(segmenter.buffer.read_recover().segment_count(), 1);
     }
 
-    /// A frame is one PES packet spread over many TS packets. Counting the
-    /// packets instead reports a GOP of three frames as one of a dozen.
     #[test]
     fn a_frame_spread_over_many_packets_is_counted_once() {
         let mut segmenter = segmenter();
         for packet in [pat(PMT_PID), pmt(H264, VIDEO_PID)] {
             segmenter.process(&packet);
         }
-        // Three frames of four packets each, the first of them the keyframe
-        // the GOP opens on, with audio interleaved as a real stream has it.
         segmenter.process(&keyframe_packet(VIDEO_PID, 0, VIDEO_STREAM_ID));
         for frame in 1..3 {
             for _ in 0..3 {
@@ -1691,14 +1445,9 @@ mod tests {
         let buffer = segmenter.buffer.read_recover();
         let segment = buffer.segments().front().unwrap();
         assert_eq!(segment.frame_count, 3);
-        // The packets really are all in there: the count is a reading of the
-        // stream, not of how much was stored.
         assert_eq!(segment.data.len() / TS_PACKET_SIZE, 16);
     }
 
-    /// The buffer the next GOP is accumulated into keeps the capacity the last
-    /// one needed, while the bytes handed to the hot buffer carry no slack at
-    /// all — they are held there for minutes, the working buffer for a second.
     #[test]
     fn the_segment_buffer_keeps_its_capacity_for_the_next_gop() {
         let mut segmenter = segmenter();
@@ -1729,24 +1478,17 @@ mod tests {
         );
     }
 
-    /// A descriptor that hangs up or errors is reported ready by `poll` — with
-    /// an error bit, not `POLLIN`. Taking that for readability leaves the loop
-    /// polling a dead descriptor as fast as the kernel answers.
     #[test]
     fn a_descriptor_in_error_ends_the_run_instead_of_being_polled_again() {
         use std::os::unix::io::FromRawFd;
 
         let mut fds = [0 as libc::c_int; 2];
         assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe");
-        // The write end of a pipe with no reader: a live descriptor that poll
-        // flags POLLERR on and that can never be read from.
         let write_end = unsafe { std::fs::File::from_raw_fd(fds[1]) };
         drop(unsafe { std::fs::File::from_raw_fd(fds[0]) });
 
         let shutdown = std::sync::atomic::AtomicBool::new(false);
         let result = std::thread::scope(|scope| {
-            // Bounds a run that spins instead of ending, so the mistake shows
-            // up as a failed assertion rather than a hung test.
             scope.spawn(|| {
                 std::thread::sleep(Duration::from_millis(250));
                 shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -1756,18 +1498,12 @@ mod tests {
 
         match result {
             Err(RtspError::NoRecording(failure)) => assert_eq!(failure.end, RunEnd::Eof),
-            // Ok means the poll was read as a timeout and the loop spun until
-            // the shutdown flag stopped it; an io error means it was read as
-            // readable and the read was attempted on a write-only descriptor.
             other => panic!("{other:?}"),
         }
     }
 
     #[test]
     fn poll_readiness_separates_data_from_a_dead_descriptor() {
-        // Bytes to read, whatever else is flagged beside them: a pipe whose
-        // writer closed still hands over what it buffered first, and the
-        // zero-length read that follows is the caller's own end-of-stream.
         for revents in [
             libc::POLLIN,
             libc::POLLIN | libc::POLLHUP,
@@ -1775,18 +1511,14 @@ mod tests {
         ] {
             assert_eq!(readiness(Ok(revents)), Readiness::Readable, "{revents:#x}");
         }
-        // Nothing to read and the descriptor is finished.
         for revents in [libc::POLLERR, libc::POLLHUP, libc::POLLNVAL] {
             assert_eq!(readiness(Ok(revents)), Readiness::Ended, "{revents:#x}");
         }
-        // Nothing happened, and a signal that ended the wait early is nothing
-        // happening: the descriptor is untouched, so the caller waits again.
         assert_eq!(readiness(Ok(0)), Readiness::Timeout);
         assert_eq!(
             readiness(Err(std::io::ErrorKind::Interrupted)),
             Readiness::Timeout
         );
-        // Any other failure is one that would repeat on every call.
         assert_eq!(
             readiness(Err(std::io::ErrorKind::InvalidInput)),
             Readiness::Ended
@@ -1803,7 +1535,6 @@ mod tests {
 
         assert_eq!(stats.counts.keyframes, 2);
         assert_eq!(stats.counts.segments, 1);
-        // A stream that did record is a plain reconnect, nothing to diagnose.
         for end in [RunEnd::SegmentTimeout, RunEnd::DataTimeout, RunEnd::Eof] {
             assert_eq!(failed(stats, end).fault(), None, "{end:?}");
         }
@@ -1811,8 +1542,6 @@ mod tests {
 
     #[test]
     fn resynchronized_noise_is_not_reported_as_transport_stream() {
-        // The scan resynchronizes on any sync byte, so noise with one 0x47 in
-        // it still yields a "TS packet". The verdict has to weigh that.
         let mut data = vec![0u8; 1000];
         data[500] = crate::mpegts::SYNC_BYTE;
         let stats = segment_bytes(&data);
@@ -1834,7 +1563,6 @@ mod tests {
         for end in [RunEnd::DataTimeout, RunEnd::Eof, RunEnd::SegmentTimeout] {
             let failure = failed(counted(StreamCounts::default()), end);
             assert_eq!(failure.fault(), Some(StreamFault::NoData), "{end:?}");
-            // No cause is assigned to a camera camon never heard from.
             let summary = failure.summary();
             assert!(summary.contains("upstream of it"), "{summary}");
             assert!(summary.contains("RUST_LOG=debug"), "{summary}");
@@ -1846,7 +1574,6 @@ mod tests {
         });
         let failure = failed(not_ts, RunEnd::SegmentTimeout);
         assert_eq!(failure.fault(), Some(StreamFault::NotTransportStream));
-        // A torn short read looks the same, and the message says so.
         assert!(failure.summary().contains("ended inside the first packet"));
 
         let flowing = StreamCounts {
@@ -1858,14 +1585,11 @@ mod tests {
             video_packets: 3_800,
             ..StreamCounts::default()
         };
-        // A run cut short says nothing about keyframes, however long the video
-        // PID had been known by then.
         for end in [RunEnd::DataTimeout, RunEnd::Eof] {
             let failure = failed(watched_for(counted(flowing), 300), end);
             assert_eq!(failure.fault(), Some(StreamFault::EndedEarly), "{end:?}");
             assert!(!failure.summary().contains("random_access_indicator"));
         }
-        // A stall is not phrased as ffmpeg having stopped: it may still run.
         assert!(
             failed(watched_for(counted(flowing), 300), RunEnd::DataTimeout)
                 .summary()
@@ -1907,12 +1631,9 @@ mod tests {
         assert!(logs[7]
             .1
             .starts_with("recorded nothing in 8 connection attempts in a row"));
-        // Every line carries the diagnosis, whatever its level.
         assert!(logs
             .iter()
             .all(|(_, line)| line.contains("random_access_indicator")));
-        // Reporting advances the streak it reports on: a report that cleared it
-        // would restart at one here and never escalate at all.
         assert_eq!(tracker.classify(&failure), Report::Quiet);
         assert_eq!(tracker.fault.count(), 13);
     }
@@ -1929,8 +1650,6 @@ mod tests {
             }
         }
         assert_eq!(&milestones[..7], &[1, 2, 4, 8, 16, 32, 64]);
-        // Doubling would next report at 128, then 256: a camera dead for half a
-        // day would go silent for hours at a time.
         assert!(
             milestones
                 .windows(2)
@@ -1947,8 +1666,6 @@ mod tests {
         assert_eq!(tracker.classify(&broken), Report::Connection(1));
         assert_eq!(tracker.classify(&broken), Report::Connection(2));
         assert_eq!(tracker.classify(&broken), Report::Quiet);
-        // An unrelated error or a panic never reaches the tracker, so the
-        // fourth run that recorded nothing still escalates on schedule.
         assert_eq!(tracker.classify(&broken), Report::Camera(4));
 
         let recorded = failed(
@@ -2003,8 +1720,6 @@ mod tests {
             ]
         );
 
-        // A run that kept going for ten minutes was a working stream, so its
-        // stop is worth a line again.
         let settled = failed(
             StreamStats {
                 run_secs: SETTLED_RUN_SECS,

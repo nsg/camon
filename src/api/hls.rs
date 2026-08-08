@@ -34,9 +34,8 @@ pub fn generate_playlist(buffer: &HotBuffer, tail_count: Option<usize>) -> Strin
     playlist.push_str(&format!("#EXT-X-TARGETDURATION:{}\n", max_duration));
     playlist.push_str(&format!("#EXT-X-MEDIA-SEQUENCE:{}\n", base_sequence));
 
-    // Where the previous segment was stamped and where it ended: the gap test
-    // needs both, because a stamp that carries no information cannot be read as
-    // a position on the timeline. See [`discontinuous`].
+    // Previous segment's stamp and end: the gap test needs both, see
+    // [`discontinuous`].
     let mut previous: Option<(u64, u64)> = None;
     for (i, segment) in segments.iter().skip(skip).enumerate() {
         let sequence = base_sequence + i as u64;
@@ -61,29 +60,8 @@ pub fn generate_playlist(buffer: &HotBuffer, tail_count: Option<usize>) -> Strin
     playlist
 }
 
-/// Whether a segment fails to continue the one before it, and the player has to
-/// be told to re-align its decoder across the join.
-///
-/// The test is a gap between where the previous segment ended and where this
-/// one is stamped: a reconnect, or a stream that stalled long enough to lose
-/// footage, leaves one.
-///
-/// Two segments both stamped at the epoch are exempt. That is the sentinel
-/// `wall_clock_ns` (in [`crate::buffer`]) hands out while the box has no idea
-/// what time it is, and it is not a position on a timeline — it is the absence
-/// of one. Measured against it every segment looks discontinuous from
-/// its predecessor, by construction: the "gap" is exactly the previous
-/// segment's own duration, so a camera recording perfectly contiguous footage
-/// on a box whose clock has not been set would have a marker before every
-/// segment it produced. No timeline signal is derived from stamps that carry no
-/// timeline.
-///
-/// The joins into and out of that stretch stay marked, deliberately: the first
-/// segment stamped after NTP lands really does begin a new timeline, and a
-/// clock knocked back to before 1970 mid-run really does end one. Saturated
-/// far-future stamps need no clause of their own — consecutive `u64::MAX`
-/// stamps sit a zero-length gap apart and never trip the test, while the jumps
-/// at either end of them do.
+/// Whether a segment fails to continue the one before it — a gap between the previous end and
+/// this stamp — so the player re-aligns its decoder.
 fn discontinuous(prev_start: u64, prev_end: u64, start: u64) -> bool {
     const MAX_GAP_NS: u64 = 100_000_000;
     if prev_start == 0 && start == 0 {
@@ -123,17 +101,12 @@ fn format_datetime(secs: i64, millis: u32) -> String {
 
 pub fn generate_segment(buffer: &HotBuffer, sequence: u64) -> Option<Arc<Vec<u8>>> {
     let segment = buffer.get_segment_by_sequence(sequence)?;
-    // Return raw MPEG-TS data directly - already properly formatted with PAT/PMT.
-    // Cloning the Arc shares the bytes, so the read lock drops without a byte copy.
+    // Cloning the Arc shares the bytes; the read lock drops without a copy.
     Some(Arc::clone(&segment.data))
 }
 
-/// A stored segment, borrowed as a byte slice so it can *be* a response body
-/// rather than be copied into one.
-///
-/// [`Bytes::from_owner`] asks its owner to borrow as `[u8]`, and `Arc<Vec<u8>>`
-/// only borrows as `Vec<u8>` — no impl bridges the two, so the bridge is this
-/// newtype and nothing more.
+/// A stored segment, borrowed as a byte slice so it can *be* a response body rather than be
+/// copied into one.
 struct SegmentBody(Arc<Vec<u8>>);
 
 impl AsRef<[u8]> for SegmentBody {
@@ -142,25 +115,8 @@ impl AsRef<[u8]> for SegmentBody {
     }
 }
 
-/// Hand a stored segment to the HTTP layer as a body over the hot buffer's own
-/// allocation, with no copy at any point.
-///
-/// The [`Arc`] rides along inside the body and is released when the response
-/// is, which is what makes the no-copy version *correct* rather than merely
-/// cheap: the hot buffer evicts on a duration window driven by the ingest
-/// thread, so a segment can age out while a client is still pulling it down.
-/// The reference held here keeps those bytes alive until the last one is
-/// written, so an eviction mid-download costs the buffer its slot but never
-/// truncates the transfer.
-///
-/// Pinning a segment for a slow client's sake is strictly cheaper than the
-/// copy it replaces, not a trade: the copy pinned memory for exactly as long —
-/// the response held it either way — but pinned a *private* few megabytes per
-/// request, plus the allocation and the memcpy to fill it. N clients dragging
-/// the same segment now share one allocation where they used to hold N. The
-/// only memory this can hold that the copy would not is a segment the buffer
-/// has already evicted, and that is bounded by the same thing that bounded the
-/// copies: one segment's worth per in-flight response, at most.
+/// Hand a stored segment to the HTTP layer as a body over the hot buffer's own allocation, no
+/// copy at any point.
 pub fn segment_body(data: Arc<Vec<u8>>) -> Bytes {
     Bytes::from_owner(SegmentBody(data))
 }
@@ -189,10 +145,6 @@ mod tests {
         playlist.matches("#EXT-X-DISCONTINUITY").count()
     }
 
-    /// On a box whose clock has not been set, every segment is stamped at the
-    /// epoch while its duration is real — so the naive gap test finds the whole
-    /// of the previous segment between them and marks every join. The footage
-    /// is contiguous; the stamps just cannot say so.
     #[test]
     fn segments_stamped_by_an_unset_clock_are_not_all_marked_discontinuous() {
         let buffer = buffer_of(&[0, 0, 0, 0]);
@@ -200,8 +152,6 @@ mod tests {
         assert_eq!(markers(&playlist), 0, "{playlist}");
     }
 
-    /// The join where NTP lands is a real discontinuity — the timeline the
-    /// player has been given jumps by decades — and stays marked.
     #[test]
     fn the_segment_stamped_once_the_clock_lands_is_marked_discontinuous() {
         let buffer = buffer_of(&[0, 0, 1_700_000_000 * SEC, 1_700_000_002 * SEC]);
@@ -209,8 +159,6 @@ mod tests {
         assert_eq!(markers(&playlist), 1, "{playlist}");
     }
 
-    /// The exemption is for stamps that carry nothing, not for gaps: a real
-    /// break between two properly stamped segments is still announced.
     #[test]
     fn a_gap_between_stamped_segments_is_still_marked_discontinuous() {
         let buffer = buffer_of(&[1_700_000_000 * SEC, 1_700_000_060 * SEC]);
@@ -218,9 +166,6 @@ mod tests {
         assert_eq!(markers(&playlist), 1, "{playlist}");
     }
 
-    /// A clock so far in the future that its stamps saturate must not overflow
-    /// the arithmetic that projects a segment's end, which in a debug build
-    /// would panic the request that asked for the playlist.
     #[test]
     fn saturated_stamps_do_not_overflow_the_playlist() {
         let buffer = buffer_of(&[u64::MAX, u64::MAX]);
@@ -244,10 +189,6 @@ mod tests {
         assert_eq!(&*out, &[1, 2, 3, 4]);
     }
 
-    /// The response body has to *be* the buffer's allocation, not a copy of it:
-    /// every live viewer pulls a segment of a few megabytes every couple of
-    /// seconds, and a per-request copy is memory and a memcpy spent for nothing
-    /// on a box that has neither to spare.
     #[test]
     fn the_served_body_is_the_buffers_own_allocation() {
         let buffer = HotBuffer::new("cam".to_string(), 60);
@@ -269,10 +210,6 @@ mod tests {
         assert_eq!(body.len(), stored.len());
     }
 
-    /// Eviction is driven by the ingest thread and takes no notice of who is
-    /// still downloading, so a segment can age out of the window while a slow
-    /// client is halfway through it. The body owns a reference to the bytes, so
-    /// what the client gets is the whole segment rather than a truncated one.
     #[test]
     fn a_segment_evicted_while_it_is_being_served_still_arrives_whole() {
         let buffer = HotBuffer::new("cam".to_string(), 2);

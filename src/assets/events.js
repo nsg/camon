@@ -1,5 +1,3 @@
-// View 2: Event Browser.
-
 const eventsView = document.getElementById('events-view');
 const eventsBackBtn = document.getElementById('events-back-btn');
 const eventsCameraName = document.getElementById('events-camera-name');
@@ -30,7 +28,6 @@ function showEventsView(cameraId) {
     cleanupPlaybackView();
     cleanupDebugView();
 
-    // Ensure we have warm events loaded
     if (currentDetailCameraId !== cameraId) {
         currentDetailCameraId = cameraId;
         fetchWarmEvents(cameraId);
@@ -40,20 +37,15 @@ function showEventsView(cameraId) {
     eventsView.hidden = false;
     eventsCameraName.textContent = cameraId;
 
-    // Reset filter
     eventFilter = 'all';
     filterBtns.forEach(b => b.classList.toggle('active', b.dataset.filter === 'all'));
 
     renderEventList();
 }
 
-// === View 2: Event List Rendering ===
-
 function renderEventList() {
     eventList.innerHTML = '';
 
-    // One filter per event type, matched on the wire name, so no type can
-    // fall through every filter the way continuous chunks used to.
     const filtered = eventFilter === 'all'
         ? warmEvents
         : warmEvents.filter(e => e.event_type === eventFilter);
@@ -63,10 +55,8 @@ function renderEventList() {
         return;
     }
 
-    // Sort by time descending
     const sorted = [...filtered].sort((a, b) => b.start_ms - a.start_ms);
 
-    // Group by date
     const groups = new Map();
     sorted.forEach(ev => {
         const label = formatDateLabel(new Date(ev.start_ms));
@@ -87,9 +77,6 @@ function renderEventList() {
         events.forEach(ev => {
             const item = document.createElement('div');
             item.className = 'event-list-item';
-            // Chunks of one long recording get a rail down their left edge
-            // tying them together; the list runs newest-first, so a chunk
-            // continues the one below it.
             if (isChunkOfRun(ev)) item.classList.add('chain-part');
 
             const thumbSrc = authUrl(`api/cameras/${encodeURIComponent(currentDetailCameraId)}/events/${ev.key}/thumbnail`);
@@ -99,17 +86,11 @@ function renderEventList() {
             const typeLabel = eventTypeLabel(ev) + chainPartLabel(ev);
             const typeClass = eventTypeClass(ev);
 
-            // Salvaged from an interrupted write at startup: flag it so the
-            // viewer knows the tail may be cut short.
             const recoveredBadge = ev.recovered
                 ? ` <span class="event-recovered-badge" title="Recovered after an interruption — footage may be truncated">⚠</span>`
                 : '';
 
-            // A motion run is subsampled to at most 4 filmstrip thumbs, and
-            // short runs yield fewer — render exactly the frames that exist so
-            // we never request a missing index (which 404s to a broken glyph).
-            // The onerror handler hides any frame that still fails to load
-            // (e.g. pre-count events or a partial write).
+            // Do not request nonexistent filmstrip slots; partial writes still hide on error.
             let thumbHtml;
             if (ev.filmstrip_frames > 0) {
                 const cid = encodeURIComponent(currentDetailCameraId);
@@ -120,9 +101,6 @@ function renderEventList() {
                 thumbHtml = `<img class="event-list-thumb" src="${esc(thumbSrc)}" loading="lazy" alt="">`;
             }
 
-            // Nothing about the chain goes here: the type line already says
-            // "part 3" or "continued", and in continuous recording every
-            // row is a continuation, so repeating it distinguishes nothing.
             const detailText = ev.event_type === 'object' && ev.object_classes ? ev.object_classes.join(', ') : '';
 
             item.innerHTML = `
@@ -150,7 +128,6 @@ function renderEventList() {
         eventList.appendChild(groupEl);
     });
 
-    // Arriving from a history day row: jump to that day's section.
     if (eventsScrollDay) {
         const target = eventList.querySelector(`.event-day-group[data-day="${CSS.escape(eventsScrollDay)}"]`);
         eventsScrollDay = null;

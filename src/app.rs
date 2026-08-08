@@ -1,13 +1,5 @@
-//! Process orchestration: startup, the camera/analyzer/writer task graph, and
-//! the graceful drain both shutdown paths end in.
-//!
-//! The drain is phased — producers, then consumers, then writers — and
-//! [`crate::shutdown`] is where that contract and its bounds are written down.
-//! What lives here is the sequencing itself.
-//!
-//! Lives in the library rather than in `main.rs` so it is compiled and tested
-//! once. The binary is the shim around it, and keeps what only a binary has:
-//! argument dispatch and the self-updater.
+//! Process orchestration: startup, the camera/analyzer/writer task graph, and the graceful
+//! drain both shutdown paths end in.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -50,28 +42,12 @@ pub enum RunError {
     /// make one. Startup ends rather than serving the writes unguarded.
     #[error("cannot generate an API token: {source}")]
     ApiToken { source: std::io::Error },
-    /// Warm storage is configured and could not be built at all — in practice
-    /// the remote backend's HTTP client, which is where `reqwest` starts the
-    /// TLS stack, loads the system root certificates and reads the proxy
-    /// environment.
-    ///
-    /// Fatal, and it has to be. Recording *is* the product: a camon that came
-    /// up without the storage its config asks for would answer every API call,
-    /// publish every detection and persist not one second of footage, and the
-    /// only notice of it would be the recording watchdog's warning a whole day
-    /// later. Nothing takes over either — a configured stathost is the warm
-    /// backend, so there is no local disk waiting behind it. Ending here, with
-    /// the fault named, is the one outcome an operator can act on.
+    /// Warm storage is configured and could not be built — in practice the remote backend's
+    /// HTTP client (TLS stack, root certificates, proxy environment).
     #[error("cannot start warm storage: {source}")]
     WarmStorage { source: std::io::Error },
-    /// A supervised task the process cannot run without died. The drain has
-    /// already run by the time this is returned — see [`crate::supervise`].
-    ///
-    /// A list, because one fault reaches several guards and the first to arrive
-    /// is not reliably the origin: an analyzer panicking drops the sender its
-    /// detection worker is parked on, and the worker can report its own clean
-    /// exit while the analyzer is still unwinding. Naming only the first would
-    /// hand the operator the victim and keep the culprit to ourselves.
+    /// A supervised task the process cannot run without died; the drain has already run by now
+    /// (see [`crate::supervise`]).
     #[error("supervised tasks died and camon cannot run without them: {}", .tasks.join(", "))]
     TaskDied { tasks: Vec<String> },
 }
@@ -145,35 +121,17 @@ fn parse_override_or_exit(spec: &str) -> config::Override {
 struct ShutdownSignal {
     flag: Arc<AtomicBool>,
     wake: Arc<tokio::sync::Notify>,
-    /// Broadcast wakeup for workers that would otherwise only notice the flag
-    /// on their next poll — a camera task parked in its reconnect backoff can
-    /// be a minute away from one. Separate from `wake`, which carries a single
-    /// permit meant for the main task.
+    /// Broadcast wakeup for workers parked far from their next flag poll (a
+    /// reconnect backoff can be a minute long). Separate from `wake`, whose
+    /// single permit is meant for the main task.
     drain: Arc<tokio::sync::Notify>,
-    /// Set once an update has replaced the binary on disk. Tracked separately
-    /// from the flag because it can become true at any point up to the end of
-    /// the drain — including after a signal already started one, from a check
-    /// that was in flight — and the restart watchdog keys off it.
+    /// Set once an update has replaced the binary on disk — possibly after a
+    /// signal already started a drain, from a check that was in flight. The
+    /// restart watchdog keys off it.
     update_installed: Arc<AtomicBool>,
 }
 
 /// The switch that tells the restart enforcement a new binary is on disk.
-///
-/// Asking for a restart is two facts, and only one of them can wait. That the
-/// drain should start is news the updater brings back when it returns. That a
-/// replacement binary now exists under the running one is true from the instant
-/// the rename returns — and between that instant and the updater's return there
-/// is a directory fsync, on the filesystem that may be exactly what is failing,
-/// synchronous and cancellable by nothing. A process wedged there has already
-/// installed the update, has an enforcement thread running, and has told it
-/// nothing; it goes on running the old code for as long as the box is up, which
-/// is the failure the enforcement exists to prevent, one call deeper than where
-/// it was first closed.
-///
-/// So the updater is handed this and flips it at the rename, before anything
-/// else it does. It carries no drain request: raising the flag alone arms the
-/// watchdog's own deadline and changes nothing else, which is exactly the
-/// property that makes it safe to do early.
 #[derive(Clone, Default)]
 pub struct InstalledMarker {
     installed: Arc<AtomicBool>,
@@ -210,22 +168,13 @@ impl ShutdownSignal {
         self.flag.load(Ordering::Relaxed)
     }
 
-    /// Raise the flag and wake every worker waiting on it. `notify_waiters`
-    /// reaches all of them at once but leaves no permit behind for one that
-    /// arrives afterwards, hence the flag re-check in `sleep_or_shutdown`.
-    ///
-    /// It does not wake the main task parked in `wait_for_shutdown`, so it is
-    /// only for callers that reach that themselves — anyone else has to notify
-    /// `wake` too, as `request_restart` does, or the drain never starts.
+    /// Raise the flag and wake every worker waiting on it.
     fn request(&self) {
         self.flag.store(true, Ordering::Relaxed);
         self.drain.notify_waiters();
     }
 
     /// Ask for the drain from inside the process, where no signal is coming.
-    ///
-    /// `notify_one` leaves a permit behind when nobody is waiting yet, so the
-    /// wakeup cannot be lost to a race with the main task reaching it.
     fn request_now(&self) {
         self.request();
         self.wake.notify_one();
@@ -252,14 +201,7 @@ impl ShutdownSignal {
         })
     }
 
-    /// Sleep for `duration`, cut short the moment shutdown is requested, so a
-    /// pending delay never holds the drain up.
-    ///
-    /// The `Notified` is created before the flag is read, and tokio guarantees
-    /// it receives every `notify_waiters` that happens after its creation, even
-    /// one landing before it is first polled. A request is therefore either
-    /// already visible in the flag or still to come and caught by the notify —
-    /// there is no ordering in which this sleeps the full duration.
+    /// Sleep for `duration`, cut short the moment shutdown is requested.
     async fn sleep_or_shutdown(&self, duration: std::time::Duration) {
         let notified = self.drain.notified();
         if self.requested() {
@@ -275,33 +217,15 @@ impl ShutdownSignal {
 const UPDATE_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(12 * 60 * 60);
 
 /// When the loop makes its first check.
-///
-/// The startup attempt checks straight away — it *is* the startup check, and a
-/// box that was off while a release was published should not run the old binary
-/// for another twelve hours; nothing waits for it, so immediate costs the
-/// cameras nothing. Every attempt after it waits a full interval first, which
-/// is not politeness: [`crate::supervise::RestartLimit::cycling_every`] judges
-/// a restarted task by whether it outlived its own cadence, so an attempt that
-/// checked immediately and died would report an uptime of nearly nothing, and
-/// four of those in a row would escalate the updater to the fatal policy in
-/// seconds rather than the two days the limit is calibrated for — taking a
-/// recording NVR down over a version check, which is the one thing the
-/// restartable policy exists to prevent.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum FirstCheck {
     Immediately,
     AfterOneInterval,
 }
 
-/// An update installed while camon is running must not cut the recording short:
-/// it asks for the same graceful shutdown a signal does, so the analyzers,
-/// continuous recorders and warm writers drain before the process goes away.
-/// The loop is one-shot in that sense — after an install there is nothing left
-/// to check, the process is on its way out.
-///
-/// When it makes the first of those checks is [`FirstCheck`]'s question, and
-/// the answer differs between the attempt startup spawns and the ones the
-/// supervisor puts back after it.
+/// An installed update asks for the same graceful shutdown a signal does, so
+/// the recording drains before the process goes away; after an install there
+/// is nothing left to check and the loop returns.
 async fn run_update_check_loop_with<F, Fut, E>(
     interval_period: std::time::Duration,
     first: FirstCheck,
@@ -338,30 +262,7 @@ async fn run_update_check_loop_with<F, Fut, E>(
     }
 }
 
-/// The self-updater lives in the binary, so it reaches this as a plain
-/// argument: the library orchestrates the check (and what an installed update
-/// does to the running process) without depending on the updater itself.
-///
-/// **This does not wait for a check.** It starts one and returns, and that is
-/// the point: the startup check used to be awaited right here, between the HTTP
-/// bind and the first camera, so a release download that was slow, stalled, or
-/// deliberately trickled by whatever answered the request held every camera off
-/// the air for as long as it cared to — with no total deadline on the download
-/// to bound how long that was. An NVR that is not recording is an NVR that is
-/// failing, and no version check is worth that. The check now runs beside the
-/// cameras, where an install asks for the ordinary graceful drain instead of
-/// exiting inline, and where taking its time costs nothing but time.
-///
-/// Restartable rather than fatal: an updater that dies leaves camon running an
-/// old binary, which is a lot less bad than a recording NVR taken down over a
-/// version check. The `Arc` is what lets the same checker be handed to a second
-/// attempt, and the flag beside it is what makes only the *first* attempt check
-/// immediately — see [`FirstCheck`] for why a restarted one must not.
-///
-/// The enforcement is asked for by value it cannot be given late: taking
-/// [`RestartEnforcement`] here means the thread that guarantees the restart
-/// exists before anything can install one. That ordering used to be free —
-/// startup installed updates inline, before any of this — and is not any more.
+/// The self-updater lives in the binary and reaches this as a plain argument.
 fn check_for_updates<F, Fut, E>(
     config: &Config,
     shutdown: &ShutdownSignal,
@@ -416,30 +317,12 @@ fn log_object_detection_config(config: &Config) -> bool {
 }
 
 /// The warm backend and whether its index describes the store.
-///
-/// The second half exists for the retention task: a backend whose scan failed
-/// is refusing to prune or enforce its budget until a sweep rebuilds the index,
-/// and the sweep it is waiting for is the one this schedules — so that first
-/// sweep comes early instead of an hour later. `true` when there is no warm
-/// storage at all, which has nothing to heal.
-///
-/// `backend` is `None` for one reason only: `[storage] enabled = false`. That
-/// is the invariant `spawn_cameras` rests on when it unwraps the backend for a
-/// camera's warm writer, and why a backend that cannot be constructed ends
-/// startup ([`RunError::WarmStorage`]) rather than being absorbed into this
-/// `None` — which would turn "storage is off" and "storage is broken" into the
-/// same value and reach that unwrap with the wrong one.
 struct Storage {
     backend: Option<Arc<dyn WarmStorageBackend>>,
     scanned: bool,
 }
 
-/// `stop` is the process shutdown flag. The remote backend takes it at
-/// construction rather than being handed one per call: every request-issuing
-/// loop it owns reads it before sending, which is what keeps a single event
-/// write inside the drain's phase-3 budget (see
-/// [`crate::storage::contract`]). Local disk needs none — its every step is
-/// local I/O with nothing to cancel.
+/// `stop` is the process shutdown flag.
 async fn init_storage(
     config: &Config,
     camera_ids: &[String],
@@ -452,31 +335,20 @@ async fn init_storage(
         });
     }
 
-    // A configured (and enabled) [storage.stathost] section switches the warm
-    // backend from local disk to the remote host. Local disk is the default.
     if let Some(stathost) = config.storage.stathost.as_ref().filter(|s| s.enabled) {
         tracing::info!(
             url = %stathost.url,
             bucket = %stathost.bucket,
             "using remote stathost warm-storage backend"
         );
-        // A client that cannot be built is a permanent, local fault — the TLS
-        // stack, the system root store, a malformed proxy in the environment —
-        // and every start will hit it again. It ends startup rather than being
-        // absorbed: this backend *is* the warm store when it is configured, so
-        // carrying on means a camon that serves, detects and alerts while
-        // recording nothing at all, and the first sign of that is a watchdog
-        // warning a day later. See [`RunError::WarmStorage`].
+        // A client that cannot be built is a permanent local fault and ends
+        // startup — see [`RunError::WarmStorage`].
         let backend = StathostBackend::new(stathost, camera_ids, stop)
             .map_err(|source| RunError::WarmStorage { source })?;
         backend.recover_orphans();
-        // A store that cannot be listed does not stop camon: the cameras record
-        // and upload either way, and holding startup for a host that may be
-        // down for hours would cost footage that nothing else would have
-        // recorded. What it does cost is retention, and that is worth a line of
-        // its own — the backend refuses to prune or evict until a later scan
-        // succeeds, saying so on every retention sweep and, for the budget it
-        // is asked about before every write, on a widening schedule.
+        // A store that cannot be listed does not stop camon — holding startup for a host that
+        // may be down for hours would cost footage. What it costs is retention: the backend
+        // refuses to prune or evict until a later scan succeeds.
         let scanned = match backend.scan().await {
             Ok(()) => true,
             Err(e) => {
@@ -497,14 +369,11 @@ async fn init_storage(
 
     let data_dir = std::path::PathBuf::from(&config.storage.data_dir);
     let backend = LocalDiskBackend::new(data_dir, camera_ids);
-    // Salvage any event files orphaned mid-write by a crash or power cut
-    // BEFORE the scan, so recovered events are indexed like any other.
+    // Orphans are recovered BEFORE the scan, so recovered events are indexed
+    // like any other.
     backend.recover_orphans();
-    // Infallible for local disk — see its `scan` — but handled rather than
-    // discarded, so that a backend which grows a failure mode here is not able
-    // to acquire a silent one. Nothing here gates on the scan the way the
-    // remote backend does: a directory that could not be read is one directory,
-    // and retention sweeps what it did read.
+    // Infallible for local disk today, but handled so a backend that grows a
+    // failure mode here cannot acquire a silent one.
     if let Err(e) = backend.scan().await {
         tracing::warn!(error = %e, "warm index scan failed; some events may not be indexed");
     }
@@ -531,9 +400,8 @@ fn init_motion_settings(
 }
 
 /// The classes the MQTT bridge publishes occupancy entities for: read off the
-/// detector itself, so an entity can never exist for a class nothing looks for
-/// or the other way round. No client means no detections at all — object
-/// detection is off, or its client could not be built — and so no entities.
+/// detector itself, so an entity can never exist for a class nothing looks
+/// for or the other way round. No client, no detections, no entities.
 fn mqtt_object_classes(client: Option<&OllamaClient>) -> Vec<String> {
     client
         .map(|c| c.allowed_classes().to_vec())
@@ -541,9 +409,7 @@ fn mqtt_object_classes(client: Option<&OllamaClient>) -> Vec<String> {
 }
 
 /// Where the bridge remembers the entity set it announced to Home Assistant.
-/// Beside the per-camera state in the data dir, and written even when warm
-/// storage is off: the file is a few hundred bytes and the entities exist
-/// either way.
+/// Written even when warm storage is off: the entities exist either way.
 fn mqtt_entities_path(config: &Config) -> std::path::PathBuf {
     std::path::PathBuf::from(&config.storage.data_dir).join("mqtt_entities.json")
 }
@@ -577,17 +443,14 @@ fn create_ollama_client(config: &Config) -> Option<OllamaClient> {
 const EVENT_CHANNEL_CAPACITY: usize = 8;
 
 struct CameraHandles {
-    /// The producers, with the buffer each one fills. Phase 1 of the drain
-    /// joins these first and then publishes each buffer's watermark, which is
-    /// why the buffer travels with the handle rather than only in
-    /// `buffers_map`.
+    /// The producers, with the buffer each one fills: phase 1 joins these and
+    /// then publishes each buffer's watermark.
     pipeline_handles: Vec<(String, tokio::task::JoinHandle<()>, Arc<RwLock<HotBuffer>>)>,
-    /// Every worker below is per-camera and keeps its camera's id beside it, so
-    /// that a drain which has to abandon one can say which recording to
-    /// distrust rather than only which kind of task stopped answering.
+    /// Every worker below keeps its camera's id beside it, so a drain that
+    /// abandons one can say which recording to distrust.
     analyzer_handles: Vec<(String, tokio::task::JoinHandle<()>)>,
-    /// Per-camera continuous-recording drivers (storage on + analytics off).
-    /// Empty in event mode. Drained in phase 2, before the writers' senders
+    /// Per-camera continuous-recording drivers (storage on + analytics off);
+    /// empty in event mode. Drained in phase 2, before the writers' senders
     /// drop, so their final chunk is still accepted.
     continuous_handles: Vec<(String, tokio::task::JoinHandle<()>)>,
     warm_handles: Vec<(String, tokio::task::JoinHandle<()>)>,
@@ -619,22 +482,12 @@ struct SpawnContext<'a> {
     /// Notices a camera that is recording nothing, whatever the reason.
     recording_watchdog: &'a Arc<RecordingWatchdog>,
     shutdown: &'a ShutdownSignal,
-    /// Every task below is spawned through this, so that one dying is noticed
-    /// where it happens instead of at the stop. All of them are fatal — see
+    /// Every task below is spawned through this; all of them are fatal — see
     /// the policy table in [`run_with_config`].
     supervisor: &'a Supervisor,
 }
 
 /// Say what this process is going to do with its footage, once, at startup.
-///
-/// The two states where nothing is written are the reason this is not just an
-/// info line: neither can be inferred later from an empty archive, and the
-/// recording watchdog deliberately stays quiet about both, so this is the only
-/// place they are ever said. Analytics without storage warns — events are
-/// detected, published to MQTT, and then discarded, which is a real setup for a
-/// motion sensor but an expensive mistake if recording was the point. Neither
-/// disabled is only an info line: nothing is being computed and thrown away,
-/// camon is a live-view proxy, and the operator asked for exactly that.
 fn log_recording_mode(config: &Config) {
     match (config.storage.enabled, config.analytics.enabled) {
         (true, true) => {
@@ -657,14 +510,7 @@ fn log_recording_mode(config: &Config) {
     }
 }
 
-/// What a camera is expected to produce, which is what makes its silence
-/// suspicious or not — or `None` when nothing is expected of it.
-///
-/// With storage off no write can ever succeed, so a silence timer is guaranteed
-/// to fire and says nothing the configuration did not already say. Those states
-/// are reported once at startup by [`log_recording_mode`] and then left alone:
-/// a daily warning about a camera that was never asked to record only teaches
-/// the operator to ignore the ones about cameras that were.
+/// What a camera is expected to produce — `None` when nothing is expected of it.
 fn recording_mode(config: &Config) -> Option<RecordingMode> {
     if !config.storage.enabled {
         return None;
@@ -696,9 +542,9 @@ fn spawn_cameras(ctx: &SpawnContext, cameras: Vec<config::CameraConfig>) -> Came
         let camera_id = cam_config.id.clone();
 
         if let Some(mode) = mode {
-            // Seeded from what is already on disk, not from now: this process
-            // may be minutes old on a box that restarts nightly, and a silence
-            // that resets with it is never long enough to notice.
+            // Seeded from what is already on disk, not from now: on a box that
+            // restarts nightly, a silence that resets with the process is
+            // never long enough to notice.
             let already_silent_for = storage::watchdog::silence_before_startup(
                 ctx.storage
                     .as_ref()
@@ -755,11 +601,9 @@ fn spawn_cameras(ctx: &SpawnContext, cameras: Vec<config::CameraConfig>) -> Came
             .pipeline_handles
             .push((camera_id.clone(), handle, Arc::clone(&buffer)));
 
-        // Continuous recording: storage on, analytics off. With no analyzer to
-        // close motion runs, a dedicated task rolls fixed-length chunks straight
-        // from the hot buffer into the same warm writer. Gated on the mode that
-        // the watchdog is told about, so the two cannot disagree about which
-        // combination is continuous.
+        // Continuous mode rolls fixed-length chunks straight from the hot
+        // buffer into the warm writer. Gated on the same mode the watchdog is
+        // told about, so the two cannot disagree.
         if let Some(RecordingMode::Continuous { chunk }) = mode {
             if let Some(tx) = event_tx.clone() {
                 let recorder = run_continuous_recorder(
@@ -814,11 +658,9 @@ fn spawn_cameras(ctx: &SpawnContext, cameras: Vec<config::CameraConfig>) -> Came
     handles
 }
 
-/// Which of the two kinds of stop this was, for what is said about it
-/// afterwards. `Internal` covers both things that ask for a drain from inside
-/// the process — an installed update and a supervised task's death — because
-/// the wakeup is the same one; which of them it was is [`Supervisor::first_failure`]'s
-/// answer, not this one's.
+/// Which of the two kinds of stop this was. `Internal` covers both an
+/// installed update and a supervised task's death — which of them it was is
+/// [`Supervisor::first_failure`]'s answer, not this one's.
 enum ShutdownReason {
     Signal,
     Internal,
@@ -842,110 +684,29 @@ async fn wait_for_shutdown(shutdown: &ShutdownSignal) -> ShutdownReason {
     reason
 }
 
-/// Last-resort liveness backstop for a drain nobody outside the process is
-/// bounding — the one that follows an installed update, and the one a
-/// supervised task's death asks for. A signal shutdown is bounded by the
-/// service manager (`TimeoutStopSec` / OpenRC's `retry`, both set by the unit
-/// `camon install service` writes); an internally requested one is not, so a
-/// drain that never finishes would leave the process up for ever: running the
-/// old code after an update, or running without whatever task just died.
-///
-/// It guarantees the restart *eventually* happens; it does not guarantee that
-/// what it terminates was stuck. What it has to cover, against a black-holing
-/// stathost server, is one request that uses its whole `UPLOAD_TIMEOUT` — the
-/// one already in flight when the flag went up. Nothing queues behind it any
-/// more: every request-issuing loop in the storage layer reads the flag before
-/// sending (see [`crate::storage::contract`]'s third guarantee), so the rest of
-/// a writer's queue drains without touching the network, an event still being
-/// uploaded is abandoned after its current request rather than after the seven
-/// that used to follow it — sidecar, video, a retry each, then a put per
-/// filmstrip frame, all serial — and the retention sweep stops between the
-/// deletes of a single event. So this can still abandon a drain that is making
-/// progress, but only ever by one request per task. That is the accepted trade:
-/// the alternative is an NVR that silently never restarts.
-///
-/// It is also the budget the drain's own phases are sized against, and
-/// [`graceful_shutdown`] measures phase 3's deadline from it. When the two
-/// clocks start together — a supervised death, or a signal a check installs
-/// into — that arithmetic holds exactly: the drain finishes and says what it
-/// lost a moment before this thread would have taken the process out from under
-/// it without saying anything. See [`crate::shutdown`].
-///
-/// They no longer always start together. This clock starts when a restart
-/// becomes necessary, and for an update that is the instant the new binary is
-/// renamed into place ([`InstalledMarker`]) — which can be well before the
-/// drain, since the check runs beside everything else camon does and the
-/// updater still has an fsync, a log line and a return to get through, any of
-/// which can be slow on a box whose disk is what is failing. A drain that
-/// starts late therefore gets what is left of the 360 seconds rather than all
-/// of it, and phase 3 can be cut short by this thread instead of finishing just
-/// inside it. That is the intended order of preference: the deadline exists
-/// because a process that never restarts is worse than a drain that loses its
-/// tail, and the further behind the drain is, the more likely it is that
-/// something is wedged rather than merely slow.
+/// Last-resort liveness backstop for a drain nobody outside the process is bounding — after
+/// an installed update or a supervised task's death.
 pub const RESTART_DRAIN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(360);
 
 /// How often the watchdog looks for a reason to arm. It polls from startup
 /// onwards, so this is also how long it can lag the flag going up.
 const WATCHDOG_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
 
-/// Proof that the restart enforcement is running.
-///
-/// It exists to be a parameter. Anything that can ask for a restart camon has
-/// to enforce itself takes one of these, so the enforcement cannot be started
-/// after the thing it enforces — an ordering that is not otherwise visible in
-/// any type, and that startup got wrong for free once the update check stopped
-/// running in front of everything else.
-///
-/// It carries nothing: the whole value is having been returned by
-/// [`spawn_restart_watchdog`], which cannot happen before the thread is running.
+/// Passed to update checks so they cannot run before the restart watchdog is armed.
 struct RestartEnforcement;
 
 /// Block until something has asked for a restart that nothing outside this
-/// process is bounding.
-///
-/// Split out from the thread because everything after it — a fixed sleep and an
-/// `_exit` — is not survivable in a test, while this is exactly the part worth
-/// pinning: what arms the watchdog is the *state*, not being called at the
-/// start of a drain.
+/// process is bounding. Split out from the thread because the sleep and
+/// `_exit` after it are not survivable in a test.
 fn wait_for_a_restart_reason(update_installed: &AtomicBool, task_died: &AtomicBool) {
     while !update_installed.load(Ordering::Relaxed) && !task_died.load(Ordering::Relaxed) {
         std::thread::sleep(WATCHDOG_POLL_INTERVAL);
     }
 }
 
-/// Spawned during startup, before the first thing that can ask for a restart,
-/// and armed by the state rather than by whichever `select!` arm woke the wait:
-/// when a signal and an update land together the arm that wins is
-/// pseudo-random, and an in-flight check can install the binary — or a
-/// supervised task can die — after a signal drain has already begun. Either way
-/// the process must still end.
-///
-/// Started that early because an update can now land *during* startup: the
-/// check runs beside it rather than in front of it, so the binary can be
-/// replaced while the storage scan is still running — a synchronous scan that
-/// no shutdown flag can cancel from outside. Armed only at the drain, as it
-/// used to be, a scan that never came back would leave the process running the
-/// old code for ever with the new one already on disk, and nothing anywhere
-/// would notice. It costs one thread that sleeps until it is needed.
-///
-/// The exit status is read when the deadline trips rather than when the thread
-/// arms, so an update that installs into a stop a task's death already started
-/// still exits nonzero — the failure outranks the update. What it does *not*
-/// do is turn a deliberate stop into a failure: a task that dies mid-drain is
-/// classified as asked-for by [`crate::supervise`] and never sets this flag, so
-/// a SIGTERM shutdown that loses a task on its way out still exits 0, by
-/// design. The one narrow exception is a task whose exit reads the stop flag in
-/// the instant before the signal handler stores it: that reads as a death and
-/// this exits nonzero, which is the honest answer for a race nobody can call
-/// either way.
-///
-/// A wedged `spawn_blocking` thread and a blocked `sync_all` are both
-/// uncancellable from async code, so this is a plain thread. Everything the
-/// operator needs is logged when it arms: past that point the thread only
-/// sleeps and terminates, because whatever wedged the drain could just as
-/// easily have wedged stderr. `_exit` runs no atexit handlers and no
-/// destructors — nothing that could block on the same wedge.
+/// Starts before any restart request and watches state so requests arriving during startup or
+/// drain still arm it. A plain thread and `_exit` remain effective when async work or destructors
+/// wedge.
 fn spawn_restart_watchdog(
     update_installed: Arc<AtomicBool>,
     task_died: Arc<AtomicBool>,
@@ -969,15 +730,8 @@ fn spawn_restart_watchdog(
 /// `offline` marker and disconnect before giving up on it.
 pub const MQTT_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// Join a set of per-camera tasks under one shared deadline, so a rack of
-/// cameras cannot multiply a per-task bound into a stop that outlives its
-/// budget. See [`crate::shutdown`] for why every phase of the drain is bounded.
-///
-/// What is abandoned is named — the task and the camera it belongs to — because
-/// an operator reading this line afterwards is trying to work out which
-/// camera's recording to distrust, and "a motion analyzer" does not answer
-/// that. The consumer's own bound has usually already logged how much it left
-/// behind; this says which one stopped answering at all.
+/// Join a set of per-camera tasks under one shared deadline, so a rack of cameras cannot
+/// multiply a per-task bound into a stop that outlives its budget (see [`crate::shutdown`]).
 async fn join_all_before(
     handles: Vec<(String, tokio::task::JoinHandle<()>)>,
     deadline: tokio::time::Instant,
@@ -1002,27 +756,14 @@ async fn graceful_shutdown(
     detect_worker_handle: Option<tokio::task::JoinHandle<()>>,
     mqtt_handle: Option<tokio::task::JoinHandle<()>>,
 ) {
-    // Phase 3's deadline, taken here rather than when phase 3 begins: the
-    // budget is one budget, and a phase that overran has to come out of the
-    // writers' share and not out of the service manager's patience.
+    // Phase 3's deadline, taken here rather than when phase 3 begins: a phase
+    // that overran comes out of the writers' share, not the service manager's
+    // patience.
     let budget_ends =
         tokio::time::Instant::now() + RESTART_DRAIN_DEADLINE - crate::shutdown::TEARDOWN_MARGIN;
 
-    // PHASE 1 — the producers stop, completely, before anything downstream is
-    // asked to finish. Each camera thread is at most one 500ms poll from
-    // noticing the flag, after which it flushes the GOP it was filling, kills
-    // its ffmpeg and returns. A camera that does not come back inside the
-    // shared bound is left running: a provisional watermark is published from
-    // wherever its buffer had reached, and everything behind it carries on.
-    // Waiting for it instead would mean a stuck network read could stop the
-    // process from ever restarting.
-    //
-    // This is the first thing the drain does. It used to be the second, behind
-    // the retention join below, and that cost nothing back when every worker
-    // exited on the flag — but a consumer's phase-2 bound runs from the flag,
-    // so a remote sweep parked on a request timeout would spend the consumers'
-    // whole gate before the cameras were even joined, and every one of them
-    // would then report a lost tail it never actually had a chance to drain.
+    // PHASE 1 — the producers stop, completely, before anything downstream is asked to
+    // finish.
     let mut buffers_with_ids = Vec::new();
     let cameras_joined_by = tokio::time::Instant::now() + crate::shutdown::CAMERA_JOIN_BOUND;
     for (camera_id, handle, buffer) in handles.pipeline_handles {
@@ -1039,10 +780,9 @@ async fn graceful_shutdown(
         } else {
             tracing::info!(camera = %camera_id, "camera pipeline stopped");
         }
-        // PHASE 2 opens here: the watermark is published by the drain, after
-        // the join, so that no push can land behind it. Unconditional — a
-        // consumer waiting on a watermark that is never published is a
-        // consumer waiting out its whole bound for nothing.
+        // PHASE 2 opens here: the watermark is published after the join, so
+        // no push can land behind it. Unconditional — a consumer waiting on a
+        // watermark that never comes waits out its whole bound for nothing.
         let watermark = {
             let mut buf = buffer.write_recover();
             if stopped {
@@ -1060,13 +800,8 @@ async fn graceful_shutdown(
         buffers_with_ids.push((camera_id, buffer));
     }
 
-    // PHASE 2 — analyzers and continuous recorders keep consuming until they
-    // have drained through their camera's watermark, so the tail the camera
-    // pushed on its way out is part of the event or chunk they flush rather
-    // than footage that arrived one poll too late. Each bounds its own drain;
-    // this bound is only for the tick it is in when that one trips. Recorders
-    // are joined before the senders are dropped below, so their final chunk is
-    // guaranteed accepted.
+    // PHASE 2 — analyzers and continuous recorders drain through their camera's watermark, so
+    // the tail the camera pushed on its way out is part of what they flush.
     let consumers_joined_by = tokio::time::Instant::now() + crate::shutdown::CONSUMER_JOIN_BOUND;
     join_all_before(
         handles.analyzer_handles,
@@ -1081,24 +816,17 @@ async fn graceful_shutdown(
     )
     .await;
 
-    // The detection worker is aborted, not drained: queued jobs and even an
-    // in-flight Ollama request (up to 90s) are droppable by design — losing
-    // one costs only an object upgrade, never footage. Aborting also releases
-    // the worker's warm-writer senders so the writers below can drain.
+    // The detection worker is aborted, not drained: losing a queued job or an
+    // in-flight Ollama request costs only an object upgrade, never footage.
+    // Aborting also releases its warm-writer senders for the drain below.
     if let Some(handle) = detect_worker_handle {
         handle.abort();
         let _ = handle.await;
     }
 
-    // Joined here — after the analyzers flushed their final MotionEnd, before
-    // the buffers and writers go away. What preserves that last transition is
-    // not the position of this join but how long the bridge goes on receiving:
-    // it stops only once the producers have dropped their senders (see
-    // `mqtt::bridge_is_done`), which for a phase-2 analyzer can be half a
-    // minute after the stop flag. Joining here is what gives it somewhere to
-    // publish the transition to, and the retained `offline` marker after it. A
-    // broker that has become unreachable must not hold shutdown up, hence the
-    // timeout.
+    // Joined after the analyzers flushed their final MotionEnd: the bridge stops only once the
+    // producers drop their senders (see `mqtt::bridge_is_done`), and joining here lets it
+    // publish that last transition and the retained `offline` marker.
     if let Some(handle) = mqtt_handle {
         let abort = handle.abort_handle();
         if tokio::time::timeout(MQTT_SHUTDOWN_TIMEOUT, handle)
@@ -1110,69 +838,15 @@ async fn graceful_shutdown(
         }
     }
 
-    // PHASE 3 — with all senders gone the warm writers drain their queues and
-    // exit; awaiting them is what puts every accepted event on disk. BOTH
-    // sender holders must drop — the map's clones alone keep the channels open,
-    // which deadlocked shutdown here until 2026-07-24. Bounded by what the
-    // earlier phases left of the budget, which is nearly all of it in a healthy
-    // stop: a consumer abandoned in phase 2 still holds a sender, so the
-    // channel it holds open would otherwise make this wait for ever.
+    // PHASE 3 — with all senders gone the warm writers drain their queues and exit; awaiting
+    // them puts every accepted event on disk.
     drop(handles.event_senders);
     drop(handles.event_sender_map);
     join_all_before(handles.warm_handles, budget_ends, "warm writer").await;
 
-    // The retention sweep, joined last and inside phase 3's deadline. Waited
-    // for rather than aborted, because a sweep that is allowed to reach the end
-    // of the event it is deleting leaves no work behind, and asking it to stop
-    // is how that is arranged: it polls the shutdown flag between events, so it
-    // ends by itself within one event's deletes — or, on a remote backend still
-    // retrying the index scan its startup could not do, within the one listing
-    // or sidecar read already in flight, since that retry polls the same flag
-    // between attempts and between reads.
-    //
-    // What waiting does NOT buy is protection from being cut mid-delete. If the
-    // bound below trips, this drain returns, the runtime is torn down and the
-    // sweep's future is dropped wherever it was awaiting — and on the updater's
-    // path the process `_exit`s under it. Detaching a task is not letting it
-    // finish. The store survives that for the same reason it survives the
-    // service manager's SIGKILL, which no arrangement here has ever been able
-    // to prevent: one event's delete is recoverable wherever it is interrupted.
-    // How, and by whom, differs by backend, because the two delete in different
-    // orders and for good reasons of their own:
-    //
-    // * Local disk (`warm_index::remove_event_files`) unlinks the sidecar and
-    //   thumbnails first and the `.ts` last, so the survivor is a bare `.ts` —
-    //   which is what the startup scan indexes and what any later retention
-    //   sweep expires again, finishing the job. Pinned by
-    //   `a_delete_that_cannot_finish_leaves_the_video_rather_than_its_metadata`
-    //   (the interrupted state is the recoverable one),
-    //   `prune_keeps_events_it_could_not_delete_and_retries_them` (a later
-    //   sweep retries it) and `prune_unindexes_events_whose_files_already_
-    //   vanished` (an interruption past the last unlink leaves no phantom
-    //   entry).
-    // * Stathost (`delete_event_objects`) goes thumbnails, video, sidecar —
-    //   deliberately the other way round, so that a refused video delete never
-    //   leaves a `.ts` whose type the next scan has to guess. Its survivor is
-    //   therefore an orphan `.json` (or an orphan thumbnail), which indexes
-    //   nothing, and its healer is `sweep_orphaned_metadata`. That runs on a
-    //   `ScanKind::Startup` pass ONLY — a healing rescan skips orphan
-    //   collection by design, pinned by
-    //   `a_healing_rescan_leaves_orphaned_metadata_for_the_next_startup` — so
-    //   this survivor waits for a restart rather than for the next sweep. It
-    //   costs a few hundred bytes until then and nothing else: nothing indexes
-    //   it, counts it against the budget or reads it. A delete abandoned for
-    //   shutdown reaches the same state deliberately and stops there
-    //   (`a_sweep_stops_between_the_deletes_of_a_single_event`), and
-    //   `orphaned_thumbnails_are_collected_and_live_ones_are_not` pins the
-    //   collection that eventually follows.
-    //
-    // Moving the wait here from the head of the drain changes no interleaving:
-    // the sweep has been running concurrently with everything since the flag
-    // went up and still is, and it touches the store while the cameras touch
-    // their hot buffers — only the waiting moved. What it buys is that a sweep
-    // parked on a remote request timeout now spends the writers' remainder of
-    // the budget, which it shares with them, instead of spending phase 2's gate
-    // before phase 2 had begun.
+    // The retention sweep, joined last and inside phase 3's deadline — so a sweep parked on a
+    // remote request timeout spends the writers' remainder of the budget instead of phase 2's
+    // gate.
     if let Some(handle) = retention_handle {
         if tokio::time::timeout_at(budget_ends, handle).await.is_err() {
             tracing::warn!(
@@ -1194,23 +868,16 @@ async fn graceful_shutdown(
     }
 }
 
-/// Run camon: load the configuration, bring the cameras up, serve the API, and
-/// drain everything again when a signal or an installed update asks for it.
-///
-/// `check_update` is the binary's self-updater, called once at startup and then
-/// every [`UPDATE_CHECK_INTERVAL`] until it installs something. It is handed an
-/// [`InstalledMarker`] because the moment a replacement binary exists cannot
-/// wait for it to return.
+/// Run camon: load the configuration, bring the cameras up, serve the API, and drain everything
+/// again when a signal or an installed update asks for it.
 pub async fn run<F, Fut, E>(check_update: F) -> Result<(), Box<dyn std::error::Error>>
 where
     F: Fn(InstalledMarker) -> Fut + Send + Sync + 'static,
     Fut: std::future::Future<Output = Result<bool, E>> + Send + 'static,
     E: std::fmt::Display + 'static,
 {
-    // A healthy production log is empty: only things that need attention
-    // (warn and up) are logged by default. Dev builds keep the full debug
-    // stream, and RUST_LOG (e.g. `RUST_LOG=camon=debug`) overrides both when
-    // an incident needs more detail.
+    // A healthy production log is empty (warn and up); dev builds keep the
+    // debug stream, and RUST_LOG overrides both.
     let default_filter = if cfg!(debug_assertions) {
         "camon=debug"
     } else {
@@ -1237,11 +904,9 @@ where
         }
     };
 
-    // Same treatment for a startup that could not take its socket and for a
-    // run that lost a task it cannot do without: one line the operator can act
-    // on, and a nonzero status for the service manager. Exiting here rather
-    // than returning the error keeps `main` from printing the `Debug` form on
-    // top of it; by this point the drain, if there was one, is over.
+    // One line the operator can act on and a nonzero status for the service
+    // manager; exiting here keeps `main` from printing the `Debug` form on
+    // top of it. By this point the drain, if there was one, is over.
     if let Err(e) = run_with_config(config, check_update).await {
         eprintln!("error: {e}");
         std::process::exit(1);
@@ -1249,44 +914,9 @@ where
     Ok(())
 }
 
-/// Everything after the configuration has been read, which is everything that
-/// can be tested: the same startup, task graph and drain, minus the logging
-/// setup and argument parsing a process only does once.
-///
-/// # The supervision policy, task by task
-///
-/// Every long-lived task is spawned through the [`Supervisor`], which turns
-/// "the task stopped while camon was running" into either a restart or a
-/// process exit. Which one, and why:
-///
-/// | task | policy | why |
-/// |---|---|---|
-/// | `http-server` | fatal | The UI, the API and Home Assistant ingress are all it. A camon that cannot be reached is not doing its job, and nothing in-process can put a dead `axum::serve` back. Its socket is bound before any of this, so a death here is a real failure and not a busy port. |
-/// | `camera:<id>` | fatal | This task *is* the reconnect loop — it already survives ffmpeg dying, the stream going away and the box losing the network (see [`run_camera`]). Past that there is nothing left to retry, and its hot buffer feeds an analyzer and a recorder that would go on consuming from a buffer nobody fills. |
-/// | `analyzer:<id>` | fatal | Holds a live decoder, an open motion run and a warm-writer sender. A restart would resume with no baseline, mid-buffer, possibly duplicating an event it had already handed over. In event mode nothing else writes anything, so a camera whose analyzer is gone is a camera recording nothing. |
-/// | `continuous-recorder:<id>` | fatal | Same, for the analytics-off mode: it owns the chunk being rolled and the sender it rolls into. |
-/// | `warm-writer:<id>` | fatal | Owns the receiving end of its camera's event channel, which cannot be handed to a replacement — the producers already hold the senders. A dead writer silently stops that camera's recording and then blocks its analyzer on a channel nobody drains. |
-/// | `detection-worker` | fatal | Owns the crop queue's receiving end, for the same reason, and every job it accepts is a record the event registry keeps open until it is settled ([`crate::storage::event_registry`]). A worker that stops answering leaks those records for as long as the process lives. |
-/// | `mqtt-bridge` | fatal | Owns the receiving end of the event channel every analyzer publishes into, *and* the poller it cannot rebuild. Broker outages are the poller's own business and it reconnects through them; the poller dying is not that (see the `None` arm in [`crate::mqtt::run_bridge`]), and neither is this task dying, which leaves Home Assistant with stale entities and the analyzers filling a channel with no consumer. |
-/// | `retention` | restart | Periodic and stateless between sweeps: everything it needs is rebuilt from the config and the backend. A panic on one malformed event should not stop an NVR from recording. |
-/// | `recording-watchdog` | restart | Periodic, and its whole state is the registrations it keeps across a restart of its own loop. |
-/// | `storage-anchor` | restart | Periodic, and its baseline is in the `Arc` it polls, not in the task. |
-/// | `update-check` | restart | A dead updater means camon keeps running the version it has, which is not worth taking a recording process down for. |
-///
-/// Each restartable task is given [`RestartLimit::cycling_every`] of *its own*
-/// interval constant, so the streak that decides "restarting is not fixing
-/// this" is measured against the cadence that task actually works at — an hour
-/// for the sweep, a minute for the watchdog and the anchor, twelve hours for
-/// the updater. A permanently broken one escalates to the fatal policy four
-/// failures in, and the process restart that follows is the loudest and most
-/// thorough recovery camon has; [`crate::supervise`] states what that costs.
-///
-/// Everything spent under a supervised task belongs to that task and is not
-/// supervised separately: the camera's buffer-stats logger, the MQTT snapshot
-/// renders, the thumbnail renders behind an API request. They are bounded by
-/// the task that owns them and die with it. The MQTT poller is the exception
-/// that proves the rule — it is a child task whose death its parent cannot
-/// survive, so the parent watches for it explicitly and ends.
+/// Everything after the configuration has been read, which is everything that can be tested:
+/// the same startup, task graph and drain, minus the logging setup and argument parsing a
+/// process only does once.
 async fn run_with_config<F, Fut, E>(config: Config, check_update: F) -> Result<(), RunError>
 where
     F: Fn(InstalledMarker) -> Fut + Send + Sync + 'static,
@@ -1299,8 +929,7 @@ where
     let supervisor = shutdown.supervisor();
 
     // The listening socket is taken here, synchronously, before anything is
-    // brought up behind it. See [`api::bind`] for what binding inside the
-    // server task used to cost.
+    // brought up behind it — see [`api::bind`].
     let http_addr = std::net::SocketAddr::new(config.http.bind_addr(), config.http.port);
     let listener = api::bind(http_addr)
         .await
@@ -1308,9 +937,9 @@ where
             addr: http_addr,
             source,
         })?;
-    // Decided here, once, and before any of it is served: what the API asks of
-    // a request, and — for a deployment that would otherwise be open — the
-    // token it will ask for, generated and persisted on the way through.
+    // Decided once, before anything is served: what the API asks of a
+    // request, generating and persisting a token if the deployment would
+    // otherwise be open.
     let api_auth = api::ApiAuth::resolve(
         http_addr.ip(),
         config.http.token.as_deref(),
@@ -1319,11 +948,9 @@ where
     )
     .map_err(|source| RunError::ApiToken { source })?;
 
-    // Before the update check, and it has to be: from the moment that check is
-    // running, an update can be installed into a process that is still starting
-    // up, and something has to guarantee the restart even if startup itself
-    // never finishes. The thread sleeps until one of the two flags it watches
-    // goes up, so on every ordinary run it costs nothing but the thread.
+    // Must precede the update check: from the moment the check runs, an
+    // update can install into a process still starting up, and the restart
+    // must be guaranteed even if startup never finishes.
     let enforcement =
         spawn_restart_watchdog(Arc::clone(&shutdown.update_installed), supervisor.died());
     // Spawned, not awaited: nothing below waits for a version check. See
@@ -1347,9 +974,8 @@ where
     )
     .await?;
     // The recording-silence watchdog cannot see the storage volume being
-    // unmounted: writes to the bare mountpoint succeed and keep resetting it.
-    // So the volume is watched directly — by the backends that have one to
-    // lose, which is the local-disk one only.
+    // unmounted — writes to the bare mountpoint succeed and keep resetting it
+    // — so the local-disk backend watches its volume directly.
     let volume_anchor = storage
         .as_ref()
         .and_then(|backend| backend.volume_anchor().cloned());
@@ -1357,9 +983,9 @@ where
 
     log_recording_mode(&config);
 
-    // Object detection runs on ONE global worker task with a small bounded
-    // job queue — strictly serial, at most one in-flight Ollama request
-    // across all cameras (the GPU degrades badly under parallel load).
+    // Object detection runs on ONE global worker: at most one in-flight
+    // Ollama request across all cameras (the GPU degrades badly under
+    // parallel load).
     let ollama_client = if object_detection_ready {
         create_ollama_client(&config)
     } else {
@@ -1424,10 +1050,9 @@ where
         let limit = RestartLimit::cycling_every(crate::buffer::warm::PRUNE_INTERVAL);
         supervisor.restartable("retention", limit, move || {
             let task = RetentionTask::new(Arc::clone(&backend), &warm_config, Arc::clone(&flag));
-            // A backend that never got its index is waiting for a sweep to
-            // retry the scan, so it does not wait the usual hour for one. A
-            // restarted sweep asks for the same head start: whatever killed the
-            // last one, the index is no fresher than it was.
+            // A backend that never got its index is waiting for a sweep to retry the scan, so
+            // it does not wait the usual hour for one. A restarted sweep asks for the same head
+            // start: whatever killed the last one, the index is no fresher than it was.
             let task = if warm_index_scanned {
                 task
             } else {
@@ -1478,10 +1103,7 @@ where
         storage,
         motion_settings,
     );
-    // Serving on the socket startup already took. Any return is a failure —
-    // there is no version of "camon is running" that does not answer here — so
-    // the supervisor takes the process down and the service manager brings it
-    // back with a fresh listener.
+    // Serving on the socket startup already took.
     let server_handle = supervisor.critical("http-server", async move {
         if let Err(e) = api::serve(listener, app_state, api_auth).await {
             tracing::error!(error = %e, "the API server stopped serving");
@@ -1514,9 +1136,6 @@ where
         handle.abort();
     }
 
-    // Nothing to start here any more: `enforcement` has been running since
-    // before the update check, and arms itself from the flags whenever they go
-    // up — during startup, during this drain, or not at all.
     let RestartEnforcement = enforcement;
     graceful_shutdown(
         camera_handles,
@@ -1530,13 +1149,6 @@ where
 }
 
 /// What the process leaves behind once the drain is over.
-///
-/// A supervised death outranks whatever woke the wait: the drain it asked for
-/// looks exactly like any other from the inside, and the only thing that tells
-/// an operator (or a service manager reading `$?`) that this restart was not
-/// asked for is the nonzero status and the tasks named in the message. Every
-/// death is named, in arrival order — `decided_by` says which of them started
-/// the stop, which is not the same claim as which one failed first.
 fn stop_outcome(
     reason: ShutdownReason,
     deaths: Vec<String>,
@@ -1659,18 +1271,6 @@ async fn run_camera(
 mod tests {
     use super::*;
 
-    /// `spawn_cameras` unwraps the backend for every camera it starts whenever
-    /// `[storage] enabled`, so `enabled` has to imply a backend. A remote
-    /// client that will not build is the one way that could stop being true,
-    /// and absorbing it into `backend: None` would not degrade anything — it
-    /// would reach that unwrap and end the process on a message about an
-    /// invariant, pointing the operator at everything except the certificate
-    /// store or proxy that actually broke.
-    ///
-    /// So it ends startup here instead, beside the socket and the API token,
-    /// naming the fault. Recording is the product: a camon that came up
-    /// without the storage its config asks for would serve, detect and alert
-    /// while persisting nothing, and nothing else would say so for a day.
     #[tokio::test]
     async fn a_warm_backend_that_cannot_be_built_ends_startup_instead_of_running_storageless() {
         let remote: Config = toml::from_str(
@@ -1691,8 +1291,6 @@ mod tests {
         match refused {
             Err(RunError::WarmStorage { source }) => {
                 let message = format!("{}", RunError::WarmStorage { source });
-                // What the operator is handed on stderr: the subsystem, and
-                // the three things that break a client build.
                 assert!(message.contains("warm storage"), "{message}");
                 assert!(message.contains("HTTP client"), "{message}");
                 assert!(message.contains("root certificate"), "{message}");
@@ -1706,8 +1304,6 @@ mod tests {
             ),
         }
 
-        // The invariant itself, from both sides: storage that is enabled always
-        // arrives with a backend, and storage that is off always without one.
         let local = tempfile::tempdir().unwrap();
         let on: Config = toml::from_str(&format!(
             "[storage]\ndata_dir = {:?}\n",
@@ -1738,10 +1334,6 @@ mod tests {
         assert_eq!(next_backoff_secs(60), 60);
     }
 
-    /// A camera parked in its reconnect backoff used to hold the drain up for
-    /// the whole delay — up to a minute plus jitter — because the sleep only
-    /// ended on its own. Paused time: the assertion is on the virtual clock, so
-    /// a regression reads as a full 60s rather than as a slow test.
     #[tokio::test(start_paused = true)]
     async fn reconnect_backoff_ends_as_soon_as_shutdown_is_requested() {
         let shutdown = ShutdownSignal::new();
@@ -1762,8 +1354,6 @@ mod tests {
         );
     }
 
-    /// The flag can already be up when the sleep is reached — the pipeline it
-    /// follows may have exited because of it.
     #[tokio::test(start_paused = true)]
     async fn reconnect_backoff_is_skipped_when_shutdown_is_already_requested() {
         let shutdown = ShutdownSignal::new();
@@ -1786,10 +1376,6 @@ mod tests {
         config
     }
 
-    /// Only a camera that is expected to record is watched for silence. The two
-    /// storage-off states are said once at startup instead: a daily warning
-    /// about a camera nobody asked to record is noise that teaches the operator
-    /// to skip the warnings about the ones that were.
     #[test]
     fn only_cameras_expected_to_record_are_watched() {
         assert_eq!(
@@ -1808,8 +1394,6 @@ mod tests {
         assert_eq!(recording_mode(&config_with(false, false)), None);
     }
 
-    /// The continuous limit is derived from the configured cap, not from the
-    /// default, so an operator who changes one changes the other.
     #[test]
     fn the_continuous_chunk_cap_comes_from_the_config() {
         let mut config = config_with(true, false);
@@ -1822,8 +1406,6 @@ mod tests {
         );
     }
 
-    /// A stand-in for the binary's update check that counts its calls and
-    /// replays a scripted sequence of outcomes.
     fn scripted_checker(
         outcomes: Vec<Result<bool, std::io::Error>>,
     ) -> (
@@ -1845,11 +1427,6 @@ mod tests {
         (check, calls)
     }
 
-    /// Failed and empty checks keep the loop alive and must never look like an
-    /// installed update. Terminated by a stand-in signal rather than an
-    /// install, so that the install branch — the one that would take the whole
-    /// test binary down if it regressed — stays confined to the child process
-    /// in `applied_update_returns_instead_of_exiting`.
     #[tokio::test]
     async fn failed_update_checks_do_not_request_shutdown() {
         let shutdown = ShutdownSignal::new();
@@ -1881,17 +1458,6 @@ mod tests {
         );
     }
 
-    /// Whether the answer arrives is not startup's business: this call starts a
-    /// check and returns, and startup only gets to the cameras because it does.
-    ///
-    /// The checker here parks and never answers, which is what a release
-    /// download from a server that accepts the connection and then trickles
-    /// looks like from the inside. What is proved is the one step this test can
-    /// see — that `check_for_updates` returns promptly and leaves the check
-    /// running — not the whole startup sequence, which is pinned by the call
-    /// site being a plain statement rather than an `await`. The `let ()` is the
-    /// other half of that: it stops compiling the moment this becomes something
-    /// with a future to await again.
     #[tokio::test(start_paused = true)]
     async fn check_for_updates_returns_without_waiting_for_an_answer() {
         let config = config_from(&format!("[update]\nenabled = true\n{ONE_CAMERA}"));
@@ -1914,8 +1480,6 @@ mod tests {
             .expect("the call waited for a version check that never came back")
             .expect("it panicked instead of returning");
 
-        // And the check is genuinely running, not skipped: what was given up is
-        // waiting for the answer, not asking the question.
         tokio::time::sleep(Duration::from_secs(1)).await;
         assert_eq!(
             calls.load(Ordering::Relaxed),
@@ -1924,10 +1488,6 @@ mod tests {
         );
     }
 
-    /// The cadence from both ends. The startup attempt does not wait for the
-    /// interval — that loop *is* the startup check, and a box that was off
-    /// while a release was published must not run the old binary for another
-    /// twelve hours — and the check after it waits exactly one interval.
     #[tokio::test(start_paused = true)]
     async fn the_first_check_of_the_startup_loop_is_immediate() {
         let shutdown = ShutdownSignal::new();
@@ -1959,16 +1519,6 @@ mod tests {
         );
     }
 
-    /// And the half that keeps the supervisor's arithmetic honest: a *restarted*
-    /// attempt waits a whole cadence before its first check, because that is
-    /// what [`RestartLimit::cycling_every`] measures an attempt's uptime
-    /// against. An attempt that checked immediately and died would look like it
-    /// had lasted no time at all, and four such deaths in a row escalate the
-    /// updater to the fatal policy — a restarted NVR every few seconds, over a
-    /// version check that is allowed to fail.
-    ///
-    /// Driven through the real `check_for_updates`, since the flag that
-    /// distinguishes the two lives in the closure it hands the supervisor.
     #[tokio::test(start_paused = true)]
     async fn a_restarted_update_check_waits_a_cadence_before_checking() {
         let config = config_from(&format!("[update]\nenabled = true\n{ONE_CAMERA}"));
@@ -1983,8 +1533,6 @@ mod tests {
             let first = seen.len() == 1;
             drop(seen);
             async move {
-                // The first attempt dies on its first check, which is exactly
-                // the shape whose uptime the restart limit has to judge.
                 assert!(!first, "the first attempt died, as this test intends");
                 Ok::<bool, std::io::Error>(false)
             }
@@ -1993,7 +1541,6 @@ mod tests {
             spawn_restart_watchdog(Arc::clone(&shutdown.update_installed), supervisor.died());
         check_for_updates(&config, &shutdown, &supervisor, &enforcement, check);
 
-        // Long enough for the restart backoff and one whole cadence after it.
         tokio::time::sleep(UPDATE_CHECK_INTERVAL * 2).await;
 
         let seen = when.lock().expect("checker poisoned");
@@ -2006,11 +1553,6 @@ mod tests {
         );
     }
 
-    /// The enforcement is keyed to the state, not to the drain that usually
-    /// notices it. An update installed while startup is still running — which
-    /// is possible now that the check runs beside startup instead of in front
-    /// of it — has to arm this even though no drain has begun and the main task
-    /// may never reach one.
     #[test]
     fn the_restart_enforcement_arms_without_a_drain_to_start_it() {
         let update_installed = Arc::new(AtomicBool::new(false));
@@ -2044,8 +1586,6 @@ mod tests {
         );
     }
 
-    /// A shutdown already under way must not have an install started
-    /// underneath it — the binary would be swapped while the drain runs.
     #[tokio::test]
     async fn update_check_is_skipped_once_shutdown_is_requested() {
         let shutdown = ShutdownSignal::new();
@@ -2062,9 +1602,6 @@ mod tests {
         assert_eq!(calls.load(Ordering::Relaxed), 0, "checked during shutdown");
     }
 
-    /// Both shutdown paths end in this same drain, and phase 3's contract is
-    /// that an event already accepted by a warm writer reaches disk before the
-    /// process goes away — the footage the update path used to lose.
     #[tokio::test]
     async fn graceful_shutdown_drains_queued_events_to_disk() {
         use crate::buffer::warm::FinishedEvent;
@@ -2114,9 +1651,6 @@ mod tests {
             event_sender_map: HashMap::from([("cam".to_string(), tx)]),
             buffers_map: HashMap::new(),
         };
-        // Bounded: the failure this guards against — a sender that outlives the
-        // drain, as in the 2026-07-24 deadlock — hangs rather than returns, and
-        // an unexplained CI timeout is a bad way to find that out.
         tokio::time::timeout(
             Duration::from_secs(30),
             graceful_shutdown(handles, None, None, None),
@@ -2127,8 +1661,6 @@ mod tests {
         let written = dir.path().join("cam").join("movements").join("0_1000.ts");
         assert!(written.exists(), "queued event was not flushed to disk");
     }
-
-    // ---- The phased stop, end to end (see `crate::shutdown`) ----
 
     const SEC: u64 = 1_000_000_000;
 
@@ -2153,11 +1685,6 @@ mod tests {
         }
     }
 
-    /// One camera wired the way [`spawn_cameras`] wires a continuous-recording
-    /// one — hot buffer, continuous recorder, warm writer, local disk — with
-    /// `camera` standing in for the camera task and handed the buffer to push
-    /// into. The chunk cap is an hour, so the only chunk that ever rolls is the
-    /// final one and its name says exactly how much of the recording survived.
     fn add_continuous_camera<F, Fut>(
         handles: &mut CameraHandles,
         dir: &std::path::Path,
@@ -2206,8 +1733,6 @@ mod tests {
         ));
     }
 
-    /// A camera that notices the stop flag one poll late and then flushes the
-    /// GOP it was still filling, which is what every real one does.
     async fn records_two_seconds_then_a_tail(buffer: Arc<RwLock<HotBuffer>>) {
         buffer.write_recover().push(gop(0));
         buffer.write_recover().push(gop(1));
@@ -2221,16 +1746,6 @@ mod tests {
             .join(format!("{stem}.ts"))
     }
 
-    /// The bug the phases exist for, through the whole graph. One stop flag
-    /// used to halt the producer and its consumer at the same instant, so the
-    /// GOP a camera pushed on its way out was written by nobody — every stop,
-    /// every camera, every time.
-    ///
-    /// The filename is the proof: `{first_pts}_{duration_ms}.ts`, so a
-    /// three-second recording that lost its tail is not a subtly shorter file,
-    /// it is `0_2000.ts` where `0_3000.ts` should be. Paused time throughout —
-    /// the bounds involved are tens of seconds and none of them should be
-    /// reached.
     #[tokio::test(start_paused = true)]
     async fn the_tail_a_camera_pushes_on_its_way_out_reaches_disk() {
         let dir = tempfile::tempdir().unwrap();
@@ -2257,18 +1772,12 @@ mod tests {
             continuous_file(dir.path(), "cam", "0_3000").exists(),
             "the recording is missing the tail the camera pushed while stopping"
         );
-        // Following the watermark, not waiting out a bound: a drain that only
-        // finished because something timed out is not the fix.
         assert!(
             started.elapsed() < crate::shutdown::CAMERA_JOIN_BOUND,
             "the drain waited out a bound instead of following the watermark"
         );
     }
 
-    /// The second time this goes wrong: a camera thread that never comes back —
-    /// an ffmpeg unkillable in D state, a read that returns to nobody — must
-    /// cost its own tail and not the restart. Its watermark is published on its
-    /// behalf so the consumers behind it are not left waiting for one.
     #[tokio::test(start_paused = true)]
     async fn a_camera_that_never_stops_is_abandoned_with_a_provisional_watermark() {
         let buffer = HotBuffer::new("cam".to_string(), 3600);
@@ -2293,10 +1802,6 @@ mod tests {
             crate::shutdown::CAMERA_JOIN_BOUND,
             "the camera join was not bounded"
         );
-        // Published, so nothing downstream waits on a watermark that is never
-        // coming — and flagged provisional, because the thread it was published
-        // for is still running and its consumers must not read the sequence as
-        // the end of the recording.
         assert_eq!(
             buffer.read_recover().terminal_watermark(),
             Some(crate::shutdown::Watermark {
@@ -2307,10 +1812,6 @@ mod tests {
         );
     }
 
-    /// Watermarks are per camera, so one camera's failure is one camera's loss.
-    /// A shared one — a single "the cameras have stopped" flag, say — would let
-    /// the slowest camera in the rack decide how much of everyone else's
-    /// footage was kept.
     #[tokio::test(start_paused = true)]
     async fn a_camera_that_hangs_does_not_cost_its_neighbour_its_tail() {
         let dir = tempfile::tempdir().unwrap();
@@ -2353,16 +1854,6 @@ mod tests {
         );
     }
 
-    /// The retention sweep is joined at the end of the drain, not the start.
-    ///
-    /// Waiting for it first cost nothing back when every worker exited on the
-    /// stop flag, but a phase-2 consumer's bound runs from that flag: a remote
-    /// sweep parked on a request timeout would spend the consumers' whole gate
-    /// before the cameras had even been joined, and every consumer would then
-    /// report a tail it was never given a chance to drain. So the assertion is
-    /// on the ordering itself — the sweep observes, from inside itself, that
-    /// the cameras were joined and their watermarks published long before it
-    /// finished.
     #[tokio::test(start_paused = true)]
     async fn a_slow_retention_sweep_does_not_hold_up_the_camera_joins() {
         let buffer = HotBuffer::new("cam".to_string(), 3600);
@@ -2372,8 +1863,6 @@ mod tests {
         let probe = Arc::clone(&watermark_was_out);
         let watched = Arc::clone(&buffer);
         let retention = tokio::spawn(async move {
-            // Longer than every phase-2 bound there is, which is exactly the
-            // sweep this ordering exists for.
             tokio::time::sleep(crate::shutdown::TAIL_DRAIN_BOUND * 2).await;
             probe.store(
                 watched.read_recover().terminal_watermark().is_some(),
@@ -2402,11 +1891,6 @@ mod tests {
         );
     }
 
-    /// A consumer that stalls past its own bound is abandoned where it stands
-    /// and the phases behind it run anyway. It is still holding a warm-writer
-    /// sender when that happens, which is why phase 3 is bounded too: a channel
-    /// nobody will ever close is a writer that never returns, and a stop that
-    /// never ends is worse than the tail it was trying to save.
     #[tokio::test(start_paused = true)]
     async fn a_stalled_consumer_does_not_hold_the_stop_open() {
         use crate::buffer::warm::FinishedEvent;
@@ -2477,17 +1961,6 @@ mod tests {
         );
     }
 
-    // ---- Task supervision (see `crate::supervise`) ----
-
-    /// The socket is taken during startup readiness, so a port that is already
-    /// in use ends the process instead of being logged inside a detached task.
-    ///
-    /// Both assertions are about *ordering*, which is the whole point: a bind
-    /// that happens after the cameras are spawned leaves camon recording with
-    /// no UI and no ingress, alive, and therefore never restarted by anything.
-    /// Nothing that follows the bind may have run — not the update check, which
-    /// comes next, and not storage, whose first act is to write the volume
-    /// anchor's marker into the data directory.
     #[tokio::test]
     async fn a_bind_that_fails_ends_startup_before_anything_is_brought_up() {
         let held = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2499,8 +1972,6 @@ mod tests {
              [storage]\nenabled = true\ndata_dir = {:?}\n{ONE_CAMERA}",
             data_dir.path()
         ));
-        // Enabled above precisely so that this would be called — it is the very
-        // next thing startup does — if the bind had not ended it first.
         let (check, calls) = scripted_checker(vec![Ok(false)]);
 
         let error = run_with_config(config, move |_: InstalledMarker| check())
@@ -2523,13 +1994,6 @@ mod tests {
         );
     }
 
-    /// A task dying is a stop, not a shrug: it runs the same phased drain a
-    /// SIGTERM does — so the footage in flight still lands — and then exits
-    /// nonzero, which is the only thing that makes systemd or the Home
-    /// Assistant Supervisor start camon again.
-    ///
-    /// The recording is the assertion that matters. A death that killed the
-    /// process where it stood would leave `0_2000.ts`, or nothing at all.
     #[tokio::test(start_paused = true)]
     async fn a_supervised_death_drains_the_footage_and_exits_nonzero() {
         let dir = tempfile::tempdir().unwrap();
@@ -2546,8 +2010,6 @@ mod tests {
 
         supervisor.critical("warm-writer:cam", async { panic!("nothing to write with") });
 
-        // The main task is waiting for a signal that is never coming; the death
-        // is what wakes it.
         let reason = tokio::time::timeout(RESTART_DRAIN_DEADLINE, wait_for_shutdown(&shutdown))
             .await
             .expect("a supervised death never woke the drain");
@@ -2577,22 +2039,12 @@ mod tests {
         );
     }
 
-    /// The other half of the same seam: a stop nobody had to be told about
-    /// exits zero, so an operator can tell `systemctl stop` from a camon that
-    /// fell over.
     #[test]
     fn a_stop_that_was_asked_for_exits_zero() {
         assert!(stop_outcome(ShutdownReason::Signal, Vec::new(), None).is_ok());
         assert!(stop_outcome(ShutdownReason::Internal, Vec::new(), None).is_ok());
     }
 
-    /// Every restartable task is judged against its own cadence, and the
-    /// threshold has to be more than one of them: a task that dies on its first
-    /// tick every single time has an uptime of about one cadence, and a
-    /// threshold it could meet would let it clear its own streak and be
-    /// restarted for ever — which is exactly the shape the first design of this
-    /// could not escalate. Read off the same interval constants the tasks
-    /// themselves tick on, so a cadence that changes brings its limit with it.
     #[test]
     fn every_restartable_task_outlives_its_own_cadence_before_it_counts_as_healthy() {
         for (task, cadence) in [
@@ -2610,12 +2062,6 @@ mod tests {
         }
     }
 
-    /// One fault reaches two guards, and which of them gets there first is a
-    /// race the origin routinely loses — an analyzer panicking drops the queue
-    /// sender its detection worker is parked on, so the worker can report a
-    /// clean exit while the analyzer is still unwinding. The message the
-    /// operator is left with has to carry both, or it hands them the victim and
-    /// keeps the culprit back.
     #[test]
     fn the_exit_message_names_every_task_that_died() {
         let deaths = vec![
@@ -2630,11 +2076,6 @@ mod tests {
         assert!(message.contains("detection-worker"), "{message}");
     }
 
-    /// A stop can be asked for twice — a SIGTERM landing while an update check
-    /// already in flight installs a binary and asks for a restart, the ordering
-    /// [`spawn_restart_watchdog`] exists for. The second request finds a flag
-    /// that is already up and a drain already running, and must change nothing
-    /// about what reaches disk.
     #[tokio::test(start_paused = true)]
     async fn a_stop_asked_for_twice_still_lands_the_whole_tail() {
         let dir = tempfile::tempdir().unwrap();
@@ -2672,18 +2113,8 @@ mod tests {
         );
     }
 
-    /// Set on the child process spawned by
-    /// [`applied_update_returns_instead_of_exiting`]; holds the path of the
-    /// marker file that only a normal return can produce.
     const UPDATE_LOOP_MARKER_ENV: &str = "CAMON_TEST_UPDATE_LOOP_MARKER";
 
-    /// The regression itself: this branch used to call `process::exit(0)`,
-    /// skipping the drain. libtest cannot catch that in-process — all tests
-    /// share one process, so an `exit(0)` mid-run ends the binary with a
-    /// success status and the whole run is reported green — so the install
-    /// branch is exercised *only* here, in a child process that can write its
-    /// marker only by returning from the loop. No other test may install an
-    /// update, or it would take the binary down before this one runs.
     #[test]
     fn applied_update_returns_instead_of_exiting() {
         if let Ok(marker) = std::env::var(UPDATE_LOOP_MARKER_ENV) {
@@ -2694,10 +2125,6 @@ mod tests {
                 .enable_all()
                 .build()
                 .unwrap();
-            // Run under supervision, the way startup does: the loop returning
-            // after an install is the one exit here that is *meant* to happen,
-            // and a supervisor that read it as a task death would turn every
-            // update into a failed process.
             runtime.block_on(async {
                 let check = Arc::new(check);
                 let signal = shutdown.clone();
@@ -2730,8 +2157,6 @@ mod tests {
                 shutdown.update_installed.load(Ordering::Relaxed),
                 "watchdog would never arm"
             );
-            // A stored permit, so the main task starts the drain even if it
-            // only reaches `notified()` after the update landed.
             runtime.block_on(async {
                 tokio::time::timeout(Duration::from_secs(5), shutdown.wake.notified())
                     .await
@@ -2751,8 +2176,6 @@ mod tests {
                 "app::tests::applied_update_returns_instead_of_exiting",
             ])
             .env(UPDATE_LOOP_MARKER_ENV, &marker)
-            // The child's own libtest chatter is noise here; its stderr is kept
-            // so a panic inside it is still readable.
             .stdout(std::process::Stdio::null())
             .spawn()
             .expect("failed to re-run this test as a child process");
@@ -2785,9 +2208,6 @@ mod tests {
         Config::load_from_with_overrides(&path, &[]).unwrap()
     }
 
-    /// The classes the model is asked about and the classes Home Assistant
-    /// gets occupancy entities for are one list. Two gates that drifted apart
-    /// is how `classes = []` came to mean opposite things.
     #[test]
     fn both_consumers_are_handed_the_same_object_classes() {
         let config = config_from(&format!(
@@ -2800,8 +2220,6 @@ mod tests {
         assert_eq!(mqtt_object_classes(Some(&client)), expected);
     }
 
-    /// Either half of the gate off means no detector runs, so the bridge must
-    /// publish no occupancy entities either.
     #[test]
     fn no_object_classes_reach_the_bridge_when_nothing_detects() {
         for flags in [
@@ -2810,8 +2228,6 @@ mod tests {
         ] {
             let config = config_from(&format!("{flags}\n{ONE_CAMERA}"));
             assert!(!log_object_detection_config(&config));
-            // Startup builds no client in this state, and without one the
-            // bridge is handed nothing.
             assert!(mqtt_object_classes(None).is_empty(), "with {flags:?}");
         }
     }

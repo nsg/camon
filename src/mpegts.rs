@@ -1,17 +1,4 @@
 //! Shared MPEG-TS packet parsing.
-//!
-//! Two consumers with very different lifetimes share this bit-twiddling:
-//!
-//! - the live segmenter ([`crate::camera`]) extracts a PES PTS per video
-//!   packet while slicing the stream into GOP segments, and
-//! - startup orphan recovery ([`crate::storage`]) trims a torn `.ts.tmp` file
-//!   to its last intact packet and reads its first/last PTS to recompute the
-//!   real duration of footage that survived a crash or power cut — in one
-//!   streaming pass ([`scan_ts_stream`]), because the file it is handed is an
-//!   interrupted recording of unbounded size and the box it runs on is booting.
-//!
-//! Recovery is READ-ONLY reuse: nothing here may change behavior for the live
-//! path (PTS extraction, segment durations, or the filename-stem convention).
 
 /// Size of one MPEG-TS packet.
 pub const TS_PACKET_SIZE: usize = 188;
@@ -29,23 +16,15 @@ const PTS_MODULUS: u64 = 1 << 33;
 /// multiple of the packet size so a full buffer never splits a packet.
 const SCAN_BUFFER_PACKETS: usize = 348;
 
-/// The most of a file a [`scan_ts_stream`] ever holds in RAM: one buffer,
-/// allocated once and reused, whatever the file's size. This is the whole
-/// memory cost of recovering an orphaned recording — the pass keeps three
-/// numbers and no bytes.
+/// The most of a file a [`scan_ts_stream`] ever holds in RAM, whatever the
+/// file's size: one buffer, allocated once and reused.
 pub const SCAN_BUFFER_BYTES: usize = SCAN_BUFFER_PACKETS * TS_PACKET_SIZE;
 
 /// What one pass over a `.ts` file found in it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TsScan {
-    /// Length of the longest prefix of the file that consists of whole,
-    /// plausible TS packets: a multiple of 188 bytes where every packet starts
-    /// with the 0x47 sync byte.
-    ///
-    /// This is where a torn tail write gets trimmed off an orphaned `.ts.tmp`:
-    /// a partial final packet, or garbage after a corrupted packet, must not
-    /// poison the file. The scan stops at the first bad sync byte, so anything
-    /// after in-file corruption is discarded along with the tail.
+    /// Length of the longest prefix of the file that consists of whole, plausible TS packets: a
+    /// multiple of 188 bytes where every packet starts with the 0x47 sync byte.
     pub valid_len: u64,
     /// First and last PES PTS *within that prefix* — the bytes after it are
     /// not part of the file being salvaged, so they may not date it either.
@@ -53,22 +32,12 @@ pub struct TsScan {
     pub last_pts: Option<u64>,
 }
 
-/// Scan a stream of TS packets for the three things recovery needs: where the
-/// intact packets stop, and the first and last PES PTS before that point.
-///
-/// Streaming rather than `read`-it-all is the point. The caller's input is a
-/// recording an unclean shutdown interrupted, which is as large as the event
-/// was long — a continuous chunk is tens of megabytes and a stuck writer's
-/// leftovers can be far more — and it is read during startup on a box whose
-/// memory is the reason events are streamed everywhere else. One buffer of
-/// [`SCAN_BUFFER_BYTES`] is the whole allocation, and the prefix is walked
-/// forward exactly once, so the last PTS is the last one *seen* rather than
-/// found by a second pass from the end.
+/// Scan a stream of TS packets for the three things recovery needs: where the intact packets
+/// stop, and the first and last PES PTS before that point.
 pub fn scan_ts_stream<R: std::io::Read>(mut reader: R) -> std::io::Result<TsScan> {
     let mut buf = vec![0u8; SCAN_BUFFER_BYTES];
-    // Bytes of a packet that straddled the end of the last fill, kept at the
-    // front of the buffer. Always under one packet, because the buffer holds a
-    // whole number of them.
+    // A packet straddling the end of a fill is kept at the front of the
+    // buffer; always under one packet, since the buffer holds a whole number.
     let mut filled = 0usize;
     let mut scan = TsScan {
         valid_len: 0,
@@ -108,11 +77,8 @@ pub fn scan_ts_file(path: &std::path::Path) -> std::io::Result<TsScan> {
     scan_ts_stream(std::fs::File::open(path)?)
 }
 
-/// Extract the 33-bit PTS (90 kHz units) from a TS packet that starts a PES
-/// packet, or `None` if the payload is not a PES header carrying a PTS.
-///
-/// This is the exact parser the live segmenter uses on video packets; keep
-/// behavior identical for 188-byte input.
+/// Extract the 33-bit PTS (90 kHz units) from a TS packet that starts a PES packet, or `None`
+/// if the payload is not a PES header carrying a PTS.
 pub fn extract_pes_pts(packet: &[u8]) -> Option<u64> {
     if packet.len() < TS_PACKET_SIZE {
         return None;
@@ -129,7 +95,6 @@ pub fn extract_pes_pts(packet: &[u8]) -> Option<u64> {
         4
     };
 
-    // PES header: 0x00 0x00 0x01 stream_id
     if payload_start + 14 > TS_PACKET_SIZE {
         return None;
     }
@@ -138,13 +103,11 @@ pub fn extract_pes_pts(packet: &[u8]) -> Option<u64> {
         return None;
     }
 
-    // Check PTS_DTS_flags (bits 7-6 of byte 7)
     let pts_dts_flags = (p[7] >> 6) & 0x03;
     if pts_dts_flags < 2 {
         return None; // No PTS present
     }
 
-    // Parse 33-bit PTS from 5 bytes (bytes 9-13)
     let pts = ((p[9] as u64 & 0x0E) << 29)
         | ((p[10] as u64) << 22)
         | ((p[11] as u64 & 0xFE) << 14)
@@ -194,12 +157,8 @@ fn starts_video_pes(packet: &[u8]) -> bool {
     p[0] == 0x00 && p[1] == 0x00 && p[2] == 0x01 && (0xE0..=0xEF).contains(&p[3])
 }
 
-/// Whether the packet's adaptation field flags a random access point — a
-/// keyframe, on a video PID.
-///
-/// The live segmenter cuts a new segment on exactly this predicate, and
-/// [`keyframe_count`] counts the result, so the two must agree byte for byte:
-/// they share this one definition rather than a comment promising they match.
+/// Whether the packet's adaptation field flags a random access point — a keyframe, on a video
+/// PID.
 pub fn has_random_access_indicator(packet: &[u8]) -> bool {
     if packet.len() < TS_PACKET_SIZE || (packet[3] & 0x20) == 0 {
         return false;
@@ -208,14 +167,9 @@ pub fn has_random_access_indicator(packet: &[u8]) -> bool {
     adaptation_len > 0 && adaptation_len < 184 && (packet[5] & 0x40) != 0
 }
 
-/// Number of video keyframes in a buffer of whole TS packets, read from the
-/// adaptation field's random_access_indicator — the same signal the live
-/// segmenter cuts on, so a hot-buffer segment contains exactly one.
-///
-/// The count is restricted to the video PID because ffmpeg's muxer flags
-/// *every* audio packet as a random access point; counting those would inflate
-/// the keyframe count several-fold. `0` when the buffer holds no video PES at
-/// all (an empty or garbled segment).
+/// Number of video keyframes in a buffer of whole TS packets, read from the adaptation field's
+/// random_access_indicator — the same signal the live segmenter cuts on, so a hot-buffer
+/// segment contains exactly one.
 pub fn keyframe_count(data: &[u8]) -> usize {
     let packets = || data.chunks_exact(TS_PACKET_SIZE);
     let video_pid = match packets().find(|p| starts_video_pes(p)) {
@@ -311,15 +265,12 @@ mod tests {
     #[test]
     fn extract_pes_pts_rejects_non_pes_and_short_input() {
         assert_eq!(extract_pes_pts(&null_packet()), None);
-        // No payload flag at all.
         let mut p = pes_packet(0x100, 42);
         p[3] = 0x00;
         assert_eq!(extract_pes_pts(&p), None);
-        // PTS_DTS_flags say no PTS.
         let mut p = pes_packet(0x100, 42);
         p[11] = 0x00;
         assert_eq!(extract_pes_pts(&p), None);
-        // Truncated input must not panic.
         assert_eq!(extract_pes_pts(&[0x47, 0x40, 0x00]), None);
     }
 
@@ -338,7 +289,6 @@ mod tests {
         let mut data = Vec::new();
         data.extend_from_slice(&null_packet());
         data.extend_from_slice(&pes_packet(0x100, 1000));
-        // Torn tail: a partial packet that even starts with a sync byte.
         data.push(SYNC_BYTE);
         data.extend_from_slice(&[0xAB; 50]);
         assert_eq!(scan(&data).valid_len, 2 * TS_PACKET_SIZE as u64);
@@ -348,8 +298,6 @@ mod tests {
     fn valid_prefix_stops_at_bad_sync_byte() {
         let mut data = Vec::new();
         data.extend_from_slice(&pes_packet(0x100, 1000));
-        // A full-length "packet" of garbage: everything after it is discarded
-        // too, even a valid-looking packet — and so is its PTS.
         data.extend_from_slice(&[0x00; TS_PACKET_SIZE]);
         data.extend_from_slice(&pes_packet(0x100, 2000));
         let scanned = scan(&data);
@@ -371,8 +319,6 @@ mod tests {
         assert_eq!(scan(&[]).last_pts, None);
     }
 
-    /// A reader that reports the largest slice it was ever asked to fill, and
-    /// hands the data back in awkward pieces so packets straddle the fills.
     struct CountingReader<'a> {
         data: &'a [u8],
         chunk: usize,
@@ -391,12 +337,8 @@ mod tests {
         }
     }
 
-    /// The whole point of the streaming scan: what it holds is one buffer, not
-    /// the file. A recording interrupted by a power cut is as large as the
-    /// event was long, and this runs while the box is booting.
     #[test]
     fn a_scan_of_a_large_file_never_holds_more_than_one_buffer() {
-        // 4 MiB of packets — 64× the buffer — ending in a torn tail.
         let mut data = Vec::new();
         data.extend_from_slice(&pes_packet(0x100, 90_000));
         while data.len() < 4 * 1024 * 1024 {
@@ -428,8 +370,6 @@ mod tests {
         assert!(reader.reads > 500, "a whole-file read is not a stream");
     }
 
-    /// Every fill boundary is a packet boundary the scan has to stitch back
-    /// together; the result may not depend on how the bytes arrived.
     #[test]
     fn a_scan_is_the_same_however_the_reads_are_chopped_up() {
         let mut data = Vec::new();
@@ -460,14 +400,12 @@ mod tests {
 
     #[test]
     fn keyframe_count_counts_one_per_segment_start() {
-        // A hot-buffer segment: keyframe, then plain video packets.
         let mut data = Vec::new();
         data.extend_from_slice(&keyframe_packet(0x100, 0, VIDEO));
         for i in 1..5 {
             data.extend_from_slice(&pes_packet(0x100, i * 3_000));
         }
         assert_eq!(keyframe_count(&data), 1);
-        // Two concatenated segments count as two.
         data.extend_from_slice(&keyframe_packet(0x100, 90_000, VIDEO));
         data.extend_from_slice(&pes_packet(0x100, 93_000));
         assert_eq!(keyframe_count(&data), 2);
@@ -475,8 +413,6 @@ mod tests {
 
     #[test]
     fn keyframe_count_ignores_audio_random_access_points() {
-        // The muxer flags every audio packet as a random access point; only
-        // video keyframes may be counted.
         let mut data = Vec::new();
         data.extend_from_slice(&keyframe_packet(0x100, 0, VIDEO));
         for i in 0..8 {
@@ -487,23 +423,18 @@ mod tests {
 
     #[test]
     fn random_access_indicator_is_the_segmenter_predicate() {
-        // What the live segmenter cuts on is what the analyzer counts.
         assert!(has_random_access_indicator(&keyframe_packet(
             0x100, 0, VIDEO
         )));
-        // No adaptation field at all.
         assert!(!has_random_access_indicator(&pes_packet(0x100, 0)));
-        // Adaptation field present, flag clear.
         let mut p = keyframe_packet(0x100, 0, VIDEO);
         p[5] = 0x00;
         assert!(!has_random_access_indicator(&p));
-        // Adaptation field length out of range.
         let mut p = keyframe_packet(0x100, 0, VIDEO);
         p[4] = 0;
         assert!(!has_random_access_indicator(&p));
         p[4] = 200;
         assert!(!has_random_access_indicator(&p));
-        // Short input must not panic on any of the packet accessors.
         assert!(!has_random_access_indicator(&[0x47, 0x40]));
         assert!(!starts_video_pes(&[0x47]));
         assert_eq!(packet_pid(&[0x47, 0x40]), NULL_PID);
@@ -514,7 +445,6 @@ mod tests {
         assert_eq!(keyframe_count(&[]), 0);
         assert_eq!(keyframe_count(&null_packet()[..]), 0);
         assert_eq!(keyframe_count(&[0u8; 4 * TS_PACKET_SIZE]), 0);
-        // Video packets without a flagged random access point.
         assert_eq!(keyframe_count(&pes_packet(0x100, 5_000)[..]), 0);
     }
 
@@ -522,7 +452,6 @@ mod tests {
     fn pts_delta_handles_wraparound() {
         assert_eq!(pts_delta_ms(0, 90_000), 1_000);
         assert_eq!(pts_delta_ms(90_000, 90_000), 0);
-        // Wrap: last restarted from zero after the 33-bit rollover.
         let just_before_wrap = PTS_MODULUS - 45_000; // 0.5s before wrap
         assert_eq!(pts_delta_ms(just_before_wrap, 45_000), 1_000);
     }

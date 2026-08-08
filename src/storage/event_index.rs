@@ -1,28 +1,4 @@
 //! The in-RAM warm event index, and the retention skeletons built on it.
-//!
-//! Both storage backends — [`LocalDiskBackend`](crate::storage::LocalDiskBackend)
-//! and [`StathostBackend`](crate::storage::StathostBackend) — keep the same
-//! thing in memory: per camera, a list of [`WarmEventEntry`] sorted in
-//! [`page_key`] order, answering the API's `query`/`find_event` and driving
-//! retention. Only
-//! the *objects* differ (files in a directory tree versus keys on an HTTP
-//! store), so only the object I/O is the backends' own; everything above it
-//! lives here and is written once.
-//!
-//! What is deliberately *not* unified is the identity of an entry. Local disk
-//! carries the event type in the path (the directory), the remote store carries
-//! it inside the sidecar, and each layout admits a different set of distinct
-//! events — so the index is generic over an [`EventIdentity`] rather than
-//! picking one spelling and making the other backend live with it. See that
-//! trait for the argument in full.
-//!
-//! Every lookup — the read path's `find_event` included — names an entry by a
-//! whole key ([`position`]). There is no by-start-PTS variant to reach for:
-//! nothing makes a start unique, so a lookup on one returns an arbitrary
-//! member of its run, which on the read path meant serving the wrong recording
-//! of a same-start pair. What an API request
-//! names is an [`EventRef`], and each backend narrows that to the identity its
-//! own layout has.
 
 use std::collections::HashMap;
 use std::marker::PhantomData;
@@ -33,31 +9,13 @@ use crate::locks::LockExt;
 
 const NANOS_PER_MS: u64 = 1_000_000;
 
-/// The most filmstrip frames one event ever has: `{stem}_thumb_0.jpg` …
-/// `_thumb_3.jpg` is the whole set a store can hold, which is what makes
-/// counting them a bounded probe rather than an open-ended walk.
-///
-/// Taken from the analyzer that writes them rather than agreed with by
-/// convention. Storage reads this number back off a store it does not control:
-/// every probe, every count and every delete stops here, so a producer raised
-/// to five frames while this stayed at four would upload a fifth thumbnail that
-/// nothing ever counts and no delete ever reaches — a leak on the remote store
-/// that shows up as a budget slowly drifting from the truth, on installations
-/// only, months later.
+/// The most filmstrip frames one event ever has. Taken from the analyzer that writes them, not
+/// agreed by convention: every probe, count and delete stops here, so a producer raised past a
+/// stale copy would leak frames nothing counts or deletes.
 pub(crate) const MAX_FILMSTRIP_FRAMES: usize = crate::analytics::pipeline::FILMSTRIP_FRAMES;
 
-/// How many filmstrip frames to index for an event whose frames answer
-/// `present`: one past the highest frame that exists, and never more than
-/// [`MAX_FILMSTRIP_FRAMES`].
-///
-/// Not "how many are there", and the difference is a lost frame. Counting up
-/// from zero until the first miss reads a filmstrip whose `thumb_0` a crash
-/// took as having no frames at all, hiding the three that are on disk from the
-/// UI and — worse — from the deletes, which walk `0..filmstrip_frames` and
-/// would leak every frame above the hole for the life of the installation. The
-/// count is a high-water mark instead, so a gap costs one broken frame in the
-/// filmstrip and nothing else: everything stored is still named, still served
-/// where it exists, and still reclaimed with the event.
+/// Frames to index for an event whose frames answer `present`: one past the highest that
+/// exists, capped at [`MAX_FILMSTRIP_FRAMES`].
 pub(crate) fn filmstrip_frame_count(mut present: impl FnMut(usize) -> bool) -> usize {
     (0..MAX_FILMSTRIP_FRAMES)
         .rfind(|&i| present(i))
@@ -115,37 +73,14 @@ pub struct WarmEventEntry {
     pub start_pts_ns: u64,
     pub duration_ms: u32,
     pub event_type: EventType,
-    /// Size of the event's video object. What playback ranges are resolved
-    /// against, and so the *video's* size and nothing else's.
+    /// Size of the video object alone — what playback ranges are resolved
+    /// against; folding in the sidecar would serve ranges past the video's end.
     pub file_size: u64,
     /// Size of the event's sidecar, or zero where there is none.
-    /// Kept apart from `file_size` because the two answer different questions —
-    /// one is how many bytes a player may seek within, the other is how many
-    /// bytes retention will reclaim — and a backend that folded them together
-    /// would serve ranges past the end of the video.
-    ///
-    /// Kept apart from [`thumbnail_bytes`](Self::thumbnail_bytes) because the
-    /// two change at different moments: an object upgrade rewrites the sidecar
-    /// and touches no frame, and a shorter rewrite of a stem drops frames and
-    /// leaves the sidecar. A single lumped figure could follow neither without
-    /// knowing what the other half of it had been.
-    ///
-    /// Filled by whichever backend's accounting depends on it. Local disk leaves
-    /// it zero and says why in [`contract`](crate::storage::contract): there the
-    /// filesystem counts every byte natively and `statvfs` is the authority, so
-    /// a figure maintained beside it could only ever be a second opinion that
-    /// drifts.
     pub sidecar_bytes: u64,
-    /// Size of the event's filmstrip frames — the ones that are really there.
-    ///
-    /// Not "all `filmstrip_frames` of them", and the two answer different
-    /// questions on a filmstrip with a hole in it. The count is a high-water
-    /// mark, so that everything stored is named and reached
-    /// ([`filmstrip_frame_count`]); the bytes are only what the store's listing
-    /// actually accounted for. A lost `thumb_1` therefore leaves a count of 4
-    /// and the weight of 3, which is the honest pair: the budget must not be
-    /// charged for an object that is not there, and the delete must not stop
-    /// short of one that is.
+    /// Size of the filmstrip frames that are really there — which on a filmstrip with a hole
+    /// is fewer than `filmstrip_frames` names: the count is a high-water mark
+    /// ([`filmstrip_frame_count`]), the bytes only what the listing accounted for.
     pub thumbnail_bytes: u64,
     pub object_classes: Vec<String>,
     pub backend: Option<String>,
@@ -162,25 +97,16 @@ pub struct WarmEventEntry {
     /// after a crash or power cut (from the sidecar `"recovered"` flag). The
     /// tail may be truncated at the last intact packet.
     pub recovered: bool,
-    /// Set once a deletion of this event has failed. Purely in-RAM (a restart
-    /// clears it, and the scan retries everything). What it buys differs by
-    /// backend, which is why it is a flag and not an exclusion:
-    /// [`EvictionPolicy`] either skips flagged entries outright or only demotes
-    /// them to the back of their tier. The hourly sweep ignores it and keeps
-    /// retrying — that is where a transient failure gets its second chance.
+    /// Set once a deletion of this event has failed. In-RAM only (a restart
+    /// clears it). A flag, not an exclusion: [`EvictionPolicy`] skips or
+    /// demotes flagged entries, and the hourly sweep ignores it and retries.
     pub delete_failed: bool,
 }
 
 impl WarmEventEntry {
-    /// Every byte this event costs the store — the figure a client-side budget
-    /// is measured against.
-    ///
-    /// Counting the video alone is what let a store sit permanently over a cap
-    /// it believed it was under: an event's sidecar and its four filmstrip
-    /// frames are small next to its video and are not small next to nothing, and
-    /// they are never reclaimed on their own — they go when the event goes. So
-    /// they are charged when the event is charged. Saturating, because a corrupt
-    /// listing must not wrap a budget into "empty".
+    /// Every byte this event costs the store — video, sidecar and filmstrip
+    /// together, since the latter two are only ever reclaimed with the event.
+    /// Saturating, because a corrupt listing must not wrap a budget to "empty".
     pub fn stored_bytes(&self) -> u64 {
         self.file_size
             .saturating_add(self.sidecar_bytes)
@@ -210,54 +136,20 @@ pub(crate) fn deduplicate_detections(details: &[DetectionDetail]) -> Vec<(String
     best.into_iter().collect()
 }
 
-/// What identifies one indexed event, and with it exactly one set of stored
-/// objects.
-///
-/// The start PTS alone does not. Nothing enforces its uniqueness — a scan
-/// happily indexes two events sharing a start — so unindexing on it would drop
-/// a surviving entry on the strength of some other entry's delete, which is the
-/// leak the whole retention path exists to prevent.
-///
-/// Beyond that the two backends genuinely disagree, and neither spelling can be
-/// imposed on the other:
-///
-/// * **Local disk** keys on `(start, event_type, duration)`. The type *is* a
-///   path component there — `{camera}/{event_type}/{start}_{duration}.ts` — so
-///   the same start and duration under two types are two files, and a key that
-///   dropped the type would have one entry's delete unindex the other's file.
-/// * **The remote store** keys on `(start, duration)`. The type lives inside
-///   the sidecar and an upgrade rewrites it without moving a single object, so
-///   two entries differing only in type would name *the same* objects — and the
-///   upgrade would leave an entry answering to a key nothing on the host has.
-///
-/// Both say the same thing — "the one stored event these bytes belong to" —
-/// spelled in the layout each backend actually has, so the index takes the
-/// spelling as a type parameter.
+/// What identifies one indexed event, and with it exactly one set of stored objects. Start PTS
+/// alone does not — nothing enforces its uniqueness, so unindexing on it could drop a
+/// surviving entry on another entry's delete.
 pub(crate) trait EventIdentity: Copy + Eq {
     /// The identity of an entry already in hand.
     fn of(entry: &WarmEventEntry) -> Self;
-    /// This key's place in [`page_key`]'s order — what every list is sorted by
-    /// — relative to an entry. `Equal` exactly where `of` would yield this
-    /// key: each identity spells enough of the full key to be unique in its
-    /// own index.
+    /// This key's place in [`page_key`]'s order — what every list is sorted by — relative
+    /// to an entry. `Equal` exactly where `of` would yield this key: each identity spells
+    /// enough of the full key to be unique in its own index.
     fn cmp_entry(self, entry: &WarmEventEntry) -> std::cmp::Ordering;
 }
 
-/// The whole identity of one event, as an API request spells it: the composite
-/// path segment `{start_pts_ns}_{duration_ms}_{event_type}`, e.g.
-/// `81234000000_5200_movement`.
-///
-/// The read path used to name an event by its start PTS alone, which is not an
-/// identity — a movement event and a continuous chunk can begin on the same
-/// keyframe, and the lookup then served whichever of them a binary search
-/// landed on. So the URL carries everything either backend's identity is made
-/// of, and each [`WarmStorageBackend`](crate::storage::WarmStorageBackend)
-/// narrows it to its own: local disk uses all three fields, the remote store
-/// only the stem, deliberately (see its `find_event`).
-///
-/// The `{start}_{duration}` prefix is the remote store's object stem, and the
-/// type is spelled as the event listing spells it ([`EventType::as_str`]), so a
-/// key in a URL is readable against both the listing and the bucket.
+/// The whole identity of one event, as an API request spells it: the composite path segment
+/// `{start_pts_ns}_{duration_ms}_{event_type}`, e.g.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EventRef {
     pub start_pts_ns: u64,
@@ -279,14 +171,9 @@ impl EventRef {
         Self::new(entry.start_pts_ns, entry.duration_ms, entry.event_type)
     }
 
-    /// Parse one path segment. Every part must be there and be exactly what it
-    /// claims: two integers that fit, and a type spelled the way the listing
-    /// spells it. Anything else is `None` and answers `400` — a key that
-    /// resolved partially would be the start-PTS-only lookup back again.
-    ///
-    /// Splitting from the left is what makes this unambiguous: no type name
-    /// contains an underscore, so a segment with extra parts fails on the type
-    /// rather than being silently truncated.
+    /// Parse one path segment. Every part is required and exact; anything else
+    /// is `None` (a 400). Left-splitting is unambiguous — no type name contains
+    /// an underscore, so extra parts fail rather than truncate silently.
     pub fn parse(segment: &str) -> Option<Self> {
         let (start, rest) = segment.split_once('_')?;
         let (duration, event_type) = rest.split_once('_')?;
@@ -321,10 +208,8 @@ impl EventIdentity for (u64, EventType, u32) {
     }
 }
 
-/// The remote store: every object of an event is built from one stem,
-/// `{start_pts_ns}_{duration_ms}`, and the type is inside the sidecar. The
-/// key is a prefix of [`page_key`], and no two entries here share one — the
-/// type never has to break a tie this identity cannot see.
+/// The remote store: the key is the object stem `{start_pts_ns}_{duration_ms}`,
+/// a prefix of [`page_key`] no two entries here share.
 impl EventIdentity for (u64, u32) {
     fn of(entry: &WarmEventEntry) -> Self {
         (entry.start_pts_ns, entry.duration_ms)
@@ -335,41 +220,26 @@ impl EventIdentity for (u64, u32) {
     }
 }
 
-/// Outcome of deleting one indexed event's stored objects. The three cases mean
-/// different things to the index and to the caller's counters, and only
+/// Outcome of deleting one indexed event's stored objects; only
 /// [`Removal::Deleted`] reclaimed any space.
 pub(crate) enum Removal {
     /// The video is gone; its bytes are back.
     Deleted,
-    /// The video was already absent. Nothing was reclaimed, but the index entry
-    /// has to go too — it describes something that does not exist.
+    /// The video was already absent. Nothing was reclaimed, but the stale
+    /// index entry has to go too.
     Missing,
-    /// Shutdown arrived before the deletion could be started, or between two of
-    /// the requests it takes. Nothing is flagged and nothing is counted — the
-    /// pass simply ends, because whatever was not deleted is not a fault of the
-    /// store's and the next sweep (or the next start) finds it exactly as it
-    /// was.
-    ///
-    /// Distinct from [`Failed`](Self::Failed) because that flag is read by
-    /// eviction, which demotes what carries it: a store that was working
-    /// perfectly must not come back from a restart-free shutdown with its
-    /// oldest events marked as having resisted deletion.
+    /// Shutdown arrived before or during the deletion. Ends the pass, nothing flagged or
+    /// counted — distinct from [`Failed`](Self::Failed) because eviction demotes flagged
+    /// entries, and a shutdown is not the store refusing.
     Abandoned,
     /// The store refused or could not be reached. The entry stays indexed so a
-    /// later pass retries it instead of leaking the objects.
-    ///
-    /// The cost is deliberate: such an event stays listed, and stays offered
-    /// for playback, indefinitely past its configured retention — for as long
-    /// as the deletion keeps failing. A visible retention violation an operator
-    /// can see and act on beats a file that is gone from the index, still
-    /// eating space, and never retried by anything.
+    /// later pass retries it instead of leaking the objects — a visible
+    /// retention violation beats a file that is never retried.
     Failed,
 }
 
-/// What one deletion pass achieved. The three counts are distinct outcomes with
-/// distinct operator meanings — "nothing to delete", "deletions are failing",
-/// and "someone else already reclaimed it" all produce zero deleted events and
-/// call for different reactions.
+/// What one deletion pass achieved, split by outcome — the three counts mean
+/// different things to an operator.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct EmergencyOutcome {
     /// Events deleted; the only count that reflects reclaimed bytes.
@@ -390,22 +260,8 @@ fn position<K: EventIdentity>(entries: &[WarmEventEntry], key: K) -> Option<usiz
         .ok()
 }
 
-/// The total order the lists are kept sorted in and a listing is cut into
-/// pages on: start PTS, then duration, then the event type's wire name.
-///
-/// Start alone will not do, and the reason is not exotic. A box with no working
-/// clock stamps every event `0` ([`wall_clock_ns`](crate::buffer::wall_clock_ns)
-/// reads a pre-1970 clock as zero rather than taking the recording pipeline
-/// down with it), and age expiry is inert there — `now - start` saturates to
-/// zero for everything, so nothing ages out. A no-RTC box therefore holds its
-/// *whole archive* under one start, as many entries as the identity space
-/// allows, and any page boundary expressible only as a start PTS lands either
-/// before all of them or after all of them.
-///
-/// The three fields are exactly [`EventRef`] — what a URL already names an
-/// event by and what the listing already hands the client back — and the two
-/// backends' identities are each a permutation of them, so no two entries can
-/// tie here that either store could tell apart.
+/// The total order the lists are sorted in and a listing pages on: start PTS, then duration,
+/// then the type's wire name.
 fn page_key(entry: &WarmEventEntry) -> (u64, u32, &'static str) {
     (
         entry.start_pts_ns,
@@ -415,22 +271,15 @@ fn page_key(entry: &WarmEventEntry) -> (u64, u32, &'static str) {
 }
 
 /// Where a page resumes: an exclusive upper bound in [`page_key`]'s order.
-///
-/// Separate from `to_ns` because that one matches by overlap, and an event that
-/// began before a window and reaches into it belongs to that window — so a
-/// walker that moved `to_ns` down to the oldest event it had seen would be
-/// handed the long chunks it had already been given, page after page. A bound
-/// that only descends cannot repeat itself.
+/// Separate from `to_ns`, which matches by overlap — walking `to_ns` down
+/// would re-serve long events; a bound that only descends cannot repeat.
 #[derive(Debug, Clone, Copy)]
 pub enum EventCursor {
-    /// Everything that starts before this moment. All a walker needs while the
-    /// starts it is walking are distinct — but a page it cut inside a run of
-    /// equal starts cannot be resumed with one of these without skipping the
-    /// rest of that run.
+    /// Everything that starts before this moment. Enough while starts are
+    /// distinct, but cannot resume inside a run of equal starts.
     Start(u64),
-    /// Everything ordered below this event, which can name a position *inside*
-    /// a run of equal starts. What the listing's own answer supports: the key
-    /// of the oldest event in a page resumes exactly beneath it.
+    /// Everything ordered below this event — a position even inside a run of
+    /// equal starts: the key of a page's oldest event resumes beneath it.
     Event(EventRef),
 }
 
@@ -451,16 +300,8 @@ impl EventCursor {
     }
 }
 
-/// What one listing request may read: the window it asks about, where it
-/// resumes from, and the ceiling on how much of the archive it may copy.
-///
-/// The ceiling is the point, and it is a hard one. An archive is years deep on
-/// a box that has been recording for years — and on a box with no clock it is
-/// all under one start PTS — and a listing that copied all of it did so under
-/// the lock the camera's warm writer needs to index the event it has just
-/// committed. So any client, and under the open-read policy any client at all,
-/// could stall recording by asking. A page is bounded work: bounded to copy,
-/// bounded to serialize, bounded to send, whatever the archive looks like.
+/// What one listing request may read: window, resume point, and a hard ceiling on how much of
+/// the archive it may copy.
 #[derive(Debug, Clone, Copy)]
 pub struct EventPage {
     /// Events are matched by overlap with `[from_ns, to_ns]`, not by start.
@@ -468,8 +309,7 @@ pub struct EventPage {
     pub to_ns: u64,
     /// Where the previous page ended, if this is not the first.
     pub before: Option<EventCursor>,
-    /// The most entries this page may copy. Never exceeded — not by a boundary
-    /// run, not by anything.
+    /// The most entries this page may copy. Never exceeded.
     pub limit: usize,
 }
 
@@ -493,23 +333,15 @@ impl EventPage {
         }
     }
 
-    /// The whole window, however deep the archive is. Tests only: production
-    /// callers must name a limit, which is the entire point of this type.
+    /// The whole window, however deep the archive is. Tests only.
     #[cfg(test)]
     pub(crate) fn unbounded(from_ns: u64, to_ns: u64) -> Self {
         Self::new(from_ns, to_ns, usize::MAX)
     }
 }
 
-/// The greatest `limit` entries of `newest_first` that reach into the window,
-/// returned in ascending [`page_key`] order.
-///
-/// Takes an iterator rather than a slice so the walk itself is the seam: what
-/// this pulls is what the caller's read lock is held across, and a test can
-/// count it (see `a_page_walks_only_as_far_as_its_limit`). The `from_ns`
-/// filter is why it is a walk at all: a long event can start far before the
-/// window and still reach into it, so "ends after `from_ns`" is not monotone
-/// in the sort order and cannot be binary-searched.
+/// The greatest `limit` entries of `newest_first` that reach into the window, in ascending
+/// [`page_key`] order.
 fn page_of<'a>(
     newest_first: impl Iterator<Item = &'a WarmEventEntry>,
     from_ns: u64,
@@ -525,20 +357,11 @@ fn page_of<'a>(
 }
 
 /// The per-camera event lists both backends index into, keyed by `K`.
-///
-/// Every list is sorted in [`page_key`] order and every entry is unique under `K`;
-/// [`insert`](Self::insert) maintains both. `used_bytes` is maintained as the
-/// sum of indexed `file_size` — the remote backend measures its storage budget
-/// against it, and keeping it here rather than beside the budget is what stops
-/// the two drifting apart.
 pub(crate) struct EventIndex<K> {
     cameras: HashMap<String, RwLock<Vec<WarmEventEntry>>>,
     used_bytes: AtomicU64,
-    /// Entries [`insert_locked`](Self::insert_locked) has had to shift along to
-    /// keep the list sorted, counted so a test can tell a scan that builds the
-    /// index one insertion at a time from one that builds it in bulk. The
-    /// difference is quadratic and invisible in every other observation of the
-    /// finished index — see `replace_camera`.
+    /// Entries shifted to keep the lists sorted, so a test can tell a
+    /// one-at-a-time build from a bulk one — see `replace_camera`.
     #[cfg(test)]
     shifted_entries: AtomicU64,
     _key: PhantomData<fn() -> K>,
@@ -578,16 +401,8 @@ impl<K: EventIdentity> EventIndex<K> {
         self.used_bytes.load(Ordering::Relaxed)
     }
 
-    /// Move tracked usage by the difference between what was indexed and what
-    /// it replaced, in one atomic operation: an add followed by a subtract
-    /// would let a concurrent reader — the budget guard runs on every camera's
-    /// writer task — see a total inflated by the old entry's whole size and
-    /// evict against it.
-    ///
-    /// Callers owe it the truth: `removed` must be bytes this index actually
-    /// has charged. Nothing here checks that, and an over-large `removed` wraps
-    /// the counter to near `u64::MAX` rather than clamping at zero — which the
-    /// remote backend's budget would then read as a full store.
+    /// Move tracked usage by the difference, in one atomic operation: an add then a subtract
+    /// would let the concurrent budget guard see an inflated total and evict against it.
     fn charge(&self, added: u64, removed: u64) {
         if removed > added {
             self.used_bytes
@@ -598,24 +413,9 @@ impl<K: EventIdentity> EventIndex<K> {
         }
     }
 
-    /// Replace one camera's whole list, as a startup scan does. `entries` need
-    /// not be sorted; the index's ordering invariant is restored here, once,
-    /// by one O(n log n) sort.
-    ///
-    /// This is why a scan collects before it indexes rather than inserting each
-    /// event as it learns of it. A store lists in no useful order — decimal
-    /// stems sort lexicographically, and a no-RTC box's archive shares one
-    /// start PTS — so each of those insertions lands in the middle of the list
-    /// and shifts the rest, which is O(n²) memory traffic on the one pass that
-    /// runs at startup over the whole archive.
-    ///
-    /// One thing this does not do that [`insert`](Self::insert) does: collapse
-    /// two entries onto one identity. Nothing camon writes can produce a pair —
-    /// an identity is derived from a stored object's name, and two names cannot
-    /// be one object — so the difference is reachable only through foreign
-    /// objects in the store whose names parse to the same key, which would now
-    /// be indexed twice rather than the second silently replacing the first.
-    /// Neither is correct for them, and neither is what makes them wrong.
+    /// Replace one camera's whole list, as a startup scan does: unsorted input, one O(n log n)
+    /// sort — per-event insertion would be O(n²) on the one pass that covers the whole
+    /// archive.
     pub(crate) fn replace_camera(&self, camera_id: &str, mut entries: Vec<WarmEventEntry>) {
         let Some(lock) = self.cameras.get(camera_id) else {
             return;
@@ -631,15 +431,7 @@ impl<K: EventIdentity> EventIndex<K> {
         self.charge(added, removed);
     }
 
-    /// Index one event, replacing whatever entry already held its identity and
-    /// returning it.
-    ///
-    /// A second entry under an identity that already has one would describe
-    /// objects that do not exist: on the remote store a `PUT` is an upload *or*
-    /// an update, and on local disk a re-written stem overwrites the file it
-    /// names. Either way the storage holds one event, so the index holds one
-    /// entry — and the byte total moves by the difference rather than counting
-    /// the same bytes twice.
+    /// Index one event, replacing whatever entry already held its identity and returning it.
     pub(crate) fn insert(&self, camera_id: &str, entry: WarmEventEntry) -> Option<WarmEventEntry> {
         let lock = self.cameras.get(camera_id)?;
         let added = entry.stored_bytes();
@@ -651,16 +443,7 @@ impl<K: EventIdentity> EventIndex<K> {
         replaced
     }
 
-    /// Index one event only if nothing holds its identity yet, reporting
-    /// whether it landed.
-    ///
-    /// For a rebuild that runs while the write path is live: there, what is
-    /// already indexed was put there by this process from what it just uploaded
-    /// and is newer than anything a listing taken seconds ago can say, so the
-    /// rebuild must yield to it rather than overwrite it. The test and the
-    /// insertion are one locked step because the two racing writers are exactly
-    /// what this is for — a `contains` followed by an `insert` can be overtaken
-    /// between them, and the entry that loses is the fresh one.
+    /// Index one event only if nothing holds its identity yet, reporting whether it landed.
     pub(crate) fn insert_absent(&self, camera_id: &str, entry: WarmEventEntry) -> bool {
         let Some(lock) = self.cameras.get(camera_id) else {
             return false;
@@ -678,13 +461,8 @@ impl<K: EventIdentity> EventIndex<K> {
     }
 
     /// [`insert`](Self::insert)'s list surgery, without the byte accounting, so
-    /// [`reidentify`](Self::reidentify) can re-place an entry under the write
-    /// lock it is already holding.
-    ///
-    /// One event at a time, which is what the live write path has: an insertion
-    /// into the middle of the list shifts everything above it, so building a
-    /// whole camera's list this way costs O(n²) and a startup scan uses
-    /// [`replace_camera`](Self::replace_camera) instead.
+    /// [`reidentify`](Self::reidentify) can re-place an entry under the write lock it already
+    /// holds.
     fn insert_locked(
         &self,
         entries: &mut Vec<WarmEventEntry>,
@@ -715,10 +493,7 @@ impl<K: EventIdentity> EventIndex<K> {
         Some(removed)
     }
 
-    /// Mutate the entry with this key in place. `None` when no such event is
-    /// indexed. The sort key never changes, and neither may `file_size` — a
-    /// resize is a different set of bytes and goes through
-    /// [`insert`](Self::insert), which is what keeps `used_bytes` honest.
+    /// Mutate the entry with this key in place.
     pub(crate) fn update<R>(
         &self,
         camera_id: &str,
@@ -732,33 +507,7 @@ impl<K: EventIdentity> EventIndex<K> {
     }
 
     /// Mutate the entry with this key when the mutation changes the key — the
-    /// movement→object upgrade, which rewrites the very field local disk's
-    /// identity is partly made of. `false` when no such event is indexed.
-    ///
-    /// The entry is taken out and re-placed rather than mutated where it lies,
-    /// so it answers to the identity it now has and the index keeps one entry
-    /// per identity. Anything already holding the new identity is displaced,
-    /// which is what the storage did too: an upgrade that renames its stem over
-    /// an existing object leaves one stored event, so the index keeps one entry
-    /// and refunds the bytes the overwrite cost.
-    ///
-    /// Addressing this by start PTS alone — which nothing enforces the
-    /// uniqueness of — is the bug this replaced: a binary search on the start
-    /// returns an arbitrary member of the run, so an upgrade could reclassify a
-    /// sibling event and leave the one it named untouched. See
-    /// [`EventIdentity`].
-    ///
-    /// Unlike [`update`](Self::update), `f` *may* change what the entry weighs
-    /// ([`WarmEventEntry::stored_bytes`]): the entry is re-placed rather than
-    /// edited where it lies, so the accounting below can follow the resize.
-    /// What it must not do is lie — what it leaves behind is what `used_bytes`
-    /// will count, so it has to be the size of the objects the store now holds
-    /// under the new identity.
-    ///
-    /// `f` runs on a copy, and the list is touched only once it has returned.
-    /// A panic inside it therefore leaves the index exactly as it was, bytes
-    /// and entries both — the single-step property poison recovery rests on
-    /// (see [`crate::locks::LockExt`]).
+    /// movement→object upgrade. `false` when no such event is indexed.
     pub(crate) fn reidentify(
         &self,
         camera_id: &str,
@@ -771,14 +520,8 @@ impl<K: EventIdentity> EventIndex<K> {
         })
     }
 
-    /// [`reidentify`](Self::reidentify) for a mutation that decides, once it
-    /// has the entry in front of it, whether to happen at all — returning
-    /// `false` to leave the index exactly as it was.
-    ///
-    /// The decision has to be made *inside* the write lock, which is what this
-    /// exists for: the callers are repairs applied to an entry a concurrent
-    /// live write may have already made the repair unnecessary for, and a look
-    /// followed by a separate mutation can be overtaken between the two.
+    /// [`reidentify`](Self::reidentify) for a mutation that decides, entry in hand, whether to
+    /// happen at all — `false` leaves the index as it was.
     pub(crate) fn reidentify_if(
         &self,
         camera_id: &str,
@@ -802,10 +545,7 @@ impl<K: EventIdentity> EventIndex<K> {
             entries.remove(i);
             (old_size, new_size, self.insert_locked(&mut entries, entry))
         };
-        // What the entry now weighs, against what left the index: its own
-        // former size — it was re-placed, not added to — plus anything it
-        // displaced. With the size unchanged this is exactly the displaced
-        // refund.
+        // New size charged; the former size and anything displaced refunded.
         self.charge(
             new_size,
             old_size.saturating_add(displaced.map_or(0, |e| e.stored_bytes())),
@@ -826,32 +566,8 @@ impl<K: EventIdentity> EventIndex<K> {
         self.update(camera_id, key, |entry| entry.delete_failed = true);
     }
 
-    /// One page of the events overlapping [`EventPage`]'s window, in ascending
-    /// [`page_key`] order. An inverted range is empty.
-    ///
-    /// The upper bound and the cursor both binary-search — each is a bound in
-    /// the order the list is sorted in — but the lower one cannot: a long
-    /// event (a continuous chunk) can start far before the window and still
-    /// reach into it, and "ends after `from_ns`" is not monotone in the sort
-    /// order. The candidate prefix is walked instead — newest first, so that
-    /// the walk *stops* at the page's limit rather than running the archive's
-    /// whole length.
-    ///
-    /// This is what the read lock is held for, and it is deliberately all it is
-    /// held for: at most `limit` entries are cloned here, and everything a
-    /// response is then made of — mapping to the wire type, serializing,
-    /// writing the socket — happens on the copy, after this has returned and
-    /// dropped the guard with it. That last part holds by construction rather
-    /// than by test: the guard is a local of this function and no caller can be
-    /// handed one. The lock it shares is the one every warm writer takes to
-    /// index the event it has just committed, so a listing that copied a
-    /// years-deep archive under it stalled recording for as long as the copy
-    /// took.
-    ///
-    /// What the page bounds is the copying, and not in every case the walking:
-    /// a request naming a narrow `from_ns` high up a deep archive walks past
-    /// everything below the window without filling its page — comparisons
-    /// against entries already in RAM, no clone, no allocation.
+    /// One page of the events overlapping [`EventPage`]'s window, in ascending [`page_key`]
+    /// order. An inverted range is empty.
     pub(crate) fn query(&self, camera_id: &str, page: EventPage) -> Vec<WarmEventEntry> {
         if page.from_ns > page.to_ns {
             return Vec::new();
@@ -867,12 +583,9 @@ impl<K: EventIdentity> EventIndex<K> {
         page_of(entries[..end].iter().rev(), page.from_ns, page.limit)
     }
 
-    /// The entry with this key, for the API read path.
-    ///
-    /// Keyed like every other lookup here, and for the same reason: two events
-    /// can share a start PTS, so a search on the start alone would offer an
-    /// arbitrary one of them for playback — the wrong recording, its own
-    /// duration and thumbnails included.
+    /// The entry with this key, for the API read path. Keyed in full: a search
+    /// on the start alone would offer an arbitrary member of a same-start run
+    /// for playback.
     pub(crate) fn find(&self, camera_id: &str, key: K) -> Option<WarmEventEntry> {
         let entries = self.cameras.get(camera_id)?.read_recover();
         position(&entries, key).map(|i| entries[i].clone())
@@ -886,12 +599,8 @@ impl<K: EventIdentity> EventIndex<K> {
         entries.last().map(WarmEventEntry::end_pts_ns)
     }
 
-    /// This camera's events past their retention, oldest first and already
-    /// capped to this sweep's share (see [`cap_sweep_deletions`]).
-    ///
-    /// `max_age` is asked per entry rather than per type: the remote backend
-    /// measures an event whose type it could not read against the longest
-    /// configured retention instead of its placeholder's.
+    /// This camera's events past their retention, oldest first and already capped to this
+    /// sweep's share (see [`cap_sweep_deletions`]).
     pub(crate) fn expired_for_sweep(
         &self,
         camera_id: &str,
@@ -936,29 +645,8 @@ impl<K: EventIdentity> EventIndex<K> {
     }
 }
 
-/// Delete one camera's expired events and unindex what actually went.
-///
-/// This is the shared half of a retention sweep: the failure handling, which is
-/// the same on both backends and has to stay that way. A refused delete keeps
-/// its entry — the objects are still stored, so the next sweep must see them
-/// again — and is flagged so the per-sweep cap stops being spent on it. A
-/// delete that found nothing there unindexes like a successful one but
-/// reclaimed nothing, and is counted separately. Neither ends the pass: the
-/// events behind a poisoned one are the space this exists to reclaim.
-///
-/// `cancel` is polled between events. It is deliberately *not* the only place a
-/// shutdown is noticed: one event can be several remote requests, and a flag
-/// read only here would leave all of them to run after it went up. A backend
-/// whose deletion is remote reads the flag between its own requests too and
-/// reports [`Removal::Abandoned`], which ends the pass from the inside — the
-/// entry stays, nothing is flagged, and nothing is counted, because a shutdown
-/// is not the store refusing.
-///
-/// What makes stopping mid-event safe is each backend's deletion *order*, not
-/// this poll: both are arranged so that whatever survives an interruption is
-/// something a later pass or a later start can finish, and never a video that
-/// has lost the record of what it is. See each backend's `remove`/`delete` for
-/// which way round it goes and why.
+/// Delete one camera's expired events and unindex what actually went — the failure handling
+/// both backends share.
 pub(crate) async fn sweep_expired<K, F, Fut>(
     index: &EventIndex<K>,
     camera_id: &str,
@@ -990,31 +678,14 @@ where
                 outcome.failed += 1;
                 index.flag_delete_failed(camera_id, key);
             }
-            // The entry stays, unflagged and uncounted; the loop's own `cancel`
-            // would end the pass on the next turn anyway, and ending it here
-            // saves that turn.
+            // Shutdown: the entry stays, unflagged and uncounted.
             Removal::Abandoned => break,
         }
     }
     outcome
 }
 
-/// Eviction order, cheapest footage to lose first. Both space-pressure paths —
-/// local disk's low-space guard and the remote store's byte budget — delete in
-/// this order, and both are deliberately outside [`cap_sweep_deletions`]:
-/// neither *trigger* is clock-derived, and running out of room stops recording
-/// altogether. So a pass here can delete the very footage a held-back sweep is
-/// holding.
-///
-/// The choice of victim within a tier is clock-derived even though the trigger
-/// is not: it is oldest [`start_pts`](crate::buffer::GopSegment) first, and
-/// that stamp is only as ordered as the clock that wrote it. On a box whose
-/// clock reads 0 until NTP lands, everything recorded before it lands sorts
-/// ahead of an archive that is genuinely years older, so sustained space
-/// pressure eats the newest footage first while age expiry — which needs the
-/// same clock — is inert. That is a known cost of recording through a wrong
-/// clock rather than not recording at all; it is not repaired here, because
-/// the alternative to evicting something under space pressure is stopping.
+/// Eviction order, cheapest footage to lose first.
 const EVICTION_TIERS: [EventType; 3] = [
     EventType::Continuous,
     EventType::Movement,
@@ -1022,57 +693,22 @@ const EVICTION_TIERS: [EventType; 3] = [
 ];
 
 /// How a space-pressure pass treats an event that has already refused to be
-/// deleted, and what it says when one goes. The two backends fail differently
+/// deleted, and what it says when one goes — the two backends fail differently
 /// enough that these cannot be defaults.
 pub(crate) struct EvictionPolicy {
-    /// Never offer a flagged event again (local disk) rather than only demoting
-    /// it to the back of its tier (the remote store).
-    ///
-    /// Local disk can afford to exclude because it steps over failures: a
-    /// flagged file never blocks the rest, and re-attempting one the filesystem
-    /// has refused costs a syscall to learn nothing on a path that runs ahead of
-    /// every write. Excluding *and* stopping would starve the remote pass
-    /// outright — an outage flags one candidate per pass, and the hourly sweep
-    /// only ever retries events that are already age-expired, so once the store
-    /// came back nothing under retention would be reclaimable and the budget
-    /// would sit over its limit permanently.
+    /// Never offer a flagged event again (local disk) rather than only demoting it to the back
+    /// of its tier (the remote store).
     pub skip_failed: bool,
-    /// One refused delete ends the whole pass (the remote store) rather than
-    /// being stepped over (local disk).
-    ///
-    /// A refusal from a network store is an answer about the store, not about
-    /// one poisoned object, so the next candidate is overwhelmingly likely to
-    /// fail the same way — and each attempt can sit for a request timeout inline
-    /// in a warm writer with a camera's recording waiting behind it. A local
-    /// unlink that fails says something about one file, and stopping there would
-    /// let the oldest few undeletable events starve every newer deletable one
-    /// and stop recording outright.
+    /// One refused delete ends the whole pass (the remote store) rather than being stepped over
+    /// (local disk).
     pub stop_on_failure: bool,
-    /// What to log when an event is evicted. Space pressure on a disk and a
-    /// full client-side budget are different situations to be told about.
+    /// What to log when an event is evicted — disk pressure and a full
+    /// client-side budget are different situations to be told about.
     pub reason: &'static str,
 }
 
-/// Delete the oldest events, cheapest tier first, until `satisfied` reports the
-/// pressure is gone or the candidates are exhausted.
-///
-/// A pass never ends on a failure *count*, only on [`EvictionPolicy`]'s
-/// explicit `stop_on_failure`: counting failures would let a handful of
-/// undeletable events at the head of the queue starve every deletion behind
-/// them for good.
-///
-/// `tier_of` is asked rather than read off the entry because the remote backend
-/// evicts an event whose type it could not establish with the objects — the
-/// tier kept longest — where the entry's own `event_type` is only a placeholder.
-///
-/// `cancel` is the shutdown flag, polled between events exactly as
-/// [`sweep_expired`] polls it and for a stronger reason: this pass runs *ahead
-/// of a write*, on a camera's own writer task, which the drain is waiting on.
-/// A pass that kept evicting after the flag went up would spend the drain's
-/// budget deleting real stored footage to make room for an event the same
-/// shutdown is about to abandon unwritten. Local disk passes a predicate that
-/// never fires, which is the honest answer for a backend whose eviction is a
-/// handful of unlinks — see [`crate::storage::contract`]'s third guarantee.
+/// Delete the oldest events, cheapest tier first, until `satisfied` reports the pressure is
+/// gone or the candidates are exhausted.
 pub(crate) async fn evict_tiers<K, F, Fut>(
     index: &EventIndex<K>,
     policy: EvictionPolicy,
@@ -1091,11 +727,8 @@ where
         let mut candidates = index.candidates(|camera_id, entry| {
             (!policy.skip_failed || !entry.delete_failed) && tier_of(camera_id, entry) == tier
         });
-        // Oldest first, but everything that has already refused to be deleted
-        // after everything that has not: with `skip_failed` there is nothing
-        // flagged left to order, and without it the retries are reached only
-        // once this tier's untried candidates are exhausted and the pressure is
-        // still there — the point at which the pass would otherwise give up.
+        // Oldest first, with already-failed entries demoted behind the rest:
+        // retries are reached only once the untried candidates are exhausted.
         candidates.sort_by_key(|(_, e)| (e.delete_failed, e.start_pts_ns));
 
         for (camera_id, entry) in candidates {
@@ -1112,8 +745,7 @@ where
                         break 'tiers;
                     }
                 }
-                // Shutdown, part-way through this event: unflagged, uncounted,
-                // and the end of the pass.
+                // Shutdown: unflagged, uncounted, end of the pass.
                 Removal::Abandoned => break 'tiers,
                 Removal::Missing => {
                     index.remove(&camera_id, key);
@@ -1139,56 +771,15 @@ where
 /// Share of a camera's archive one sweep may delete — a quarter.
 const SWEEP_DELETE_SHARE: usize = 4;
 
-/// Floor under the share, so an archive of a handful of events still expires in
-/// one sweep. Losing four events is not the loss the cap exists to prevent, and
-/// dribbling them out an hour at a time would only make retention look broken
-/// on small installs.
+/// Floor under the share, so an archive of a handful of events still expires
+/// in one sweep instead of dribbling out an hour at a time.
 const SWEEP_DELETE_FLOOR: usize = 4;
 
 fn sweep_delete_limit(indexed: usize) -> usize {
     indexed.div_ceil(SWEEP_DELETE_SHARE).max(SWEEP_DELETE_FLOOR)
 }
 
-/// Hold back the tail of an over-large expiry, so no single sweep can empty an
-/// archive.
-///
-/// An event's start time is wall clock at keyframe time and its age is
-/// `now - start`, so a forward clock correction of J ages every stored event by
-/// J at once. A box with no battery-backed RTC does exactly that on an ordinary
-/// boot: systemd-timesyncd (and fake-hwclock) restore the clock they saved at
-/// shutdown, so the box comes up as far behind as it was switched off and jumps
-/// forward when NTP lands — J is the off-time, and a box switched off over a
-/// weekend jumps a weekend. Once J reaches the retention window, every event
-/// ever recorded is expired in the same sweep. That sweep used to delete the
-/// lot, and report it at `info!`.
-///
-/// So one flat cap covers every expiry, on both backends: at most
-/// [`sweep_delete_limit`] events per camera per sweep, oldest first, with a
-/// `warn!` naming the counts whenever anything is held back. The cap is
-/// deliberately blind to *why* an event expired. A clock jump, a shortened
-/// retention and a long outage are indistinguishable from inside a sweep, and
-/// every test that tries to tell them apart is a hole at the jump sizes it
-/// guesses wrong about — "how far past due is it" leaves J up to 1.25 retention
-/// windows uncapped, and "does anything recent survive" disengages the moment
-/// the first post-jump event is recorded, which is within seconds.
-///
-/// Ordinary retention never comes near the cap: an hourly sweep of an R-day
-/// retention expires 1/(24R) of an archive, under 4% at the one-day minimum
-/// camon accepts. What does reach it is a real mass expiry — retention cut from
-/// 30 days to 2, a camera whose whole archive aged out while it was offline —
-/// and that still drains completely, a quarter of what is left per sweep (never
-/// fewer than [`SWEEP_DELETE_FLOOR`]) until only what the retention keeps
-/// remains. It takes a working day instead of one pass, and says so at `warn!`
-/// the whole way down.
-///
-/// The space-pressure paths deliberately bypass it; see [`EVICTION_TIERS`].
-///
-/// Events whose deletion already failed do not count against the cap: they were
-/// let through an earlier sweep's cap and are only being retried, and charging
-/// them again would let a few undeletable events at the head of the queue
-/// starve every deletion behind them for good. That relies on failures being
-/// flagged ([`WarmEventEntry::delete_failed`]), which [`sweep_expired`] does for
-/// both backends.
+/// Hold back the tail of an over-large expiry, so no single sweep can empty an archive.
 fn cap_sweep_deletions(
     camera_id: &str,
     indexed: usize,
@@ -1198,9 +789,8 @@ fn cap_sweep_deletions(
     let limit = sweep_delete_limit(indexed);
     let mut budget = limit;
     let mut held_back = 0usize;
-    // Filtering in place keeps the index's oldest-first order, so the oldest
-    // footage goes first and a sweep cut short by shutdown has still deleted
-    // the events nearest their retention.
+    // Filtering in place keeps oldest-first order, so a sweep cut short by
+    // shutdown has still deleted the events nearest their retention.
     let deleting: Vec<WarmEventEntry> = expired
         .into_iter()
         .filter(|entry| {
@@ -1256,11 +846,6 @@ mod tests {
         }
     }
 
-    /// Storage stops counting exactly where the analyzer stops writing. The
-    /// two used to be separate literals agreeing by convention, and a producer
-    /// raised past the consumer would upload a frame nothing counts, serves or
-    /// deletes — a leak on the remote store that surfaces as a budget drifting
-    /// from the truth, months later, on installations only.
     #[test]
     fn the_frame_count_stops_where_the_analyzer_stops_writing() {
         assert_eq!(
@@ -1274,9 +859,6 @@ mod tests {
         );
     }
 
-    /// The frame count names every frame that exists, gaps and all: a store
-    /// that lost `thumb_0` still holds the three above it, and a count that
-    /// stopped at the hole would hide them from the UI and from the delete.
     #[test]
     fn a_filmstrip_count_names_every_frame_that_exists() {
         let count = |present: &[usize]| {
@@ -1286,12 +868,9 @@ mod tests {
         assert_eq!(count(&[]), 0);
         assert_eq!(count(&[0]), 1);
         assert_eq!(count(&[0, 1, 2, 3]), 4);
-        // Gaps: the count reaches past them rather than stopping at them.
         assert_eq!(count(&[1, 2, 3]), 4);
         assert_eq!(count(&[0, 2]), 3);
         assert_eq!(count(&[3]), 4);
-        // Bounded: a probe is a `stat` or a listing lookup, so no frame beyond
-        // what the pipeline writes is ever asked about — and none twice.
         let mut asked = Vec::new();
         for present in [true, false] {
             asked.clear();
@@ -1304,11 +883,6 @@ mod tests {
         }
     }
 
-    /// A lookup compares the whole key: every member of a run of equal starts
-    /// is reachable as itself, and a near-miss — the right start with the
-    /// wrong rest of the key — is absent, not a sibling. Landing somewhere in
-    /// the run and stopping is how the local upgrade used to reclassify a
-    /// sibling event.
     #[test]
     fn position_finds_the_named_entry_within_a_run_of_equal_starts() {
         let entries = [
@@ -1318,12 +892,9 @@ mod tests {
             entry(2000, EventType::Movement, 2000),
             entry(3000, EventType::Movement, 1000),
         ];
-        // Every member of the run is reachable, at either end and in the middle.
         for (i, e) in entries.iter().enumerate() {
             assert_eq!(position(&entries, <(u64, EventType, u32)>::of(e)), Some(i));
         }
-        // Absent: the right start with the wrong rest of the key, and a start
-        // nothing has.
         assert_eq!(
             position(&entries, (2000, EventType::Continuous, 1000)),
             None
@@ -1336,8 +907,6 @@ mod tests {
         );
     }
 
-    /// The same walk under the remote store's identity, where the type is not
-    /// part of the key and the duration is all that separates the run.
     #[test]
     fn position_separates_a_run_by_the_remote_identity() {
         let entries = [
@@ -1349,10 +918,6 @@ mod tests {
         assert_eq!(position(&entries, (2000u64, 3000u32)), None);
     }
 
-    /// The read path's lookup, under both identities: each member of a run of
-    /// equal starts comes back as itself. The old `find` binary-searched the
-    /// start alone and returned whichever member it landed on, so one of the
-    /// two lookups below was always the wrong event.
     #[test]
     fn find_returns_the_named_member_of_a_run_of_equal_starts() {
         let local: EventIndex<(u64, EventType, u32)> = EventIndex::new(&["cam".to_string()]);
@@ -1372,7 +937,6 @@ mod tests {
                 .file_size,
             20
         );
-        // A start nothing has, and a start something has under another key.
         assert!(local
             .find("cam", (2500, EventType::Movement, 1000))
             .is_none());
@@ -1381,7 +945,6 @@ mod tests {
             .find("other", (2000, EventType::Movement, 1000))
             .is_none());
 
-        // The remote store's identity: the duration separates the run.
         let remote: EventIndex<(u64, u32)> = EventIndex::new(&["cam".to_string()]);
         remote.insert("cam", sized(entry(2000, EventType::Movement, 1000), 30));
         remote.insert("cam", sized(entry(2000, EventType::Object, 2000), 40));
@@ -1390,9 +953,6 @@ mod tests {
         assert!(remote.find("cam", (2000, 3000)).is_none());
     }
 
-    /// The wire spelling of a key, both ways. A URL that resolved partially —
-    /// a missing part, a type this build does not know — would be the start-only
-    /// lookup back again, so nothing here is optional.
     #[test]
     fn an_event_ref_round_trips_through_its_path_segment() {
         for event_type in [
@@ -1433,22 +993,17 @@ mod tests {
         }
     }
 
-    /// `used_bytes` moves by the difference between what was indexed and what
-    /// it replaced, in either direction.
     #[test]
     fn charge_moves_used_bytes_by_the_difference() {
         let index: EventIndex<(u64, EventType, u32)> = EventIndex::new(&[]);
         index.charge(100, 0);
         assert_eq!(index.used_bytes(), 100);
-        // Replaced by something smaller, then something larger.
         index.charge(30, 100);
         assert_eq!(index.used_bytes(), 30);
         index.charge(80, 30);
         assert_eq!(index.used_bytes(), 80);
-        // Replaced like for like.
         index.charge(80, 80);
         assert_eq!(index.used_bytes(), 80);
-        // Removed.
         index.charge(0, 80);
         assert_eq!(index.used_bytes(), 0);
     }
@@ -1462,9 +1017,6 @@ mod tests {
         EventIndex::new(&["cam".to_string()])
     }
 
-    /// An iterator that reports how far it was pulled, so a test can measure
-    /// the walk the read lock is held across rather than guess at it from a
-    /// clock.
     struct Counted<I> {
         inner: I,
         visited: std::rc::Rc<std::cell::Cell<usize>>,
@@ -1482,10 +1034,6 @@ mod tests {
         }
     }
 
-    /// Walk every page of `index` with the cursor a client would carry — the
-    /// key of each page's oldest event — and return what the walk saw, in the
-    /// order it assembled. `pages` caps the walk so a cursor that stops
-    /// advancing fails the test instead of hanging the run.
     fn walk_pages(
         index: &EventIndex<(u64, EventType, u32)>,
         limit: usize,
@@ -1510,14 +1058,6 @@ mod tests {
         (seen, sizes)
     }
 
-    /// The whole point of a page: the work done while the lock is held is set
-    /// by the page, not by the archive — which is what used to stall every
-    /// camera's warm writer for as long as a listing took to copy.
-    ///
-    /// Measured on the walk itself, since that walk is exactly the body of
-    /// [`EventIndex::query`]'s locked section. That the *guard* falls with it
-    /// is structural — it is a local of `query` and no caller is handed one —
-    /// so there is nothing here for a test to hold open.
     #[test]
     fn a_page_walks_only_as_far_as_its_limit() {
         let archive: Vec<WarmEventEntry> = (1..=100_000)
@@ -1536,19 +1076,10 @@ mod tests {
 
         assert_eq!(page.len(), 50);
         assert_eq!(visited.get(), 50);
-        // And it is the newest 50, oldest first.
         assert_eq!(page[0].start_pts_ns, 99_951 * 1000);
         assert_eq!(page[49].start_pts_ns, 100_000 * 1000);
     }
 
-    /// A page ends exactly where its limit says, run of equal starts or not,
-    /// and hands back a cursor that resumes inside that run.
-    ///
-    /// Completing the run instead — which reads as a rounding error on an
-    /// archive where a run is a keyframe's worth of events — is unbounded where
-    /// it matters: a box whose clock never started stamps every event zero, and
-    /// age expiry cannot drain what it stamped, so the run *is* the archive and
-    /// "finish the run" is "copy everything" wearing a limit.
     #[test]
     fn a_page_ends_inside_a_run_of_equal_starts_rather_than_finishing_it() {
         let index = index_with_cam();
@@ -1564,20 +1095,14 @@ mod tests {
 
         let page = index.query("cam", EventPage::new(0, u64::MAX, 2));
 
-        // Two asked for, two served, both from the top of the order: 3000, then
-        // the greatest member of the run at 2000 — which is by the type's wire
-        // name, "object" being the last of the three.
         assert_eq!(page.len(), 2);
         assert_eq!(page_key(&page[0]), (2000, 1, "object"));
         assert_eq!(page_key(&page[1]), (3000, 1, "movement"));
 
-        // A page of nothing is nothing, rather than a walk with no floor to
-        // stop against.
         assert!(index
             .query("cam", EventPage::new(0, u64::MAX, 0))
             .is_empty());
 
-        // And the rest of that run is what the next page opens with.
         let next = index.query(
             "cam",
             EventPage::new(0, u64::MAX, 2).before(EventCursor::Event(EventRef::of(&page[0]))),
@@ -1586,18 +1111,9 @@ mod tests {
         assert_eq!(page_key(&next[1]), (2000, 1, "movement"));
     }
 
-    /// The regime the compound cursor exists for: a box with no working clock
-    /// stamps every event `0` and cannot age any of them out, so one run is the
-    /// whole archive. Pages are exactly the size asked for, and the walk still
-    /// reaches every event once.
-    ///
-    /// The entries are inserted in an order that is not their page order, so
-    /// the page order is the insertion path's doing and not the sequence's.
     #[test]
     fn a_single_start_archive_pages_at_exactly_its_limit() {
         let index = index_with_cam();
-        // 3000 distinct identities under one start, distinguished by duration
-        // alone. Mixed-type runs are covered by the two tests below this one.
         let mut durations: Vec<u32> = (1..=3000).collect();
         durations.rotate_left(1499);
         for duration_ms in durations {
@@ -1617,9 +1133,6 @@ mod tests {
         assert_eq!(keys, every, "every event once, in page order, no holes");
     }
 
-    /// A mixed run of equal starts — differing by duration or by type alone —
-    /// pages across a boundary in [`page_key`] order: every event once,
-    /// ascending, however the run was inserted.
     #[test]
     fn ties_page_across_a_boundary_in_full_key_order() {
         let index = index_with_cam();
@@ -1653,7 +1166,6 @@ mod tests {
         );
     }
 
-    /// Every event once, in start order, across a walk of the whole index.
     #[test]
     fn a_page_walk_reaches_the_oldest_event_without_repeating_any() {
         let index = index_with_cam();
@@ -1661,8 +1173,6 @@ mod tests {
             index.insert("cam", entry(i * 1000, EventType::Movement, 1));
         }
 
-        // Four pages of seven cover twenty-five events; the fifth is the empty
-        // one that says so.
         let (seen, sizes) = walk_pages(&index, 7, 5);
 
         assert_eq!(sizes, vec![7, 7, 7, 4]);
@@ -1670,9 +1180,6 @@ mod tests {
         assert_eq!(starts, (1..=25u64).map(|i| i * 1000).collect::<Vec<_>>());
     }
 
-    /// The simple cursor still works where the starts are distinct — which is
-    /// every box with a clock — so a client that only knows how to send a
-    /// timestamp is not left without a way to page.
     #[test]
     fn a_bare_start_cursor_resumes_a_walk_of_distinct_starts() {
         let index = index_with_cam();
@@ -1693,8 +1200,6 @@ mod tests {
             vec![3000, 4000, 5000, 6000]
         );
 
-        // Exclusive: an event starting exactly at the cursor is one the
-        // previous page has already served.
         let third = index.query(
             "cam",
             EventPage::new(0, u64::MAX, 10).before(EventCursor::Start(3000)),
@@ -1705,9 +1210,6 @@ mod tests {
         );
     }
 
-    /// What a walk of a live archive is stable against, pinned: the writer
-    /// appends above the cursor and retention deletes below it, and neither can
-    /// make the walk repeat an event or skip one that is still stored.
     #[test]
     fn a_page_walk_survives_the_archive_changing_under_it() {
         let index = index_with_cam();
@@ -1720,8 +1222,6 @@ mod tests {
         assert_eq!(first[0].start_pts_ns, 11_000);
         let cursor = EventCursor::Event(EventRef::of(&first[0]));
 
-        // A camera records while the walk is between pages, and retention takes
-        // the oldest event and the very one the cursor was read from.
         index.insert("cam", entry(21_000, EventType::Movement, 1));
         index.remove("cam", (1000, EventType::Movement, 1));
         index.remove("cam", (11_000, EventType::Movement, 1));
@@ -1729,17 +1229,10 @@ mod tests {
         let second = index.query("cam", EventPage::new(0, u64::MAX, 10).before(cursor));
         let starts: Vec<u64> = second.iter().map(|e| e.start_pts_ns).collect();
 
-        // The new event is above the cursor: this walk does not see it, and the
-        // next poll starts again from the top.
         assert!(!starts.contains(&21_000));
-        // What retention took is gone; everything still stored is here, once.
         assert_eq!(starts, (2..=10u64).map(|i| i * 1000).collect::<Vec<_>>());
     }
 
-    /// The same story one level down, inside a run of equal starts: the cursor
-    /// is a position in an order, not a reference to an entry, so a page
-    /// resumes correctly when the event it was cut at has been deleted — and
-    /// when other members of that run have gone with it.
     #[test]
     fn a_mid_run_cursor_survives_the_run_changing_under_it() {
         let index = index_with_cam();
@@ -1752,8 +1245,6 @@ mod tests {
         assert_eq!(durations, vec![7, 8, 9, 10]);
         let cursor = EventCursor::Event(EventRef::of(&first[0]));
 
-        // The entry the cursor was cut at goes, one still-unread member of the
-        // run goes with it, and a new one lands below the cursor.
         index.remove("cam", (0, EventType::Movement, 7));
         index.remove("cam", (0, EventType::Movement, 5));
         index.insert("cam", entry(0, EventType::Object, 3));
@@ -1761,10 +1252,6 @@ mod tests {
         let second = index.query("cam", EventPage::new(0, u64::MAX, 4).before(cursor));
         let keys: Vec<(u64, u32, &str)> = second.iter().map(page_key).collect();
 
-        // Resumes exactly beneath a cursor whose entry no longer exists, skips
-        // nothing that is still stored, and repeats nothing already served. The
-        // late arrival sorts below the cursor, so this walk does see it — an
-        // honest read of an archive that changed, not a snapshot.
         assert_eq!(
             keys,
             vec![
@@ -1776,9 +1263,6 @@ mod tests {
         );
     }
 
-    /// A `reidentify` onto an identity another entry already holds. The store
-    /// wrote one event over the other, so the index keeps one entry — the
-    /// re-placed one — and the displaced entry's bytes come back.
     #[test]
     fn reidentify_displaces_the_entry_holding_the_new_identity() {
         let index = index_with_cam();
@@ -1786,7 +1270,6 @@ mod tests {
         index.insert("cam", sized(entry(1000, EventType::Object, 500), 70));
         assert_eq!(index.used_bytes(), 370);
 
-        // The movement is upgraded onto the object sibling's identity.
         assert!(
             index.reidentify("cam", (1000, EventType::Movement, 500), |e| {
                 e.event_type = EventType::Object;
@@ -1795,15 +1278,11 @@ mod tests {
 
         let entries = index.query("cam", EventPage::unbounded(0, u64::MAX));
         assert_eq!(entries.len(), 1);
-        // The survivor is the entry that moved, not the one it landed on.
         assert_eq!(entries[0].file_size, 300);
         assert_eq!(entries[0].event_type, EventType::Object);
         assert_eq!(index.used_bytes(), 300);
     }
 
-    /// `insert_absent` yields to whatever holds the identity — bytes included,
-    /// since an insert that did not happen must not be charged — and behaves
-    /// like `insert` when nothing does.
     #[test]
     fn insert_absent_yields_to_the_entry_already_holding_the_identity() {
         let index = index_with_cam();
@@ -1820,7 +1299,6 @@ mod tests {
             "charged an insert that did not happen"
         );
 
-        // A different identity is not the same event, whatever it shares.
         assert!(index.insert_absent("cam", sized(entry(1000, EventType::Object, 500), 70)));
         assert_eq!(
             index.query("cam", EventPage::unbounded(0, u64::MAX)).len(),
@@ -1830,8 +1308,6 @@ mod tests {
         assert!(!index.insert_absent("other", sized(entry(1000, EventType::Movement, 500), 5)));
     }
 
-    /// Nothing to displace, and a closure that changes nothing: the entry and
-    /// the byte total both stay put.
     #[test]
     fn reidentify_with_a_no_op_closure_leaves_the_index_alone() {
         let index = index_with_cam();
@@ -1849,9 +1325,6 @@ mod tests {
         assert_eq!(index.used_bytes(), 300);
     }
 
-    /// The closure may resize the entry it re-places, and `used_bytes` counts
-    /// what it left behind — the old size *and* any displaced entry refunded,
-    /// the new size charged.
     #[test]
     fn reidentify_follows_a_resize_by_the_closure() {
         let index = index_with_cam();
@@ -1871,11 +1344,6 @@ mod tests {
         assert_eq!(index.used_bytes(), 500);
     }
 
-    /// The shared sweep polls its cancel between events, which is what stops a
-    /// pass that was already under way when the flag went up. Both backends'
-    /// `prune` also check before the camera loop, so a sweep that starts
-    /// stopped never reaches this — which is exactly why it is pinned here,
-    /// against the skeleton, rather than only through a backend.
     #[tokio::test]
     async fn a_sweep_stops_between_events_when_it_is_cancelled_part_way() {
         let index = index_with_cam();
@@ -1886,7 +1354,6 @@ mod tests {
             index.insert("cam", e.clone());
         }
 
-        // Runs on the second ask: one event is deleted, the rest are not.
         let mut asked = 0;
         let outcome = sweep_expired(
             &index,
@@ -1907,9 +1374,6 @@ mod tests {
         );
     }
 
-    /// The same for the eviction pass, which runs ahead of a write on a
-    /// camera's own writer task — so a flag that goes up mid-pass has a drain
-    /// waiting behind it.
     #[tokio::test]
     async fn an_eviction_stops_between_events_when_it_is_cancelled_part_way() {
         let index = index_with_cam();
@@ -1942,10 +1406,6 @@ mod tests {
         );
     }
 
-    /// A panic in the closure leaves the index exactly as it was: the entry is
-    /// still there and still charged. `reidentify` builds the new value before
-    /// touching the list, which is the property `LockExt`'s poison recovery is
-    /// justified by.
     #[test]
     fn reidentify_leaves_the_index_intact_when_the_closure_panics() {
         let index = index_with_cam();

@@ -1,16 +1,4 @@
 //! Ollama vision-model client for object detection.
-//!
-//! Requests structured output via Ollama's `format` field with a strict JSON
-//! schema (flat numeric-only fields, the class as an enum of the configured
-//! allowlist, `maxItems` on the detections array). The enum sidesteps a Gemma
-//! repetition-collapse bug seen with free-text fields, and the schema was
-//! validated empirically against the production server (2026-07-23 A/B run:
-//! JSON-schema output parsed cleanly on every image, warm latency 9-17s).
-//!
-//! The client is async and is only ever driven by the single global detection
-//! worker (see `detect_worker`), which guarantees at most ONE in-flight
-//! request to Ollama at any time — the production GPU handles parallel load
-//! badly.
 
 use base64::Engine;
 use serde::{Deserialize, Serialize};
@@ -102,10 +90,7 @@ pub struct OllamaClient {
     primary: OllamaServer,
     fallback: Option<OllamaServer>,
     confidence_threshold: f32,
-    /// The configured allowlist, lowercased. Taken as given — no substitution,
-    /// so the classes asked of the model are exactly the ones the MQTT bridge
-    /// publishes occupancy entities for. `Config::validate` rejects an empty
-    /// list while object detection is on.
+    /// The configured allowlist, lowercased.
     allowed_classes: Vec<String>,
 }
 
@@ -156,10 +141,8 @@ impl OllamaClient {
         &self.allowed_classes
     }
 
-    /// Startup sanity check: ask each configured server for its pulled models
-    /// (`/api/tags`) and warn loudly if the configured model is missing. This
-    /// surfaces a typo'd model name in seconds instead of a silent string of
-    /// failed detections. Non-fatal — the server may simply be down right now.
+    /// Startup sanity check: ask each configured server for its pulled models (`/api/tags`) and
+    /// warn loudly if the configured model is missing.
     pub async fn check_models(&self) {
         for server in std::iter::once(&self.primary).chain(self.fallback.as_ref()) {
             let url = format!("{}/api/tags", server.base_url);
@@ -320,19 +303,13 @@ fn build_format_schema(allowed_classes: &[String]) -> serde_json::Value {
     })
 }
 
-/// Parse a structured response and apply semantic validation. Anything
-/// nonsensical — class outside the allowlist, confidence outside [0, 1],
-/// bounding box outside the frame — is dropped with a log line rather than
-/// propagated. Detections below the confidence threshold are filtered
-/// silently (expected, not an error).
+/// Parse a structured response and apply semantic validation.
 fn parse_detections(content: &str, threshold: f32, allowed_classes: &[String]) -> Vec<Detection> {
     let payload: DetectionsPayload = match serde_json::from_str(content) {
         Ok(p) => p,
         Err(e) => match salvage_truncated(content) {
-            // Dense scenes can blow past maxItems (Ollama does not enforce it
-            // in the constrained-decoding grammar; observed live 2026-07-23)
-            // and get cut mid-array by the num_predict cap. The complete
-            // leading detections are still good — salvage them.
+            // Ollama may ignore maxItems and hit num_predict mid-array; complete leading
+            // detections remain valid.
             Some(p) => {
                 tracing::warn!(
                     count = p.detections.len(),
@@ -379,10 +356,9 @@ fn parse_detections(content: &str, threshold: f32, allowed_classes: &[String]) -
     detections
 }
 
-/// Repair a generation cut off mid-array by the `num_predict` cap: walk the
-/// closing braces from the end, cut back to the last complete detection
-/// object, close the array, and re-parse. Returns `None` when nothing
-/// salvageable remains.
+/// Repair a generation cut off mid-array by the `num_predict` cap: walk the closing braces from
+/// the end, cut back to the last complete detection object, close the array, and re-parse.
+/// Returns `None` when nothing salvageable remains.
 fn salvage_truncated(content: &str) -> Option<DetectionsPayload> {
     for (i, _) in content.char_indices().rev().filter(|&(_, c)| c == '}') {
         let candidate = format!("{}]}}", &content[..=i]);
@@ -508,7 +484,6 @@ mod tests {
         assert!(parse_detections("NONE", 0.5, &classes()).is_empty());
         assert!(parse_detections("", 0.5, &classes()).is_empty());
         assert!(parse_detections(r#"{"foo": 1}"#, 0.5, &classes()).is_empty());
-        // Missing required field
         assert!(parse_detections(
             r#"{"detections": [{"class": "person", "confidence": 0.9}]}"#,
             0.5,
@@ -558,7 +533,6 @@ mod tests {
 
     #[test]
     fn parse_garbage_bbox_dropped() {
-        // Origin outside the frame, negative size, absurd size.
         let content = r#"{"detections": [
             {"class": "person", "confidence": 0.9, "x": 1.2, "y": 0.1, "w": 0.2, "h": 0.2},
             {"class": "person", "confidence": 0.9, "x": 0.1, "y": -0.5, "w": 0.2, "h": 0.2},
@@ -571,7 +545,6 @@ mod tests {
 
     #[test]
     fn parse_overhanging_bbox_clamped() {
-        // Box slightly overhangs the right edge: clamp, keep.
         let content = r#"{"detections": [{"class": "car", "confidence": 0.9, "x": 0.9, "y": 0.9, "w": 0.3, "h": 0.3}]}"#;
         let results = parse_detections(content, 0.5, &classes());
         assert_eq!(results.len(), 1);
@@ -582,8 +555,6 @@ mod tests {
 
     #[test]
     fn parse_salvages_truncated_response() {
-        // A generation cut off mid-string by the num_predict cap, as observed
-        // live on a dense pedestrian scene (2026-07-23).
         let content = r#"{"detections": [
             {"class": "person", "confidence": 0.95, "x": 0.01, "y": 0.53, "w": 0.03, "h": 0.47},
             {"class": "person", "confidence": 0.9, "x": 0.02, "y": 0.55, "w": 0.02, "h": 0.45},
@@ -600,7 +571,6 @@ mod tests {
 
     #[test]
     fn parse_enforces_detection_cap_client_side() {
-        // Ollama does not enforce maxItems in its grammar; the client caps.
         let one =
             r#"{"class": "person", "confidence": 0.9, "x": 0.1, "y": 0.1, "w": 0.2, "h": 0.2}"#;
         let content = format!(r#"{{"detections": [{}]}}"#, vec![one; 40].join(","));
@@ -617,9 +587,6 @@ mod tests {
         assert!(prompt.contains("detections"));
     }
 
-    /// Config validation makes this unreachable in production; the point is
-    /// that the client invents no classes of its own, so it can never look for
-    /// something the MQTT bridge has no entity for.
     #[test]
     fn empty_class_list_is_not_substituted() {
         let client =

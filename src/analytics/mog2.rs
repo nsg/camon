@@ -1,19 +1,6 @@
-//! Pure-Rust port of the Zivkovic adaptive Gaussian-mixture background
-//! subtractor ("MOG2") for single-channel (grayscale) input, matching the
-//! semantics of OpenCV's `BackgroundSubtractorMOG2` with shadow detection
-//! disabled.
-//!
-//! References:
-//! - Z. Zivkovic, "Improved adaptive Gaussian mixture model for background
-//!   subtraction", ICPR 2004.
-//! - Z. Zivkovic, F. van der Heijden, "Efficient adaptive density estimation
-//!   per image pixel for the task of background subtraction", Pattern
-//!   Recognition Letters 27(7), 2006.
-//!
-//! The per-pixel update loop is a faithful port of OpenCV's implementation
-//! (`modules/video/src/bgfg_gaussmix2.cpp`), including its mode ordering,
-//! complexity-reduction pruning (CT), and auto learning-rate schedule, so the
-//! output can be validated against OpenCV frame-by-frame.
+//! Pure-Rust port of the Zivkovic adaptive Gaussian-mixture background subtractor ("MOG2") for
+//! single-channel (grayscale) input, matching the semantics of OpenCV's
+//! `BackgroundSubtractorMOG2` with shadow detection disabled.
 
 /// Maximum number of Gaussian components per pixel (OpenCV `nmixtures`).
 const NMIXTURES: usize = 5;
@@ -87,14 +74,8 @@ impl Mog2 {
         self.frames
     }
 
-    /// Update the model with one grayscale frame and write the foreground
-    /// mask (0 = background, 255 = foreground) into `fg_mask`.
-    ///
-    /// `learning_rate` follows OpenCV semantics: a negative value selects the
-    /// automatic schedule `alpha = 1 / min(2 * frame_count, history)`, which
-    /// adapts fast while the model is young and settles at `1 / history`.
-    ///
-    /// A dimension change reinitializes the model.
+    /// Update the model with one grayscale frame and write the foreground mask (0 = background,
+    /// 255 = foreground) into `fg_mask`.
     pub fn apply(
         &mut self,
         frame: &[u8],
@@ -304,7 +285,6 @@ mod tests {
         for _ in 0..100 {
             apply(&mut mog2, &frame);
         }
-        // Converged variance is VAR_MIN = 4; Tb = 16 → |diff| < 8 is background.
         let mask = apply(&mut mog2, &[105u8; W * H]);
         assert!(mask.iter().all(|&v| v == 0), "within Tb·var is background");
 
@@ -319,14 +299,10 @@ mod tests {
     fn step_change_adapts_at_history_rate() {
         let mut mog2 = Mog2::new(300, 16.0);
         let old = vec![60u8; W * H];
-        // Long static period: auto learning rate settles at 1/history.
         for _ in 0..400 {
             apply(&mut mog2, &old);
         }
 
-        // Permanent step change. The new component's weight grows as
-        // 1 - (1 - 1/300)^t and the pixel flips to background once it exceeds
-        // 1 - BACKGROUND_RATIO = 0.1, i.e. after ≈ 300·ln(1/0.9) ≈ 32 frames.
         let new = vec![180u8; W * H];
         let mut flipped_at = None;
         for t in 1..=80 {
@@ -368,8 +344,6 @@ mod tests {
         for _ in 0..100 {
             apply(&mut mog2, &frame);
         }
-        // One-frame flash, then back to normal: the model must still call the
-        // original scene background.
         apply(&mut mog2, &[250u8; W * H]);
         let mask = apply(&mut mog2, &frame);
         assert!(mask.iter().all(|&v| v == 0));

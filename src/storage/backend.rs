@@ -1,29 +1,4 @@
 //! Storage-backend abstraction over warm event storage.
-//!
-//! The warm writer and the playback API do not touch storage directly; they go
-//! through a [`WarmStorageBackend`]. [`LocalDiskBackend`] lives here and owns
-//! the on-disk layout, the atomic write ladder, crash recovery and lazy ffmpeg
-//! thumbnailing that used to live in `buffer/warm.rs` and `api/server.rs`;
-//! [`StathostBackend`](crate::storage::StathostBackend) is the remote one. What
-//! they have in common — the in-RAM index and the retention skeletons over it —
-//! is in [`event_index`](crate::storage::event_index), so a backend here is
-//! object I/O and the policy that goes with it, nothing more.
-//!
-//! The trait is shaped so the two can differ where they must, without a caller
-//! ever knowing which one it has:
-//!
-//! * an upgrade is expressed as an *intent* ([`upgrade_event`](WarmStorageBackend::upgrade_event))
-//!   rather than "rename these paths" — LocalDisk moves files, the remote
-//!   backend rewrites a sidecar in place (it has no rename);
-//! * thumbnails are *acquired through the backend*
-//!   ([`read_thumbnail`](WarmStorageBackend::read_thumbnail)) — LocalDisk keeps
-//!   today's lazy ffmpeg generation + on-disk caching, single-flighted per
-//!   thumbnail so a page of posters is one render each rather than one per
-//!   request, the remote backend fetches a pre-rendered image;
-//! * video is returned as a *stream*
-//!   ([`read_video`](WarmStorageBackend::read_video)) — callers never see a
-//!   `PathBuf` or a fully-buffered `Vec<u8>`; the body is an async byte stream
-//!   with HTTP Range support, so a 10-60 MB event never lands whole in RAM.
 
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -51,17 +26,15 @@ pub enum WriteOutcome {
     Written,
     /// The write failed with ENOSPC — worth an emergency prune and one retry.
     NoSpace,
-    /// The write failed for any other reason (already logged) — including a
-    /// commit that landed but could not be made durable, where the event is on
-    /// disk and indexed yet not guaranteed to survive a power cut. Never
-    /// retried by the writer.
+    /// The write failed for any other reason (already logged) — including a commit that
+    /// landed but could not be made durable, where the event is on disk and indexed yet not
+    /// guaranteed to survive a power cut. Never retried by the writer.
     Failed,
 }
 
-/// Why a thumbnail could not be produced. Every variant is an internal error;
-/// a missing *event* is a not-found decided by the caller, not a thumbnail
-/// error. The `&'static str` messages match the pre-refactor API responses
-/// byte-for-byte.
+/// Why a thumbnail could not be produced. Every variant is an internal error; a missing *event*
+/// is a not-found decided by the caller, not a thumbnail error. The `&'static str` messages
+/// match the pre-refactor API responses byte-for-byte.
 #[derive(Debug)]
 pub enum ThumbnailError {
     SpawnFailed,
@@ -127,17 +100,8 @@ pub enum ServedRange {
 }
 
 impl ServedRange {
-    /// A partial range, but only if `[start, end]` really is one of an object
-    /// of `total` bytes: bounds in order and inside the object.
-    ///
-    /// The check belongs here rather than at each caller because what is on the
-    /// other side of it is subtraction. A `Partial` is served with a
-    /// `Content-Length` of `end - start + 1`, so a reversed pair underflows —
-    /// a panic in a debug build, and camon ships debug — and an `end` past the
-    /// object promises a body longer than the stream will ever produce, which
-    /// hangs the player instead. Local disk resolves its own ranges and cannot
-    /// produce either; the remote backend is repeating a `Content-Range` a
-    /// server it does not control wrote, and that is not the same thing.
+    /// A partial range, but only if `[start, end]` really is one of an object of `total` bytes:
+    /// bounds in order and inside the object.
     pub fn partial(start: u64, end: u64, total: u64) -> Option<Self> {
         (start <= end && end < total).then_some(Self::Partial { start, end })
     }
@@ -164,10 +128,9 @@ pub struct VideoStream {
     pub range: ServedRange,
 }
 
-/// Resolve a requested range against an object's total size, returning the
-/// satisfied inclusive `[start, end]` or `None` when unsatisfiable (RFC 7233):
-/// a `bytes=a-` / `bytes=a-b` whose `a >= total`, or an empty `bytes=-0`
-/// suffix. An open or over-long upper bound is clamped to the last byte.
+/// Resolve a requested range against an object's total size, returning the satisfied inclusive
+/// `[start, end]` or `None` when unsatisfiable (RFC 7233): a `bytes=a-` / `bytes=a-b` whose `a
+/// >= total`, or an empty `bytes=-0` suffix.
 fn resolve_range(req: RangeRequest, total: u64) -> Option<(u64, u64)> {
     if total == 0 {
         return None;
@@ -194,15 +157,8 @@ fn resolve_range(req: RangeRequest, total: u64) -> Option<(u64, u64)> {
 }
 
 /// Everything the warm writer and the playback API need from storage.
-///
-/// The in-RAM index that answers `query`/`find_event` and backs
-/// `prune`/`emergency_prune` is not part of this contract: both backends own an
-/// [`EventIndex`](crate::storage::event_index::EventIndex) and neither exposes
-/// it.
 #[async_trait]
 pub trait WarmStorageBackend: Send + Sync {
-    // ---- writer path ----
-
     /// Durably persist a finished event (video bytes + optional sidecar +
     /// filmstrip frames) and index it. Atomicity, fsync, and commit ordering
     /// are the backend's concern.
@@ -213,37 +169,9 @@ pub trait WarmStorageBackend: Send + Sync {
     /// and rewrites the sidecar; a remote backend rewrites a sidecar in place.
     async fn upgrade_event(&self, camera_id: &str, upgrade: &EventUpgrade);
 
-    /// Delete events older than their per-class retention, bounded by the
-    /// per-camera share one sweep may take (`cap_sweep_deletions`), so a
-    /// forward clock jump cannot empty an archive in a single pass.
-    ///
-    /// `cancel` is the shutdown flag, and how finely it must be polled is part
-    /// of this contract rather than a matter of taste. A sweep is long, and on
-    /// a remote backend *one event* is several requests, each able to sit on a
-    /// request timeout: polling only between events therefore leaves a whole
-    /// event's worth of them inside the one that was in progress when the flag
-    /// went up, which is more than the drain's phase 3 has to give (see
-    /// [`crate::storage::contract`]'s third guarantee). So an implementation
-    /// whose deletions are remote requests **must poll `cancel` between them**
-    /// — this `cancel`, the one passed here, and not merely some flag of its
-    /// own that production happens to alias to it — and may report
-    /// [`Removal::Abandoned`](crate::storage::event_index::Removal) to say that
-    /// it did: the entry stays indexed, unflagged and uncounted, and the pass
-    /// ends. A backend that read only its own stop would keep this promise by
-    /// coincidence and break it for any caller whose `cancel` is its own.
-    ///
-    /// What that costs is bounded by the *order* a backend deletes in, and
-    /// choosing that order so a stop is survivable anywhere is the real
-    /// obligation here. Stopping part-way must never be able to leave a video
-    /// whose type record is gone — an event the next rebuild reads back as the
-    /// wrong class, and expires on the wrong retention. Both backends arrange
-    /// that, in opposite directions and for reasons of their own: local disk
-    /// unlinks the metadata first and the `.ts` last, so the survivor of an
-    /// interrupted delete is a bare `.ts` whose type is still its directory and
-    /// which the next sweep expires again; the remote store deletes the video
-    /// before the sidecar, so the survivor is metadata with no video, which
-    /// indexes nothing and the next startup collects. Neither can produce a
-    /// video that has lost the record of what it is.
+    /// Delete events older than their per-class retention, bounded by the per-camera share one
+    /// sweep may take (`cap_sweep_deletions`), so a forward clock jump cannot empty an archive
+    /// in a single pass.
     async fn prune(
         &self,
         movement_max_age_ns: u64,
@@ -265,61 +193,32 @@ pub trait WarmStorageBackend: Send + Sync {
     /// Free bytes available on the backing store, for the low-space guard.
     fn free_space(&self) -> std::io::Result<u64>;
 
-    // ---- startup ----
-
-    /// Rebuild the in-RAM index from durable storage. Async because a remote
-    /// backend rebuilds its index over HTTP (list + sidecar fetches);
-    /// LocalDisk's body is synchronous filesystem work.
-    ///
-    /// `Err` means the index does not describe the store — not that some events
-    /// were skipped, which both backends report as they go, but that the
-    /// backend never found out what is there. It is a `Result` rather than a
-    /// log line because an index that was never built and an index of an empty
-    /// store are the same object in RAM and the opposite instruction to
-    /// retention, and only a caller holding the error can tell them apart. It
-    /// is not fatal: startup continues, because a camera that cannot list its
-    /// archive can still record into it.
+    /// Rebuild the in-RAM index from durable storage. Async because a remote backend rebuilds
+    /// its index over HTTP (list + sidecar fetches); LocalDisk's body is synchronous filesystem
+    /// work.
     async fn scan(&self) -> std::io::Result<()>;
 
     /// Salvage writes interrupted by a crash or power cut, before the scan.
     fn recover_orphans(&self);
 
     /// The volume watch, for a backend that has a local filesystem to lose.
-    ///
-    /// `None` by default, which is the honest answer for a backend that owns no
-    /// filesystem: nothing can be unmounted out from under a remote store, and
-    /// a host that has gone away fails its uploads outright rather than letting
-    /// them land somewhere else and report success. That silent redirection is
-    /// the entire fault [`StorageAnchor`] exists to notice.
     fn volume_anchor(&self) -> Option<&Arc<StorageAnchor>> {
         None
     }
-
-    // ---- API read path ----
 
     /// One page of the events overlapping the request's window, oldest first
     /// and never more than the page's limit (see [`EventPage`]).
     fn query(&self, camera_id: &str, page: EventPage) -> Vec<WarmEventEntry>;
 
     /// The one indexed event this key names, if it is still there.
-    ///
-    /// The key is whole ([`EventRef`]) because a start PTS is not an identity:
-    /// two events can begin on the same keyframe — a movement event and the
-    /// continuous chunk covering it, or a run and the shorter chunk it was split
-    /// from — and a lookup by start alone offered an arbitrary one of them for
-    /// playback. What each backend does with the parts differs; see the impls.
     fn find_event(&self, camera_id: &str, event: EventRef) -> Option<WarmEventEntry>;
 
-    /// End of this camera's newest stored event, in wall-clock nanoseconds, or
-    /// `None` when it has nothing stored. Seeds the recording watchdog: silence
-    /// has to be measured from the last footage that exists, not from process
-    /// start, or a nightly restart resets it before it can ever be reported.
+    /// End of this camera's newest stored event, in wall-clock nanoseconds, or `None` when it
+    /// has nothing stored.
     fn newest_event_end_ns(&self, camera_id: &str) -> Option<u64>;
 
-    /// Stream a stored event's video (callers never see a path, and the body is
-    /// never fully buffered). `range` carries an optional single HTTP range; the
-    /// returned [`VideoStream`] reports the total size and how the range was
-    /// resolved (full / partial / unsatisfiable).
+    /// Stream a stored event's video (callers never see a path, and the body is never fully
+    /// buffered).
     async fn read_video(
         &self,
         camera_id: &str,
@@ -346,11 +245,6 @@ pub trait WarmStorageBackend: Send + Sync {
 }
 
 /// The local-filesystem backend: the on-disk warm store.
-///
-/// Owns the data directory and the in-RAM [`WarmEventIndex`]. This is the home
-/// of everything filesystem-specific — the fsync/rename atomic ladder, statvfs
-/// free-space checks, ffmpeg thumbnailing — that used to live inline in the
-/// writer and the API handlers.
 pub struct LocalDiskBackend {
     data_dir: PathBuf,
     index: WarmEventIndex,
@@ -419,19 +313,13 @@ impl WarmStorageBackend for LocalDiskBackend {
         if min_free_bytes == 0 {
             return;
         }
-        // With the volume gone this whole guard is about the wrong disk: the
-        // `create_dir_all` below would rebuild the storage tree on whatever is
-        // behind the mountpoint, and statvfs would report that filesystem's
-        // free space. See `emergency_prune` for why nothing is deleted either.
+        // With the volume gone this whole guard is about the wrong disk: the `create_dir_all`
+        // below would rebuild the storage tree on whatever is behind the mountpoint, and
+        // statvfs would report that filesystem's free space.
         if !self.anchor.is_intact() {
             return;
         }
         // data_dir may not exist before the first write; statvfs needs it.
-        // Synced, because this runs before every write and would otherwise be
-        // what creates the storage root: the event write's own synced
-        // `create_dir_all` walks up only as far as the first directory that
-        // already exists, so a root left durable-less here is a root the first
-        // power cut can take away with everything under it.
         let _ = crate::durable::create_dir_all_synced_async(&self.data_dir).await;
         match self.free_space() {
             Ok(free) if should_emergency_prune(free, min_free_bytes) => {
@@ -451,15 +339,8 @@ impl WarmStorageBackend for LocalDiskBackend {
     }
 
     async fn emergency_prune(&self, camera_id: &str, min_free_bytes: u64) {
-        // Free space read through a path that no longer leads to the storage
-        // volume is a figure about some other disk, and the response to a low
-        // figure here is to delete footage. Deleting the archive to make room
-        // on a filesystem the archive is not on is the one thing camon does in
-        // this situation that cannot be undone afterwards, so it stops until
-        // the volume is back. Writing carries on — footage in the wrong place
-        // beats no footage, and it can be moved. The verdict is a cached flag,
-        // so this costs no syscall on the write path, and it reads intact until
-        // a check has actually proved otherwise.
+        // Free space read through a path that no longer leads to the storage volume is a figure
+        // about some other disk, and the response to a low figure here is to delete footage.
         if !self.anchor.is_intact() {
             tracing::warn!(
                 camera = %camera_id,
@@ -535,14 +416,9 @@ impl WarmStorageBackend for LocalDiskBackend {
     }
 
     async fn scan(&self) -> std::io::Result<()> {
-        // Always `Ok`: this walk reports the directories and files it could not
-        // read one by one and indexes the rest, and a data dir that is not there
-        // at all is an empty store rather than an unknown one — nothing else
-        // could have written to it either.
-        //
-        // Off the runtime, because the body of it is blocking filesystem work
-        // that a failing disk can hold for a long time — see
-        // [`WarmEventIndex::scan_off_thread`].
+        // Always `Ok`: this walk reports the directories and files it could not read one by one
+        // and indexes the rest, and a data dir that is not there at all is an empty store
+        // rather than an unknown one — nothing else could have written to it either.
         self.index.scan_off_thread().await;
         Ok(())
     }
@@ -646,12 +522,6 @@ impl WarmStorageBackend for LocalDiskBackend {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Filesystem write mechanics (moved verbatim out of buffer/warm.rs). Kept as
-// free functions with their original signatures so the writer's behavior tests
-// exercise them exactly as before.
-// ---------------------------------------------------------------------------
-
 /// Local sidecars carry no `event_type`: the directory an event lives in is
 /// what says what it is, and the scan reads it from there.
 fn build_sidecar_json(event: &FinishedEvent) -> String {
@@ -668,20 +538,7 @@ fn is_no_space(e: &std::io::Error) -> bool {
     e.raw_os_error() == Some(libc::ENOSPC)
 }
 
-/// Atomically write a small metadata file (sidecar/thumbnail): stage as
-/// `.tmp`, then rename.
-///
-/// The *contents* are deliberately not fsynced. The one contents fsync per
-/// event is spent on the video, which is the thing that cannot be
-/// reconstructed; a sidecar that a power cut leaves empty or torn costs the
-/// event's detections and its `continues` flag, and the index scan already
-/// falls back to a plain movement when a sidecar will not parse. Staging still
-/// earns its keep: it keeps a *reader* from ever seeing a half-written file,
-/// and any leftover `.tmp` is swept at startup.
-///
-/// The *rename* is made durable, but not here — these files live in the same
-/// directory as the `.ts` they belong to, so the single directory fsync after
-/// the commit rename covers their entries too.
+/// Atomically write a small metadata file (sidecar/thumbnail): stage as `.tmp`, then rename.
 async fn write_metadata_atomic(final_path: &Path, data: &[u8]) -> std::io::Result<()> {
     crate::durable::replace_atomic_async(final_path, data).await
 }
@@ -713,10 +570,9 @@ fn build_index_entry(
         duration_ms: duration_ms as u32,
         event_type: event.event_type(),
         file_size,
-        // The filesystem counts the sidecar and the thumbnails without being
-        // told to, and `statvfs` is this backend's accounting authority — see
-        // [`crate::storage::contract`]. A second figure maintained here could
-        // only drift from the one that decides anything.
+        // The filesystem counts the sidecar and the thumbnails without being told to, and
+        // `statvfs` is this backend's accounting authority — see
+        // [`crate::storage::contract`].
         sidecar_bytes: 0,
         thumbnail_bytes: 0,
         object_classes: event.object_classes.clone(),
@@ -733,20 +589,6 @@ fn build_index_entry(
 }
 
 /// Persist one event durably. Write order is deliberate:
-///
-/// 1. video bytes → `{stem}.ts.tmp`, then fsync — the footage is durable and
-///    recoverable (via startup orphan recovery) from this point on, before
-///    anything else is risked;
-/// 2. sidecar and thumbnails, each atomically under their final names;
-/// 3. rename `{stem}.ts.tmp` → `{stem}.ts` — the commit point. The index scan
-///    only ever looks at `.ts` files, so a crash at any earlier step leaves a
-///    recoverable `.tmp` (plus adoptable metadata), never a half-indexed
-///    event; a crash after the rename leaves a complete event;
-/// 4. fsync the event directory, which is what makes step 3 survive a power
-///    cut — the rename is atomic, but the directory entry naming the file is
-///    not durable until the directory is synced. A failure here still leaves
-///    the event on disk and indexed, but it is reported as `Failed`, not
-///    `Written` (see [`commit_outcome`]).
 async fn write_event(
     data_dir: &Path,
     camera_id: &str,
@@ -793,10 +635,8 @@ async fn write_event(
         };
     }
 
-    // Step 2: metadata under final names, so a crash before the commit rename
-    // lets recovery adopt them. Failures here are non-fatal — the video wins.
-    // Object events always get a sidecar (detections); follow-on chunks get one
-    // too — even movement-only chunks — so `continues` survives a restart scan.
+    // Step 2: metadata under final names, so a crash before the commit rename lets recovery
+    // adopt them.
     if event.has_objects || event.continues {
         let meta_path = file_path.with_extension("json");
         if let Err(e) =
@@ -852,15 +692,6 @@ async fn write_event(
 }
 
 /// What a commit whose directory fsync failed is worth reporting as.
-///
-/// Not `Written`: this trait promises to *durably* persist, `Written` is what
-/// resets the camera's recording-silence watchdog, and a storage stack failing
-/// every fsync would otherwise look perfectly healthy while nothing it wrote
-/// was guaranteed to survive. Not `NoSpace` either, whatever errno says — that
-/// outcome asks the writer for an emergency prune and a retry, and there is
-/// nothing to retry when the event is already committed. `Failed` is not
-/// retried by the writer, so reporting it honestly costs no rewrite and drops
-/// no footage; it only stops a durability failure from being called a success.
 fn commit_outcome(synced: std::io::Result<()>) -> WriteOutcome {
     match synced {
         Ok(()) => WriteOutcome::Written,
@@ -868,27 +699,9 @@ fn commit_outcome(synced: std::io::Result<()>) -> WriteOutcome {
     }
 }
 
-/// Apply a post-hoc movement→object upgrade. Runs only on the writer task,
-/// so it serializes behind any pending write of the same event (FIFO
-/// channel) and never races another file mutation.
-///
-/// Step order is chosen for crash safety — the index scan only ever looks at
-/// `.ts` files, so the `.ts` rename is the commit point:
-///
-/// 1. write the new sidecar (with detections) atomically into `objects/`;
-/// 2. rename the `.ts` from `movements/` to `objects/` — the commit;
-/// 3. move the filmstrip thumbnails;
-/// 4. delete the old `movements/` sidecar, if any;
-/// 5. fsync `objects/` and then `movements/`, so the entries the rename moved
-///    between them are durable and a power cut cannot resurrect the event as a
-///    movement — in that order and no further than the first failure, for the
-///    reason [`sync_move`] gives.
-///
-/// A crash before step 2 leaves a stray sidecar in `objects/` that the scan
-/// ignores; after step 2 the event is object-classified with its detections.
-/// If the movement file is missing entirely (write failed, already pruned,
-/// or a duplicate upgrade), the upgrade is skipped with a warning — the
-/// detections remain visible in the detection store/API.
+/// Apply a post-hoc movement→object upgrade. Runs only on the writer task, so it serializes
+/// behind any pending write of the same event (FIFO channel) and never races another file
+/// mutation.
 async fn upgrade_event(
     data_dir: &Path,
     camera_id: &str,
@@ -968,11 +781,8 @@ async fn upgrade_event(
         },
     );
     if !updated {
-        // A retention sweep that snapshotted this event as a movement,
-        // then found `movements/{stem}.ts` already renamed away, drops the
-        // entry as vanished. The footage is fine and now lives under
-        // objects/, so re-index it here rather than leaving it invisible
-        // until the next startup scan re-reads the directory.
+        // A retention sweep that snapshotted this event as a movement, then found
+        // `movements/{stem}.ts` already renamed away, drops the entry as vanished.
         tracing::warn!(camera = %camera_id, start_pts_ns = upgrade.start_pts_ns,
             "upgraded event was not in the warm index (pruned mid-upgrade?), re-indexing it");
         warm_index.insert(
@@ -989,30 +799,16 @@ async fn upgrade_event(
     );
 }
 
-/// Make a rename *between* two directories durable: fsync the destination,
-/// then the source. The order is not a preference and the `?` is not a
-/// shortcut — each step is only safe once the one before it succeeded:
-///
-/// * destination first, because it holds the only remaining name for the file.
-///   Making the source's deletion durable while the destination entry is still
-///   only in the page cache is the one combination that loses the event
-///   outright: a power cut then takes away both names at once. So a failed
-///   destination sync must not be followed by the source sync — hence `?`.
-/// * source second, and its failure is survivable rather than fixable: the old
-///   name can come back, leaving the same footage listed twice (the scan does
-///   not deduplicate) — once as the upgraded object event and once as the
-///   movement it was, which then expires on the shorter movement retention.
-///   That is a visible duplicate and some wasted disk, which is the cheaper
-///   half of the trade against losing the recording.
+/// Make a rename *between* two directories durable: fsync the destination, then the source. The
+/// order is not a preference and the `?` is not a shortcut — each step is only safe once the
+/// one before it succeeded:
 async fn sync_move(dest: &Path, src: &Path) -> std::io::Result<()> {
     crate::durable::sync_dir_async(dest).await?;
     crate::durable::sync_dir_async(src).await
 }
 
-/// Rebuild an index entry for an event that was upgraded while nothing in the
-/// index described it any more. Everything comes from the upgrade itself
-/// except the file size and the filmstrip count, which are read back off disk
-/// exactly as the startup scan would read them.
+/// Rebuild an index entry for an event that was upgraded while nothing in the index described
+/// it any more.
 async fn reindexed_upgrade(
     dst_ts: &Path,
     objects: &Path,
@@ -1045,19 +841,8 @@ async fn reindexed_upgrade(
     }
 }
 
-/// Read the cached poster frame at `thumb_path`, calling `generate` to render
-/// it if it is missing — once, however many callers miss it together.
-///
-/// The page-load pattern is N requests for the same not-yet-rendered thumbnail
-/// arriving at once; without the guard each one spawns its own ffmpeg for the
-/// identical output file. Waiters re-read the cache after the guard, so they
-/// find the finished file instead of rendering it again, and the guard is keyed
-/// on the thumbnail path so unrelated thumbnails never queue behind each other.
-/// A failed render is not remembered: the guard is released, the key is dropped
-/// and the next request is free to try again.
-///
-/// Split out from [`LocalDiskBackend::read_thumbnail`] so tests can count
-/// renders without an ffmpeg on the machine.
+/// Read the cached poster frame at `thumb_path`, calling `generate` to render it if it is
+/// missing — once, however many callers miss it together.
 async fn read_or_generate_thumbnail<F, Fut>(
     flight: &SingleFlight<PathBuf>,
     thumb_path: &Path,
@@ -1085,13 +870,7 @@ where
         .map_err(|_| ThumbnailError::ReadFailed)
 }
 
-/// How long one poster render may take before its ffmpeg is killed. The work
-/// is decoding the *first* frame of a local file and scaling it to 320px — no
-/// seek, no encode of any length — which is a fraction of a second even on an
-/// SBC, so this is not a budget but a ceiling on a wedged process. It has to be
-/// one, because the render holds the thumbnail's single-flight key: without it
-/// one stuck ffmpeg parks every other request for that poster forever, where
-/// before it only cost its own request.
+/// How long one poster render may take before its ffmpeg is killed.
 const THUMBNAIL_RENDER_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Render a single poster frame from `ts_path` into `thumb_path` with ffmpeg.
@@ -1100,23 +879,8 @@ async fn generate_thumbnail(ts_path: &Path, thumb_path: &Path) -> Result<(), Thu
     publish_rendered(thumb_path, |staged| render_poster_frame(ts_path, staged)).await
 }
 
-/// Run `render` against a staging path and publish its output to `thumb_path`
-/// by rename, bounded by [`THUMBNAIL_RENDER_TIMEOUT`].
-///
-/// ffmpeg fills its output file in place, so pointing it at the live name
-/// publishes the image progressively: the unguarded cache read in
-/// [`read_or_generate_thumbnail`] can pick up a half-written frame and serve it
-/// as the poster, and a render that is killed part-way — the timeout here, or a
-/// disconnecting client dropping this future onto `kill_on_drop` — leaves a
-/// truncated `.jpg` that every later request treats as a permanent cache hit.
-/// Staging is what the rest of the storage layer already does for exactly this
-/// reason ([`crate::durable`]); a reader here therefore sees either no file or
-/// the whole image.
-///
-/// The staging file is removed on every failure this function observes. A
-/// cancellation it never returns from can still leave one behind, which is why
-/// the name is `{stem}.jpg.tmp` — one per thumbnail, overwritten by the next
-/// attempt rather than accumulating, and swept by startup orphan recovery.
+/// Run `render` against a staging path and publish its output to `thumb_path` by rename,
+/// bounded by [`THUMBNAIL_RENDER_TIMEOUT`].
 async fn publish_rendered<F, Fut>(thumb_path: &Path, render: F) -> Result<(), ThumbnailError>
 where
     F: FnOnce(PathBuf) -> Fut,
@@ -1149,10 +913,6 @@ where
 }
 
 /// The ffmpeg half of a poster render, writing wherever it is pointed.
-///
-/// `-f image2` is what the staging name costs: ffmpeg picks its output format
-/// from the extension, and `.jpg.tmp` is not one it knows. Naming the muxer
-/// explicitly produces the same bytes the `.jpg` name used to.
 async fn render_poster_frame(ts_path: &Path, out_path: PathBuf) -> Result<(), ThumbnailError> {
     let mut child = tokio::process::Command::new("ffmpeg")
         .args(["-hide_banner", "-loglevel", "error", "-i"])
@@ -1196,21 +956,12 @@ mod tests {
 
     const SEC: u64 = 1_000_000_000;
 
-    // ---- the shared storage contract --------------------------------------
-    //
-    // One assertion body, two backends: see `storage::contract::contract_tests`
-    // for why these are written there and called here. Local disk is the
-    // backend whose guarantees the remote one was supposed to reproduce, so it
-    // is also the one whose passing them proves the assertions are about the
-    // contract rather than about stathost.
-
     fn contract_backend() -> (tempfile::TempDir, LocalDiskBackend) {
         let dir = tempfile::tempdir().unwrap();
         let backend = LocalDiskBackend::new(dir.path().to_path_buf(), &["cam".to_string()]);
         (dir, backend)
     }
 
-    /// Every byte under `dir`, which is what this backend's store *is*.
     fn bytes_under(dir: &Path) -> u64 {
         let Ok(entries) = std::fs::read_dir(dir) else {
             return 0;
@@ -1276,7 +1027,6 @@ mod tests {
         .await;
     }
 
-    /// Drain a [`VideoStream`] body to bytes (test-only; real callers stream).
     async fn drain(vs: VideoStream) -> Vec<u8> {
         use futures_util::StreamExt;
         let mut buf = Vec::new();
@@ -1296,8 +1046,6 @@ mod tests {
         }
     }
 
-    /// A hot buffer with `count` one-second segments (seq 0..count), where
-    /// segment N starts at N seconds and holds bytes [N; 4].
     fn populated_buffer(count: u64) -> std::sync::Arc<std::sync::RwLock<HotBuffer>> {
         let buffer = HotBuffer::new("cam".to_string(), 3600);
         {
@@ -1345,15 +1093,12 @@ mod tests {
         let outcome = write_event(dir.path(), "cam", &event, &index).await;
         assert_eq!(outcome, WriteOutcome::Written);
 
-        // 4 one-second segments (seq 4..=7) => stem "{first_pts}_{4000}".
         let stem = format!("{}_4000", first_pts);
         let movements = dir.path().join("cam").join("movements");
         assert!(movements.join(format!("{}.ts", stem)).exists());
         assert!(movements.join(format!("{}_thumb_0.jpg", stem)).exists());
         assert!(movements.join(format!("{}_thumb_1.jpg", stem)).exists());
-        // Movement-only events have no sidecar.
         assert!(!movements.join(format!("{}.json", stem)).exists());
-        // Atomic pattern leaves no .tmp staging residue behind.
         let leftovers: Vec<_> = std::fs::read_dir(&movements)
             .unwrap()
             .flatten()
@@ -1374,10 +1119,6 @@ mod tests {
         );
     }
 
-    /// The video is written straight from the event's shared segments rather
-    /// than from one buffer holding a copy of them all, so the file has to be
-    /// pinned as their bytes in order: a chunk written twice, skipped or
-    /// reordered would still produce a plausible `.ts` of the right size.
     #[tokio::test]
     async fn written_event_bytes_are_the_segments_back_to_back() {
         let dir = tempfile::tempdir().unwrap();
@@ -1405,16 +1146,6 @@ mod tests {
         assert_eq!(expected.len(), event.total_bytes);
     }
 
-    /// Whether an fsync reached the platter is not observable from a test, and
-    /// neither is a lost directory entry without cutting real power. What is
-    /// observable is that the durable variants used on the commit path behave
-    /// like the plain ones did: a first-ever write, where the whole tree has to
-    /// be created and synced from `data_dir` down, still commits.
-    ///
-    /// Driven through the backend in the order the writer really uses — the
-    /// low-space guard first, which is what creates `data_dir` on a first run,
-    /// then the write. Calling `write_event` alone would skip the guard and so
-    /// skip the directory that matters most.
     #[tokio::test]
     async fn first_write_commits_into_a_tree_that_did_not_exist() {
         let dir = tempfile::tempdir().unwrap();
@@ -1438,13 +1169,6 @@ mod tests {
             .exists());
     }
 
-    /// The policy a real fsync failure would exercise, which no test can
-    /// provoke: the directory is openable whenever the rename into it just
-    /// succeeded, and a permission trick would be a no-op for a root test
-    /// runner. What is pinned is the decision itself — a commit that could not
-    /// be made durable is not a successful write, because `Written` is what
-    /// resets the recording-silence watchdog (`buffer::warm`), and `Failed`
-    /// rather than `NoSpace` because only `NoSpace` is retried.
     #[test]
     fn a_commit_that_cannot_be_synced_is_not_reported_as_written() {
         assert_eq!(commit_outcome(Ok(())), WriteOutcome::Written);
@@ -1454,12 +1178,6 @@ mod tests {
         );
     }
 
-    /// The `?` in `sync_move` is load-bearing: syncing the source directory
-    /// after the destination sync failed makes the *removal* of the old name
-    /// durable while the new name is not, which loses the event entirely. That
-    /// the source is skipped is enforced by the type, not observable here; what
-    /// a test can pin is that a destination that cannot be synced ends the
-    /// sequence with an error instead of being logged past.
     #[tokio::test]
     async fn sync_move_stops_at_a_destination_it_cannot_sync() {
         let dir = tempfile::tempdir().unwrap();
@@ -1472,14 +1190,9 @@ mod tests {
         assert!(sync_move(&dir.path().join("gone"), &movements)
             .await
             .is_err());
-        // A source that cannot be synced is reported too, but only after the
-        // destination is durable — a duplicate movement entry, not a lost event.
         assert!(sync_move(&objects, &dir.path().join("gone")).await.is_err());
     }
 
-    /// A regular file where the camera directory belongs: the directory can
-    /// never be created, whatever user the test runs as. The error has to reach
-    /// the caller as a failed write rather than being swallowed by the sync.
     #[tokio::test]
     async fn write_fails_when_the_event_directory_cannot_be_created() {
         let dir = tempfile::tempdir().unwrap();
@@ -1505,8 +1218,6 @@ mod tests {
     async fn movement_follow_on_chunk_writes_continues_sidecar() {
         let dir = tempfile::tempdir().unwrap();
         let buffer = populated_buffer(10);
-        // Follow-on chunk: no pre-padding (min_start_seq == first_motion_seq),
-        // movement-only, continues == true.
         let event = {
             let buf = buffer.read_recover();
             assemble_event(&buf, None, "cam", 5, 7, 5, 0, true, None).unwrap()
@@ -1521,7 +1232,6 @@ mod tests {
         let duration_ms = (7 - 5 + 1) * 1000;
         let stem = format!("{}_{}", first_pts, duration_ms);
         let movements = dir.path().join("cam").join("movements");
-        // A movement chunk that continues DOES get a sidecar, carrying the flag.
         let sidecar = movements.join(format!("{}.json", stem));
         assert!(sidecar.exists());
         let json = std::fs::read_to_string(&sidecar).unwrap();
@@ -1564,7 +1274,6 @@ mod tests {
         let stem = format!("{}_4000", first_pts);
         let movements = dir.path().join("cam").join("movements");
         let objects = dir.path().join("cam").join("objects");
-        // Files moved: .ts, sidecar, thumbnails all under objects/ now.
         assert!(objects.join(format!("{stem}.ts")).exists());
         assert!(objects.join(format!("{stem}.json")).exists());
         assert!(objects.join(format!("{stem}_thumb_0.jpg")).exists());
@@ -1572,7 +1281,6 @@ mod tests {
         assert!(!movements.join(format!("{stem}.ts")).exists());
         assert!(!movements.join(format!("{stem}_thumb_0.jpg")).exists());
 
-        // Sidecar carries the detections (deduped to best per class).
         let json = std::fs::read_to_string(objects.join(format!("{stem}.json"))).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["backend"], serde_json::json!("ollama"));
@@ -1584,7 +1292,6 @@ mod tests {
         assert!((parsed["detections"][0]["confidence"].as_f64().unwrap() - 0.9).abs() < 0.01);
         assert!(parsed.get("continues").is_none());
 
-        // Index entry updated in place: retention class is now Object.
         let entry = index
             .find_event("cam", EventRef::new(first_pts, 4000, EventType::Object))
             .unwrap();
@@ -1592,16 +1299,12 @@ mod tests {
         assert_eq!(entry.object_classes, vec!["person".to_string()]);
         assert_eq!(entry.backend.as_deref(), Some("ollama"));
         assert_eq!(entry.detections.len(), 2);
-        // resolve_file_path follows the new event type.
         assert_eq!(
             index.resolve_file_path("cam", &entry),
             objects.join(format!("{stem}.ts"))
         );
     }
 
-    /// One camera's events, newest information first, reached by duration alone
-    /// — which is how a test names a member of a run of equal starts whose
-    /// *type* is the thing under test and so cannot be part of the lookup.
     fn sibling(index: &WarmEventIndex, duration_ms: u32) -> Option<WarmEventEntry> {
         index
             .query("cam", EventPage::unbounded(0, u64::MAX))
@@ -1609,19 +1312,10 @@ mod tests {
             .find(|e| e.duration_ms == duration_ms)
     }
 
-    /// Two events sharing a start PTS are two events. The upgrade rewrites the
-    /// one it named — not whichever of the pair a binary search on the start
-    /// returns — and the sweep afterwards deletes the one *it* names. The
-    /// remote backend has had this test; the local index reached in by start
-    /// alone, so an upgrade could flip a sibling to `Object` while the event
-    /// actually upgraded stayed a movement pointing at a path the rename had
-    /// moved away from.
     #[tokio::test]
     async fn siblings_sharing_a_start_pts_are_upgraded_and_pruned_by_full_key() {
         let dir = tempfile::tempdir().unwrap();
         let buffer = populated_buffer(10);
-        // Same first segment, so the same start PTS; different lengths, so two
-        // distinct files and two distinct keys.
         let (short, long) = {
             let buf = buffer.read_recover();
             (
@@ -1642,10 +1336,6 @@ mod tests {
             2
         );
 
-        // Upgrade one named sibling. Which of the two it is does not matter now
-        // that every path into the index carries a whole key; the start-only
-        // lookup this replaced returned an unspecified member of the run, so
-        // whichever one was named, the other could be the one rewritten.
         let (target_ms, spared_ms) = (short_ms, long_ms);
         upgrade_event(dir.path(), "cam", &upgrade_for(&short), &index).await;
 
@@ -1678,7 +1368,6 @@ mod tests {
             .join(format!("{first_pts}_{target_ms}.ts"))
             .exists());
 
-        // The movement sibling expires; the object one does not.
         index.prune(1, u64::MAX, u64::MAX, || false).await;
         assert!(sibling(&index, spared_ms).is_none());
         assert!(sibling(&index, target_ms).is_some());
@@ -1688,21 +1377,6 @@ mod tests {
         assert!(objects.join(format!("{first_pts}_{target_ms}.ts")).exists());
     }
 
-    /// The read path, on the same pair: each sibling is served as itself.
-    ///
-    /// Two stored events share this start — one movement, one continuous chunk
-    /// of the same length, which is what a camera recording continuously while
-    /// something moves in front of it produces — so the URLs asking for them
-    /// differ only in the type. The lookup this replaced binary-searched the
-    /// start and could only ever answer with one of the two, whichever std
-    /// landed on: a request for the movement served the continuous chunk's
-    /// video, duration and poster frame, or the other way round. Nothing about
-    /// it looked like an error.
-    ///
-    /// It also pins the paths those bytes come from apart. The poster frame is
-    /// rendered lazily and single-flighted on its output path
-    /// ([`LocalDiskBackend::thumbnails`]), so two events resolving to one
-    /// thumbnail path would share a render and serve one picture for both.
     #[tokio::test]
     async fn same_start_siblings_are_each_served_by_their_own_key() {
         let dir = tempfile::tempdir().unwrap();
@@ -1736,8 +1410,6 @@ mod tests {
                 .find_event("cam", key)
                 .unwrap_or_else(|| panic!("{key} is not indexed"));
             assert_eq!(EventRef::of(&entry), key, "{key} served another event");
-            // And the objects behind it are that event's own: the same stem
-            // under its own tier directory.
             let ts = dir
                 .path()
                 .join("cam")
@@ -1748,12 +1420,8 @@ mod tests {
             assert!(ts.exists());
             posters.push(resolved.with_extension("jpg"));
         }
-        // The single-flight key for a lazily rendered poster frame is its output
-        // path, so the pair must not share one.
         assert_ne!(posters[0], posters[1]);
 
-        // A key nothing is stored under is absent rather than nearly-matching:
-        // the same start and type with another duration, and the third type.
         assert!(backend
             .find_event(
                 "cam",
@@ -1768,16 +1436,10 @@ mod tests {
             .is_none());
     }
 
-    /// Local sidecars carry no `event_type`: the directory an event lives in is
-    /// what says what it is, and a second answer in the JSON could only drift
-    /// from it. Both local writers pass `None` — the fresh write and the
-    /// upgrade — and every other assertion here parses the sidecar for the
-    /// fields it wants, so a `Some` slipping into either would go unseen.
     #[tokio::test]
     async fn local_sidecars_name_no_event_type() {
         let dir = tempfile::tempdir().unwrap();
         let buffer = populated_buffer(10);
-        // A continuing movement, so the fresh write produces a sidecar at all.
         let event = {
             let buf = buffer.read_recover();
             assemble_event(&buf, None, "cam", 5, 7, 5, 0, true, None).unwrap()
@@ -1824,8 +1486,6 @@ mod tests {
         upgrade.continues = true;
         upgrade_event(dir.path(), "cam", &upgrade, &index).await;
 
-        // A fresh scan of the directory sees an object event with the
-        // continues flag preserved; no stale movement sidecar remains.
         let scanned = WarmEventIndex::new(&["cam".to_string()], dir.path().to_path_buf());
         scanned.scan();
         let entry = scanned
@@ -1841,11 +1501,6 @@ mod tests {
         assert!(leftovers.is_empty(), "movement residue: {leftovers:?}");
     }
 
-    /// The interleaving the index-level key test cannot reach: a sweep
-    /// snapshots the movement, this upgrade renames the file into objects/,
-    /// and only then does the sweep look — finds `movements/{stem}.ts` gone,
-    /// and unindexes the entry. The footage is fine, so the upgrade puts it
-    /// back rather than leaving it invisible until the next restart.
     #[tokio::test]
     async fn upgrade_reindexes_an_event_a_racing_prune_unindexed() {
         let dir = tempfile::tempdir().unwrap();
@@ -1857,9 +1512,6 @@ mod tests {
         event.filmstrip_frames = Some(std::sync::Arc::new(vec![vec![0xff], vec![0xfe]]));
         let first_pts = event.first_pts;
 
-        // Files on disk, deliberately absent from the index under test:
-        // written through a throwaway index, leaving exactly the state a
-        // racing sweep leaves behind when it unindexes as vanished.
         let index = WarmEventIndex::new(&["cam".to_string()], dir.path().to_path_buf());
         let writer_index = WarmEventIndex::new(&["cam".to_string()], dir.path().to_path_buf());
         write_event(dir.path(), "cam", &event, &writer_index).await;
@@ -1875,7 +1527,6 @@ mod tests {
         assert_eq!(entry.event_type, EventType::Object);
         assert_eq!(entry.object_classes, vec!["person".to_string()]);
         assert_eq!(entry.detections.len(), 2);
-        // Read back off disk, as the startup scan would have.
         assert_eq!(entry.file_size, 16);
         assert_eq!(entry.filmstrip_frames, 2);
         assert_eq!(
@@ -1887,8 +1538,6 @@ mod tests {
         );
     }
 
-    /// The trait seam itself: the flag the retention task holds has to reach
-    /// the sweep, not just exist.
     #[tokio::test]
     async fn local_disk_prune_honors_the_cancel_flag() {
         let (backend, entry, dir) = backend_with_event().await;
@@ -1906,13 +1555,6 @@ mod tests {
         drop(dir);
     }
 
-    /// A `min_free_bytes` of `u64::MAX` makes every filesystem look full, which
-    /// is exactly what an unmounted `data_dir` does to the guard: it reads a
-    /// device that has nothing to do with the archive. Deleting real footage on
-    /// the strength of that reading is the one move here with no way back, so
-    /// while the anchor says the volume moved, nothing is deleted — and the
-    /// same call with the volume in place still deletes, so the veto is what
-    /// stopped it and not the setup.
     #[tokio::test]
     async fn a_storage_volume_that_moved_stops_the_emergency_prune() {
         let (backend, entry, dir) = backend_with_event().await;
@@ -1952,7 +1594,6 @@ mod tests {
             model: "m".to_string(),
             continues: false,
         };
-        // Never written (or already pruned): nothing happens, nothing panics.
         upgrade_event(dir.path(), "cam", &upgrade, &index).await;
         assert!(!dir.path().join("cam").join("objects").exists());
         assert!(index
@@ -1966,7 +1607,6 @@ mod tests {
         let buffer = populated_buffer(20);
         let index = WarmEventIndex::new(&["cam".to_string()], dir.path().to_path_buf());
 
-        // First chunk after startup: continues == false.
         let first = {
             let buf = buffer.read_recover();
             assemble_continuous_chunk(&buf, "cam", 0, 4, false).unwrap()
@@ -1974,7 +1614,6 @@ mod tests {
         let first_pts = first.first_pts;
         write_event(dir.path(), "cam", &first, &index).await;
 
-        // Follow-on chunk: continues == true.
         let second = {
             let buf = buffer.read_recover();
             assemble_continuous_chunk(&buf, "cam", 5, 9, true).unwrap()
@@ -1983,10 +1622,8 @@ mod tests {
         write_event(dir.path(), "cam", &second, &index).await;
 
         let continuous = dir.path().join("cam").join("continuous");
-        // Both chunks routed to continuous/.
         assert!(continuous.join(format!("{}_5000.ts", first_pts)).exists());
         assert!(continuous.join(format!("{}_5000.ts", second_pts)).exists());
-        // First chunk: no sidecar (nothing to persist). Follow-on: continues sidecar.
         assert!(!continuous.join(format!("{}_5000.json", first_pts)).exists());
         assert!(continuous
             .join(format!("{}_5000.json", second_pts))
@@ -2016,7 +1653,6 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let buffer = populated_buffer(20);
 
-        // Write a first + follow-on continuous chunk with the real writer.
         let writer_index = WarmEventIndex::new(&["cam".to_string()], dir.path().to_path_buf());
         for (start, last, continues) in [(0u64, 4u64, false), (5, 9, true)] {
             let event = {
@@ -2026,7 +1662,6 @@ mod tests {
             write_event(dir.path(), "cam", &event, &writer_index).await;
         }
 
-        // A fresh index scanning the same dir must recover type + continues.
         let scanned = WarmEventIndex::new(&["cam".to_string()], dir.path().to_path_buf());
         scanned.scan();
         let events = scanned.query("cam", EventPage::unbounded(0, u64::MAX));
@@ -2038,7 +1673,6 @@ mod tests {
 
     #[tokio::test]
     async fn local_disk_backend_writes_reads_and_upgrades_through_the_trait() {
-        // Trait-level smoke test: exercise the public seam end-to-end.
         let dir = tempfile::tempdir().unwrap();
         let buffer = populated_buffer(10);
         let mut event = {
@@ -2057,7 +1691,6 @@ mod tests {
             WriteOutcome::Written
         );
 
-        // Indexed and queryable through the trait.
         let entry = backend
             .find_event("cam", EventRef::new(first_pts, 4000, EventType::Movement))
             .unwrap();
@@ -2069,15 +1702,12 @@ mod tests {
             1
         );
 
-        // Video comes back as a stream, not a path or a Vec.
         let video = drain(backend.read_video("cam", &entry, None).await.unwrap()).await;
         assert_eq!(video.len(), 16);
 
-        // Filmstrip frames are readable through the backend.
         assert!(backend.read_filmstrip("cam", &entry, 0).await.is_ok());
         assert!(backend.read_filmstrip("cam", &entry, 1).await.is_ok());
 
-        // Upgrade intent reclassifies the event to Object.
         backend.upgrade_event("cam", &upgrade_for(&event)).await;
         let upgraded = backend
             .find_event("cam", EventRef::new(first_pts, 4000, EventType::Object))
@@ -2086,12 +1716,9 @@ mod tests {
         assert_eq!(upgraded.object_classes, vec!["person".to_string()]);
     }
 
-    // ---- range resolution --------------------------------------------------
-
     #[test]
     fn resolve_range_covers_every_form() {
         let total = 100;
-        // bytes=10-19  → the middle window.
         assert_eq!(
             resolve_range(
                 RangeRequest::FromTo {
@@ -2102,7 +1729,6 @@ mod tests {
             ),
             Some((10, 19))
         );
-        // bytes=50-    → from an offset to EOF.
         assert_eq!(
             resolve_range(
                 RangeRequest::FromTo {
@@ -2113,7 +1739,6 @@ mod tests {
             ),
             Some((50, 99))
         );
-        // bytes=0-     → the whole object, as a partial.
         assert_eq!(
             resolve_range(
                 RangeRequest::FromTo {
@@ -2124,12 +1749,10 @@ mod tests {
             ),
             Some((0, 99))
         );
-        // bytes=-20    → the suffix.
         assert_eq!(
             resolve_range(RangeRequest::Suffix(20), total),
             Some((80, 99))
         );
-        // Upper bound past EOF is clamped to the last byte.
         assert_eq!(
             resolve_range(
                 RangeRequest::FromTo {
@@ -2140,7 +1763,6 @@ mod tests {
             ),
             Some((90, 99))
         );
-        // A suffix longer than the object clamps to the whole object.
         assert_eq!(
             resolve_range(RangeRequest::Suffix(500), total),
             Some((0, 99))
@@ -2150,7 +1772,6 @@ mod tests {
     #[test]
     fn resolve_range_rejects_unsatisfiable() {
         let total = 100;
-        // start at or past EOF.
         assert_eq!(
             resolve_range(
                 RangeRequest::FromTo {
@@ -2171,9 +1792,7 @@ mod tests {
             ),
             None
         );
-        // bytes=-0 is an empty, unsatisfiable suffix.
         assert_eq!(resolve_range(RangeRequest::Suffix(0), total), None);
-        // Any range against a zero-length object is unsatisfiable.
         assert_eq!(
             resolve_range(
                 RangeRequest::FromTo {
@@ -2207,9 +1826,6 @@ mod tests {
         assert_eq!(RangeRequest::Suffix(20).header_value(), "bytes=-20");
     }
 
-    // ---- LocalDisk streamed range reads ------------------------------------
-
-    /// A backend holding one 16-byte movement event; returns (backend, entry).
     async fn backend_with_event() -> (LocalDiskBackend, WarmEventEntry, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let buffer = populated_buffer(10);
@@ -2240,10 +1856,8 @@ mod tests {
 
     #[tokio::test]
     async fn local_disk_range_reads_start_middle_suffix() {
-        // The 16-byte body is four 4-byte segments: [4;4][5;4][6;4][7;4].
         let (backend, entry, _dir) = backend_with_event().await;
 
-        // Start window: bytes 0-3 → the first segment (all 4s).
         let vs = backend
             .read_video(
                 "cam",
@@ -2262,7 +1876,6 @@ mod tests {
         assert_eq!(vs.total_size, 16);
         assert_eq!(drain(vs).await, vec![4u8; 4]);
 
-        // Middle window: bytes 4-11 spans the 5s and 6s segments.
         let vs = backend
             .read_video(
                 "cam",
@@ -2282,7 +1895,6 @@ mod tests {
         expected.extend_from_slice(&[6u8; 4]);
         assert_eq!(drain(vs).await, expected);
 
-        // Suffix: last 4 bytes → the final segment (all 7s).
         let vs = backend
             .read_video("cam", &entry, Some(RangeRequest::Suffix(4)))
             .await
@@ -2297,7 +1909,6 @@ mod tests {
     #[tokio::test]
     async fn local_disk_open_ended_range_clamps_to_eof() {
         let (backend, entry, _dir) = backend_with_event().await;
-        // bytes=12- → from offset 12 to EOF (clamped end = 15).
         let vs = backend
             .read_video(
                 "cam",
@@ -2315,7 +1926,6 @@ mod tests {
         ));
         assert_eq!(drain(vs).await, vec![7u8; 4]);
 
-        // An upper bound past EOF is clamped rather than rejected.
         let vs = backend
             .read_video(
                 "cam",
@@ -2337,7 +1947,6 @@ mod tests {
     #[tokio::test]
     async fn local_disk_unsatisfiable_range_is_reported() {
         let (backend, entry, _dir) = backend_with_event().await;
-        // start == total → unsatisfiable, empty body, size still reported.
         let vs = backend
             .read_video(
                 "cam",
@@ -2354,14 +1963,6 @@ mod tests {
         assert!(drain(vs).await.is_empty());
     }
 
-    // --- lazy thumbnail generation -----------------------------------------
-    //
-    // Against `read_or_generate_thumbnail` rather than `read_thumbnail`, so a
-    // render can be counted and made slow without an ffmpeg on the machine.
-
-    /// Counts renders and the renders running at once, and refuses to finish
-    /// until the gate opens — so a missing guard shows up as overlap, not as a
-    /// race the scheduler happens to serialize.
     #[derive(Default)]
     struct Renders {
         total: std::sync::atomic::AtomicUsize,
@@ -2376,9 +1977,6 @@ mod tests {
             let now = self.live.fetch_add(1, Ordering::SeqCst) + 1;
             self.peak.fetch_max(now, Ordering::SeqCst);
             gate.acquire().await.unwrap().forget();
-            // Publish the way production does — staged, then renamed — so a
-            // request whose unguarded cache read lands mid-render sees no file
-            // rather than an empty or half-written one.
             let staged = crate::durable::tmp_path(path);
             tokio::fs::write(&staged, b"jpeg").await.unwrap();
             tokio::fs::rename(&staged, path).await.unwrap();
@@ -2401,8 +1999,6 @@ mod tests {
         let flight = std::sync::Arc::new(SingleFlight::<PathBuf>::new());
         let renders = std::sync::Arc::new(Renders::default());
         let gate = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
-        // All eight requests leave the line together; the file cannot exist
-        // before the gate opens, so every one of them takes the miss path.
         let start = std::sync::Arc::new(tokio::sync::Barrier::new(9));
 
         let tasks: Vec<_> = (0..8)
@@ -2444,8 +2040,6 @@ mod tests {
     async fn different_thumbnails_render_concurrently() {
         let dir = tempfile::tempdir().unwrap();
         let flight = std::sync::Arc::new(SingleFlight::<PathBuf>::new());
-        // Both renders only clear the barrier if they run at the same time; a
-        // guard shared across thumbnails would deadlock into the timeout.
         let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
 
         let tasks: Vec<_> = (0..2)
@@ -2490,7 +2084,6 @@ mod tests {
         assert!(matches!(failed, Err(ThumbnailError::SpawnFailed)));
         assert_eq!(flight.live_keys(), 0, "failure left the key held");
 
-        // Nothing was remembered: the next request renders and is served.
         let served = read_or_generate_thumbnail(&flight, &path, || async {
             tokio::fs::write(&path, b"jpeg").await.unwrap();
             Ok(())
@@ -2500,9 +2093,6 @@ mod tests {
         assert_eq!(served, b"jpeg");
     }
 
-    /// A render that dies part-way through its output must not poison the
-    /// cache: the half-written bytes stay on the staging path, never the live
-    /// one, so no request ever reads them and the next request renders afresh.
     #[tokio::test]
     async fn partially_written_thumbnail_is_never_served() {
         let dir = tempfile::tempdir().unwrap();
@@ -2524,7 +2114,6 @@ mod tests {
             "a failed render left its staging file behind"
         );
 
-        // The truncated attempt was not remembered as a cache hit.
         let served = read_or_generate_thumbnail(&flight, &path, || async {
             publish_rendered(&path, |staged| async move {
                 tokio::fs::write(&staged, b"jpeg").await.unwrap();
@@ -2537,14 +2126,6 @@ mod tests {
         assert_eq!(served, b"jpeg");
     }
 
-    /// A wedged render is killed at the timeout instead of holding its
-    /// single-flight key forever, and whatever it had written is cleaned up.
-    ///
-    /// Paused time: the runtime jumps the clock when nothing is runnable, so
-    /// the 15-second ceiling elapses instantly. The partial write is done with
-    /// the blocking API to keep the pause deterministic — an async write could
-    /// still be in flight on the blocking pool when the clock jumps, and land
-    /// after the cleanup it is supposed to precede.
     #[tokio::test(start_paused = true)]
     async fn wedged_render_times_out_and_leaves_no_cache() {
         let dir = tempfile::tempdir().unwrap();
@@ -2590,8 +2171,6 @@ mod tests {
         let path = dir.path().join("poster.jpg");
         let flight = SingleFlight::<PathBuf>::new();
 
-        // Generation "succeeds" without leaving a file behind — unchanged
-        // behaviour: the read afterwards fails and that is what is reported.
         let err = read_or_generate_thumbnail(&flight, &path, || async { Ok(()) })
             .await
             .unwrap_err();

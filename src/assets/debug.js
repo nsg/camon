@@ -1,5 +1,3 @@
-// View 4: Detection Debug.
-
 const debugView = document.getElementById('debug-view');
 const debugBackBtn = document.getElementById('debug-back-btn');
 const debugCameraName = document.getElementById('debug-camera-name');
@@ -7,8 +5,6 @@ const debugList = document.getElementById('debug-list');
 const debugEmpty = document.getElementById('debug-empty');
 const debugLinkBtn = document.getElementById('debug-link-btn');
 let debugPoller = null;
-
-// === Detection Debug ===
 
 function wireDebugView() {
     debugBackBtn.addEventListener('click', () => {
@@ -35,8 +31,7 @@ function showDebugView(cameraId) {
     });
 }
 
-// Called by every other view as well: leaving the debug view is otherwise
-// the one way to walk away from a poller that keeps running.
+// Every view calls this so navigation cannot strand the poller.
 function cleanupDebugView() {
     if (debugPoller) {
         debugPoller.stop();
@@ -52,7 +47,6 @@ function renderDebugList(cameraId, entries) {
     }
     debugEmpty.hidden = true;
 
-    // Show newest first
     const reversed = [...entries].reverse();
     const encodedId = encodeURIComponent(cameraId);
 
@@ -96,7 +90,6 @@ function renderDebugList(cameraId, entries) {
         </div>`;
     }).join('');
 
-    // Draw overlays once full-frame images load
     debugList.querySelectorAll('.debug-full-frame-image').forEach(img => {
         const entryId = img.dataset.entryId;
         const entry = entries.find(e => String(e.id) === entryId);
@@ -117,7 +110,6 @@ function drawDebugOverlay(img, entry) {
     const ctx = canvas.getContext('2d');
     ctx.clearRect(0, 0, w, h);
 
-    // Motion rects — green
     ctx.strokeStyle = '#0f0';
     ctx.lineWidth = 2;
     ctx.setLineDash([6, 3]);
@@ -125,7 +117,6 @@ function drawDebugOverlay(img, entry) {
         ctx.strokeRect(rx * w, ry * h, rw * w, rh * h);
     }
 
-    // Crop rect — yellow
     ctx.setLineDash([]);
     if (entry.crop_rect) {
         const [cx, cy, cw, ch] = entry.crop_rect;
@@ -136,7 +127,6 @@ function drawDebugOverlay(img, entry) {
         ctx.fillRect(cx * w, cy * h, cw * w, ch * h);
     }
 
-    // Ollama rects — red with class label
     ctx.setLineDash([]);
     ctx.lineWidth = 2;
     ctx.font = `bold ${Math.max(12, Math.round(h * 0.025))}px monospace`;

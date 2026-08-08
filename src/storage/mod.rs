@@ -26,15 +26,8 @@ pub use store::{MapKind, MotionEntry, MotionStore};
 pub use warm_index::WarmEventIndex;
 pub use watchdog::{RecordingMode, RecordingWatchdog};
 
-/// An `Instant` `ago` in the past, for the stores whose demand windows are
-/// measured against the monotonic clock: a test reaches across a window with
-/// this instead of waiting one out.
-///
-/// It saturates at the present when the clock does not reach back that far (it
-/// starts at boot). Saturating this way round keeps a failed back-date reading
-/// as "just now" rather than "long ago", so a test that expects a window to
-/// have closed fails loudly instead of passing because the timestamp went
-/// missing.
+/// An `Instant` `ago` in the past, so a test can reach across a demand window instead of
+/// waiting one out.
 #[cfg(test)]
 pub(crate) fn back_date(ago: std::time::Duration) -> std::time::Instant {
     let now = std::time::Instant::now();

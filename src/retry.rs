@@ -1,10 +1,5 @@
-//! Shared retry mechanics: how long to wait before trying again, how loudly to
-//! say so, and how to keep every camera from retrying in lockstep.
-//!
-//! The three parts are separate because the things that retry combine them
-//! differently — a reconnect counts seconds, a decoder spawn counts `Duration`s
-//! — but the *policy* is one policy, and it lives here so two callers cannot
-//! drift into reporting the same failure at different rates.
+//! Shared retry policy: backoff schedule, failure-report throttling, and
+//! jitter, kept in one place so callers cannot drift apart.
 
 use std::time::Duration;
 
@@ -16,22 +11,19 @@ pub struct RetrySchedule {
 }
 
 impl RetrySchedule {
-    /// Saturating: a schedule is a pair of constants today, but a doubling that
-    /// wraps would turn the longest backoff into no backoff at all.
+    /// Saturating: a doubling that wrapped would turn the longest backoff into
+    /// no backoff at all.
     pub fn next(self, current: Duration) -> Duration {
         current.saturating_mul(2).min(self.max)
     }
 }
 
-/// Cap on how far apart two reports of one unbroken streak may fall. Doubling
-/// alone would report the 128th failure and then go quiet until the 256th; at
-/// roughly a failure a minute that is hours of silence about something still
-/// broken.
+/// Cap on how far apart two reports of one unbroken streak may fall: doubling
+/// alone would leave hours of silence about something still broken.
 pub const MAX_REPORT_GAP: u32 = 60;
 
-/// Consecutive occurrences of one kind of failure, and when to speak up about
-/// them. Doubling keeps a permanently broken thing visible without a line a
-/// minute forever; [`MAX_REPORT_GAP`] stops the gap growing past about an hour.
+/// Consecutive occurrences of one kind of failure, reported at doubling
+/// milestones capped by [`MAX_REPORT_GAP`].
 pub struct Streak {
     count: u32,
     next_report: u32,
@@ -51,9 +43,6 @@ impl Streak {
         Self::default()
     }
 
-    /// How many consecutive occurrences have been counted. Only the reporting
-    /// decision is behaviour; the raw count is here for tests that pin how far
-    /// a streak has run.
     #[cfg(test)]
     pub fn count(&self) -> u32 {
         self.count
@@ -75,10 +64,8 @@ impl Streak {
     }
 }
 
-/// Apply +/-20% jitter to a delay (in ms) using an externally supplied random
-/// value. Failures that hit every camera at once — an fd table that filled up,
-/// a fork that lost a race for memory — would otherwise put every camera's
-/// retry on the same tick and rebuild the same pile-up each round.
+/// Apply +/-20% jitter to a delay (in ms). A failure that hits every camera at
+/// once would otherwise put every retry on the same tick.
 pub fn apply_jitter(base_ms: u64, rand: u64) -> u64 {
     if base_ms == 0 {
         return 0;
@@ -91,16 +78,15 @@ pub fn apply_jitter(base_ms: u64, rand: u64) -> u64 {
     (base_ms as i64 + offset).max(0) as u64
 }
 
-/// A random-enough number without a dependency: the hasher `HashMap` seeds
-/// itself from is already process-random.
+/// A random-enough number without a dependency: `RandomState` is already
+/// process-random.
 pub fn jitter_source() -> u64 {
     use std::collections::hash_map::RandomState;
     use std::hash::{BuildHasher, Hasher};
     RandomState::new().build_hasher().finish()
 }
 
-/// [`apply_jitter`] over a `Duration`, for callers that never had a millisecond
-/// count to begin with.
+/// [`apply_jitter`] over a `Duration`.
 pub fn jittered(delay: Duration) -> Duration {
     Duration::from_millis(apply_jitter(delay.as_millis() as u64, jitter_source()))
 }

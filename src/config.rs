@@ -155,11 +155,8 @@ pub enum ConfigError {
     },
 }
 
-/// A single `--set <dotted.path>=<value>` startup override, applied to the
-/// parsed config tree before it is deserialized into [`Config`]. Overrides win
-/// over the file's values and can create missing intermediate tables. The
-/// value's TOML type comes from the setting it names rather than from how the
-/// text looks — see [`Override::reading_against`].
+/// A single `--set <dotted.path>=<value>` startup override, applied to the parsed config tree
+/// before it is deserialized into [`Config`].
 #[derive(Debug, Clone)]
 pub struct Override {
     path: Vec<String>,
@@ -167,10 +164,9 @@ pub struct Override {
 }
 
 impl Override {
-    /// Parse a `dotted.path=value` argument. Splits on the first `=`; the value
-    /// stays raw text until it is typed against the config schema. An argument
-    /// without `=`, with an empty key, or with an empty path segment is
-    /// rejected.
+    /// Parse a `dotted.path=value` argument. Splits on the first `=`; the value stays raw text
+    /// until it is typed against the config schema. An argument without `=`, with an empty key,
+    /// or with an empty path segment is rejected.
     pub fn parse(arg: &str) -> Result<Self, String> {
         let (path, raw) = arg
             .split_once('=')
@@ -200,20 +196,7 @@ impl Override {
         toml::Value::String(self.raw.clone())
     }
 
-    /// The TOML scalar this override should insert, or `None` when `base`
-    /// gives no answer.
-    ///
-    /// The type has to come from the target field. `--set http.port=8080` must
-    /// become an integer while `--set mqtt.password=8080` must stay a string,
-    /// and nothing about the text itself tells them apart — reading by shape
-    /// alone mistyped every all-digit secret. A hand-kept list of string keys
-    /// would instead mistype the next key someone adds, silently and only for
-    /// whoever overrides it.
-    ///
-    /// A reading is only ever taken from a [`Config`] that deserialized, so a
-    /// failure — here or anywhere else in `base` — is never mistaken for an
-    /// answer about this key. Callers pass a `base` that isolates the question
-    /// as far as it can be isolated; see [`Config::load_from_with_overrides`].
+    /// The TOML scalar this override should insert, or `None` when `base` gives no answer.
     fn reading_against(&self, base: &toml::Value) -> Option<toml::Value> {
         let guess = self.guess();
         // A string reading is the last resort anyway: nothing else applies, so
@@ -304,7 +287,7 @@ impl CameraConfig {
 }
 
 /// The password embedded in a URL's userinfo (`scheme://user:pass@host/...`),
-/// if any. Used to keep credentials out of logs.
+/// if any. Keeps credentials out of logs.
 pub fn url_password(url: &str) -> Option<&str> {
     url_password_range(url).map(|range| &url[range])
 }
@@ -357,17 +340,11 @@ pub struct HttpConfig {
     /// Address the listener binds to. Validated as an [`IpAddr`] at load time.
     #[serde(default = "default_http_bind")]
     pub bind: String,
-    /// Shared secret required on every `/api` request, reads included. `None`
-    /// (the default) does *not* mean "open": on a non-loopback bind camon
-    /// generates a token of its own and requires it for anything that changes
-    /// state. See [`crate::api::ApiAuth`] for the full table.
+    /// Shared secret required on every `/api` request, reads included.
     #[serde(default)]
     pub token: Option<String>,
-    /// Declares that something in front of camon is the authentication boundary
-    /// (Home Assistant ingress, an authenticating reverse proxy). Camon then
-    /// asks for nothing itself: no generated token, no startup warning. The
-    /// add-on forces this on, because ingress reaches camon over the container
-    /// network and could never present a token camon invented.
+    /// Declares that something in front of camon is the authentication boundary (Home Assistant
+    /// ingress, an authenticating reverse proxy).
     #[serde(default)]
     pub allow_open: bool,
 }
@@ -419,10 +396,7 @@ fn default_ollama_model() -> String {
     "gemma4:e4b".to_string()
 }
 
-/// Per-request timeout for Ollama calls. Warm-inference latency on modest
-/// GPUs runs up to ~50s per frame (measured 2026-07-23), so 90s gives real
-/// headroom; a timeout only costs the object upgrade of an event, never the
-/// footage.
+/// Per-request Ollama timeout; expiry costs an object upgrade, never footage.
 fn default_ollama_timeout_secs() -> u64 {
     90
 }
@@ -484,10 +458,9 @@ impl Default for ObjectDetectionConfig {
     }
 }
 
-// Deterministic motion-detection defaults. These seed a camera's
-// motion_settings.json the first time it is seen; thereafter the per-camera
-// file (edited live from the web UI) wins. Ranges must match the clamps in
-// `analytics::motion_settings`.
+// Deterministic motion-detection defaults. These seed a camera's motion_settings.json the first
+// time it is seen; thereafter the per-camera file (edited live from the web UI) wins. Ranges
+// must match the clamps in `analytics::motion_settings`.
 fn default_motion_var_threshold() -> f64 {
     16.0 // sensitivity; range 4..=96, higher = less sensitive
 }
@@ -574,11 +547,7 @@ fn default_continuous_retention_days() -> u64 {
     1
 }
 
-/// Upper bound on any `*_retention_days`. Retention is held in nanoseconds
-/// (`days * 86400 * 1e9`), which overflows `u64` around 213000 days and wraps
-/// into a *short* retention — the one failure mode that deletes footage instead
-/// of keeping it. 10 years is far past any real archive and leaves the product
-/// nowhere near the wrap.
+/// Upper bound on any `*_retention_days`.
 const MAX_RETENTION_DAYS: u64 = 3650;
 
 /// Upper bound on any `*_secs` duration in the config, and the same ten years
@@ -586,10 +555,7 @@ const MAX_RETENTION_DAYS: u64 = 3650;
 /// arithmetic it protects.
 const MAX_DURATION_SECS: u64 = MAX_RETENTION_DAYS * 86_400;
 
-/// 2 GiB. Roughly an hour of footage at a typical 4 Mbps camera bitrate —
-/// enough slack for the hourly retention prune to catch up before the disk
-/// actually fills — while also keeping the filesystem out of the near-full
-/// regime where allocation slows down and other services start failing.
+/// Reserve 2 GiB so hourly retention can catch up before the filesystem fills.
 fn default_min_free_bytes() -> u64 {
     2 * 1024 * 1024 * 1024
 }
@@ -598,10 +564,7 @@ fn default_stathost_enabled() -> bool {
     true
 }
 
-/// Remote "stathost" warm-storage backend (github.com/nsg/stathost). Presence
-/// of a `[storage.stathost]` section — with `enabled` left at its default of
-/// `true` — switches the warm backend from local disk to this static file host.
-/// Analytics, motion settings, and the hot buffer always stay local.
+/// Remote "stathost" warm-storage backend (github.com/nsg/stathost).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StathostConfig {
@@ -611,10 +574,7 @@ pub struct StathostConfig {
     pub bucket: String,
     /// Per-bucket bearer token, sent as `Authorization: Bearer <token>`.
     pub token: String,
-    /// Client-side storage budget in bytes. The client can't see the server's
-    /// disk, so retention-by-space becomes a budget: when tracked usage exceeds
-    /// it, the oldest events are pruned (continuous → movements → objects).
-    /// 0 (the default) means unlimited — rely on time-based retention only.
+    /// Client-side storage budget in bytes.
     #[serde(default)]
     pub max_stored_bytes: u64,
     /// Set to `false` to keep the section but fall back to local-disk storage.
@@ -637,12 +597,7 @@ pub struct WarmConfig {
     pub pre_padding_secs: u64,
     #[serde(default = "default_warm_post_padding_secs")]
     pub post_padding_secs: u64,
-    /// Cap on the wall-clock length of a single event. A run exceeding this is
-    /// split into chained, independently playable chunks. 0 disables chunking,
-    /// which continuous recording cannot do — there it is the only thing that
-    /// rolls a chunk. A recording has to fit in the hot buffer: fatal in
-    /// continuous mode, a warning in event mode, where
-    /// [`pre_padding_secs`](Self::pre_padding_secs) counts too.
+    /// Cap on the wall-clock length of a single event.
     #[serde(default = "default_max_event_duration_secs")]
     pub max_event_duration_secs: u64,
     #[serde(default = "default_movement_retention_days")]
@@ -653,10 +608,9 @@ pub struct WarmConfig {
     /// short by default: continuous at ~4 Mbps is roughly 43 GB/day/camera.
     #[serde(default = "default_continuous_retention_days")]
     pub continuous_retention_days: u64,
-    /// Low-space guard: before each event write, if the storage filesystem
-    /// has less than this many bytes free, the oldest events are
-    /// emergency-pruned (continuous → movements → objects) until space
-    /// recovers. 0 disables the guard.
+    /// Low-space guard: before each event write, if the storage filesystem has less than this
+    /// many bytes free, the oldest events are emergency-pruned (continuous → movements →
+    /// objects) until space recovers. 0 disables the guard.
     #[serde(default = "default_min_free_bytes")]
     pub min_free_bytes: u64,
 }
@@ -685,10 +639,9 @@ pub struct UpdateConfig {
     pub enabled: bool,
 }
 
-/// Opt-in: an update is only checked against the sha256sums.txt published
-/// beside it in the same GitHub release, which protects against a corrupt
-/// download but not against a tampered release, and the installed service runs
-/// as root.
+/// Opt-in: an update is only checked against the sha256sums.txt published beside it in the same
+/// GitHub release, which protects against a corrupt download but not against a tampered
+/// release, and the installed service runs as root.
 fn default_update_enabled() -> bool {
     false
 }
@@ -719,18 +672,14 @@ fn default_mqtt_discovery_prefix() -> String {
     "homeassistant".to_string()
 }
 
-/// Snapshot cadence while motion is active. Snapshots are motion-gated by
-/// design (see `crate::mqtt`), so this only ever costs decode work during a
-/// run — 5s is a compromise between a responsive HA camera tile and the
-/// per-frame ffmpeg decode.
+/// Snapshot cadence while motion is active. Snapshots are motion-gated by design (see
+/// `crate::mqtt`), so this only ever costs decode work during a run — 5s is a compromise
+/// between a responsive HA camera tile and the per-frame ffmpeg decode.
 fn default_mqtt_snapshot_interval_secs() -> u64 {
     5
 }
 
 /// How long an occupancy sensor stays ON after the last sighting of its class.
-/// The vision model only sees frames during motion runs, so without a hold-off
-/// a parked person would flap OFF between runs; a minute reads as "still here"
-/// for automations without pinning the sensor ON indefinitely.
 fn default_mqtt_occupancy_hold_secs() -> u64 {
     60
 }
@@ -797,15 +746,9 @@ pub struct Config {
     pub mqtt: MqttConfig,
     #[serde(default)]
     pub cameras: Vec<CameraConfig>,
-    /// The file this config was read from, kept so camon can put things beside
-    /// it — today only the API token it generates for an otherwise-open
-    /// deployment, which belongs where the operator already looks for camon's
-    /// settings. `None` for a config that did not come from a file (tests, and
-    /// `toml::from_str`), which costs that config a *persisted* token, never
-    /// the protection itself.
-    ///
-    /// Not a setting: `deny_unknown_fields` plus `serde(skip)` means a
-    /// `source_path` key in the TOML is refused like any other typo.
+    /// The file this config was read from, kept so camon can put things beside it — today
+    /// only the API token it generates for an otherwise-open deployment, which belongs where
+    /// the operator already looks for camon's settings.
     #[serde(skip)]
     source_path: Option<PathBuf>,
 }
@@ -815,10 +758,8 @@ pub struct Config {
 const API_TOKEN_FILE: &str = "api-token";
 
 impl Config {
-    /// The file a generated API token is read from and written to: beside the
-    /// config file, so `/etc/camon/config.toml` puts it at
-    /// `/etc/camon/api-token`. `None` when the config did not come from a file
-    /// and there is therefore nowhere obvious to keep it.
+    /// The file a generated API token is read from and written to: beside the config file, so
+    /// `/etc/camon/config.toml` puts it at `/etc/camon/api-token`.
     pub fn token_file_path(&self) -> Option<PathBuf> {
         let source = self.source_path.as_ref()?;
         // A bare `config.toml` has an empty parent, which joins to a plain
@@ -837,26 +778,8 @@ impl Config {
         Self::load_from_with_overrides(DEFAULT_CONFIG_PATH, overrides)
     }
 
-    /// Load from an explicit TOML path, applying each `--set` override into the
-    /// parsed value tree before deserializing. Overrides win over file values.
-    ///
-    /// An override's TOML type is read from the setting it names, in two
-    /// passes that keep the answer independent of everything else — of the
-    /// other overrides, of the order they were given in, and of any unrelated
-    /// defect in the file:
-    ///
-    /// 1. Against an empty tree, so the only thing the schema can complain
-    ///    about is the key under test. This answers for every setting whose
-    ///    enclosing tables are all `#[serde(default)]` — which is all of them
-    ///    but `[storage.stathost]`, whose `url`/`bucket`/`token` are required.
-    /// 2. For the leftovers, against the whole config once every override is
-    ///    in place and retired keys are gone, so the required siblings exist.
-    ///    That tree is built from pass-1 readings alone, so it does not depend
-    ///    on the order the overrides were given in either.
-    ///
-    /// A reading is only ever taken from a `Config` that deserialized, so a
-    /// failure elsewhere can never be mistaken for an answer: it leaves the
-    /// plain reading in place, and the load reports the real problem.
+    /// Load from an explicit TOML path, applying each `--set` override into the parsed value
+    /// tree before deserializing. Overrides win over file values.
     pub fn load_from_with_overrides<P: AsRef<Path>>(
         path: P,
         overrides: &[Override],
@@ -882,11 +805,8 @@ impl Config {
         }
 
         if !undecided.is_empty() {
-            // A key can only be judged against a tree the rest of which
-            // parses, so the leftovers get two views of the finished config:
-            // one holding them at their plain reading, one holding all of them
-            // as text — with several numeric-looking secrets in the same
-            // table, the first view never parses.
+            // Unknown keys need both plain and string-valued parses because secrets may look
+            // numeric while siblings require their native types.
             let plain = value.clone();
             let mut as_text = value.clone();
             for &index in &undecided {
@@ -914,14 +834,7 @@ impl Config {
         Ok(config)
     }
 
-    /// Canonicalize values that several consumers have to agree on. Object
-    /// classes are matched case-insensitively by the Ollama client but compared
-    /// verbatim by the MQTT bridge, so `classes = ["Person"]` would otherwise
-    /// yield an occupancy sensor that can never turn on. Deduplicating is part
-    /// of the same fix: once folded, `["Person", "person"]` would produce two
-    /// discovery payloads sharing one unique id. Surrounding whitespace goes
-    /// for the same reason — `" person"` reaches the topic verbatim but comes
-    /// back from the model trimmed.
+    /// Canonicalize values that several consumers have to agree on.
     fn normalize(&mut self) {
         let classes = &mut self.analytics.object_detection.classes;
         for class in classes.iter_mut() {
@@ -990,22 +903,16 @@ impl Config {
             }
 
             let cap = self.storage.max_event_duration_secs;
-            // Continuous recording (storage on, analytics off) has no motion
-            // run to close a chunk, so the cap is the only thing that rolls
-            // one. In event mode 0 is a real setting: don't chunk, and let
-            // motion end close the event.
-            //
-            // Continuous mode is settled here, before any event-mode rule is
-            // considered, so a config that is wrong in both readings is always
-            // reported as the mode it will actually run in.
+            // Continuous recording (storage on, analytics off) has no motion run to close a
+            // chunk, so the cap is the only thing that rolls one. In event mode 0 is a real
+            // setting: don't chunk, and let motion end close the event.
             if !self.analytics.enabled {
                 if cap == 0 {
                     return Err(ConfigError::ZeroMaxEventDurationInContinuousMode);
                 }
-                // Continuous chunks are cut straight from the buffer with no
-                // padding at all, so the cap is the whole span. Fatal because
-                // `plan_continuous_roll` can then never fire: nothing at all
-                // is written, rather than something imperfect.
+                // Continuous chunks are cut straight from the buffer with no padding at all, so
+                // the cap is the whole span. Fatal because `plan_continuous_roll` can then
+                // never fire: nothing at all is written, rather than something imperfect.
                 if cap >= self.buffer.hot_duration_secs {
                     return Err(ConfigError::ContinuousChunkExceedsHotBuffer {
                         cap,
@@ -1013,22 +920,12 @@ impl Config {
                     });
                 }
             } else {
-                // Event mode. Two different losses can be read off the config
-                // here, they are caused by different things, and a config can
-                // hold both — so each is reported on its own terms rather than
-                // one standing in for the other.
+                // Quiet-window and event-span losses are independent, so report both.
                 let post = self.storage.post_padding_secs;
                 let hot = self.buffer.hot_duration_secs;
                 let evicted_head = crate::buffer::warm::EVICTED_HEAD_WARNING;
 
-                // What closes a run is a quiet stretch outlasting
-                // post_padding_secs, measured on the clock — the tracker never
-                // consults the buffer. So the run does close, but if the
-                // padding is as wide as the buffer, everything the run was made
-                // of has been evicted by then. Below this threshold the same
-                // loss is possible and depends on the scene
-                // (motion + post_padding must fit), so only this much can be
-                // said from the file alone.
+                // Run closure is clock-based and independent of buffer residency.
                 if post >= hot {
                     if cap == 0 {
                         // Nothing else can close a run, so this is every event
@@ -1045,28 +942,8 @@ impl Config {
                              10 unless you set it"
                         );
                     } else if cap < hot {
-                        // A chunk closes at whichever comes first, and both are
-                        // measured from the chunk's own start: the cap at `cap`,
-                        // the quiet window at `e + post` where `e` is the last
-                        // motion inside the chunk (`RunTracker::observe` tests
-                        // the window with `>` and the cap with `>=`, so an exact
-                        // tie goes to the cap). With `cap < hot`
-                        // the cap is always the earlier of the two, so every
-                        // chunk holding motion is assembled less than a buffer's
-                        // worth of time after it opened, with its footage
-                        // resident. Nothing is lost *here* — said that way and
-                        // not as "no footage is lost", because the span rule
-                        // below may be reporting a loss of its own in the very
-                        // next line, by a mechanism this one says nothing about.
-                        //
-                        // The cost is the tail. Motion stopping does not end the
-                        // run — the quiet window still has to elapse — but the
-                        // chunk it stopped in closes at the next cap boundary,
-                        // and no chunk opens on padding, so the quiet after
-                        // that boundary is recorded nowhere. How much trailing
-                        // context a run keeps is where motion stopped relative
-                        // to the boundary: anywhere from nothing to a full cap,
-                        // never the {post}s the setting names.
+                        // A cap below the hot window preserves each chunk, but padding after the
+                        // last cap boundary belongs to no chunk.
                         tracing::warn!(
                             post_padding_secs = post,
                             hot_duration_secs = hot,
@@ -1080,25 +957,8 @@ impl Config {
                              unless you set it"
                         );
                     } else {
-                        // `cap >= hot` is legal in event mode (only continuous
-                        // recording refuses it), and here it costs footage. A
-                        // chunk that holds motion closes at
-                        // `min(cap, e + post)`, and with both `cap` and `post`
-                        // at least `hot` that is at least `hot` however the race
-                        // goes — so by the time the chunk is assembled its
-                        // oldest segments have been evicted. Every chunk opens
-                        // *on* motion (the first on the motion that started the
-                        // run, a follow-on on the motion that carried it past
-                        // the cap or returned inside the quiet window), so what
-                        // is evicted is always motion, and there is no
-                        // cheap-to-lose chunk anywhere in the chain.
-                        //
-                        // The span rule below always fires too (`cap + pre` is
-                        // at least `cap`, so at least `hot`), and the two do not
-                        // contradict: this is the quiet window beating the cap,
-                        // that is the cap's own span not fitting the buffer.
-                        // Both are true, both name their own mechanism, and they
-                        // are fixed by different numbers.
+                        // `cap >= hot` is legal in event mode (only continuous recording
+                        // refuses it), and here it costs footage.
                         tracing::warn!(
                             post_padding_secs = post,
                             hot_duration_secs = hot,
@@ -1116,20 +976,8 @@ impl Config {
                     }
                 }
 
-                // A different mechanism with a different cost: here the chunk
-                // closes on time, but the span it asks the buffer for — the cap
-                // plus the pre-padding reach-back — is wider than the buffer
-                // holds, so a long event loses its opening seconds. It can hold
-                // at the same time as the relation above, and then both are
-                // true and both are said.
-                //
-                // A warning, not an error: unlike continuous mode this still
-                // records. Refusing to boot over it would be the worse trade,
-                // since the cap is 120 by default (so it may never have been
-                // written), trimming hot_duration_secs is exactly what a
-                // RAM-pressured box would do, and config load precedes the
-                // updater, so an auto-updating install would stay down until
-                // someone read the log.
+                // A cap plus pre-padding wider than the hot buffer loses the event head,
+                // independently of the quiet-window relation above.
                 if cap != 0 {
                     if let Some(total) = event_span_overrun(cap, self.storage.pre_padding_secs, hot)
                     {
@@ -1154,11 +1002,9 @@ impl Config {
 
         self.validate_analytics()?;
 
-        // An empty allowlist reads as either "detect the defaults" or "detect
-        // nothing" depending on who is asked, and both readings are already
-        // spelled out unambiguously elsewhere: omit the key, or set
-        // enabled = false. Rejecting it keeps the detector and the MQTT bridge
-        // from ever disagreeing about what is being looked for.
+        // An empty allowlist reads as either "detect the defaults" or "detect nothing"
+        // depending on who is asked, and both readings are already spelled out unambiguously
+        // elsewhere: omit the key, or set enabled = false.
         if self.analytics.enabled && self.analytics.object_detection.enabled {
             let classes = &self.analytics.object_detection.classes;
             if classes.is_empty() {
@@ -1221,43 +1067,8 @@ impl Config {
         Ok(())
     }
 
-    /// Analytics numbers that a value can switch *off* rather than tune, held
-    /// to the line this file draws between refusing to start and correcting a
-    /// value: **fatal only where the loss would be silent.** Where the run
-    /// already complains about the consequence, or the value has a reading
-    /// somebody could have meant, [`repair`](Self::repair) fixes it and warns.
-    ///
-    /// Silence is what makes the difference worth a refusal, because config
-    /// load runs before the self-updater: an install that auto-updates into a
-    /// stricter camon and then refuses to start cannot update out of it again,
-    /// which is why retired keys are dropped rather than rejected. That price
-    /// is only worth paying against a failure nobody would otherwise see.
-    ///
-    /// - `sample_fps = 0` becomes an `fps=0` filter on the crop decoder, and
-    ///   nothing else: motion analysis is keyframe-driven through a different
-    ///   decoder, so recording carries on. What stops is every frame the
-    ///   vision model and the event thumbnails are made from — ffmpeg spawns,
-    ///   emits nothing, and exits, with its output silenced (`-loglevel
-    ///   quiet`) and its status unread. Nothing anywhere says so, and no
-    ///   operator means "zero frames per second".
-    /// - a motion default that is not a number used to reach the detector
-    ///   through a clamp that cannot bound it, where `area >= NaN` is false for
-    ///   every blob there will ever be: motion detection off, events stopping
-    ///   altogether, and only the recording watchdog's eventual "recorded
-    ///   nothing" line — which names no cause — to show for it.
-    ///   [`MotionSettings::sanitize`](crate::analytics::motion_settings::MotionSettings::sanitize)
-    ///   now substitutes the default before the detector is built, so this
-    ///   refusal is the first of two nets rather than the only one: it is what
-    ///   makes the mistake *visible*, since the second net is silent by nature
-    ///   and would leave a camera running settings nobody chose.
-    /// - a confidence floor that is not a number turns the filter off rather
-    ///   than up: `confidence < NaN` is false, so every detection of an
-    ///   allowed class is kept whatever the model thought of it.
-    ///
-    /// Only what the run will actually read: with analytics off no analyzer is
-    /// spawned and no motion settings store is built, and with object detection
-    /// off no client is created — same reasoning as the storage checks above,
-    /// which a disabled `[storage]` skips.
+    /// Reject values that silently disable enabled analytics; repair values with an
+    /// unambiguous correction.
     fn validate_analytics(&self) -> Result<(), ConfigError> {
         if !self.analytics.enabled {
             return Ok(());
@@ -1267,19 +1078,7 @@ impl Config {
             return Err(ConfigError::ZeroSampleFps);
         }
 
-        // These two seed every camera's motion_settings.json, and a value that
-        // is not a number is the one thing `repair`'s clamp cannot correct:
-        // there is no nearest valid slider to a NaN. It is refused rather than
-        // substituted because nobody writes `nan` meaning anything, and a
-        // detector quietly running on a default the operator did not choose is
-        // worth less than being told to fix the line.
-        //
-        // The first of two nets, not the only one: `MotionSettings::sanitize`
-        // substitutes the module default for a non-finite slider before the
-        // detector is built, so this refusal is what makes the loss *visible*
-        // rather than what makes it survivable. Both are deliberate — the check
-        // here covers the config file, sanitize covers the per-camera files and
-        // the API, and neither can see the other's input.
+        // NaN has no nearest valid slider value for `repair` to choose.
         for (key, value) in [
             ("var_threshold", self.analytics.motion.var_threshold),
             ("min_contour_area", self.analytics.motion.min_contour_area),
@@ -1292,11 +1091,7 @@ impl Config {
         if !self.analytics.object_detection.enabled {
             return Ok(());
         }
-        // Only the reading that cannot be corrected: a finite threshold out of
-        // range is clamped by `repair`, the way an out-of-range motion slider
-        // is, but there is no nearest sensible value for a number that is not
-        // one, and getting it wrong here means keeping detections rather than
-        // dropping them.
+        // Finite thresholds can be clamped; NaN would silently admit every detection.
         let confidence = self.analytics.object_detection.confidence_threshold;
         if !confidence.is_finite() {
             return Err(ConfigError::ConfidenceThresholdNotANumber { value: confidence });
@@ -1306,30 +1101,13 @@ impl Config {
     }
 
     /// Values camon corrects instead of refusing, warning as it does.
-    ///
-    /// The other half of [`validate_analytics`](Self::validate_analytics)'s
-    /// line. Each of these is either already complained about where it bites —
-    /// so the config is not the operator's only clue — or has a reading
-    /// somebody plausibly meant, and both are worth less than a box that will
-    /// not boot and cannot self-update.
-    ///
-    /// Correcting is only defensible while it is *said*, so every branch here
-    /// warns with the field, what was written and what is being used. That is
-    /// also why the motion sliders are corrected here rather than left to
-    /// `MotionSettings::sanitize`, which bounds them per camera without a word:
-    /// an operator who wrote `var_threshold = 1000` was running a detector
-    /// pinned at its least sensitive setting and was never told, while the one
-    /// who wrote a confidence of 4.5 was. Sanitize stays as the second net,
-    /// under the API and the per-camera files this pass never sees.
     fn repair(&mut self) {
         if !self.analytics.enabled {
             return;
         }
 
-        // The same correction the settings store would make silently, made
-        // once, out loud, over the value the operator actually wrote. Finite
-        // only: a slider that is not a number is fatal in `validate_analytics`,
-        // because there is no nearest value to correct it to.
+        // The same correction the settings store would make silently, made once, out loud, over
+        // the value the operator actually wrote.
         for (key, value, min, max) in [
             (
                 "var_threshold",
@@ -1360,15 +1138,8 @@ impl Config {
             return;
         }
 
-        // Clamped rather than refused, matching the motion sliders above: one
-        // policy for "a real number, out of its range" across the whole file. A
-        // threshold above 1.0 drops every detection and a negative one is the
-        // same as 0.0 — the model's own confidences are validated into [0, 1]
-        // before they are compared, so neither can do anything a bound cannot.
-        // Finite only, which is the other half of that one policy: `inf` does
-        // have a clamp, but taking it would mean this file rejected `nan` and
-        // accepted `inf` for the same field while rejecting both for the motion
-        // sliders next door.
+        // Clamped rather than refused, matching the motion sliders above: one policy for "a
+        // real number, out of its range" across the whole file.
         let confidence = &mut self.analytics.object_detection.confidence_threshold;
         if confidence.is_finite() && !(0.0..=1.0).contains(confidence) {
             let clamped = confidence.clamp(0.0, 1.0);
@@ -1381,11 +1152,8 @@ impl Config {
             *confidence = clamped;
         }
 
-        // Substituted rather than refused: "0 means no timeout" is a widespread
-        // convention and someone may well have written it meaning that. Here it
-        // is the opposite — reqwest deadlines every request immediately — but
-        // the detection worker already warns on each failed job, so the
-        // consequence is visible either way.
+        // Substituted rather than refused: "0 means no timeout" is a widespread convention and
+        // someone may well have written it meaning that.
         let timeout = &mut self.analytics.object_detection.ollama.timeout_secs;
         if *timeout == 0 {
             *timeout = default_ollama_timeout_secs();
@@ -1397,49 +1165,12 @@ impl Config {
         }
     }
 
-    /// Seconds that are multiplied out to nanoseconds somewhere downstream, and
-    /// the one duration that must not be zero.
-    ///
-    /// The same discipline as [`MAX_RETENTION_DAYS`], for the same arithmetic:
-    /// `secs * 1_000_000_000` wraps `u64` around 584 years, and a wrapped
-    /// duration is not a large one but a tiny or a zero one — which is how an
-    /// absurd setting turns into no recording instead of obviously too much of
-    /// it. The bound is the ten years `MAX_RETENTION_DAYS` already allows,
-    /// expressed in seconds: far past any real padding, buffer or chunk, and 58
-    /// times short of the wrap.
-    ///
-    /// Each bound is gated where its arithmetic actually runs, and nowhere
-    /// wider — a value nothing will read must not stop the load, or turning a
-    /// feature off would be a way to strand an install that a stricter camon
-    /// updated into. The three multiplications, and their gates:
-    ///
-    /// - `hot_duration_secs`: `HotBuffer::new` multiplies it for every camera
-    ///   before any mode is consulted, and the live view reads that buffer with
-    ///   analytics and storage both off. **Ungated**, and the only one that
-    ///   also may not be 0.
-    /// - `pre_padding_secs`: multiplied bare (`* 1_000_000_000`) where the
-    ///   analyzer is spawned, inside the analytics gate; continuous recording
-    ///   never pads. **Gated on `[analytics] enabled`.**
-    /// - `max_event_duration_secs`: converted with `as_nanos() as u64` in the
-    ///   continuous recorder, which truncates rather than wraps above the same
-    ///   horizon. **Gated on `[storage] enabled`** — a superset of the
-    ///   continuous mode that does the conversion, kept together with the other
-    ///   rules about this field so they cannot disagree about when the cap
-    ///   matters.
-    ///
-    /// `post_padding_secs` is deliberately **not** bounded here. It was, and
-    /// the justification did not survive being checked: it only ever becomes a
-    /// `Duration::from_secs` and is compared with `saturating_duration_since`,
-    /// neither of which can overflow. What a huge one really costs — a run
-    /// whose footage is evicted before anything closes it — is a relation to
-    /// the buffer rather than a magnitude, and `validate` warns about that
-    /// relation from a far lower and more meaningful threshold.
+    /// Seconds that are multiplied out to nanoseconds somewhere downstream, and the one
+    /// duration that must not be zero.
     fn validate_durations(&self) -> Result<(), ConfigError> {
-        // A zero-length hot buffer evicts every segment in the same call that
-        // pushed it, so the analyzer is fed nothing, no event can be assembled
-        // from a buffer that holds none, and continuous recording has nothing
-        // to cut. Fatal for the same reason `sample_fps = 0` is: nothing says
-        // so, and nobody means "buffer nothing".
+        // A zero-length hot buffer evicts every segment in the same call that pushed it, so the
+        // analyzer is fed nothing, no event can be assembled from a buffer that holds none, and
+        // continuous recording has nothing to cut.
         if self.buffer.hot_duration_secs == 0 {
             return Err(ConfigError::ZeroHotDuration);
         }
@@ -1479,25 +1210,13 @@ impl Config {
     }
 }
 
-/// The span of an event that will not fit in the hot buffer, or `None` when it
-/// fits. Only `pre` widens an event — it reaches back before the first motion
-/// segment at assembly time — while post-padding cannot: a chunk ends at the
-/// cap whatever the segment that crosses it is, since padding there closes the
-/// chunk and leaves the run pending rather than extending it. So the padding a
-/// chunk carries is padding *inside* the cap. The comparison is strict because
-/// both the recorder's tick and segment rounding overshoot slightly; with
-/// integer seconds that leaves at least a second of slack.
+/// The span of an event that will not fit in the hot buffer, or `None` when it fits.
 fn event_span_overrun(cap: u64, pre: u64, hot: u64) -> Option<u64> {
     let total = cap.saturating_add(pre);
     (total >= hot).then_some(total)
 }
 
-/// Keys camon itself shipped and later removed, with the advice to print when
-/// one turns up. They are dropped with a warning rather than rejected by the
-/// strict unknown-field check: a config that booted before must keep booting.
-/// An install that auto-updated into a stricter camon would otherwise be stuck
-/// — config load happens before the updater runs, so it could never start long
-/// enough to update out of the failure.
+/// Keys camon itself shipped and later removed, with the advice to print when one turns up.
 const RETIRED_KEYS: &[(&[&str], &str)] = &[
     (
         &["analytics", "object_detection", "backend"],
@@ -1533,12 +1252,8 @@ fn strip_retired_keys(root: &mut toml::Value) -> Vec<(String, &'static str)> {
     found
 }
 
-/// A camera id is used verbatim as a directory name under the storage
-/// `data_dir`, so it must be a single path component. This is footgun
-/// protection rather than a security boundary — ids reaching `data_dir.join()`
-/// come only from operator config, and API handlers resolve a request to a
-/// known camera before any path is built — so it denies the few shapes that
-/// misbehave and accepts everything else, punctuation and non-ASCII included.
+/// A camera id is used verbatim as a directory name under the storage `data_dir`, so it must be
+/// a single path component.
 fn validate_camera_id(id: &str) -> Result<(), ConfigError> {
     let trimmed = id.trim();
     if trimmed.is_empty() {
@@ -1641,12 +1356,10 @@ url = "rtsp://user:pass@10.0.0.6:554/stream1"
         assert!(matches!(err, ConfigError::NoCameras), "got {err:?}");
     }
 
-    /// Type and insert one override the way the first pass of
-    /// `load_from_with_overrides` does: judged against nothing but itself.
     fn apply_override(spec: &str, tree: &mut toml::Value) {
         let ov = Override::parse(spec).unwrap();
         let reading = ov.reading_against(&empty_tree()).unwrap_or_else(|| {
-            // Pass 2 answers these; the callers below never use one.
+            // Without a schema reading, infer the scalar from its text.
             ov.guess()
         });
         insert_at(tree, &ov.path, reading);
@@ -1682,8 +1395,6 @@ url = "rtsp://user:pass@10.0.0.6:554/stream1"
         assert_eq!(v["storage"]["data_dir"].as_str(), Some("/data/storage"));
     }
 
-    /// The add-on forwards Supervisor-generated MQTT credentials through
-    /// `--set`, and those are regularly all digits.
     #[test]
     fn override_of_a_string_key_stays_a_string_when_it_looks_numeric() {
         let mut v: toml::Value = toml::from_str("").unwrap();
@@ -1695,11 +1406,6 @@ url = "rtsp://user:pass@10.0.0.6:554/stream1"
         assert_eq!(v["http"]["token"].as_str(), Some("1e5"));
     }
 
-    /// The first pass judges an override against a tree holding nothing else,
-    /// which only works while every table in `Config` has a serde default. Add
-    /// a required field to one and its keys silently fall through to the
-    /// second pass instead — which is weaker, so this is worth knowing about.
-    /// `[storage.stathost]` is the one table that is already like that.
     #[test]
     fn every_setting_in_the_example_can_be_judged_on_its_own() {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("config.toml.example");
@@ -1709,8 +1415,6 @@ url = "rtsp://user:pass@10.0.0.6:554/stream1"
         assert!(settings.len() > 20, "only found {}", settings.len());
 
         for (path, value) in settings {
-            // The known exception, documented above; the example has no
-            // stathost section today, so this is here for the day it does.
             if path.starts_with("storage.stathost.") {
                 continue;
             }
@@ -1725,8 +1429,6 @@ url = "rtsp://user:pass@10.0.0.6:554/stream1"
         }
     }
 
-    /// Every scalar in `value` as a dotted path and its value, skipping
-    /// arrays: `[[cameras]]` and `classes` are not reachable with `--set`.
     fn collect_scalars(
         value: &toml::Value,
         prefix: &mut Vec<String>,
@@ -1746,9 +1448,6 @@ url = "rtsp://user:pass@10.0.0.6:554/stream1"
         }
     }
 
-    /// `[storage.stathost]`'s `url`/`bucket`/`token` are required, so none of
-    /// its keys can be judged alone — the second pass answers for them once
-    /// the rest of the table is in place, whether it comes from the file...
     #[test]
     fn override_of_a_string_key_in_a_table_with_required_fields_stays_a_string() {
         let toml = format!(
@@ -1760,9 +1459,6 @@ url = "rtsp://user:pass@10.0.0.6:554/stream1"
         assert_eq!(config.storage.stathost.unwrap().token, "12345");
     }
 
-    /// ...or from the overrides themselves. Keeping a bearer token out of the
-    /// config file is the reason to reach for `--set` here, so the table has
-    /// to be constructible this way.
     #[test]
     fn a_table_with_required_fields_can_be_built_from_overrides_alone() {
         let config = load_with_overrides(
@@ -1779,9 +1475,6 @@ url = "rtsp://user:pass@10.0.0.6:554/stream1"
         assert_eq!(stathost.bucket, "camon");
     }
 
-    /// Typing may not depend on the order the flags were written in — the
-    /// numeric-looking token is as likely to be written first as last — nor on
-    /// how many of the values in one table look numeric.
     #[test]
     fn override_typing_is_independent_of_argument_order() {
         let forwards = [
@@ -1800,9 +1493,6 @@ url = "rtsp://user:pass@10.0.0.6:554/stream1"
         }
     }
 
-    /// Retired keys are stripped before anything is typed against the whole
-    /// config, so a leftover from an older camon cannot decide a type. Both
-    /// halves matter: the config still boots, and the token is still a string.
     #[test]
     fn a_retired_key_does_not_affect_typing() {
         let toml = format!(
@@ -1822,8 +1512,6 @@ url = "rtsp://user:pass@10.0.0.6:554/stream1"
         assert_eq!(config.analytics.motion.var_threshold, 20.0);
     }
 
-    /// A path the schema rejects whatever its type keeps its plain reading, so
-    /// the load fails with the real complaint rather than an invented type.
     #[test]
     fn override_of_an_unknown_key_keeps_its_plain_reading() {
         let mut v: toml::Value = toml::from_str("").unwrap();
@@ -1857,15 +1545,10 @@ url = "rtsp://user:pass@10.0.0.6:554/stream1"
         ];
         let config =
             Config::load_from_with_overrides(dir.path().join("config.toml"), &overrides).unwrap();
-        // File said 9090 / default-false; the overrides win.
         assert_eq!(config.http.port, 22666);
         assert!(config.update.enabled);
     }
 
-    /// Both shipped deployments are reached from another machine, so the bind
-    /// stays on every interface and neither the token nor the opt-out is set by
-    /// default. What that combination *means* is [`crate::api::ApiAuth`]'s to
-    /// say — writes end up behind a token camon makes for itself.
     #[test]
     fn http_defaults_to_all_interfaces_with_nothing_configured() {
         let dir = write_temp("config.toml", TOML_SAMPLE);
@@ -1876,11 +1559,6 @@ url = "rtsp://user:pass@10.0.0.6:554/stream1"
         assert!(!config.http.allow_open);
     }
 
-    /// A generated token goes beside the config file, wherever that turned out
-    /// to be — `/etc/camon/config.toml` puts it in `/etc/camon`, the same
-    /// directory the operator already goes to when camon needs something. A
-    /// config that came from no file at all has nowhere to put it and says so
-    /// rather than guessing at the working directory.
     #[test]
     fn a_generated_token_is_kept_beside_the_config_file() {
         let dir = write_temp("config.toml", TOML_SAMPLE);
@@ -1888,8 +1566,6 @@ url = "rtsp://user:pass@10.0.0.6:554/stream1"
         let config = Config::load_from_with_overrides(&path, &[]).unwrap();
         assert_eq!(config.token_file_path(), Some(dir.path().join("api-token")));
 
-        // A bare relative config path keeps the token relative too, resolved
-        // against the same working directory the config path was.
         let mut relative = config.clone();
         relative.source_path = Some(PathBuf::from(DEFAULT_CONFIG_PATH));
         assert_eq!(relative.token_file_path(), Some(PathBuf::from("api-token")));
@@ -1898,8 +1574,6 @@ url = "rtsp://user:pass@10.0.0.6:554/stream1"
         assert_eq!(from_text.token_file_path(), None);
     }
 
-    /// The updater installs an unsigned binary into a service that runs as
-    /// root, so it stays off until the operator asks for it.
     #[test]
     fn self_update_is_off_unless_asked_for() {
         let dir = write_temp("config.toml", TOML_SAMPLE);
@@ -1975,8 +1649,6 @@ url = "rtsp://user:pass@10.0.0.6:554/stream1"
         assert_eq!(config.mqtt.host, "10.0.0.2");
         assert_eq!(config.mqtt.username.as_deref(), Some("ha"));
         assert_eq!(config.mqtt.password.as_deref(), Some("secret"));
-        // Unset keys keep their defaults; `--set` reaches the new section
-        // through the generic override path.
         assert_eq!(config.mqtt.port, 1883);
         assert_eq!(config.mqtt.occupancy_hold_secs, 120);
     }
@@ -2055,8 +1727,6 @@ url = "rtsp://10.0.0.5:554/stream1"
 
     #[test]
     fn disabled_mqtt_leaves_camera_ids_unconstrained() {
-        // Wildcards and colliding slugs are legal ids and legal directory
-        // names; only the bridge cares.
         load_with_mqtt(WILDCARD_CAMERAS, false).unwrap();
         load_with_mqtt(COLLIDING_CAMERAS, false).unwrap();
     }
@@ -2132,8 +1802,6 @@ url = "rtsp://10.0.0.5:554/stream1"
         assert!(err.to_string().contains("yard"), "got {err}");
     }
 
-    /// Non-ASCII and punctuation are explicitly in scope: the repo owner uses
-    /// Swedish camera names, and every one of these is a fine directory name.
     #[test]
     fn ordinary_camera_ids_are_accepted() {
         for id in [
@@ -2153,8 +1821,6 @@ url = "rtsp://10.0.0.5:554/stream1"
         }
     }
 
-    /// Continuous mode (storage on, analytics off) rolls a chunk only when the
-    /// cap is reached, so 0 would write nothing until shutdown.
     #[test]
     fn zero_max_event_duration_is_rejected_only_in_continuous_mode() {
         let cameras = one_camera("yard");
@@ -2167,7 +1833,6 @@ url = "rtsp://10.0.0.5:554/stream1"
             "got {err:?}"
         );
 
-        // Event mode: 0 means "don't chunk", and motion end still closes runs.
         let event_mode = format!(
             "[analytics]\nenabled = true\n[storage]\nmax_event_duration_secs = 0\n{cameras}"
         );
@@ -2175,8 +1840,6 @@ url = "rtsp://10.0.0.5:554/stream1"
         assert_eq!(config.storage.max_event_duration_secs, 0);
     }
 
-    /// Event mode still records when the span overruns — it only loses the
-    /// head of long events — so this warns and boots rather than refusing.
     #[test]
     fn event_longer_than_the_hot_buffer_still_loads() {
         let dir = write_temp("config.toml", TOML_SAMPLE);
@@ -2190,21 +1853,14 @@ url = "rtsp://10.0.0.5:554/stream1"
         }
     }
 
-    /// Only pre_padding widens an event. post_padding cannot: `observe` tests
-    /// the post-padding close before the cap, so the chunk still ends at the
-    /// cap.
     #[test]
     fn the_event_span_counts_pre_padding_only() {
-        // 594 + 5 = 599 < 600 fits; 595 + 5 = 600 does not.
         assert_eq!(event_span_overrun(594, 5, 600), None);
         assert_eq!(event_span_overrun(595, 5, 600), Some(600));
-        // post_padding is not an input at all, so it cannot move the boundary.
         assert_eq!(event_span_overrun(590, 0, 600), None);
         assert_eq!(event_span_overrun(u64::MAX, 5, 600), Some(u64::MAX));
     }
 
-    /// Continuous chunks are cut straight from the buffer with no padding, so
-    /// the cap alone is the span.
     #[test]
     fn the_continuous_bound_is_the_cap_alone() {
         let cameras = one_camera("yard");
@@ -2216,8 +1872,6 @@ url = "rtsp://10.0.0.5:554/stream1"
             );
             load_cameras(&toml)
         };
-        // 590 works in the current release and must keep working; 599 is the
-        // last accepted value.
         load(590).unwrap();
         load(599).unwrap();
         let err = load(600).unwrap_err();
@@ -2232,8 +1886,6 @@ url = "rtsp://10.0.0.5:554/stream1"
         assert!(!message.contains("padding"), "got {message}");
     }
 
-    /// 0 is not "keep forever": every stored event is instantly past a
-    /// zero-day retention, so the next hourly sweep would delete the archive.
     #[test]
     fn zero_retention_days_is_rejected_for_every_class() {
         let cameras = one_camera("yard");
@@ -2247,14 +1899,11 @@ url = "rtsp://10.0.0.5:554/stream1"
                 matches!(err, ConfigError::ZeroRetentionDays { key: k } if k == key),
                 "got {err:?}"
             );
-            // Nothing sweeps with storage off, so nothing to refuse to boot for.
             let off = format!("[storage]\nenabled = false\n{key} = 0\n{cameras}");
             load_cameras(&off).unwrap_or_else(|e| panic!("{key} = 0 with storage off: {e}"));
         }
     }
 
-    /// Retention is held in nanoseconds, where a big enough value wraps into a
-    /// very short one — the only way this setting can delete footage.
     #[test]
     fn retention_days_past_the_bound_is_rejected() {
         let cameras = one_camera("yard");
@@ -2277,8 +1926,6 @@ url = "rtsp://10.0.0.5:554/stream1"
         }
     }
 
-    /// With storage off no writer and no continuous recorder are spawned, so
-    /// the cap is never read and must not be able to block startup.
     #[test]
     fn disabled_storage_skips_the_duration_checks() {
         let cameras = one_camera("yard");
@@ -2314,9 +1961,6 @@ url = "rtsp://10.0.0.5:554/stream1"
         assert!(matches!(err, ConfigError::Parse(_)), "got {err:?}");
     }
 
-    /// Every key documented in `config.toml.example` must still parse — with
-    /// `deny_unknown_fields` a stale example is a startup failure, not a
-    /// no-op.
     #[test]
     fn example_config_parses() {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("config.toml.example");
@@ -2325,15 +1969,8 @@ url = "rtsp://10.0.0.5:554/stream1"
         assert_eq!(config.buffer.hot_duration_secs, 600);
     }
 
-    /// The `--set` arguments `run.sh` really passes, read from the script
-    /// itself so this cannot drift from it, with the Supervisor's shell
-    /// variables filled in. Comment lines are skipped: the header explains
-    /// `--set` in prose.
     fn addon_run_sh_overrides() -> Vec<String> {
         const RUN_SH: &str = include_str!("../camon-addon/run.sh");
-        // Values the Supervisor generates. The password is all digits on
-        // purpose — those are generated too, and one read as an integer stops
-        // the add-on from starting.
         const SUPERVISOR: [(&str, &str); 4] = [
             ("${MQTT_HOST}", "core-mosquitto"),
             ("${MQTT_PORT}", "1883"),
@@ -2345,8 +1982,6 @@ url = "rtsp://10.0.0.5:554/stream1"
         for line in RUN_SH.lines().filter(|l| !l.trim_start().starts_with('#')) {
             let mut tokens = line.split_whitespace();
             while let Some(token) = tokens.next() {
-                // Ends with rather than equals: the MQTT block builds an array,
-                // so the first flag on those lines reads `MQTT_ARGS+=(--set`.
                 if !token.ends_with("--set") {
                     continue;
                 }
@@ -2365,10 +2000,6 @@ url = "rtsp://10.0.0.5:554/stream1"
         out
     }
 
-    /// The add-on forces these on every start, so a key renamed in camon is a
-    /// container that will not boot. The file underneath sets every one of
-    /// them to something else, so an override that stopped being applied is a
-    /// failure here rather than a value that happens to match a default.
     #[test]
     fn addon_overrides_still_apply() {
         let specs = addon_run_sh_overrides();
@@ -2395,9 +2026,6 @@ url = "rtsp://10.0.0.5:554/stream1"
         assert_eq!(config.mqtt.password.as_deref(), Some("48151623"));
     }
 
-    /// Retired keys have to stay bootable: rejecting them would strand an
-    /// install that auto-updated into strict parsing, since config load runs
-    /// before the updater.
     #[test]
     fn retired_keys_are_dropped_with_advice_instead_of_rejected() {
         let toml = format!(
@@ -2421,13 +2049,9 @@ url = "rtsp://10.0.0.5:554/stream1"
         for (_, advice) in &found {
             assert!(advice.contains("ollama"), "got {advice}");
         }
-        // Removed from the tree, so the strict unknown-field check never sees
-        // them, and a second pass finds nothing.
         assert!(strip_retired_keys(&mut value).is_empty());
     }
 
-    /// A retired key must stay distinguishable from a typo — the latter is
-    /// still a hard error.
     #[test]
     fn a_typo_next_to_a_retired_key_is_still_rejected() {
         let toml = format!(
@@ -2456,8 +2080,6 @@ url = "rtsp://10.0.0.5:554/stream1"
         );
     }
 
-    /// Two spellings of one class would otherwise become two discovery
-    /// payloads sharing a unique id.
     #[test]
     fn object_classes_are_deduplicated_after_folding() {
         let toml = format!(
@@ -2471,9 +2093,6 @@ url = "rtsp://10.0.0.5:554/stream1"
         );
     }
 
-    /// The detector and the MQTT bridge would otherwise read an empty list
-    /// differently: built-in defaults for one, no entities at all for the
-    /// other.
     #[test]
     fn empty_object_classes_is_rejected_while_detection_is_on() {
         let toml = format!(
@@ -2489,9 +2108,6 @@ url = "rtsp://10.0.0.5:554/stream1"
         assert!(err.to_string().contains("person, car, truck, dog, cat"));
     }
 
-    /// With nothing asking for classes there is nothing to disagree about —
-    /// and both halves of the gate turn the detector off, so both are allowed
-    /// to leave the list empty.
     #[test]
     fn empty_object_classes_is_accepted_while_nothing_detects() {
         for analytics in [
@@ -2505,8 +2121,6 @@ url = "rtsp://10.0.0.5:554/stream1"
         }
     }
 
-    /// A blank entry is an empty list one step down: the model can never
-    /// return it, and it would still get entities of its own.
     #[test]
     fn blank_object_classes_are_rejected_while_detection_is_on() {
         for classes in [r#"[""]"#, r#"["  "]"#, r#"["person", "\t"]"#] {
@@ -2523,8 +2137,6 @@ url = "rtsp://10.0.0.5:554/stream1"
         }
     }
 
-    /// Padding is folded away rather than rejected, like the case folding it
-    /// travels with: the topic and the prompt have to spell a class the same.
     #[test]
     fn padded_object_classes_are_trimmed() {
         let toml = format!(
@@ -2538,8 +2150,6 @@ url = "rtsp://10.0.0.5:554/stream1"
         );
     }
 
-    /// Omitting the key is the documented way to ask for the built-in list,
-    /// and it must stay distinct from writing an empty one.
     #[test]
     fn omitted_object_classes_are_the_defaults() {
         let toml = format!(
@@ -2551,8 +2161,6 @@ url = "rtsp://10.0.0.5:554/stream1"
         assert_eq!(config.analytics.object_detection.classes, default_classes());
     }
 
-    /// `fps=0` is a filter ffmpeg accepts and emits nothing through, so the
-    /// analyzer runs for ever on a stream it never sees a frame of.
     #[test]
     fn zero_sample_fps_is_rejected() {
         let cameras = one_camera("yard");
@@ -2561,8 +2169,6 @@ url = "rtsp://10.0.0.5:554/stream1"
         assert!(matches!(err, ConfigError::ZeroSampleFps), "got {err:?}");
         assert!(err.to_string().contains("sample_fps"), "got {err}");
 
-        // 1 is the smallest rate that decodes anything, and nothing analyzes
-        // at all with analytics off.
         load_cameras(&format!(
             "[analytics]\nenabled = true\nsample_fps = 1\n{cameras}"
         ))
@@ -2573,10 +2179,6 @@ url = "rtsp://10.0.0.5:554/stream1"
         .unwrap();
     }
 
-    /// The original defect, through the parser that admits it: TOML has a `nan`
-    /// literal, `f64::clamp` returns NaN for NaN, and the detector's
-    /// `area >= min_contour_area` is then false for every blob it will ever
-    /// see. Motion detection off, nothing in the log, a healthy-looking camera.
     #[test]
     fn motion_defaults_that_are_not_numbers_are_rejected() {
         let cameras = one_camera("yard");
@@ -2597,8 +2199,6 @@ url = "rtsp://10.0.0.5:554/stream1"
             assert!(err.to_string().contains(key), "got {err}");
         }
 
-        // A real number out of range is corrected instead — the difference
-        // between the two policies, on one field.
         let toml = format!(
             "[analytics]\nenabled = true\n[analytics.motion]\nvar_threshold = 1000\n{cameras}"
         );
@@ -2608,9 +2208,6 @@ url = "rtsp://10.0.0.5:554/stream1"
         );
     }
 
-    /// A threshold that is not a number turns the filter off — `x < NaN` is
-    /// false, so every detection of an allowed class is kept — and no clamp can
-    /// guess what was meant, so this one is fatal.
     #[test]
     fn a_confidence_threshold_that_is_not_a_number_is_rejected() {
         let cameras = one_camera("yard");
@@ -2627,13 +2224,10 @@ url = "rtsp://10.0.0.5:554/stream1"
                 "got {err}"
             );
         }
-        // Both ends are meaningful settings: keep everything, or keep only a
-        // certain detection.
         for literal in ["0.0", "0.5", "1.0"] {
             let toml = format!("{detection}\nconfidence_threshold = {literal}\n{cameras}");
             load_cameras(&toml).unwrap_or_else(|e| panic!("{literal} rejected: {e}"));
         }
-        // Nothing reads it while detection is off.
         let toml = format!(
             "[analytics]\nenabled = true\n[analytics.object_detection]\nenabled = false\n\
              confidence_threshold = nan\n{cameras}"
@@ -2641,9 +2235,6 @@ url = "rtsp://10.0.0.5:554/stream1"
         load_cameras(&toml).unwrap();
     }
 
-    /// A real number out of range is corrected, not refused — the same policy
-    /// the motion sliders have, and the model's own confidences are validated
-    /// into [0, 1] anyway, so a bound can express everything either end means.
     #[test]
     fn a_confidence_threshold_outside_zero_to_one_is_clamped_into_it() {
         let cameras = one_camera("yard");
@@ -2658,10 +2249,6 @@ url = "rtsp://10.0.0.5:554/stream1"
         }
     }
 
-    /// 0 here is not "wait forever" but a deadline every request misses. It is
-    /// corrected rather than refused: the convention it borrows is common
-    /// enough to have been meant, and the detection worker warns on every job
-    /// it costs, so the config file is not the only place this shows up.
     #[test]
     fn a_zero_ollama_timeout_becomes_the_default() {
         let cameras = one_camera("yard");
@@ -2675,7 +2262,6 @@ url = "rtsp://10.0.0.5:554/stream1"
             default_ollama_timeout_secs()
         );
 
-        // A budget that was asked for is left alone.
         let toml = format!(
             "{detection}\n[analytics.object_detection.ollama]\ntimeout_secs = 1\n{cameras}"
         );
@@ -2690,8 +2276,6 @@ url = "rtsp://10.0.0.5:554/stream1"
         );
     }
 
-    /// Somewhere for a subscriber to write, so a test can read what an operator
-    /// would have seen. The same shape `supervise` uses.
     #[derive(Clone, Default)]
     struct CapturedLog(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
 
@@ -2714,8 +2298,6 @@ url = "rtsp://10.0.0.5:554/stream1"
         }
     }
 
-    /// Everything a load of `toml` says at warn level — what an operator on a
-    /// production box (`camon=warn`) would actually see of it.
     fn warnings_from(toml: &str) -> String {
         let logs = CapturedLog::default();
         {
@@ -2732,10 +2314,6 @@ url = "rtsp://10.0.0.5:554/stream1"
         String::from_utf8(written).unwrap()
     }
 
-    /// Correcting a value instead of refusing it is only defensible while the
-    /// operator is told: this line is the entire difference between a repair
-    /// and a silent override, and production logs warnings and above. It has to
-    /// name the field — the config file is large — and say what camon used.
     #[test]
     fn every_repaired_value_is_reported_at_warn() {
         let written = warnings_from(&format!(
@@ -2762,10 +2340,6 @@ url = "rtsp://10.0.0.5:554/stream1"
         assert_eq!(written.matches("WARN").count(), 4, "got: {written}");
     }
 
-    /// The correction the operator is told about is the one the detector gets:
-    /// the config value is clamped here, and `sanitize` — which would otherwise
-    /// have made the same correction per camera without a word — has nothing
-    /// left to do to it.
     #[test]
     fn out_of_range_motion_sliders_are_clamped_on_the_config_path() {
         let toml = format!(
@@ -2787,7 +2361,6 @@ url = "rtsp://10.0.0.5:554/stream1"
         assert_eq!(seeded.var_threshold, motion.var_threshold);
         assert_eq!(seeded.min_contour_area, motion.min_contour_area);
 
-        // In range is left alone, and says nothing.
         let toml = format!(
             "[analytics]\nenabled = true\n[analytics.motion]\nvar_threshold = 24\n{}",
             one_camera("yard")
@@ -2799,9 +2372,6 @@ url = "rtsp://10.0.0.5:554/stream1"
         );
     }
 
-    /// Nothing that only the detector reads may stop a camon that is not
-    /// detecting: with object detection off both of the above are left exactly
-    /// as written.
     #[test]
     fn repairs_are_confined_to_what_object_detection_reads() {
         let toml = format!(
@@ -2815,23 +2385,6 @@ url = "rtsp://10.0.0.5:554/stream1"
         assert_eq!(config.analytics.object_detection.ollama.timeout_secs, 0);
     }
 
-    /// A post-padding that is not shorter than the buffer means a run's own
-    /// footage can be gone by the time the quiet window closes it — but what
-    /// that costs turns on what else closes chunks, and the warning has to say
-    /// the true version of it. Three shapes, three different truths:
-    ///
-    /// - no cap: the quiet window is the only close there is, so it is every
-    ///   event, and the runtime warning follows every one of them.
-    /// - a cap under the buffer: the cap always wins the race, so every chunk
-    ///   holding motion is assembled while its footage is resident — nothing is
-    ///   lost *to this mechanism*, and the cost is a trailing quiet that no
-    ///   chunk records.
-    /// - a cap at or above the buffer (legal in event mode): a motion-bearing
-    ///   chunk closes at `min(cap, e + post)`, which is at least a buffer's
-    ///   worth of time however the race goes, so footage is lost again.
-    ///
-    /// None of the three refuses the boot: the events are written, and the
-    /// assembly warns about a lost head as it happens.
     #[test]
     fn a_post_padding_that_outlasts_the_buffer_warns_in_the_terms_that_are_true() {
         let cameras = one_camera("yard");
@@ -2843,8 +2396,6 @@ url = "rtsp://10.0.0.5:554/stream1"
         };
         let evicted_head = crate::buffer::warm::EVICTED_HEAD_WARNING;
 
-        // No cap: the quiet window is the only thing that closes a run, so the
-        // loss really is every event.
         let written = warnings_from(&event_mode(600, 0));
         assert!(written.contains("every event"), "{written}");
         assert!(
@@ -2852,12 +2403,6 @@ url = "rtsp://10.0.0.5:554/stream1"
             "does not point at the runtime warning: {written}"
         );
 
-        // A cap under the buffer wins the race every time, so nothing is
-        // evicted and no runtime warning fires — the cost is the trailing quiet
-        // past a run's last chunk, which nothing records, and how much context
-        // survives depends on where motion stopped. 599 is the last cap that is
-        // safe here, and the boundary is pinned rather than a comfortable
-        // value, because the whole point of the split is where it falls.
         for cap in [120, 599] {
             let written = warnings_from(&event_mode(600, cap));
             assert!(written.contains("recorded nowhere"), "cap {cap}: {written}");
@@ -2877,8 +2422,6 @@ url = "rtsp://10.0.0.5:554/stream1"
                 !written.contains(evicted_head),
                 "cap {cap} promises a runtime warning this shape never emits: {written}"
             );
-            // The one loss claim it makes is tied to its own mechanism, because
-            // the span rule can be reporting a real loss in the next line.
             assert!(
                 written.contains("nothing is lost to the quiet window"),
                 "cap {cap} makes an unqualified loss claim: {written}"
@@ -2889,11 +2432,6 @@ url = "rtsp://10.0.0.5:554/stream1"
             );
         }
 
-        // A cap at or above the buffer is legal here, and it loses footage: a
-        // motion-bearing chunk closes at min(cap, e + post), which is at least
-        // the buffer's own length whichever way the race goes. 600 is the first
-        // cap that costs anything — one second more than the last one that
-        // does not.
         for cap in [600, 1000] {
             let written = warnings_from(&event_mode(600, cap));
             assert!(
@@ -2916,11 +2454,6 @@ url = "rtsp://10.0.0.5:554/stream1"
                 !written.contains("recorded nowhere"),
                 "cap {cap} claims the safe shape's cost: {written}"
             );
-            // The escape hatch this line used to offer — a follow-on holding
-            // only padding, closing young and losing nothing — described a
-            // chunk that cannot exist any more, because none opens on padding.
-            // Every chunk here holds motion and every one of them loses its
-            // head, so any wording that offers a cheap chunk is false.
             for absolution in ["only padding", "lose nothing", "loses nothing"] {
                 assert!(
                     !written.contains(absolution),
@@ -2929,11 +2462,9 @@ url = "rtsp://10.0.0.5:554/stream1"
             }
         }
 
-        // The ordinary shape of the same pair says nothing at all.
         assert!(warnings_from(&event_mode(10, 0)).is_empty());
         assert!(warnings_from(&event_mode(599, 0)).is_empty());
 
-        // Continuous mode has no runs to close, so the relation cannot apply.
         let continuous = format!(
             "[buffer]\nhot_duration_secs = 600\n[analytics]\nenabled = false\n[storage]\n\
              post_padding_secs = 600\nmax_event_duration_secs = 120\n{cameras}"
@@ -2941,10 +2472,6 @@ url = "rtsp://10.0.0.5:554/stream1"
         assert!(warnings_from(&continuous).is_empty());
     }
 
-    /// Two relations, two mechanisms, two costs — a config can hold both, and
-    /// then both are said. They used to share an if/else, where the padding
-    /// relation silently swallowed the span warning even though the span is a
-    /// separate thing to fix.
     #[test]
     fn each_event_mode_warning_fires_for_its_own_mechanism() {
         let cameras = one_camera("yard");
@@ -2956,22 +2483,15 @@ url = "rtsp://10.0.0.5:554/stream1"
             )
         };
 
-        // The span alone: the cap plus its reach-back does not fit, while the
-        // padding is ordinary.
         let written = warnings_from(&event_mode(10, 595, 5));
         assert!(written.contains("max_event_duration_secs"), "{written}");
         assert!(!written.contains("recorded nowhere"), "{written}");
         assert_eq!(written.matches("WARN").count(), 1, "{written}");
 
-        // The padding alone: the span fits.
         let written = warnings_from(&event_mode(600, 120, 5));
         assert!(written.contains("recorded nowhere"), "{written}");
         assert_eq!(written.matches("WARN").count(), 1, "{written}");
 
-        // Both, with the cap under the buffer: neither hides the other, because
-        // they are fixed by different numbers. This is also why the padding
-        // line may not say "no footage is lost" — the span line two lines down
-        // is saying footage is lost, and both are true of their own mechanism.
         let written = warnings_from(&event_mode(600, 595, 5));
         assert!(
             written.contains("recorded nowhere"),
@@ -2991,10 +2511,6 @@ url = "rtsp://10.0.0.5:554/stream1"
         );
         assert_eq!(written.matches("WARN").count(), 2, "{written}");
 
-        // Both, with the cap at or above the buffer: the span rule always fires
-        // here (cap + pre >= cap >= hot), and now both lines report a loss —
-        // different losses, each naming its own cause, neither denying the
-        // other.
         let written = warnings_from(&event_mode(600, 1000, 5));
         assert!(written.contains("neither is the 1000s cap"), "{written}");
         assert!(
@@ -3002,16 +2518,10 @@ url = "rtsp://10.0.0.5:554/stream1"
             "the span warning was swallowed: {written}"
         );
         assert!(!written.contains("nothing is lost"), "{written}");
-        // Nor the old absolution for a padding-only follow-on, which is not a
-        // thing that can be written any more.
         assert!(!written.contains("only padding"), "{written}");
         assert_eq!(written.matches("WARN").count(), 2, "{written}");
     }
 
-    /// Continuous mode is settled before any event-mode rule, so a config that
-    /// is wrong in both readings is reported as the mode it will run in. The
-    /// variant is the assertion: with the checks the other way round this would
-    /// report a padding relation that a mode without runs cannot have.
     #[test]
     fn continuous_mode_reports_its_own_cap_rules_first() {
         let cameras = one_camera("yard");
@@ -3034,10 +2544,6 @@ url = "rtsp://10.0.0.5:554/stream1"
         );
     }
 
-    /// A hot buffer of 0 evicts each segment in the push that added it, so the
-    /// analyzer is fed nothing and no event can be cut. Continuous mode has
-    /// always caught this sideways, through the chunk that cannot fit; event
-    /// mode said nothing at all.
     #[test]
     fn a_zero_hot_buffer_is_rejected() {
         let cameras = one_camera("yard");
@@ -3057,34 +2563,22 @@ url = "rtsp://10.0.0.5:554/stream1"
         load_cameras(&toml).unwrap();
     }
 
-    /// Seconds that reach a nanosecond multiplication are bounded, each one
-    /// gated where that multiplication actually runs — a value this run will
-    /// never read must not stop it loading, or switching a feature off would
-    /// become a way to strand a box that a stricter camon updated into.
     #[test]
     fn durations_past_the_bound_are_rejected_where_they_are_read() {
         let cameras = one_camera("yard");
         let too_large = MAX_DURATION_SECS + 1;
-        // Per field: the whole config that makes its arithmetic run, and the
-        // one that leaves the field unread. `{}` is the value under test.
         let cases: [(&str, &str, Option<&str>); 3] = [
-            // HotBuffer::new multiplies this for every camera before any mode
-            // is consulted, so no configuration leaves it unread.
             (
                 "hot_duration_secs",
                 "[buffer]\nhot_duration_secs = {}\n[analytics]\nenabled = false\n\
                  [storage]\nenabled = false\n",
                 None,
             ),
-            // app.rs multiplies this bare where the analyzer is spawned;
-            // continuous recording never pads.
             (
                 "pre_padding_secs",
                 "[analytics]\nenabled = true\n[storage]\npre_padding_secs = {}\n",
                 Some("[analytics]\nenabled = false\n[storage]\npre_padding_secs = {}\n"),
             ),
-            // The continuous recorder converts it with `as_nanos() as u64`;
-            // gated on the storage that owns the field.
             (
                 "max_event_duration_secs",
                 "[analytics]\nenabled = true\n[storage]\nenabled = true\n\
@@ -3108,13 +2602,9 @@ url = "rtsp://10.0.0.5:554/stream1"
             );
             assert!(err.to_string().contains(key), "got {err}");
 
-            // The bound itself is accepted, and it is generous: a decade of
-            // padding is nothing an operator would ever ask for.
             load_cameras(&build(reads_it, MAX_DURATION_SECS))
                 .unwrap_or_else(|e| panic!("{key} at the bound rejected: {e}"));
 
-            // And a run that will never read it loads with it absurd, so the
-            // value is judged on the restart that starts using it.
             if let Some(ignores_it) = ignores_it {
                 load_cameras(&build(ignores_it, too_large))
                     .unwrap_or_else(|e| panic!("{key} rejected while nothing reads it: {e}"));
@@ -3122,16 +2612,9 @@ url = "rtsp://10.0.0.5:554/stream1"
         }
 
         assert_eq!(MAX_DURATION_SECS, MAX_RETENTION_DAYS * 86_400);
-        // Far enough below the nanosecond wrap that no arithmetic downstream
-        // can reach it.
         assert!(MAX_DURATION_SECS.checked_mul(1_000_000_000).is_some());
     }
 
-    /// post_padding_secs is deliberately unbounded: it only ever becomes a
-    /// `Duration::from_secs` compared with `saturating_duration_since`, and
-    /// neither can overflow, so a bound would be a rule with no mechanism
-    /// under it. The relation that does cost something is warned about
-    /// separately, from a much lower threshold.
     #[test]
     fn a_post_padding_of_any_size_still_loads() {
         let toml = format!(
@@ -3143,9 +2626,6 @@ url = "rtsp://10.0.0.5:554/stream1"
         assert_eq!(config.storage.post_padding_secs, i64::MAX as u64);
     }
 
-    /// The wrap this bound is for: the pre-padding is multiplied out with no
-    /// guard at all when an analyzer is spawned, which panics in a debug build
-    /// and wraps in a release one.
     #[test]
     fn the_bounded_durations_survive_the_arithmetic_downstream() {
         let cameras = one_camera("yard");
@@ -3156,8 +2636,6 @@ url = "rtsp://10.0.0.5:554/stream1"
              max_event_duration_secs = {MAX_DURATION_SECS}\n{cameras}"
         );
         let config = load_cameras(&toml).unwrap();
-        // The three multiplications that would wrap, spelled as their callers
-        // spell them (app.rs, buffer::hot, buffer::warm).
         assert!(config
             .storage
             .pre_padding_secs
@@ -3172,23 +2650,16 @@ url = "rtsp://10.0.0.5:554/stream1"
         assert!(u64::try_from(cap.as_nanos()).is_ok());
     }
 
-    /// A zero that says something. Each of these is documented as a setting in
-    /// its own right, so no pass added to `validate` may start reading it as
-    /// the nonsense the ones above are.
     #[test]
     fn documented_sentinel_values_still_load() {
         let cameras = one_camera("yard");
         for (setting, section) in [
-            // "Never chunk; let motion end close the event" — event mode only,
-            // which the continuous check next door still refuses.
             ("max_event_duration_secs = 0", "[storage]"),
-            // "No low-space guard."
             ("min_free_bytes = 0", "[storage]"),
         ] {
             let toml = format!("[analytics]\nenabled = true\n{section}\n{setting}\n{cameras}");
             load_cameras(&toml).unwrap_or_else(|e| panic!("{setting} rejected: {e}"));
         }
-        // "Unlimited remote budget; rely on time-based retention alone."
         let toml = format!(
             "[storage.stathost]\nurl = \"https://host\"\nbucket = \"camon\"\n\
              token = \"t\"\nmax_stored_bytes = 0\n{cameras}"
@@ -3218,7 +2689,6 @@ url = "rtsp://10.0.0.5:554/stream1"
             camera("rtsp://ubnt:s3cret@10.0.0.5:554/s0").redacted_url(),
             "rtsp://ubnt:****@10.0.0.5:554/s0"
         );
-        // Username identical to the password stays visible.
         assert_eq!(
             camera("rtsp://ubnt:ubnt@10.0.0.5:554/s0").redacted_url(),
             "rtsp://ubnt:****@10.0.0.5:554/s0"

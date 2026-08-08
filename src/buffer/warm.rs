@@ -68,12 +68,8 @@ impl FinishedEvent {
 pub enum WriterMessage {
     /// Persist a newly finished event.
     Event(FinishedEvent),
-    /// Upgrade an already-written movement event to an object event: rewrite
-    /// the sidecar with detections, move the files from `movements/` to
-    /// `objects/` (which switches the retention class from
-    /// `movement_retention_days` to `object_retention_days`), and update the
-    /// warm index entry. Sent by the detection worker when an Ollama verdict
-    /// lands after its covering event already reached disk.
+    /// Upgrade a written movement event's metadata, retention class, and index entry after a
+    /// late object verdict.
     Upgrade(EventUpgrade),
 }
 
@@ -92,12 +88,6 @@ pub struct EventUpgrade {
 
 impl EventUpgrade {
     /// The upgrade one verdict asks for on one written event.
-    ///
-    /// Both halves of the reconciliation build it here — the detection worker
-    /// for a verdict that arrived after the write was enqueued, the analyzer
-    /// for one that parked before it — so the two paths cannot drift into
-    /// writing different sidecars for the same situation. See
-    /// [`crate::storage::event_registry`].
     pub fn for_event(target: UpgradeTarget, verdict: Verdict) -> Self {
         Self {
             start_pts_ns: target.start_pts_ns,
@@ -111,40 +101,10 @@ impl EventUpgrade {
     }
 }
 
-/// The runtime warning for an event whose own motion was evicted before it
-/// could be assembled. Quoted by `Config::validate`, which can see the
-/// configurations that guarantee this from the config file alone and tells the
-/// operator what to look for — so the two must stay the same words.
+/// The runtime warning for an event whose own motion was evicted before it could be assembled.
 pub const EVICTED_HEAD_WARNING: &str = "the event's head was already evicted";
 
 /// Assemble a finished event from the hot buffer and detection store.
-///
-/// Called by the analyzer the moment a motion run closes, while every segment
-/// in `[first_motion_seq - pre-padding .. last_seq]` is still resident in RAM
-/// and the detection metadata for those sequences has not been cleaned up yet.
-/// Pre-padding walks backwards from the first motion segment, staying within
-/// `pre_padding_ns` and never reaching before `min_start_seq` (the end of the
-/// previous event) or the start of the buffer.
-///
-/// Two different losses can happen at that lower bound, and only one of them is
-/// ordinary. Pre-padding that does not fit is context, best-effort by
-/// definition, and stopping short of it is silent. The run's own motion is not:
-/// if the buffer has already turned over past `first_motion_seq` — a run longer
-/// than the buffer, or one closed by a post-padding window wider than it — the
-/// event is written without the footage it exists for, and that is warned about
-/// once, with the count. Sequences below `min_start_seq` are neither: the
-/// previous event or the previous chunk of this one holds them. That clause is
-/// defensive — every production caller passes a `min_start_seq` at or below
-/// `first_motion_seq` (the tracker's barrier is settled before the next run
-/// opens), so `first_motion_seq` alone decides; the `max` only matters if a
-/// future caller breaks that shape, and then silence is the right answer.
-///
-/// `filmstrip_frames` are the thumbnails the analyzer extracted for this run;
-/// they belong to the run, not to any single sequence, so they are handed in
-/// rather than looked up.
-///
-/// Returns `None` if none of the requested segments are in the buffer any
-/// more (only possible for runs longer than the hot buffer itself).
 #[allow(clippy::too_many_arguments)]
 pub fn assemble_event(
     buffer: &HotBuffer,
@@ -157,9 +117,7 @@ pub fn assemble_event(
     continues: bool,
     filmstrip_frames: Option<Arc<Vec<Vec<u8>>>>,
 ) -> Option<FinishedEvent> {
-    // Walk backwards from the first motion segment to find the pre-padding
-    // start, matching the old rolling-window semantics (total pre-padding
-    // duration stays <= pre_padding_ns).
+    // Pre-padding must not exceed its duration or cross the prior event barrier.
     let earliest = min_start_seq.max(buffer.first_sequence());
     let mut start_seq = first_motion_seq.max(earliest);
     let mut pre_duration_ns = 0u64;
@@ -189,11 +147,8 @@ pub fn assemble_event(
     let first_pts = segments.first().map(|s| s.start_pts)?;
     let total_bytes = segments.iter().map(|s| s.data.len()).sum();
 
-    // Reported here rather than in the loop above, which never sees these: the
-    // clamp lifted its start past them, so an evicted head is the one gap that
-    // leaves no trace of itself. After the `?`, so this describes an event that
-    // was actually written — a run with nothing left at all is the caller's
-    // "skipping event", not a truncated one.
+    // Reported here rather than in the loop above, which never sees these: the clamp lifted its
+    // start past them, so an evicted head is the one gap that leaves no trace of itself.
     let wanted_start = first_motion_seq.max(min_start_seq);
     if buffer.first_sequence() > wanted_start {
         let lost = buffer.first_sequence() - wanted_start;
@@ -246,11 +201,6 @@ pub fn assemble_event(
 }
 
 /// Assemble a continuous-recording chunk from the hot buffer.
-///
-/// Reuses [`assemble_event`] with no detection store and no pre-padding: a
-/// continuous chunk is simply the raw segment range `[start_seq..=last_seq]`,
-/// GOP-aligned so each `.ts` decodes on its own. `continues` chains successive
-/// chunks (false only for the first chunk after startup).
 pub fn assemble_continuous_chunk(
     buffer: &HotBuffer,
     camera_id: &str,
@@ -271,17 +221,7 @@ pub fn assemble_continuous_chunk(
 /// wakeup itself is cheap (a lock, a subtraction).
 const CONTINUOUS_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 
-/// Decide whether to roll a continuous chunk now, and over which inclusive
-/// sequence range.
-///
-/// Pure so the boundary logic is unit-testable. `next_seq` is the first
-/// not-yet-written sequence; `last_sequence_exclusive` is the hot buffer's
-/// `last_sequence()` (one past the newest resident segment);
-/// `pending_duration_ns` is the summed duration of `[next_seq, last_sequence)`.
-/// A chunk rolls once the pending footage reaches `cap_ns`, or immediately when
-/// `force` is set — the recorder's final flush, on the tick where it has
-/// established that no more footage is coming. A zero cap only rolls on
-/// `force`. Returns the inclusive `(start, last)` range, or `None`.
+/// Decide whether to roll a continuous chunk now, and over which inclusive sequence range.
 fn plan_continuous_roll(
     next_seq: u64,
     last_sequence_exclusive: u64,
@@ -297,25 +237,6 @@ fn plan_continuous_roll(
 }
 
 /// Per-camera continuous-recording driver (analytics-disabled "dumb NVR" mode).
-///
-/// With no analyzer to close motion runs, this task owns the roll loop: it
-/// tracks the first not-yet-written sequence and, on each tick, rolls a chunk
-/// once `max_event_duration` of footage has accumulated in the hot buffer.
-/// Chunks are assembled as `Arc` clones and handed to the same per-camera
-/// [`WarmWriter`] over the existing channel; `send().await` never drops a
-/// chunk. Successive chunks are flagged `continues` (all but the first after
-/// startup) so a UI can stitch the chain.
-///
-/// At shutdown it does not flush and leave. The stop flag says a stop has
-/// begun, not that the camera has finished — it is being joined at that moment
-/// and the GOP in its hand is still coming — so the recorder holds its final
-/// chunk open until the camera publishes its terminal watermark
-/// ([`HotBuffer::seal`]) and the chunk can take in everything up to it. See
-/// [`crate::shutdown`] for the phases and their bounds; the last of every
-/// recording used to be lost to exactly this.
-///
-/// Chunk-boundary timing is lifecycle, so tick-based monotonic timing is used;
-/// segment content and PTS are untouched.
 pub async fn run_continuous_recorder(
     camera_id: String,
     buffer: Arc<RwLock<HotBuffer>>,
@@ -344,15 +265,9 @@ pub async fn run_continuous_recorder(
             .then(|| buffer.read_recover().terminal_watermark())
             .flatten();
         let expired = gate.as_ref().is_some_and(|gate| gate.expired(now));
-        // The final flush happens on the tick that knows it is the last one:
-        // once the camera has stopped and said where it stopped, or once the
-        // drain bound has run out of patience with a camera that has not.
-        // Forcing a roll on every stopping tick instead would slice the tail
-        // into one-second chunks while phase 1 was still joining the camera.
-        //
-        // A provisional watermark does not qualify — its camera is still
-        // pushing, and rolling on it would start that slicing again for the one
-        // camera least able to afford it. That chunk waits for the bound.
+        // The final flush happens on the tick that knows it is the last one: once the camera
+        // has stopped and said where it stopped, or once the drain bound has run out of
+        // patience with a camera that has not.
         let force = stopping && (terminal.is_some_and(|terminal| !terminal.provisional) || expired);
 
         // Plan + assemble under the read lock; release it before awaiting send.
@@ -393,11 +308,8 @@ pub async fn run_continuous_recorder(
             match gate.step(terminal, next_seq, now) {
                 DrainStep::Drained => break,
                 DrainStep::Abandoned => {
-                    // Whose bound this was. A final watermark means the camera
-                    // stopped and said so, and what ran out was this recorder's
-                    // ability to get the chunk away — a writer queue it is
-                    // blocking on. Anything else is a camera that never
-                    // finished stopping.
+                    // A final watermark attributes the timeout to this blocked writer; otherwise
+                    // the camera never finished stopping.
                     let ran_out_of = match who_stalled(terminal) {
                         Stalled::Consumer => {
                             "the recorder could not write out the camera's last segments before \
@@ -426,24 +338,6 @@ pub async fn run_continuous_recorder(
 }
 
 /// Persists finished events to warm storage.
-///
-/// Receives complete events (and post-hoc upgrade requests from the
-/// detection worker) over a bounded channel and handles each one inline — no
-/// detached spawns — so a writer task that has returned is a queue that reached
-/// disk. The writer owns ALL file mutations under its camera's warm-storage
-/// directory.
-///
-/// Phase 3 of the stop is the drain awaiting these tasks (see
-/// [`crate::shutdown`]). It gets whatever the earlier phases left of the stop
-/// budget, which in a healthy stop is nearly all of it; a writer still working
-/// when that runs out is abandoned with a line saying so, because the
-/// alternative to abandoning it is a service manager's SIGKILL landing in the
-/// middle of the same write.
-///
-/// Retention is NOT its business: pruning sweeps the whole store, not one
-/// camera, so it belongs to the single [`RetentionTask`]. What stays here is
-/// the write-triggered part of space management — a write that finds the disk
-/// full has to be able to make room for itself.
 pub struct WarmWriter {
     receiver: mpsc::Receiver<WriterMessage>,
     camera_id: String,
@@ -490,10 +384,8 @@ impl WarmWriter {
         tracing::debug!(camera = %self.camera_id, "warm writer shutting down");
     }
 
-    /// Write one event with the full durability ladder: low-space guard,
-    /// atomic write, and — should the disk fill up despite the guard — one
-    /// emergency-prune-and-retry. A still-failing write drops the event with
-    /// an error log; the writer task itself never crashes or wedges.
+    /// Write one event with the full durability ladder: low-space guard, atomic write, and —
+    /// should the disk fill up despite the guard — one emergency-prune-and-retry.
     async fn handle_event(&self, event: FinishedEvent) {
         self.backend
             .guard_free_space(&self.camera_id, self.min_free_bytes)
@@ -537,13 +429,6 @@ impl WarmWriter {
 pub const PRUNE_INTERVAL: Duration = Duration::from_secs(3600);
 
 /// How soon the first sweep comes when startup could not build the warm index.
-///
-/// The usual full interval rests on startup having scanned the store, and in
-/// this one case it did not: the backend is refusing to prune or enforce its
-/// byte budget until a sweep rebuilds the index, so the wait is not a quiet
-/// hour, it is an hour of retention not happening on a store that may be full.
-/// A minute is long enough for a link that was still coming up at boot to have
-/// finished doing so, which is the failure this exists for.
 const PRUNE_AFTER_FAILED_SCAN: Duration = Duration::from_secs(60);
 
 /// How often the retention task wakes to compare the clock against its next
@@ -552,17 +437,6 @@ const PRUNE_AFTER_FAILED_SCAN: Duration = Duration::from_secs(60);
 const RETENTION_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 /// The single owner of scheduled retention for the whole warm store.
-///
-/// A prune sweeps every camera, so exactly one of these runs per process. One
-/// per writer — which is what used to happen — meant N concurrent whole-store
-/// sweeps racing on the same snapshot/delete/unindex sequence.
-///
-/// The shutdown flag is handed to the backend rather than only checked around
-/// the sweep: a sweep is long (sequential deletes, each able to sit on a remote
-/// request timeout) and shutdown joins this task, so the sweep itself stops
-/// early, between events. Cancelling it from out here instead — dropping the
-/// future mid-delete — could strip an event's `.ts` and leave its sidecar and
-/// thumbnails behind, invisible to a scan that only looks at `.ts` files.
 pub struct RetentionTask {
     backend: Arc<dyn WarmStorageBackend>,
     movement_retention_ns: u64,
@@ -592,27 +466,15 @@ impl RetentionTask {
         }
     }
 
-    /// Bring the first sweep forward because startup's scan failed. A sweep is
-    /// also where a backend that could not read its store retries doing so, and
-    /// nothing it owns works until that succeeds — see
-    /// [`PRUNE_AFTER_FAILED_SCAN`]. The cadence afterwards is the usual one.
+    /// Bring the first sweep forward because startup's scan failed.
     pub fn after_a_failed_scan(mut self) -> Self {
         self.first_sweep = PRUNE_AFTER_FAILED_SCAN;
         self
     }
 
-    /// The first sweep is one full interval in: startup has just scanned the
-    /// store, as it was when the writers owned the tick, and an operator
-    /// restarting camon is rarely asking for deletions. The exception is a
-    /// startup whose scan failed — [`Self::after_a_failed_scan`] — where the
-    /// sweep is also the retry.
-    ///
-    /// Deadlines advance by whole intervals from the previous deadline, so the
-    /// cadence is fixed-rate: a sweep that takes 20 minutes does not push the
-    /// next one out to 80 minutes, and a backend timing out repeatedly cannot
-    /// drift retention arbitrarily late. Intervals that elapsed during a long
-    /// sweep are skipped rather than fired back to back — the deletions they
-    /// would have made are still due, and the next sweep makes them.
+    /// The first sweep is one full interval in: startup has just scanned the store, as it was
+    /// when the writers owned the tick, and an operator restarting camon is rarely asking for
+    /// deletions.
     pub async fn run(self) {
         let mut interval = tokio::time::interval(RETENTION_POLL_INTERVAL);
         // The poll exists to notice a deadline, not to catch up on missed
@@ -660,8 +522,6 @@ mod tests {
         }
     }
 
-    /// A hot buffer with `count` one-second segments (seq 0..count), where
-    /// segment N starts at N seconds and holds bytes [N; 4].
     fn populated_buffer(count: u64) -> std::sync::Arc<std::sync::RwLock<HotBuffer>> {
         use crate::locks::LockExt;
         let buffer = HotBuffer::new("cam".to_string(), 3600);
@@ -679,9 +539,7 @@ mod tests {
         use crate::locks::LockExt;
         let buffer = populated_buffer(10);
         let buf = buffer.read_recover();
-        // Motion at seq 5, padding through seq 7, 2s of pre-padding.
         let event = assemble_event(&buf, None, "cam", 5, 7, 0, 2 * SEC, false, None).unwrap();
-        // Pre-padding reaches back to seq 3 (segments 3 and 4 fill 2s).
         assert_eq!(event.segments.len(), 5);
         assert_eq!(event.first_pts, 3 * SEC);
         assert_eq!(event.segments[0].data[0], 3);
@@ -695,7 +553,6 @@ mod tests {
         use crate::locks::LockExt;
         let buffer = populated_buffer(10);
         let buf = buffer.read_recover();
-        // Previous event ended at seq 4 — pre-padding must not reach past 5.
         let event = assemble_event(&buf, None, "cam", 6, 8, 5, 30 * SEC, false, None).unwrap();
         assert_eq!(event.first_pts, 5 * SEC);
         assert_eq!(event.segments.len(), 4);
@@ -704,7 +561,6 @@ mod tests {
     #[test]
     fn assembly_clamps_pre_padding_to_buffer_start() {
         use crate::locks::LockExt;
-        // 5s buffer, 10 segments pushed: seq 0..=4 evicted.
         let buffer = HotBuffer::new("cam".to_string(), 5);
         {
             let mut buf = buffer.write_recover();
@@ -719,8 +575,6 @@ mod tests {
         assert_eq!(event.segments.len(), 5);
     }
 
-    /// Somewhere for a subscriber to write, so a test can read what an operator
-    /// would have seen. The same shape `supervise` uses.
     #[derive(Clone, Default)]
     struct CapturedLog(Arc<std::sync::Mutex<Vec<u8>>>);
 
@@ -743,7 +597,6 @@ mod tests {
         }
     }
 
-    /// Everything `assemble` says at warn level while it runs.
     fn warnings_from(assemble: impl FnOnce()) -> String {
         let logs = CapturedLog::default();
         {
@@ -760,15 +613,9 @@ mod tests {
         String::from_utf8(written).unwrap()
     }
 
-    /// A run longer than the buffer loses its opening motion, and the loop that
-    /// reports gaps never sees it: the clamp lifts the loop's start past the
-    /// evicted sequences, so the event used to be written short with nothing at
-    /// all in the log. This is the silent case the whole rule about padding and
-    /// buffer length exists to catch, so it has to be audible.
     #[test]
     fn an_evicted_event_head_is_warned_about_and_the_event_still_written() {
         use crate::locks::LockExt;
-        // 5s buffer, 10 segments pushed: seq 0..=4 are gone.
         let buffer = HotBuffer::new("cam".to_string(), 5);
         {
             let mut buf = buffer.write_recover();
@@ -779,8 +626,6 @@ mod tests {
         let buf = buffer.read_recover();
         assert_eq!(buf.first_sequence(), 5);
 
-        // Motion started at seq 2 and ran to 9 — three of its segments (2, 3,
-        // 4) were evicted before the run closed.
         let mut event = None;
         let written = warnings_from(|| {
             event = assemble_event(&buf, None, "cam", 2, 9, 0, 0, false, None);
@@ -794,14 +639,10 @@ mod tests {
         assert!(written.contains("lost=3"), "does not count them: {written}");
         assert_eq!(written.matches("WARN").count(), 1, "{written}");
 
-        // Truncated, not abandoned: what survived is still recorded.
         assert_eq!(event.segments.len(), 5);
         assert_eq!(event.first_pts, 5 * SEC);
     }
 
-    /// The other thing that stops at the same lower bound is pre-padding, and
-    /// losing that is the documented normal case — context is best-effort. Only
-    /// motion is worth a line, or every event on a busy camera would carry one.
     #[test]
     fn pre_padding_lost_to_the_same_clamp_stays_quiet() {
         use crate::locks::LockExt;
@@ -814,8 +655,6 @@ mod tests {
         }
         let buf = buffer.read_recover();
 
-        // Motion at seq 7 with 30s of pre-padding asked for: the reach-back is
-        // cut off at the start of the buffer, and no motion is missing.
         let written = warnings_from(|| {
             assemble_event(&buf, None, "cam", 7, 9, 0, 30 * SEC, false, None).unwrap();
         });
@@ -824,12 +663,6 @@ mod tests {
             "padding loss should be silent: {written}"
         );
 
-        // Nor does a caller asking from behind min_start_seq: whatever lies
-        // below it belongs to the previous event or chunk, which recorded it.
-        // No production caller passes min_start_seq above first_motion_seq —
-        // this pins the defensive arm: the request reaches back to 2, the
-        // buffer starts at 5, and only the barrier at 8 says that gap is not
-        // a loss. Without the max against it, this would warn.
         let written = warnings_from(|| {
             assemble_event(&buf, None, "cam", 2, 9, 8, 0, true, None).unwrap();
         });
@@ -851,9 +684,6 @@ mod tests {
         }
         let buf = buffer.read_recover();
 
-        // Nothing survived, so there is no truncated event to report — the
-        // analyzer says "skipping event" for this one, and a head warning here
-        // would be describing a write that never happened.
         let written = warnings_from(|| {
             assert!(assemble_event(&buf, None, "cam", 1, 3, 0, 0, false, None).is_none());
         });
@@ -909,23 +739,17 @@ mod tests {
         assert_eq!(event.model.as_deref(), Some("test-model"));
         assert_eq!(event.detection_details.len(), 2);
         assert!(event.filmstrip_frames.is_some());
-        // Sidecar dedupes to the best confidence per class.
         let deduped = deduplicate_detections(&event.detection_details);
         assert_eq!(deduped, vec![("person".to_string(), 0.9)]);
     }
 
-    // ---- Continuous recording (analytics disabled) ----
-
     #[test]
     fn plan_roll_waits_until_cap_reached() {
-        // 3s pending, cap 5s: not yet.
         assert_eq!(plan_continuous_roll(0, 3, 3 * SEC, 5 * SEC, false), None);
-        // 5s pending, cap 5s: rolls [0..=4].
         assert_eq!(
             plan_continuous_roll(0, 5, 5 * SEC, 5 * SEC, false),
             Some((0, 4))
         );
-        // Over the cap rolls everything pending.
         assert_eq!(
             plan_continuous_roll(0, 7, 7 * SEC, 5 * SEC, false),
             Some((0, 6))
@@ -934,7 +758,6 @@ mod tests {
 
     #[test]
     fn plan_roll_resumes_from_next_seq() {
-        // Already wrote through seq 4; pending [5..=9] is 5s at cap 5s.
         assert_eq!(
             plan_continuous_roll(5, 10, 5 * SEC, 5 * SEC, false),
             Some((5, 9))
@@ -944,13 +767,11 @@ mod tests {
     #[test]
     fn plan_roll_nothing_pending_is_none() {
         assert_eq!(plan_continuous_roll(5, 5, 0, 5 * SEC, false), None);
-        // Even forced, an empty range yields nothing to flush.
         assert_eq!(plan_continuous_roll(5, 5, 0, 5 * SEC, true), None);
     }
 
     #[test]
     fn plan_roll_force_flushes_partial_chunk() {
-        // Below the cap, but shutdown forces the remaining 2s out.
         assert_eq!(
             plan_continuous_roll(0, 2, 2 * SEC, 5 * SEC, true),
             Some((0, 1))
@@ -963,12 +784,6 @@ mod tests {
         assert_eq!(plan_continuous_roll(0, 4, 4 * SEC, 0, true), Some((0, 3)));
     }
 
-    // ---- The continuous recorder's phase-2 drain ----
-
-    /// A recorder wired to a hot buffer nothing else is writing to, with a cap
-    /// far beyond anything the test pushes, so the only chunk it ever rolls is
-    /// its final one. Paused time throughout: the bounds under test are tens of
-    /// seconds long and a test has no business waiting them out.
     fn stopping_recorder(
         buffer: &Arc<RwLock<HotBuffer>>,
         shutdown: &Arc<AtomicBool>,
@@ -994,11 +809,6 @@ mod tests {
         }
     }
 
-    /// The bug this whole phase exists for. The stop flag means a stop has
-    /// begun, not that the camera has finished: it is being joined at that
-    /// moment and the GOP in its hand is still coming. A recorder that flushed
-    /// on the flag wrote seconds 0-1 and left; it must wait for the watermark
-    /// and write 0-2.
     #[tokio::test(start_paused = true)]
     async fn the_tail_pushed_after_the_stop_flag_is_in_the_final_chunk() {
         use crate::locks::LockExt;
@@ -1006,8 +816,6 @@ mod tests {
         let shutdown = Arc::new(AtomicBool::new(true));
         let (mut rx, handle) = stopping_recorder(&buffer, &shutdown);
 
-        // Long enough that a recorder which flushed on the flag has been gone
-        // for several ticks by the time the camera's last GOP lands.
         tokio::time::sleep(Duration::from_secs(3)).await;
         buffer.write_recover().push(segment(2 * SEC, SEC, 2));
         buffer.write_recover().seal();
@@ -1027,9 +835,6 @@ mod tests {
         );
     }
 
-    /// Between the flag and the watermark the recorder is waiting, not
-    /// flushing: one chunk per tick there would slice a camera's last seconds
-    /// into one-second files while phase 1 was still joining it.
     #[tokio::test(start_paused = true)]
     async fn a_recorder_rolls_nothing_while_it_is_still_waiting_for_the_camera() {
         let buffer = populated_buffer(2);
@@ -1044,11 +849,6 @@ mod tests {
         handle.abort();
     }
 
-    /// A camera that missed its join bound is still recording, and the
-    /// watermark published on its behalf says so. Rolling the last chunk on it
-    /// and leaving would drop whatever that camera pushes next — the same loss
-    /// the phases exist to prevent, reached by a different route — so the
-    /// recorder treats it as a floor and keeps going to its own bound.
     #[tokio::test(start_paused = true)]
     async fn a_provisional_watermark_does_not_end_the_recorders_drain() {
         use crate::locks::LockExt;
@@ -1056,7 +856,6 @@ mod tests {
         let shutdown = Arc::new(AtomicBool::new(true));
         let (mut rx, handle) = stopping_recorder(&buffer, &shutdown);
 
-        // Phase 1 gives up on the camera and publishes what it has so far.
         tokio::time::sleep(Duration::from_secs(2)).await;
         buffer.write_recover().seal_provisionally();
         tokio::time::sleep(Duration::from_secs(2)).await;
@@ -1065,7 +864,6 @@ mod tests {
             "the recorder rolled its last chunk on a watermark that can still move"
         );
 
-        // The camera nobody could wait for is, of course, still recording.
         buffer.write_recover().push(segment(2 * SEC, SEC, 2));
 
         tokio::time::timeout(TAIL_DRAIN_BOUND * 4, handle)
@@ -1079,11 +877,6 @@ mod tests {
         );
     }
 
-    /// The second time this goes wrong: a camera whose thread never comes back
-    /// publishes no watermark of its own, and the drain publishes only a
-    /// provisional one after its own bound. A recorder that waited for it
-    /// unconditionally would be the reason an NVR never restarts, so its wait
-    /// is bounded — and it still writes what it has on the way out.
     #[tokio::test(start_paused = true)]
     async fn a_recorder_whose_camera_never_finishes_stops_at_its_bound() {
         let buffer = populated_buffer(2);
@@ -1107,36 +900,20 @@ mod tests {
         );
     }
 
-    // ---- Who prunes: the retention task, never a writer ----
-
     use std::sync::atomic::AtomicUsize;
 
-    /// Records what the writer and the retention task ask of storage. Only the
-    /// writer path is implemented; the read path is never reached from here.
     #[derive(Default)]
     struct RecordingBackend {
         writes: AtomicUsize,
-        /// Sweeps started, counted on entry to `prune`.
         prunes: AtomicUsize,
-        /// Sweeps that ran to completion.
         prunes_finished: AtomicUsize,
-        /// Sweeps that saw the shutdown flag and returned early.
         prunes_cancelled: AtomicUsize,
         guards: AtomicUsize,
         emergency_prunes: AtomicUsize,
-        /// When set, the next write reports a full disk and clears the flag.
         no_space_next_write: AtomicBool,
-        /// When set, every write fails outright — the outcome that loses an
-        /// event with no retry behind it.
         fail_writes: AtomicBool,
-        /// When set, the emergency prune does not make room after all, so the
-        /// retry that follows a full disk fails too.
         fail_after_prune: AtomicBool,
-        /// How long a sweep takes, for cadence tests.
         prune_duration: Duration,
-        /// When set, a sweep parks here until notified — a sweep that is in
-        /// flight and cannot be hurried, which is what a remote backend
-        /// sitting on request timeouts looks like from out here.
         prune_gate: Option<Arc<tokio::sync::Notify>>,
     }
 
@@ -1166,9 +943,6 @@ mod tests {
             if let Some(gate) = &self.prune_gate {
                 gate.notified().await;
             }
-            // A real sweep is a loop of per-event deletes that checks `cancel`
-            // between them; one delete is the granularity, so model it as one
-            // sleep and one check.
             tokio::time::sleep(self.prune_duration).await;
             if cancel.load(Ordering::Relaxed) {
                 self.prunes_cancelled.fetch_add(1, Ordering::Relaxed);
@@ -1257,12 +1031,6 @@ mod tests {
         }
     }
 
-    /// That the writer no longer runs the scheduled prune is pinned by the
-    /// type system, not by a test: it holds no retention config at all any
-    /// more, so there is nothing to prune *with*. A timing test could only
-    /// wait out the one-hour tick, and one that closes the channel first
-    /// passes against the old code too. What is worth pinning is the half of
-    /// space management that stayed: the pre-write guard.
     #[tokio::test]
     async fn writer_guards_free_space_before_writing() {
         let backend = Arc::new(RecordingBackend::default());
@@ -1284,8 +1052,6 @@ mod tests {
         assert_eq!(backend.guards.load(Ordering::Relaxed), 1);
     }
 
-    /// The other half of space management stays with the writer: a write that
-    /// finds the disk full makes room itself instead of waiting for the sweep.
     #[tokio::test]
     async fn write_that_hits_a_full_disk_emergency_prunes_and_retries() {
         let backend = Arc::new(RecordingBackend::default());
@@ -1309,8 +1075,6 @@ mod tests {
         assert_eq!(backend.prunes.load(Ordering::Relaxed), 0);
     }
 
-    /// Push one event through a writer and report how many recordings the
-    /// watchdog ended up crediting the camera with.
     async fn events_credited_to_watchdog(backend: Arc<RecordingBackend>) -> u64 {
         let watchdog = Arc::new(RecordingWatchdog::new());
         let registered = Instant::now();
@@ -1329,18 +1093,11 @@ mod tests {
         drop(tx);
         handle.await.unwrap();
 
-        // Far enough past the limit that the camera is reported either way; the
-        // count in the report is what says whether the write counted.
         let reports = watchdog.check(registered + Duration::from_secs(2 * 24 * 3600));
         assert_eq!(reports.len(), 1);
         reports[0].events
     }
 
-    /// What the watchdog counts has to be footage that actually landed — down
-    /// the full durability ladder, retry included. Both backends log a failed
-    /// write, but nothing retries it and nothing tallies what was lost, so a
-    /// camera whose writes fail has to reach the watchdog as one that is
-    /// recording nothing.
     #[tokio::test]
     async fn only_an_event_that_reached_storage_clears_the_watchdog() {
         for (case, fail_writes, no_space, fail_after_prune, expected) in [
@@ -1384,11 +1141,8 @@ mod tests {
         )
     }
 
-    /// The clock is paused, so these run on the real hourly constant in
-    /// virtual time: exact, instant, and no sleeps to be flaky about.
     #[tokio::test(start_paused = true)]
     async fn retention_sweeps_at_a_fixed_rate_whatever_a_sweep_costs() {
-        // A sweep taking half the interval must not push the next one out.
         let backend = Arc::new(RecordingBackend {
             prune_duration: PRUNE_INTERVAL / 2,
             ..Default::default()
@@ -1403,9 +1157,6 @@ mod tests {
             "swept before the first interval elapsed"
         );
 
-        // Now at 3.25 intervals. Fixed-rate starts sweeps at 1x, 2x and 3x
-        // (the third still running). Fixed-delay — deadline measured from the
-        // end of the previous sweep — would have managed two, at 1x and 2.5x.
         tokio::time::sleep(PRUNE_INTERVAL * 11 / 4).await;
         assert_eq!(
             backend.prunes.load(Ordering::Relaxed),
@@ -1421,10 +1172,6 @@ mod tests {
             .unwrap();
     }
 
-    /// A backend whose startup scan failed is refusing to prune or enforce its
-    /// budget until a sweep rebuilds its index, and the sweep is the only thing
-    /// that retries the scan — so an hour of the usual quiet is an hour of no
-    /// retention on a store that may be full.
     #[tokio::test(start_paused = true)]
     async fn a_failed_startup_scan_brings_the_first_sweep_forward() {
         let backend = Arc::new(RecordingBackend::default());
@@ -1446,8 +1193,6 @@ mod tests {
             "the retry waited out the ordinary interval"
         );
 
-        // Then the ordinary cadence: the next one is an interval later, not
-        // another minute.
         tokio::time::sleep(PRUNE_AFTER_FAILED_SCAN * 2).await;
         assert_eq!(backend.prunes.load(Ordering::Relaxed), 1);
         tokio::time::sleep(PRUNE_INTERVAL).await;
@@ -1475,11 +1220,6 @@ mod tests {
         assert_eq!(backend.prunes.load(Ordering::Relaxed), 0);
     }
 
-    /// Shutdown during a sweep is the case that decides join-vs-abort. The
-    /// sweep gets the flag and stops itself between events; the task then ends
-    /// normally, which is what lets `graceful_shutdown` join it. Cancelling it
-    /// from outside would land mid-delete and orphan sidecars and thumbnails
-    /// where the `.ts`-only startup scan can never see them again.
     #[tokio::test(start_paused = true)]
     async fn retention_task_stops_during_a_sweep_without_being_cancelled() {
         let gate = Arc::new(tokio::sync::Notify::new());
@@ -1490,7 +1230,6 @@ mod tests {
         let shutdown = Arc::new(AtomicBool::new(false));
         let handle = spawn_retention(backend.clone(), &shutdown);
 
-        // Park the task inside a sweep, the way a slow backend would.
         tokio::time::sleep(PRUNE_INTERVAL + RETENTION_POLL_INTERVAL).await;
         assert_eq!(backend.prunes.load(Ordering::Relaxed), 1);
         assert_eq!(backend.prunes_finished.load(Ordering::Relaxed), 0);
@@ -1515,14 +1254,12 @@ mod tests {
         use crate::locks::LockExt;
         let buffer = populated_buffer(10);
         let buf = buffer.read_recover();
-        // Roll [2..=6] with no detection store at all.
         let event = assemble_continuous_chunk(&buf, "cam", 2, 6, false).unwrap();
         assert!(event.is_continuous);
         assert!(!event.has_objects);
         assert!(!event.continues);
         assert!(event.detection_details.is_empty());
         assert!(event.filmstrip_frames.is_none());
-        // No pre-padding: starts exactly at the requested seq.
         assert_eq!(event.first_pts, 2 * SEC);
         assert_eq!(event.segments.len(), 5);
         assert_eq!(event.event_type(), EventType::Continuous);

@@ -1,9 +1,7 @@
-// Motion settings panel and the mask editor (movement + detection layers),
-// hosted inside the live view.
+// Motion settings and the live view's two-layer mask editor.
 
 const maskOverlay = document.getElementById('mask-overlay');
 const maskCtx = maskOverlay.getContext('2d');
-// Motion settings panel
 const settingsBtn = document.getElementById('settings-btn');
 const settingsPanel = document.getElementById('motion-settings-panel');
 const sensitivitySlider = document.getElementById('sensitivity-slider');
@@ -19,10 +17,7 @@ const settingsError = document.getElementById('settings-error');
 const settingsErrorText = document.getElementById('settings-error-text');
 const settingsErrorDismiss = document.getElementById('settings-error-dismiss');
 
-// Motion settings + mask editor. Two painted layers share the same 16x12
-// grid: the movement mask (suppresses motion detection) and the detection
-// mask (blacks pixels out of frames sent to the vision model). Painting
-// targets the active layer; both render at once in distinct colors.
+// Movement suppresses motion; detection blacks pixels out before model input.
 let motionSettings = null;
 let maskEditEnabled = false;
 let maskCells = [];
@@ -33,7 +28,6 @@ let maskRows = 12;
 let maskPainting = false;
 let maskPaintValue = true;
 
-// The cells array for the layer currently being painted.
 function activeCells() {
     return activeMaskLayer === 'detection' ? detectionCells : maskCells;
 }
@@ -41,7 +35,6 @@ function activeCells() {
 function endMaskPaint() {
     if (!maskPainting) return;
     maskPainting = false;
-    // Persist only the layer that was painted, as a partial update.
     if (activeMaskLayer === 'detection') {
         putMotionSettings({ detection_mask: detectionCells.slice() });
     } else {
@@ -49,19 +42,14 @@ function endMaskPaint() {
     }
 }
 
-// === Motion settings panel ===
-
 function wireSettingsPanel() {
     settingsBtn.addEventListener('click', () => {
         const show = settingsPanel.hidden;
         settingsPanel.hidden = !show;
         settingsBtn.classList.toggle('active', show);
         if (show) {
-            // Whatever failed last time the panel was open has been read or
-            // ignored by now; reopening should not replay it.
             clearSettingsError();
         } else if (maskEditEnabled) {
-            // Collapsing the panel exits mask-edit mode.
             setMaskEditEnabled(false);
         }
     });
@@ -115,8 +103,6 @@ function wireSettingsPanel() {
     maskOverlay.addEventListener('pointercancel', endMaskPaint);
 }
 
-// === Live Monitor: Motion Settings + Ignore Mask ===
-
 function fetchMotionSettings(cameraId) {
     apiFetch(`api/cameras/${encodeURIComponent(cameraId)}/motion/settings`)
         .then(r => r.ok ? r.json() : null)
@@ -157,11 +143,7 @@ function clearSettingsError() {
     settingsErrorText.textContent = '';
 }
 
-// The server keeps a change it could not persist applied to the running
-// detector, so a failure here deliberately leaves the sliders and the
-// painted mask showing the new value — only the message says it will not
-// survive a restart. A network failure is a different answer and says so:
-// the change may or may not have reached the server at all.
+// A persistence failure leaves the live value visible but warns it will not survive restart.
 function putMotionSettings(partial) {
     if (!currentDetailCameraId) return;
     clearSettingsError();
@@ -172,7 +154,6 @@ function putMotionSettings(partial) {
     })
         .then(r => {
             if (r.ok) return r.json().then(applyMotionSettings);
-            // A 401 raises the token prompt, which is the whole message.
             if (r.status === 401) return;
             return r.text().then(body => showSettingsError(
                 body.trim() || `the server refused the change (HTTP ${r.status})`));
@@ -191,9 +172,6 @@ function setMaskEditEnabled(enabled) {
     maskEditBtn.textContent = enabled ? 'Done editing masks' : 'Edit masks';
     maskLayerRow.hidden = !enabled;
     if (enabled) {
-        // The edit button sits below the video, so activating from there can
-        // leave the paintable canvas scrolled partly above the viewport —
-        // bring the whole video wrapper into view so every mask row is reachable.
         detailVideo.parentElement.scrollIntoView({ block: 'start', behavior: 'smooth' });
         drawMask();
     } else {
@@ -235,9 +213,6 @@ function drawMask() {
     const cellW = w / maskCols;
     const cellH = h / maskRows;
 
-    // Both layers render at once in distinct colors so overlaps are visible:
-    // movement mask (ignored motion) in red, detection mask (blacked out of
-    // the vision model) in orange. Overlapping cells simply blend.
     const fillLayer = (cells, color) => {
         maskCtx.fillStyle = color;
         for (let i = 0; i < cells.length; i++) {
@@ -250,7 +225,6 @@ function drawMask() {
     fillLayer(maskCells, 'rgba(220, 50, 50, 0.4)');
     fillLayer(detectionCells, 'rgba(255, 140, 0, 0.45)');
 
-    // Grid lines.
     maskCtx.strokeStyle = 'rgba(255, 255, 255, 0.25)';
     maskCtx.lineWidth = 1;
     for (let c = 1; c < maskCols; c++) {

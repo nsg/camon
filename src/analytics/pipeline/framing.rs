@@ -111,16 +111,8 @@ pub(super) fn crop_frame(frame: &RgbFrame, region: &NormalizedRect) -> Option<Rg
     })
 }
 
-/// Black out (set to RGB black) every pixel of `frame` that belongs to a
-/// painted detection-mask cell. `frame` is a crop covering the normalized
-/// full-frame region `crop`; the 16x12 detection mask is defined over the full
-/// frame, so each painted cell's rectangle is intersected with the crop and
-/// translated into the crop's own pixel space. Cells that fall entirely
-/// outside the crop contribute nothing.
-///
-/// The vision model must never see a masked pixel regardless of crop geometry,
-/// so intersections are rounded outward (start floored, end ceiled): a painted
-/// cell is always fully covered even when its edges land between pixels.
+/// Black out (set to RGB black) every pixel of `frame` that belongs to a painted detection-mask
+/// cell.
 pub(super) fn apply_detection_mask(frame: &mut RgbFrame, crop: NormalizedRect, mask: &[bool]) {
     if mask.len() != MASK_CELLS
         || mask.iter().all(|&m| !m)

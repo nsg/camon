@@ -105,32 +105,6 @@ impl DetectionStore {
     }
 
     /// Drop every row whose segment has aged out of the hot buffer.
-    ///
-    /// The scan is over the whole deque, not a pop from the front, because
-    /// these rows do not arrive in sequence order. The detect worker serves its
-    /// crop queue newest-job-first, so a verdict about a later run is written
-    /// ahead of one about an earlier run that was still waiting on the model —
-    /// a higher sequence sits in front of a lower one often enough. Stopping at
-    /// the first row at or above `min_sequence` would leave every aged row
-    /// behind it stranded, and one recent row at the head would strand the
-    /// whole deque, which then only grows.
-    ///
-    /// Scanning is what bounds the store, and only here: nothing at
-    /// [`insert`](Self::insert) checks a sequence against the buffer, so a
-    /// verdict that arrives for an already-evicted segment is stored and lives
-    /// until the next pass sweeps it. The bound is therefore an eventual one —
-    /// immediately after this call the deque holds only rows for segments the
-    /// hot buffer still has, and between calls it can exceed that by whatever
-    /// the worker has answered meanwhile (one job's sequences times its
-    /// classes, per job). The analyzer calls this every poll, so "meanwhile" is
-    /// a fraction of a second unless the analyzer itself is blocked; a stalled
-    /// analyzer widens the excess but cannot make it unbounded, since the
-    /// detect queue is capped per camera.
-    ///
-    /// The cost is a walk over a per-camera deque of that size on each poll — a
-    /// few hundred rows at worst, and the walk visits exactly the rows the
-    /// front-pop would have had to visit anyway once the old ones did reach the
-    /// front.
     pub fn cleanup(&self, camera_id: &str, min_sequence: u64) {
         if let Some(lock) = self.cameras.get(camera_id) {
             lock.write_recover()
@@ -176,11 +150,6 @@ mod tests {
             .collect()
     }
 
-    /// Rows arrive in verdict order, which is not sequence order: the detect
-    /// worker serves its queue newest-first, so a verdict about a later run
-    /// lands ahead of one about an earlier run that waited longer on the model.
-    /// Cleanup has to look past the recent row at the head — stopping there
-    /// strands the aged one behind it in RAM for good.
     #[test]
     fn cleanup_drops_an_aged_row_stranded_behind_a_newer_one() {
         let store = store();
@@ -191,8 +160,6 @@ mod tests {
         assert!(store.get_detection_info("cam", 5).is_empty());
     }
 
-    /// The same disorder must not leave a remnant when the whole deque has
-    /// aged out.
     #[test]
     fn cleanup_empties_a_deque_whose_out_of_order_rows_all_aged_out() {
         let store = store();
@@ -203,8 +170,6 @@ mod tests {
         assert!(sequences(&store).is_empty());
     }
 
-    /// Everything the hot buffer still holds stays, including the segment
-    /// exactly at the window edge, and its position in the deque is irrelevant.
     #[test]
     fn cleanup_keeps_in_window_rows_wherever_they_sit() {
         let store = store();

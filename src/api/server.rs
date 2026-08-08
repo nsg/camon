@@ -112,15 +112,6 @@ pub fn build_router(state: AppState, auth: &ApiAuth) -> Router {
 }
 
 /// Take the listening socket, and fail startup if it cannot be had.
-///
-/// Separate from [`serve`] because of *when* it has to happen. Binding inside
-/// the server task meant an address already in use, or a `[http] bind` this
-/// host does not have, was one `tracing::error!` line inside a detached task:
-/// camon went on recording with no UI, no ingress and no API, and — being
-/// alive — was never restarted by systemd or the Home Assistant Supervisor,
-/// which are the only things that could have fixed it. Bound here, before a
-/// single camera is spawned, the same failure ends startup with a nonzero exit
-/// and the operator gets the address in the message.
 pub async fn bind(addr: SocketAddr) -> Result<tokio::net::TcpListener, std::io::Error> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!("serving the API on http://{}", addr);
@@ -252,10 +243,9 @@ async fn segment_handler(
 ) -> Response {
     match state.buffers.get(&id) {
         Some(buffer) => {
-            // Look the segment up under the lock and take nothing but its Arc,
-            // so the ingest thread waits on a map index rather than on a
-            // response body. The body is then built over that same allocation:
-            // see hls::segment_body for why it is never copied.
+            // Take only the segment's Arc under the lock so the ingest thread
+            // never waits on a response body; hls::segment_body serves that
+            // same allocation without copying.
             let data = {
                 let buf = buffer.read_recover();
                 hls::generate_segment(&buf, n)
@@ -395,9 +385,8 @@ async fn motion_map_handler(
     }
 }
 
-/// JSON shape for the motion-settings endpoints. Carries the current values,
-/// the mask grid geometry (shared by the movement and detection masks), and the
-/// slider bounds so the UI can build its controls without hard-coding them.
+/// JSON shape for the motion-settings endpoints: current values, mask grid
+/// geometry, and slider bounds so the UI need not hard-code them.
 #[derive(Serialize)]
 struct MotionSettingsResponse {
     var_threshold: f64,
@@ -463,8 +452,7 @@ async fn motion_settings_put_handler(
         Ok(Err(e @ UpdateError::NotPersisted(_))) => {
             (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
         }
-        // The request is the problem, and the settings the detector is using
-        // are untouched — the client's, not camon's, and not a partial apply.
+        // The request is the problem; the live settings are untouched.
         Ok(Err(e @ UpdateError::NotANumber { .. })) => {
             (StatusCode::BAD_REQUEST, e.to_string()).into_response()
         }
@@ -510,7 +498,6 @@ async fn hot_events_handler(State(state): State<AppState>, Path(id): Path<String
 
     let motion = state.motion_store.get_motion(&id);
 
-    // Collect motion segments that are within the hot buffer, with their timeline offsets
     let mut motion_spans: Vec<(f64, f64)> = motion
         .iter()
         .filter(|s| s.segment_sequence >= ctx.first_sequence)
@@ -524,7 +511,6 @@ async fn hot_events_handler(State(state): State<AppState>, Path(id): Path<String
 
     motion_spans.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
 
-    // Group into events using gap threshold
     let gap_secs = HOT_EVENT_GAP_NS as f64 / 1_000_000_000.0;
     let mut events: Vec<HotEventResponse> = Vec::new();
 
@@ -567,26 +553,7 @@ async fn hot_events_handler(State(state): State<AppState>, Path(id): Path<String
 
 // Warm event types and handlers
 
-/// How many events one listing answers with, and the most a caller may ask
-/// for: `limit` can ask for a smaller page, never a larger one.
-///
-/// A listing used to answer with the whole archive, which is unbounded in the
-/// only direction that matters — a box that has been recording for years holds
-/// years of events, and every one of them was cloned out of the index under the
-/// lock each camera's warm writer takes to index what it has just committed. So
-/// the cost of a request was set by the archive rather than by the request, and
-/// (reads being open on a non-loopback bind unless `[http] token` is set) it was
-/// set by anyone who could reach the port.
-///
-/// A thousand is chosen to be past what any single view of an archive wants at
-/// once and far short of what a deep one holds: a day of continuous recording
-/// at the default 120-second chunk is 720 events, so the first page still
-/// carries more than a day of the densest recording mode there is.
-///
-/// Free to lower. The one client that walks the whole archive — the web UI's
-/// event list, in `src/assets/events-data.js` — sends no `limit` and ends its
-/// walk on an empty page rather than on a short one, precisely so that it
-/// cannot read a page clamped by this number as the end of the archive.
+/// How many events one listing answers with, and the most a caller may ask for.
 const MAX_EVENTS_PER_PAGE: usize = 1000;
 
 #[derive(Deserialize)]
@@ -599,21 +566,8 @@ struct EventsQuery {
     limit: Option<usize>,
 }
 
-/// Read a `before=` cursor, in either of the two forms it takes.
-///
-/// A bare start PTS asks for everything that began earlier, which is all a
-/// walker needs while the starts it walks are distinct. A whole event key —
-/// `{start}_{duration}_{type}`, the same key every other event route takes and
-/// the same one the listing's own answer is made of — asks for everything
-/// ordered below *that event*, which can name a position inside a run of events
-/// sharing one start. A walker that resumes with the key of the oldest event in
-/// the page it just received never skips anything; one that resumes with a bare
-/// start skips the rest of a run its page ended inside, and on a box whose
-/// clock never started that is the whole archive (see
-/// [`page_key`](crate::storage::EventPage)).
-///
-/// `None` for anything that is neither, which the caller answers `400`: a
-/// cursor that half-parsed would silently resume in the wrong place.
+/// Parse a bare start PTS or full event key cursor. Only a full key can resume inside events
+/// sharing a start; malformed cursors must fail rather than resume elsewhere.
 fn parse_cursor(before: &str) -> Option<EventCursor> {
     match before.parse::<u64>() {
         Ok(start_pts_ns) => Some(EventCursor::Start(start_pts_ns)),
@@ -654,48 +608,8 @@ struct WarmEventResponse {
     recovered: bool,
 }
 
-/// One page of a camera's stored events, oldest first.
-///
-/// The page holds the *newest* events of the window asked about, never more
-/// than [`MAX_EVENTS_PER_PAGE`] of them — newest because that is what a viewer
-/// opening an event list wants, and because it is the end of the archive that
-/// grows, so a page taken from the old end would answer the same thing forever.
-///
-/// Older events are reached by walking backwards: `before` resumes beneath the
-/// oldest event of the page just received, and is best sent as that event's
-/// whole key (see [`parse_cursor`] for the shorter form and what it cannot
-/// express). A page shorter than the `limit` asked for is the end of the
-/// archive; a walk that asks for no `limit` at all learns it from an empty
-/// page, which is one extra request and no assumption about the server's cap.
-///
-/// The walk is stable in the senses a live NVR can offer, and no further:
-///
-/// * Nothing is ever served twice, and on an archive nothing is inserted into
-///   or deleted from, nothing is missed either: the cursor is a position in a
-///   total order over `(start, duration, type)`, so a page can end anywhere,
-///   including inside a run of events that share a start PTS.
-/// * Events recorded while the walk is in progress are missed by that walk and
-///   picked up by the next poll. Usually because they are appended above the
-///   cursor; but an event recorded at the cursor's *own* start PTS is also
-///   missed whenever it sorts above it, which on a box with no working clock —
-///   where every event starts at zero — is the ordinary case rather than the
-///   corner one.
-/// * That much rests on wall-clock time moving forward. It usually does, and
-///   nothing here requires it to: after a backward correction (an NTP step, an
-///   RTC-less box learning the time) a newly recorded event can sort *below*
-///   the cursor and turn up mid-walk. It is still served once — the walk is
-///   not a snapshot, and does not claim to be one.
-/// * Events deleted while the walk is in progress (retention prunes from the
-///   oldest end) are absent from later pages. They no longer exist; a walk that
-///   showed them would be describing footage nobody can play. The cursor is a
-///   position rather than a reference to an entry, so it keeps working when the
-///   event it was taken from is one of the deleted ones — and equally when the
-///   deletion falls inside the run it was taken from.
-///
-/// The bound is also what a listing costs an unauthenticated caller: reads stay
-/// open on a non-loopback bind unless `[http] token` is set, so the events this
-/// endpoint copies per request is a property of the request and not of how long
-/// the box has been recording.
+/// One page of a camera's stored events, oldest first: the *newest* [`MAX_EVENTS_PER_PAGE`]
+/// events of the window asked about.
 async fn warm_events_handler(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -715,12 +629,8 @@ async fn warm_events_handler(
     if from > to {
         return (StatusCode::BAD_REQUEST, "from must not be greater than to").into_response();
     }
-    // Clamped rather than refused, for every value that is a count at all: a
-    // client asking for more than the cap gets the cap, and a client asking for
-    // none gets one event, since a page walk that reads a zero-length page as
-    // "the end" would stop before it started. A `limit` that is not a count —
-    // negative, fractional, or not a number — never reaches here: the query
-    // extractor fails it, which is a `400`.
+    // Clamped rather than refused: a limit of zero would read as an empty
+    // page, i.e. end-of-walk. Non-numeric limits fail in the extractor (400).
     let limit = query
         .limit
         .unwrap_or(MAX_EVENTS_PER_PAGE)
@@ -739,9 +649,8 @@ async fn warm_events_handler(
         .map(|e| WarmEventResponse {
             start_pts_ns: e.start_pts_ns.to_string(),
             duration_ms: e.duration_ms,
-            // The one spelling of a type: the same `as_str` an event key in a
-            // URL is built from, so a listing and the keys made from it cannot
-            // disagree about what a type is called.
+            // Same `as_str` spelling event keys are built from, so a listing
+            // and its keys cannot disagree.
             event_type: e.event_type.as_str().to_string(),
             object_classes: e.object_classes.clone(),
             backend: e.backend.clone(),
@@ -764,15 +673,6 @@ async fn warm_events_handler(
 }
 
 /// Resolve an `{event}` path segment to the one stored event it names.
-///
-/// The segment is a whole [`EventRef`] — `{start_pts_ns}_{duration_ms}_{type}` —
-/// because a start PTS alone identifies nothing: events sharing one are two
-/// recordings, and these routes used to serve whichever of them a search on the
-/// start returned. So a segment that is not a key is a `400`, exactly as an
-/// unparseable start PTS was, and only a key with an event behind it reads
-/// anything.
-///
-/// `Err` carries the status and message to answer with.
 fn resolve_event(
     backend: &Arc<dyn WarmStorageBackend>,
     camera_id: &str,
@@ -820,14 +720,8 @@ async fn warm_playlist_handler(
 }
 
 /// Parse an incoming single-range HTTP `Range` header into a [`RangeRequest`].
-///
-/// Returns `None` — meaning "serve the whole object (200)" — for an absent
-/// header, a non-`bytes` unit, syntactic garbage, a reversed range, or a
-/// multi-range request (`a-b,c-d`): we do not implement `multipart/byteranges`,
-/// so we deliberately fall back to the full body rather than erroring.
 fn parse_range_header(value: &str) -> Option<RangeRequest> {
     let spec = value.trim().strip_prefix("bytes=")?;
-    // Multi-range → decline; the caller serves the full body.
     if spec.contains(',') {
         return None;
     }
@@ -844,7 +738,6 @@ fn parse_range_header(value: &str) -> Option<RangeRequest> {
     }
     let end: u64 = end.parse().ok()?;
     if end < start {
-        // Reversed range is invalid syntax → ignore, serve full.
         return None;
     }
     Some(RangeRequest::FromTo {
@@ -880,12 +773,6 @@ async fn warm_segment_handler(
 }
 
 /// What a failed read of an indexed event answers.
-///
-/// A store that answered with something that is not this event — a `206` whose
-/// `Content-Range` describes no range of it — has not said the event is gone,
-/// and a `404` would tell a client to stop asking for footage that is still
-/// there. Every other failure keeps the not-found it has always had: the file
-/// is indexed and unreadable, which from a client's side is the same as absent.
 fn video_error_response(error: &std::io::Error) -> Response {
     if error.kind() == std::io::ErrorKind::InvalidData {
         return (
@@ -923,14 +810,7 @@ fn video_stream_response(video: VideoStream) -> Response {
         )
             .into_response(),
         ServedRange::Partial { start, end } => {
-            // The length of a partial body is a subtraction, and a subtraction
-            // needs its operands checked before it happens, not after: a
-            // reversed pair underflows — a panic in the debug build camon ships
-            // — and an end past the object promises bytes the stream will never
-            // produce, which hangs the player. The backend that resolved the
-            // range is supposed to have established both (see
-            // [`ServedRange::partial`]); if one ever reaches here having not,
-            // the request fails cleanly instead of serving a corrupt 206.
+            // Reject invalid 206 bounds before subtraction or playback.
             let Some(body_len) = range.body_len(total_size) else {
                 tracing::warn!(
                     start,
@@ -988,8 +868,6 @@ async fn warm_thumbnail_handler(
         Err(response) => return response.into_response(),
     };
 
-    // The backend acquires the poster frame (LocalDisk lazily renders + caches
-    // it via ffmpeg); every failure here is an internal error.
     match backend.read_thumbnail(&id, &entry).await {
         Ok(data) => jpeg_response(data),
         Err(e) => thumbnail_error_response(e),
@@ -1016,11 +894,9 @@ struct DebugEntryResponse {
     ollama_rects: Vec<(String, f32, f32, f32, f32)>,
 }
 
-/// The debug view's poll — and, by being it, the one thing that tells the
-/// detector somebody is watching. The store opens a demand window on this
-/// request; the analyzer and the detection worker produce and keep frames only
-/// while it is open, so a route that stops reaching the store here leaves the
-/// view permanently empty. See [`DetectionDebugStore::wanted`].
+/// The debug view's poll, and the one thing that opens the store's demand window: frames are
+/// produced and kept only while it is open, so a route that stops reaching the store leaves the
+/// view permanently empty.
 async fn detection_debug_handler(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -1091,9 +967,8 @@ async fn warm_filmstrip_handler(
         return (StatusCode::NOT_FOUND, "camera not found").into_response();
     }
 
-    // Bounded by what the analyzer writes, from the same constant the store
-    // counts and deletes by — a third hand-written `3` here is how a filmstrip
-    // grown to five frames would come to have one nothing can ask for.
+    // Bounded by the same constant the analyzer writes and the store deletes
+    // by, not a hand-written copy of it.
     if usize::from(index) >= MAX_FILMSTRIP_FRAMES {
         let last = MAX_FILMSTRIP_FRAMES - 1;
         return (StatusCode::BAD_REQUEST, format!("index must be 0-{last}")).into_response();
@@ -1124,9 +999,6 @@ mod tests {
 
     const TOKEN: &str = "s3cr3t token";
 
-    /// Bind the router to an ephemeral loopback port and return its base URL.
-    /// Requests go over real HTTP so the middleware is exercised exactly as it
-    /// is in production, headers and query string included.
     async fn serve(auth: &ApiAuth) -> String {
         let ids = vec!["cam".to_string()];
         let buffers = HashMap::from([("cam".to_string(), HotBuffer::new("cam".to_string(), 60))]);
@@ -1145,8 +1017,6 @@ mod tests {
         format!("http://{addr}")
     }
 
-    /// Like [`serve`], but hands back the motion store so a test can publish
-    /// what the debug endpoints read.
     async fn serve_with_motion_store() -> (String, MotionStore) {
         let ids = vec!["cam".to_string()];
         let buffers = HashMap::from([("cam".to_string(), HotBuffer::new("cam".to_string(), 60))]);
@@ -1166,8 +1036,6 @@ mod tests {
         (format!("http://{addr}"), motion_store)
     }
 
-    /// Like [`serve`], but hands back the detection debug store, whose demand
-    /// window this API is the only opener of.
     async fn serve_with_debug_store() -> (String, DetectionDebugStore) {
         let ids = vec!["cam".to_string()];
         let buffers = HashMap::from([("cam".to_string(), HotBuffer::new("cam".to_string(), 60))]);
@@ -1187,11 +1055,6 @@ mod tests {
         (format!("http://{addr}"), debug_store)
     }
 
-    /// The detector's debug frames are a megabyte a run and are kept only while
-    /// somebody is watching. This route is what says somebody is: the analyzer
-    /// and the detection worker both ask the store, and nothing else ever
-    /// answers yes. If the entry list stops registering the request, the view
-    /// goes permanently blank.
     #[tokio::test]
     async fn asking_for_the_debug_entries_is_what_says_somebody_is_watching() {
         let (base, debug_store) = serve_with_debug_store().await;
@@ -1209,8 +1072,6 @@ mod tests {
             "the view was polled and the detector was still told nobody wants its frames"
         );
 
-        // And with the window open, what the worker stores is what the view
-        // serves — all the way to the JPEG bytes.
         debug_store.insert(
             "cam",
             vec![Arc::new(vec![0xaa])],
@@ -1247,10 +1108,6 @@ mod tests {
         assert_eq!(full.status(), reqwest::StatusCode::OK);
         assert_eq!(full.bytes().await.unwrap().as_ref(), [0xbb]);
 
-        // The images are the seam: they are fetched as a consequence of a list
-        // the viewer already has, so they must not be able to hold the window
-        // open by themselves. A cached page, or a URL somebody bookmarked,
-        // would otherwise keep the detector encoding frames for nobody.
         debug_store.mark_requested_ago("cam", std::time::Duration::from_secs(600));
         for url in [
             format!("{base}/api/cameras/cam/detection-debug/{id}/frame/0"),
@@ -1267,9 +1124,6 @@ mod tests {
         }
     }
 
-    /// Every stage the UI asks for has to resolve to its own map — one route
-    /// serving them all makes a mixed-up stage a silent wrong picture rather
-    /// than a compile error.
     #[tokio::test]
     async fn each_motion_map_stage_serves_its_own_jpeg() {
         let (base, motion_store) = serve_with_motion_store().await;
@@ -1308,10 +1162,6 @@ mod tests {
         }
     }
 
-    /// Like [`serve_with_storage`], but holding two events that start on the
-    /// same keyframe: a 2-second movement event with one filmstrip frame, and
-    /// the 4-second continuous chunk covering it. Returns the base URL, the temp
-    /// dir (which must outlive the server) and the two indexed entries.
     async fn serve_with_same_start_events() -> (String, tempfile::TempDir, Vec<WarmEventEntry>) {
         use crate::buffer::warm::{assemble_continuous_chunk, assemble_event};
         use crate::buffer::GopSegment;
@@ -1365,16 +1215,6 @@ mod tests {
         (format!("http://{addr}"), dir, events)
     }
 
-    /// Two recordings begin on the same keyframe — a motion event and the
-    /// continuous chunk covering it — and each of these routes has to answer
-    /// with the one its URL names.
-    ///
-    /// The URL carries the whole key, because it used to carry the start PTS
-    /// alone and that names both events: the lookup binary-searched it and
-    /// answered every one of these requests with whichever of the two it landed
-    /// on. A viewer asking for the movement got the continuous chunk's video,
-    /// under the movement's duration in the manifest, with its filmstrip
-    /// missing — and nothing in the exchange said so.
     #[tokio::test]
     async fn each_same_start_event_is_served_under_its_own_key() {
         let (base, _dir, events) = serve_with_same_start_events().await;
@@ -1404,8 +1244,6 @@ mod tests {
             let body = segment.bytes().await.unwrap();
             assert_eq!(body.len(), bytes, "{key} was served another event's video");
 
-            // Only the movement event has a filmstrip; the continuous chunk's
-            // frame 0 does not exist, and must not resolve to the movement's.
             let frame = reqwest::get(format!("{events}/filmstrip/0")).await.unwrap();
             match event_type {
                 EventType::Movement => {
@@ -1416,8 +1254,6 @@ mod tests {
             }
         }
 
-        // A key nothing is stored under is a 404 — including the third type at
-        // a start two other events do hold.
         let missing = EventRef::new(start, 2000, EventType::Object);
         let status = reqwest::get(format!(
             "{base}/api/cameras/cam/events/{missing}/playlist.m3u8"
@@ -1427,8 +1263,6 @@ mod tests {
         .status();
         assert_eq!(status, reqwest::StatusCode::NOT_FOUND);
 
-        // A segment that is not a key at all is a 400, as an unparseable start
-        // PTS was — the bare start PTS these routes used to take included.
         for bad in [
             start.to_string(),
             format!("{start}_2000"),
@@ -1443,8 +1277,6 @@ mod tests {
         }
     }
 
-    /// Like [`serve`], but with warm storage enabled over an empty data dir.
-    /// The returned directory must outlive the server.
     async fn serve_with_storage() -> (String, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let ids = vec!["cam".to_string()];
@@ -1468,7 +1300,6 @@ mod tests {
         (format!("http://{addr}"), dir)
     }
 
-    /// State with one camera whose motion settings live under `data_dir`.
     fn motion_settings_state(data_dir: &std::path::Path) -> AppState {
         let ids = vec!["cam".to_string()];
         let buffers = HashMap::from([("cam".to_string(), HotBuffer::new("cam".to_string(), 60))]);
@@ -1482,7 +1313,6 @@ mod tests {
         )
     }
 
-    /// Serve with motion settings backed by `data_dir`.
     async fn serve_with_motion_settings(data_dir: &std::path::Path) -> String {
         let app = build_router(motion_settings_state(data_dir), &ApiAuth::Open);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1491,13 +1321,9 @@ mod tests {
         format!("http://{addr}")
     }
 
-    /// A settings PUT that cannot be made durable must not answer 200 — the
-    /// operator would take a painted mask as saved and lose it on restart.
     #[tokio::test]
     async fn a_settings_put_that_cannot_be_persisted_is_not_a_success() {
         let dir = tempfile::tempdir().unwrap();
-        // A regular file where the camera's directory belongs: nothing can be
-        // written underneath it, whatever user the test runs as.
         std::fs::write(dir.path().join("cam"), b"not a directory").unwrap();
         let base = serve_with_motion_settings(dir.path()).await;
 
@@ -1513,7 +1339,6 @@ mod tests {
         );
         assert!(response.text().await.unwrap().contains("not saved"));
 
-        // The value is live regardless, and the GET says so.
         let live: serde_json::Value =
             reqwest::get(format!("{base}/api/cameras/cam/motion/settings"))
                 .await
@@ -1524,12 +1349,6 @@ mod tests {
         assert_eq!(live["var_threshold"], 32.0);
     }
 
-    /// A slider value that is not a real number would switch motion detection
-    /// off for that camera — `area >= NaN` is false for every blob — so no
-    /// route into the store accepts one and the live settings are left alone.
-    /// Over HTTP the body never gets that far: JSON has no way to spell a
-    /// non-finite number, so serde refuses it first. The store's own refusal,
-    /// which is what catches any other writer, is pinned in `motion_settings`.
     #[tokio::test]
     async fn a_settings_put_that_is_not_a_number_never_reaches_the_detector() {
         let dir = tempfile::tempdir().unwrap();
@@ -1544,10 +1363,6 @@ mod tests {
             .await
             .unwrap();
 
-        // Refused by serde as it is deserialized, before any handler runs —
-        // which is the point being pinned here, not the store's own guard: no
-        // spelling of a non-finite number survives the JSON body. The guard
-        // itself is covered by the test below, which calls the handler.
         let response = client
             .put(&url)
             .header("content-type", "application/json")
@@ -1561,11 +1376,6 @@ mod tests {
         assert_eq!(live["var_threshold"], 32.0, "the refused value took hold");
     }
 
-    /// What the store's own refusal answers, reached by calling the handler
-    /// directly: no JSON body can carry a non-finite number today, so this is
-    /// the only way to see the arm that will answer for the writer that
-    /// eventually can. A bad request, not a server fault — camon's state is
-    /// fine, and untouched.
     #[tokio::test]
     async fn a_slider_value_the_store_refuses_is_a_400_not_a_500() {
         let dir = tempfile::tempdir().unwrap();
@@ -1599,7 +1409,6 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
 
-        // The writable camera still answers 200 on the same route.
         let response = reqwest::Client::new()
             .put(format!("{base}/api/cameras/cam/motion/settings"))
             .json(&serde_json::json!({ "var_threshold": 32.0 }))
@@ -1609,8 +1418,6 @@ mod tests {
         assert_eq!(response.status(), reqwest::StatusCode::OK);
     }
 
-    /// One indexed event. Nothing here is on disk: the listing routes answer
-    /// from the index alone, so this is the whole of what a listing sees.
     fn indexed_entry(start_pts_ns: u64, duration_ms: u32) -> WarmEventEntry {
         WarmEventEntry {
             start_pts_ns,
@@ -1630,15 +1437,10 @@ mod tests {
         }
     }
 
-    /// A server whose camera has `count` indexed events, one second apart and
-    /// one second long — the deep archive the page bound exists for.
     async fn serve_with_deep_archive(count: u64) -> (String, tempfile::TempDir) {
         serve_with_archive((1..=count).map(|i| indexed_entry(i * 1_000_000_000, 1000))).await
     }
 
-    /// A server whose camera has `count` events all stamped zero: the archive a
-    /// box with no working clock builds, where distinct durations are the only
-    /// thing separating one event from another and nothing can age out.
     async fn serve_with_zero_stamped_archive(count: u32) -> (String, tempfile::TempDir) {
         serve_with_archive((1..=count).map(|duration_ms| indexed_entry(0, duration_ms))).await
     }
@@ -1671,9 +1473,6 @@ mod tests {
         (format!("http://{addr}"), dir)
     }
 
-    /// The start PTS of each listed event, in the order the response gives
-    /// them. A string on the wire, because nanoseconds since the epoch are past
-    /// what a JSON number holds exactly.
     fn listed_starts(events: &[serde_json::Value]) -> Vec<u64> {
         events
             .iter()
@@ -1687,12 +1486,6 @@ mod tests {
         response.json().await.unwrap()
     }
 
-    /// A listing answers with one page, however deep the archive is — and with
-    /// the *newest* page of it, since that is the end a viewer opens on and the
-    /// end that grows. Every clone under the read lock is bounded by this
-    /// number (the scan itself can still be archive-long, at heap-replacement
-    /// cost per entry); before it, a listing cloned the whole index out from
-    /// under the lock every warm writer needs.
     #[tokio::test]
     async fn a_listing_answers_with_one_page_of_the_newest_events() {
         let (base, _dir) = serve_with_deep_archive(2500).await;
@@ -1700,21 +1493,17 @@ mod tests {
         let events = list_events(format!("{base}/api/cameras/cam/events")).await;
         assert_eq!(events.len(), MAX_EVENTS_PER_PAGE);
 
-        // Oldest first within the page, as the listing has always answered.
         let starts = listed_starts(&events);
         assert!(starts.windows(2).all(|w| w[0] < w[1]), "not in start order");
         assert_eq!(*starts.last().unwrap(), 2500 * 1_000_000_000);
         assert_eq!(starts[0], 1501 * 1_000_000_000);
 
-        // A caller may ask for less, never for more.
         let smaller = list_events(format!("{base}/api/cameras/cam/events?limit=7")).await;
         assert_eq!(smaller.len(), 7);
         let capped = list_events(format!("{base}/api/cameras/cam/events?limit=99999")).await;
         assert_eq!(capped.len(), MAX_EVENTS_PER_PAGE);
     }
 
-    /// The key each listed event is named by — the cursor a walker resumes on,
-    /// and the same string the UI's `eventKey` builds.
     fn listed_key(event: &serde_json::Value) -> String {
         format!(
             "{}_{}_{}",
@@ -1724,10 +1513,6 @@ mod tests {
         )
     }
 
-    /// Walking `before` backwards reaches the whole archive: every event once,
-    /// none twice, none skipped between two pages. The walk the web UI does,
-    /// including how it learns it has finished — an empty page rather than an
-    /// assumption about the server's cap.
     #[tokio::test]
     async fn a_page_walk_reaches_every_older_event_exactly_once() {
         let (base, _dir) = serve_with_deep_archive(1000).await;
@@ -1751,15 +1536,9 @@ mod tests {
 
         let every: Vec<u64> = (1..=1000).map(|i| i * 1_000_000_000).collect();
         assert_eq!(seen, every);
-        // Four pages of events and the empty one that ends the walk.
         assert_eq!(requests, 5);
     }
 
-    /// A page of a single-start archive — the no-RTC box, where every event is
-    /// stamped zero and none of them can age out — is exactly the size asked
-    /// for, and the walk still reaches every event once. A page that finished
-    /// the run its limit landed in would answer this request with the whole
-    /// archive, which is the unbounded copy the limit exists to stop.
     #[tokio::test]
     async fn a_single_start_archive_pages_at_exactly_its_limit() {
         let (base, _dir) = serve_with_zero_stamped_archive(3000).await;
@@ -1790,19 +1569,11 @@ mod tests {
         assert_eq!(seen, (1..=3000u64).collect::<Vec<_>>());
     }
 
-    /// The shape the web UI reads, field by field: a bare JSON array of events,
-    /// each with a string start PTS, a numeric duration, and the wire type name
-    /// its key is built from. Pagination is carried by the events themselves —
-    /// the cursor is the oldest one's key — precisely so this shape did not
-    /// have to change under the UI.
     #[tokio::test]
     async fn a_listing_keeps_the_shape_the_ui_reads() {
         let (base, _dir, _events) = serve_with_same_start_events().await;
 
         let events = list_events(format!("{base}/api/cameras/cam/events?limit=1")).await;
-        // One asked for, one served, even though a second event shares its
-        // start: the key that comes back names a position inside that run, so
-        // the next page picks up its sibling.
         assert_eq!(events.len(), 1);
         let next = list_events(format!(
             "{base}/api/cameras/cam/events?limit=1&before={}",
@@ -1820,7 +1591,6 @@ mod tests {
         assert!(event["duration_ms"].is_u64());
         assert!(event["event_type"].is_string());
         assert!(event["filmstrip_frames"].is_u64());
-        // The key the UI builds from those three fields resolves to a video.
         let key = listed_key(event);
         let playlist = reqwest::get(format!("{base}/api/cameras/cam/events/{key}/playlist.m3u8"))
             .await
@@ -1828,8 +1598,6 @@ mod tests {
         assert_eq!(playlist.status(), reqwest::StatusCode::OK);
     }
 
-    /// A cursor that half-parsed would resume in the wrong place silently, so
-    /// anything that is neither a start PTS nor a whole event key is refused.
     #[tokio::test]
     async fn a_cursor_that_is_neither_form_is_rejected() {
         let (base, _dir) = serve_with_deep_archive(3).await;
@@ -1845,7 +1613,6 @@ mod tests {
             );
         }
 
-        // Both forms that are a cursor still answer.
         for good in ["3000000000", "3000000000_1000_movement"] {
             let response = reqwest::get(format!("{base}/api/cameras/cam/events?before={good}"))
                 .await
@@ -1865,7 +1632,6 @@ mod tests {
         .unwrap();
         assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
 
-        // The same route with the bounds the right way round still answers.
         let response = reqwest::get(format!(
             "{base}/api/cameras/cam/events?from=0&to=9999999999"
         ))
@@ -1914,8 +1680,6 @@ mod tests {
     #[tokio::test]
     async fn query_token_carries_it_where_headers_cannot() {
         let base = serve(&ApiAuth::Everything(TOKEN.to_string())).await;
-        // Media route with a query parameter of its own: the token must coexist
-        // with it, and arrive percent-decoded.
         let response = reqwest::get(format!(
             "{base}/api/stream/cam/playlist.m3u8?live=true&token=s3cr3t%20token"
         ))
@@ -1935,9 +1699,6 @@ mod tests {
         assert_eq!(status, reqwest::StatusCode::UNAUTHORIZED);
     }
 
-    /// State-changing routes are behind the same layer, and the `?token=`
-    /// fallback — meant for `<img>` and native video, which only ever GET —
-    /// does not reach them: a write must present the header.
     #[tokio::test]
     async fn writes_require_the_header_and_never_the_query_token() {
         let base = serve(&ApiAuth::Everything(TOKEN.to_string())).await;
@@ -1962,9 +1723,6 @@ mod tests {
             .status();
         assert_eq!(status, reqwest::StatusCode::UNAUTHORIZED);
 
-        // The header still works for writes; 404 is this build's answer once
-        // authorized (motion settings are disabled in the test state), and
-        // crucially it is not a 401.
         let status = client
             .put(&url)
             .bearer_auth(TOKEN)
@@ -1994,8 +1752,6 @@ mod tests {
         assert_eq!(status, reqwest::StatusCode::OK);
     }
 
-    /// The loopback and Home Assistant deployments: nothing is asked of
-    /// anybody, reads and writes alike, because the boundary is somewhere else.
     #[tokio::test]
     async fn an_open_policy_asks_for_nothing_at_all() {
         let base = serve(&ApiAuth::Open).await;
@@ -2012,15 +1768,9 @@ mod tests {
             .await
             .unwrap()
             .status();
-        // 404 because motion settings are off in this state — what matters is
-        // that the request reached the handler at all.
         assert_eq!(status, reqwest::StatusCode::NOT_FOUND);
     }
 
-    /// The default LAN deployment, and the reason this layer exists. The mask
-    /// editor is the sharp end: a PUT that blanks a camera's motion mask stops
-    /// it recording, and nothing about the resulting silence looks like an
-    /// attack afterwards. Without the generated token it does not happen.
     #[tokio::test]
     async fn a_generated_token_refuses_a_write_that_does_not_carry_it() {
         let base = serve(&ApiAuth::Writes(TOKEN.to_string())).await;
@@ -2034,15 +1784,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), reqwest::StatusCode::UNAUTHORIZED);
-        // 401, not 403: the caller may retry with a credential, and this header
-        // is what says so — the web UI's own 401 handler raises its prompt.
         assert_eq!(
             response.headers()[reqwest::header::WWW_AUTHENTICATE],
             "Bearer"
         );
 
-        // Nor does the `?token=` fallback reach a write: it exists for <img>
-        // and native video, which only ever GET.
         let status = client
             .put(format!("{url}?token=s3cr3t%20token"))
             .json(&serde_json::json!({}))
@@ -2063,10 +1809,6 @@ mod tests {
         assert_eq!(status, reqwest::StatusCode::UNAUTHORIZED);
     }
 
-    /// And with the token the operator got from the file, the same write goes
-    /// through — a scheme the UI cannot satisfy is a regression wearing a
-    /// security badge. 404 is this build's answer past the layer (motion
-    /// settings are off in the test state); the point is that it is not a 401.
     #[tokio::test]
     async fn a_generated_token_lets_the_write_through() {
         let base = serve(&ApiAuth::Writes(TOKEN.to_string())).await;
@@ -2081,11 +1823,6 @@ mod tests {
         assert_eq!(status, reqwest::StatusCode::NOT_FOUND);
     }
 
-    /// The documented residual, pinned so it cannot change by accident: a
-    /// generated token does not gate reading. An install that upgrades itself
-    /// overnight must not come back with the live view behind a secret nobody
-    /// has yet — `[http] token` is the setting that closes this, and the
-    /// startup warning names it.
     #[tokio::test]
     async fn a_generated_token_deliberately_leaves_reading_open() {
         let base = serve(&ApiAuth::Writes(TOKEN.to_string())).await;
@@ -2097,7 +1834,6 @@ mod tests {
             assert_eq!(status, reqwest::StatusCode::OK, "{url}");
         }
 
-        // A configured token is the one that does gate them.
         let base = serve(&ApiAuth::Everything(TOKEN.to_string())).await;
         let status = reqwest::get(format!("{base}/api/cameras"))
             .await
@@ -2106,11 +1842,6 @@ mod tests {
         assert_eq!(status, reqwest::StatusCode::UNAUTHORIZED);
     }
 
-    /// A config file written before any of this existed — no `token`, no
-    /// `allow_open`, the default `0.0.0.0` bind — still starts, still serves
-    /// its UI and its footage, and has its writes guarded by a token that
-    /// appeared beside the config file. That is the whole upgrade story for
-    /// every deployment already in the field.
     #[tokio::test]
     async fn a_config_from_before_this_existed_keeps_its_ui_and_gains_a_token() {
         let dir = tempfile::tempdir().unwrap();
@@ -2141,7 +1872,6 @@ mod tests {
         );
 
         let base = serve(&auth).await;
-        // The UI shell and the reads it opens with are untouched...
         assert_eq!(
             reqwest::get(&base).await.unwrap().status(),
             reqwest::StatusCode::OK
@@ -2153,7 +1883,6 @@ mod tests {
                 .status(),
             reqwest::StatusCode::OK
         );
-        // ...and the settings editor works with the token from that file.
         let status = reqwest::Client::new()
             .put(format!("{base}/api/cameras/cam/motion/settings"))
             .bearer_auth(token)
@@ -2185,7 +1914,6 @@ mod tests {
             parse_range_header("bytes=-200"),
             Some(RangeRequest::Suffix(200))
         );
-        // Whitespace around the value is tolerated.
         assert_eq!(
             parse_range_header("bytes= 10-20 "),
             Some(RangeRequest::FromTo {
@@ -2197,16 +1925,13 @@ mod tests {
 
     #[test]
     fn parse_range_header_declines_garbage_and_multi_range() {
-        // Not a byte range at all.
         assert_eq!(parse_range_header("bytes=abc"), None);
         assert_eq!(parse_range_header("items=0-1"), None);
         assert_eq!(parse_range_header("bytes=10"), None);
         assert_eq!(parse_range_header("bytes="), None);
         assert_eq!(parse_range_header("bytes=-"), None);
         assert_eq!(parse_range_header("garbage"), None);
-        // Reversed range is invalid → decline (serve full).
         assert_eq!(parse_range_header("bytes=20-10"), None);
-        // Multi-range is unsupported → decline (serve full).
         assert_eq!(parse_range_header("bytes=0-10,20-30"), None);
     }
 
@@ -2218,12 +1943,6 @@ mod tests {
         })
     }
 
-    /// The `Content-Length` of a partial body is `end - start + 1`, and camon
-    /// ships debug builds, where a reversed pair does not wrap — it panics, in
-    /// a request handler, on a range a *remote store* chose. Ends past the
-    /// object are the other half: the header would promise bytes the stream
-    /// never produces and the player waits for them for ever. Neither is
-    /// served; the request fails cleanly and says why.
     #[test]
     fn a_partial_range_that_is_not_a_range_of_the_event_is_refused_not_subtracted() {
         for (start, end) in [
@@ -2243,9 +1962,6 @@ mod tests {
         }
     }
 
-    /// A store whose answer was not this event is not a store saying the event
-    /// is gone — telling a client `404` for that would send it away from
-    /// footage that is still there.
     #[test]
     fn a_store_that_answered_with_something_else_is_not_a_missing_event() {
         let refused = video_error_response(&std::io::Error::new(
@@ -2254,7 +1970,6 @@ mod tests {
         ));
         assert_eq!(refused.status(), StatusCode::INTERNAL_SERVER_ERROR);
 
-        // A file that really is unreadable or gone stays a not-found.
         for kind in [
             std::io::ErrorKind::NotFound,
             std::io::ErrorKind::PermissionDenied,
@@ -2265,8 +1980,6 @@ mod tests {
         }
     }
 
-    /// And the ranges that *are* ranges still stream, with the length the
-    /// arithmetic gives.
     #[test]
     fn a_satisfied_range_is_served_206_with_its_own_length() {
         let response = streamed(ServedRange::Partial { start: 10, end: 19 }, 40);
@@ -2274,13 +1987,11 @@ mod tests {
         assert_eq!(response.headers()[header::CONTENT_LENGTH], "10");
         assert_eq!(response.headers()[header::CONTENT_RANGE], "bytes 10-19/40");
 
-        // The whole object as a range, and a single byte.
         let response = streamed(ServedRange::Partial { start: 0, end: 39 }, 40);
         assert_eq!(response.headers()[header::CONTENT_LENGTH], "40");
         let response = streamed(ServedRange::Partial { start: 39, end: 39 }, 40);
         assert_eq!(response.headers()[header::CONTENT_LENGTH], "1");
 
-        // The other two shapes are unchanged.
         let response = streamed(ServedRange::Full, 40);
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(response.headers()[header::CONTENT_LENGTH], "40");

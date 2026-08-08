@@ -1,28 +1,4 @@
 //! Startup recovery of orphaned temp files left by a crash or power cut.
-//!
-//! The warm writer's atomic pattern stages every event as `{stem}.ts.tmp`
-//! (written + fsynced first, so the footage is durable before anything else)
-//! and only renames it to `{stem}.ts` — the commit point — after the sidecar
-//! and thumbnails are in place. An unclean shutdown can therefore leave a
-//! `.ts.tmp` behind, and that file may hold the critical footage of exactly
-//! the incident that cut the power. Recovery salvages it instead of deleting:
-//!
-//! 1. trim to the last complete 188-byte packet (a torn tail write must not
-//!    poison the file),
-//! 2. recompute the real duration from the first→last PES PTS delta — both
-//!    read in one streaming pass, because the interrupted file is as large as
-//!    the event was long and this runs during startup,
-//! 3. rename to a proper `{first_pts_ns}_{duration_ms}.ts`, adopting any
-//!    sidecar/thumbnails the writer finished before the crash, and mark the
-//!    sidecar `"recovered": true`, then fsync the directory so the salvage
-//!    itself is not lost to the next power cut,
-//! 4. only a file with no PES payload at all (nothing decodable) is deleted.
-//!
-//! Orphaned `.json.tmp` / `.jpg.tmp` staging files are simply deleted — the
-//! metadata cannot be reconstructed, and the video is what matters.
-//!
-//! Runs before the warm index scan, so recovered events are indexed and served
-//! like any other.
 
 use std::path::Path;
 
@@ -30,11 +6,6 @@ use super::event_index::{EventType, MAX_FILMSTRIP_FRAMES};
 use crate::mpegts;
 
 /// How a salvage reads the bytes of an orphaned `.ts.tmp`.
-///
-/// Production hands [`mpegts::scan_ts_file`], which streams the file through
-/// one fixed buffer and returns three numbers; the seam exists so a test can
-/// watch how much of a large file the salvage actually holds at once, which is
-/// the property that keeps startup off the OOM killer.
 type TmpScan = dyn Fn(&Path) -> std::io::Result<mpegts::TsScan>;
 
 /// Scan every event directory of every configured camera for `*.tmp` orphans
@@ -95,11 +66,6 @@ fn recover_dir(dir: &Path, camera_id: &str, scan: &TmpScan) {
 }
 
 /// Salvage a single orphaned `{stem}.ts.tmp`.
-///
-/// The file's bytes are never held: `scan` streams them and hands back where
-/// the intact packets stop and what the first and last PES PTS were, which is
-/// everything the salvage needs. The size below is the file's own length, read
-/// from its metadata rather than from a buffer.
 fn recover_video_tmp(path: &Path, camera_id: &str, scan: &TmpScan) {
     let scanned = match scan(path) {
         Ok(s) => s,
@@ -130,11 +96,7 @@ fn recover_video_tmp(path: &Path, camera_id: &str, scan: &TmpScan) {
     // duration than the truncated file actually holds.
     let duration_ms = mpegts::pts_delta_ms(first_pts_90k, last_pts_90k);
 
-    // Start timestamp: keep the epoch-ns value from the tmp filename stem. It
-    // was recorded when the event started and truncation only removes the
-    // tail, so it still describes the first frame. (The in-file PES PTS is a
-    // 90 kHz media clock, a different domain — it can supply the duration but
-    // not an epoch timestamp.) Fall back to the file mtime for a mangled name.
+    // Start timestamp: keep the epoch-ns value from the tmp filename stem.
     let dir = path.parent().unwrap_or(Path::new("."));
     let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
     let orig_stem = file_name.strip_suffix(".ts.tmp").unwrap_or(file_name);
@@ -171,12 +133,8 @@ fn recover_video_tmp(path: &Path, camera_id: &str, scan: &TmpScan) {
     if orig_stem != new_stem {
         adopt_thumbnails(dir, orig_stem, &new_stem);
     }
-    // One fsync per salvaged file, covering every entry this recovery just
-    // renamed in the directory. Without it a second power cut during the same
-    // boot would undo the salvage — the trimmed bytes are durable, but the name
-    // that makes them an event is not. Re-running recovery on the `.ts.tmp`
-    // that comes back is harmless (it recomputes the same stem), so a failure
-    // here is a warning, not a reason to abandon the file.
+    // One fsync per salvaged file, covering every entry this recovery just renamed in the
+    // directory.
     if let Err(e) = crate::durable::sync_dir(dir) {
         tracing::warn!(camera = %camera_id, path = %dir.display(), error = %e,
             "failed to fsync directory after recovering an event file");
@@ -263,7 +221,6 @@ mod tests {
         root.join(CAM).join("movements")
     }
 
-    /// Video bytes: PES(first_pts) + null + PES(last_pts), like a tiny GOP.
     fn video_bytes(first_pts_90k: u64, last_pts_90k: u64) -> Vec<u8> {
         let mut data = Vec::new();
         data.extend_from_slice(&pes_packet(0x100, first_pts_90k));
@@ -276,18 +233,12 @@ mod tests {
         recover_orphans(root, &[CAM.to_string()]);
     }
 
-    /// The file a power cut leaves behind is a whole event's worth of video —
-    /// tens of megabytes of continuous recording, more if the writer was stuck
-    /// — and this runs at startup, on the box whose memory pressure is why
-    /// every other read here streams. So the salvage may hold a buffer, never
-    /// the file: what it needs from those bytes is three numbers.
     #[test]
     fn a_large_interrupted_recording_is_salvaged_without_being_held_in_memory() {
         let tmp_dir = tempfile::tempdir().unwrap();
         let dir = movements_dir(tmp_dir.path());
         std::fs::create_dir_all(&dir).unwrap();
 
-        // 8 MiB — 128 buffers' worth — of 2s footage, then a torn tail write.
         let mut data = video_bytes(0, 2 * 90_000);
         while data.len() < 8 * 1024 * 1024 {
             data.extend_from_slice(&null_packet());
@@ -296,9 +247,6 @@ mod tests {
         data.extend_from_slice(&[0x47, 0x11]);
         std::fs::write(dir.join("4000_9000.ts.tmp"), &data).unwrap();
 
-        // Every read the salvage makes goes through this, so the largest slice
-        // it ever asks to have filled is the most of the file it can be
-        // holding at once.
         let peak = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let observed = std::sync::Arc::clone(&peak);
         recover_orphans_with(tmp_dir.path(), &[CAM.to_string()], &move |path| {
@@ -317,8 +265,6 @@ mod tests {
             data.len()
         );
 
-        // And it is a real salvage: the tail is trimmed and the duration comes
-        // from the footage rather than from the name.
         let final_path = dir.join("4000_2000.ts");
         assert!(final_path.exists());
         assert_eq!(
@@ -327,7 +273,6 @@ mod tests {
         );
     }
 
-    /// Reports the largest fill it was ever asked for.
     struct WatchedReader {
         inner: std::fs::File,
         peak: std::sync::Arc<std::sync::atomic::AtomicUsize>,
@@ -347,8 +292,6 @@ mod tests {
         let dir = movements_dir(tmp_dir.path());
         std::fs::create_dir_all(&dir).unwrap();
 
-        // 5s of footage (PTS delta 5 * 90000) plus a torn tail write; the tmp
-        // filename claims the originally intended 12s duration.
         let mut data = video_bytes(90_000, 90_000 + 5 * 90_000);
         data.extend_from_slice(&[0x47, 0xDE, 0xAD]); // torn final packet
         let full_len = data.len();
@@ -356,8 +299,6 @@ mod tests {
 
         recover(tmp_dir.path());
 
-        // Stem keeps the epoch start from the filename, duration is recomputed
-        // from the file's PTS delta, and the torn tail is trimmed away.
         let final_path = dir.join("7777000000_5000.ts");
         assert!(final_path.exists());
         assert!(!dir.join("7777000000_12000.ts.tmp").exists());
@@ -366,12 +307,10 @@ mod tests {
             (full_len - 3) as u64
         );
 
-        // Sidecar marks the event recovered.
         let sidecar = std::fs::read_to_string(dir.join("7777000000_5000.json")).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&sidecar).unwrap();
         assert_eq!(parsed["recovered"], serde_json::json!(true));
 
-        // The normal startup scan indexes it like any other event.
         let index = WarmEventIndex::new(&[CAM.to_string()], tmp_dir.path().to_path_buf());
         index.scan();
         let entry = index
@@ -388,9 +327,7 @@ mod tests {
         let dir = movements_dir(tmp_dir.path());
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("1000_5000.ts.tmp"), [0xAB; 300]).unwrap();
-        // Empty file too.
         std::fs::write(dir.join("2000_5000.ts.tmp"), []).unwrap();
-        // Valid TS packets but no PES payload (PSI/null only): nothing decodable.
         std::fs::write(dir.join("3000_5000.ts.tmp"), null_packet()).unwrap();
 
         recover(tmp_dir.path());
@@ -406,7 +343,6 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("1000_5000.json.tmp"), b"{").unwrap();
         std::fs::write(dir.join("1000_5000_thumb_0.jpg.tmp"), b"x").unwrap();
-        // A committed event must be untouched.
         std::fs::write(dir.join("1000_5000.ts"), b"tsdata").unwrap();
         std::fs::write(dir.join("1000_5000.json"), b"{}").unwrap();
 
@@ -424,8 +360,6 @@ mod tests {
         let dir = movements_dir(tmp_dir.path());
         std::fs::create_dir_all(&dir).unwrap();
 
-        // Crash between the sidecar/thumb writes and the commit rename: the
-        // video tmp is complete (3s claimed = 3s of PTS), metadata is final.
         let data = video_bytes(0, 3 * 90_000);
         std::fs::write(dir.join("5000_3000.ts.tmp"), &data).unwrap();
         std::fs::write(
@@ -437,8 +371,6 @@ mod tests {
 
         recover(tmp_dir.path());
 
-        // Duration matches, so the stem is unchanged; detections survive and
-        // gain the recovered flag.
         assert!(dir.join("5000_3000.ts").exists());
         let sidecar = std::fs::read_to_string(dir.join("5000_3000.json")).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&sidecar).unwrap();
@@ -466,7 +398,6 @@ mod tests {
         let dir = movements_dir(tmp_dir.path());
         std::fs::create_dir_all(&dir).unwrap();
 
-        // Truncated: file holds 2s but the stem claims 9s.
         let data = video_bytes(0, 2 * 90_000);
         std::fs::write(dir.join("6000_9000.ts.tmp"), &data).unwrap();
         std::fs::write(dir.join("6000_9000.json"), r#"{"detections":[]}"#).unwrap();
@@ -477,7 +408,6 @@ mod tests {
         assert!(dir.join("6000_2000.ts").exists());
         assert!(dir.join("6000_2000.json").exists());
         assert!(dir.join("6000_2000_thumb_0.jpg").exists());
-        // Old-stem metadata is gone, not leaked.
         assert!(!dir.join("6000_9000.json").exists());
         assert!(!dir.join("6000_9000_thumb_0.jpg").exists());
     }

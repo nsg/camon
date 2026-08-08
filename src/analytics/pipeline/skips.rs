@@ -56,10 +56,7 @@ pub(super) fn merge_skips(
     }
 }
 
-/// Shortest gap between two skipped-footage warnings. An analyzer that stays
-/// behind skips something on most of its 200 ms polls, and warnings are the
-/// level this project keeps enabled in release, so the reports are accumulated
-/// and released as one line per interval instead of per poll.
+/// Shortest gap between two skipped-footage warnings.
 pub(super) const SKIP_REPORT_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Accumulates skipped footage between warnings; see [`SKIP_REPORT_INTERVAL`].

@@ -1,13 +1,4 @@
-//! Connected-component labeling on binary masks (8-connectivity), with
-//! per-component pixel area and bounding box. Replaces OpenCV's
-//! `findContours` + `contourArea` + `boundingRect` in the motion pipeline.
-//!
-//! Note on area semantics: `area` is the exact foreground pixel count of the
-//! component. OpenCV's `contourArea` computes the polygon area of the outer
-//! contour instead, which is slightly smaller than the pixel count for the
-//! same blob — so a pixel-count filter with the same threshold is marginally
-//! more permissive (more sensitive), which is the preferred direction for a
-//! motion gate.
+//! Connected-component labeling on binary masks with 8-connectivity, pixel area, and bounds.
 
 /// One 8-connected foreground region.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,7 +44,6 @@ impl ConnectedComponents {
         self.parent.clear();
         self.parent.push(0); // dummy: provisional labels start at 1
 
-        // First pass: provisional labels, recording equivalences.
         for y in 0..h {
             let row = y * w;
             for x in 0..w {
@@ -96,7 +86,6 @@ impl ConnectedComponents {
             }
         }
 
-        // Second pass: resolve to component indices and accumulate stats.
         self.comp_of_root.clear();
         self.comp_of_root.resize(self.parent.len(), u32::MAX);
         for y in 0..h {
@@ -214,8 +203,6 @@ mod tests {
 
     #[test]
     fn u_shape_merges_into_one_component() {
-        // Two vertical arms that only connect at the bottom exercise the
-        // union-find equivalence merge.
         let (w, h) = (10, 10);
         let mut mask = vec![0u8; w * h];
         for y in 0..8 {

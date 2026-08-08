@@ -3,10 +3,9 @@ use super::mog2::Mog2;
 use super::morph::{self, StructuringElement};
 use super::motion_settings::{MASK_CELLS, MASK_COLS, MASK_ROWS};
 
-// The analyzer decodes keyframes only, and both production cameras emit a 1 s
-// GOP (measured 2026-07-23 with ffprobe: keyframes at exactly 1.000 s
-// intervals), so the effective sample rate of this detector is 1 frame per
-// second. All time constants below are scaled for 1 fps.
+// The analyzer decodes keyframes only, and both production cameras emit a 1 s GOP (measured
+// 2026-07-23 with ffprobe: keyframes at exactly 1.000 s intervals), so the effective sample
+// rate of this detector is 1 frame per second.
 
 // Frames to suppress after startup or a scene change while the background
 // model warms up. ~10 seconds at 1 fps.
@@ -18,10 +17,7 @@ const SCENE_CHANGE_RATIO: f32 = 0.8;
 // (tree sway) gets absorbed into the background model over this window.
 const MOG2_HISTORY: u32 = 300;
 
-// Learning rate (alpha) per analyzed frame. At or below the automatic floor of
-// 1/MOG2_HISTORY (≈0.0033) the detector follows OpenCV's auto schedule
-// 1/min(2·t, history) — fast adaptation while the model is young, settling at
-// the 5-minute memory above.
+// Learning rate (alpha) per analyzed frame.
 const LEARNING_RATE: f64 = 0.003;
 
 // Morphological opening kernel size (odd). Fixed: noise rejection is now the
@@ -38,12 +34,8 @@ pub struct MotionBox {
     pub height: i32,
 }
 
-/// Pure-Rust motion detector: Zivkovic MOG2 background subtraction →
-/// static ignore-mask → morphological opening → connected-component area
-/// filtering. Consumes plain grayscale frames (no OpenCV types anywhere in the
-/// motion path). All behaviour is deterministic and driven by three
-/// user-controlled settings (var_threshold, min_contour_area, ignore mask);
-/// there is no hidden auto-tuning.
+/// Pure-Rust motion detector: Zivkovic MOG2 background subtraction → static ignore-mask →
+/// morphological opening → connected-component area filtering.
 pub struct MotionDetector {
     mog2: Mog2,
     learning_rate: f64,
@@ -139,11 +131,9 @@ impl MotionDetector {
         let lr = self.effective_learning_rate();
         self.mog2.apply(gray, width, height, lr, &mut self.raw_mask);
 
-        // Static ignore mask: zero masked cells in the raw MOG2 foreground mask
-        // BEFORE scene-change evaluation, morphological opening, and CCL, so
-        // masked regions can neither raise the score nor trip scene-change
-        // suppression. Deterministic — the same mask always ignores the same
-        // pixels.
+        // Static ignore mask: zero masked cells in the raw MOG2 foreground mask BEFORE
+        // scene-change evaluation, morphological opening, and CCL, so masked regions can
+        // neither raise the score nor trip scene-change suppression.
         self.apply_ignore_mask();
 
         // Raw ratio for scene-change detection (before cleanup).
@@ -264,10 +254,8 @@ impl MotionDetector {
         self.mask_view(&self.raw_mask)
     }
 
-    /// Historical "after shadow removal" stage. Shadow detection is gone
-    /// (chromaticity-based, meaningless on grayscale), so this is now an
-    /// alias for the raw MOG2 mask — kept so the debug API/UI stage names
-    /// stay stable.
+    /// Alias for the raw mask because grayscale input cannot support chromaticity-based shadow
+    /// detection. The separate method preserves the debug API/UI stage name.
     pub fn no_shadow_mask(&self) -> Option<(&[u8], usize, usize)> {
         self.raw_mask()
     }
@@ -304,8 +292,6 @@ mod tests {
         MotionSettings, DEFAULT_MIN_CONTOUR_AREA, DEFAULT_VAR_THRESHOLD,
     };
 
-    // --- End-to-end detector tests on synthetic frames ---
-
     const W: usize = 320;
     const H: usize = 240;
 
@@ -327,17 +313,13 @@ mod tests {
         f
     }
 
-    /// Feed enough static frames to get past scene-change reset + warmup.
     fn warm_up(det: &mut MotionDetector) {
         let frame = static_frame();
-        // Frame 1 is all-foreground (fresh model) → scene-change reset, then
-        // WARMUP_FRAMES suppressed frames.
         for _ in 0..(WARMUP_FRAMES as usize + 2) {
             det.process_frame(&frame, W, H);
         }
     }
 
-    /// Build a 16x12 mask that covers the single cell containing (px, py).
     fn mask_covering(px: usize, py: usize) -> Vec<bool> {
         let mut mask = vec![false; MASK_CELLS];
         let col = (px * MASK_COLS / W).min(MASK_COLS - 1);
@@ -382,7 +364,6 @@ mod tests {
         let mut det = detector();
         warm_up(&mut det);
 
-        // 12x12 = 144 px, < 200 after opening → filtered out.
         let score = det.process_frame(&frame_with_blob(50, 50, 12), W, H);
         assert_eq!(score, 0.0);
         assert!(det.motion_bboxes().is_empty());
@@ -406,12 +387,9 @@ mod tests {
         let mut det = detector();
         warm_up(&mut det);
 
-        // Full-frame change → scene change, score 0.
         let inverted = vec![210u8; W * H];
         assert_eq!(det.process_frame(&inverted, W, H), 0.0);
 
-        // Back to the old scene: everything below warmup is suppressed, even
-        // an obvious blob.
         for _ in 0..(WARMUP_FRAMES as usize - 1) {
             let score = det.process_frame(&frame_with_blob(10, 10, 30), W, H);
             assert_eq!(score, 0.0, "warmup after scene change");
@@ -428,7 +406,6 @@ mod tests {
 
         let (fg, w, h) = det.fg_mask().unwrap();
         assert_eq!((w, h), (W, H));
-        // Opening rounds the blob's corners, so slightly under 24x24 pixels.
         let area = fg.iter().filter(|&&v| v != 0).count();
         assert!((540..=576).contains(&area), "final mask area {area}");
         assert!(det.raw_mask().is_some());
@@ -438,14 +415,12 @@ mod tests {
         let mut bg = Vec::new();
         let (w, h) = det.background_into(&mut bg).unwrap();
         assert_eq!((w, h), (W, H));
-        // The background model should still show the static scene value.
         assert!((bg[0] as i32 - 60).abs() <= 1);
     }
 
     #[test]
     fn detector_ignore_mask_suppresses_motion_in_masked_cell() {
         let mut det = detector();
-        // Mask the cell containing the blob at (100,80).
         det.set_mask(&mask_covering(112, 92));
         warm_up(&mut det);
 
@@ -457,7 +432,6 @@ mod tests {
     #[test]
     fn detector_ignore_mask_leaves_unmasked_motion() {
         let mut det = detector();
-        // Mask a far-away cell; the blob at (100,80) is elsewhere.
         det.set_mask(&mask_covering(300, 220));
         warm_up(&mut det);
 
@@ -473,7 +447,6 @@ mod tests {
     fn detector_clearing_mask_reenables_detection() {
         let mut det = detector();
         det.set_mask(&mask_covering(112, 92));
-        // An all-false mask clears masking.
         det.set_mask(&[false; MASK_CELLS]);
         warm_up(&mut det);
 
@@ -481,14 +454,6 @@ mod tests {
         assert!(score > 0.0, "cleared mask must restore detection");
     }
 
-    /// The defect this detector was blinded by: `min_contour_area = nan` in
-    /// config (TOML has a `nan` literal) survived `f64::clamp`, which returns
-    /// NaN for NaN, and landed here — where `area >= min_contour_area` is false
-    /// for every component ever labeled, so no blob is ever retained, no motion
-    /// is ever scored, and no event is ever recorded, with nothing logged and a
-    /// camera that looks like it is working. Config now refuses the value, and
-    /// the settings that seed the detector replace it with the default, so the
-    /// same input leaves detection intact.
     #[test]
     fn a_min_contour_area_that_is_not_a_number_cannot_blind_the_detector() {
         let settings = MotionSettings::from_defaults(DEFAULT_VAR_THRESHOLD, f64::NAN);
@@ -499,8 +464,6 @@ mod tests {
         assert!(score > 0.0, "a blob this size has to score");
         assert_eq!(det.motion_bboxes().len(), 1);
 
-        // The unprotected value, for contrast: every comparison against it is
-        // false, so the same frame is silently still.
         let mut blind = MotionDetector::new(DEFAULT_VAR_THRESHOLD, f64::NAN);
         warm_up(&mut blind);
         assert_eq!(
@@ -514,7 +477,6 @@ mod tests {
     fn detector_rejects_wrong_length_mask() {
         let mut det = detector();
         det.set_mask(&mask_covering(112, 92));
-        // Wrong length is ignored, so the earlier mask stays in effect.
         det.set_mask(&[true, false, true]);
         warm_up(&mut det);
         let score = det.process_frame(&frame_with_blob(100, 80, 24), W, H);

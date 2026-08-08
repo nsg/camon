@@ -1,8 +1,5 @@
-//! Binary morphology on 8-bit masks: elliptical structuring elements and
-//! opening (erosion followed by dilation), matching OpenCV's
-//! `getStructuringElement(MORPH_ELLIPSE, ..)` + `morphologyEx(MORPH_OPEN, ..)`
-//! behavior on 0/255 masks, including its border convention (out-of-bounds
-//! pixels never constrain erosion and never contribute to dilation).
+//! Binary morphology matching OpenCV's elliptical opening and border convention on 0/255
+//! masks.
 
 /// A structuring element stored as one horizontal span per kernel row:
 /// `(dy, dx_start, dx_end)` offsets relative to the anchor (kernel center),
@@ -41,11 +38,9 @@ impl StructuringElement {
     }
 }
 
-/// Morphological opening: erosion then dilation with the same element.
-/// Removes foreground features smaller than the structuring element (isolated
-/// noise pixels) while preserving the shape of larger regions.
-///
-/// `tmp` and `dst` are reusable buffers; both are resized to `w * h`.
+/// Morphological opening: erosion then dilation with the same element. Removes foreground
+/// features smaller than the structuring element (isolated noise pixels) while preserving the
+/// shape of larger regions.
 pub fn open(
     src: &[u8],
     w: usize,
@@ -139,12 +134,6 @@ mod tests {
 
     #[test]
     fn ellipse_5_matches_opencv_shape() {
-        // cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)):
-        //   0 0 1 0 0
-        //   1 1 1 1 1
-        //   1 1 1 1 1
-        //   1 1 1 1 1
-        //   0 0 1 0 0
         let se = StructuringElement::ellipse(5);
         let expected = [
             [0, 0, 1, 0, 0],
@@ -196,7 +185,6 @@ mod tests {
             }
         }
         let out = open_mask(&mask, w, h, 5);
-        // Opening rounds the corners but keeps the extent of a large square.
         assert_eq!(out[10 * w + 30], 255, "top edge center survives");
         assert_eq!(out[20 * w + 20], 255, "left edge center survives");
         assert_eq!(out[29 * w + 39 - 2], 255, "bottom edge survives");

@@ -1,5 +1,3 @@
-// View 3: Event Playback.
-
 const playbackView = document.getElementById('playback-view');
 const playbackBackBtn = document.getElementById('playback-back-btn');
 const playbackEventInfo = document.getElementById('playback-event-info');
@@ -17,7 +15,6 @@ const nextEventThumb = document.getElementById('next-event-thumb');
 const prevEventText = document.getElementById('prev-event-text');
 const nextEventText = document.getElementById('next-event-text');
 
-// Playback state
 let playbackHls = null;
 let currentPlaybackKey = null;
 let playbackAnimationId = null;
@@ -71,10 +68,8 @@ function wirePlaybackView() {
 function showPlaybackView(cameraId, key) {
     cleanupDebugView();
 
-    // Ensure warm events are available
     if (currentDetailCameraId !== cameraId) {
         currentDetailCameraId = cameraId;
-        // Need to fetch warm events before we can show prev/next
         fetchWarmEvents(cameraId).then(() => {
             updatePlaybackNav();
         });
@@ -84,7 +79,6 @@ function showPlaybackView(cameraId, key) {
     playbackView.hidden = false;
     currentPlaybackKey = key;
 
-    // Find the event
     const ev = warmEvents.find(e => e.key === key);
     if (ev) {
         const evDate = new Date(ev.start_ms);
@@ -145,8 +139,6 @@ function loadPlaybackVideo(cameraId, key) {
     }
 }
 
-// === View 3: Playback Controls ===
-
 function startPlaybackUpdate() {
     if (playbackAnimationId) cancelAnimationFrame(playbackAnimationId);
 
@@ -167,7 +159,6 @@ function startPlaybackUpdate() {
 }
 
 function getAdjacentEvents(key) {
-    // Sort events by time descending (newest first) to match event list order
     const sorted = [...warmEvents].sort((a, b) => b.start_ms - a.start_ms);
     const idx = sorted.findIndex(e => e.key === key);
     return {
