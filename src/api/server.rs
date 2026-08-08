@@ -9,6 +9,7 @@ use axum::middleware;
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
+use bytes::Bytes;
 use rust_embed::Embed;
 use serde::{Deserialize, Serialize};
 
@@ -200,7 +201,7 @@ async fn static_handler(Path(path): Path<String>) -> impl IntoResponse {
             let mime = mime_guess::from_path(&path).first_or_octet_stream();
             (
                 [(header::CONTENT_TYPE, mime.as_ref())],
-                content.data.to_vec(),
+                Bytes::from_owner(content.data),
             )
                 .into_response()
         }
