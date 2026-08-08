@@ -1,7 +1,12 @@
 # Changelog
 
-## Unreleased
+## 0.6.0
 
+- **The snapshot cameras now show their sightings.** They arrived in
+  0.5.0 but no picture ever did: the decoder that turns a sighting into
+  a frame was left waiting for input that had already ended, so every
+  snapshot timed out quietly and the tiles stayed empty. Each sighting
+  now publishes its frame as intended.
 - **Camon now protects its own settings when it is reached over a network,
   and the add-on is unaffected.** Outside Home Assistant, a camon with no
   `[http] token` used to accept a motion-settings change — including an
