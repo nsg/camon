@@ -8,8 +8,11 @@ const NANOS_PER_SEC: u64 = 1_000_000_000;
 
 pub struct HotBuffer {
     segments: VecDeque<GopSegment>,
+    segment_offsets_ns: VecDeque<u64>,
     max_duration_ns: u64,
     current_duration_ns: u64,
+    /// Cumulative duration modulo `u64`; offsets are recovered with wrapping subtraction.
+    next_offset_ns: u64,
     camera_id: String,
     first_sequence: u64,
     /// The camera's terminal watermark, or `None` while it is still producing.
@@ -21,8 +24,10 @@ impl HotBuffer {
     pub fn new(camera_id: String, max_duration_secs: u64) -> Arc<RwLock<Self>> {
         Arc::new(RwLock::new(Self {
             segments: VecDeque::new(),
+            segment_offsets_ns: VecDeque::new(),
             max_duration_ns: max_duration_secs * NANOS_PER_SEC,
             current_duration_ns: 0,
+            next_offset_ns: 0,
             camera_id,
             first_sequence: 0,
             terminal: None,
@@ -38,6 +43,8 @@ impl HotBuffer {
             "pushing GOP segment"
         );
 
+        self.segment_offsets_ns.push_back(self.next_offset_ns);
+        self.next_offset_ns = self.next_offset_ns.wrapping_add(segment.duration_ns);
         self.current_duration_ns += segment.duration_ns;
         self.segments.push_back(segment);
 
@@ -49,6 +56,7 @@ impl HotBuffer {
     fn evict_old(&mut self) {
         while self.current_duration_ns > self.max_duration_ns {
             if let Some(old) = self.segments.pop_front() {
+                self.segment_offsets_ns.pop_front();
                 self.current_duration_ns = self.current_duration_ns.saturating_sub(old.duration_ns);
                 self.first_sequence += 1;
                 tracing::trace!(
@@ -124,7 +132,7 @@ impl HotBuffer {
     }
 
     pub fn total_duration_ns(&self) -> u64 {
-        self.segments.iter().map(|s| s.duration_ns).sum()
+        self.current_duration_ns
     }
 
     /// Timeline offset in nanoseconds: the cumulative duration of all
@@ -137,13 +145,11 @@ impl HotBuffer {
         if index > self.segments.len() {
             return None;
         }
-        Some(
-            self.segments
-                .iter()
-                .take(index)
-                .map(|s| s.duration_ns)
-                .sum(),
-        )
+        if index == self.segments.len() {
+            return Some(self.current_duration_ns);
+        }
+        let first_offset = *self.segment_offsets_ns.front()?;
+        Some(self.segment_offsets_ns[index].wrapping_sub(first_offset))
     }
 }
 
@@ -187,6 +193,31 @@ mod tests {
         assert_eq!(buf.get_segment_by_sequence(2).unwrap().start_pts, 2 * SEC);
         assert_eq!(buf.get_segment_by_sequence(4).unwrap().start_pts, 4 * SEC);
         assert!(buf.get_segment_by_sequence(5).is_none());
+    }
+
+    #[test]
+    fn sequence_offsets_survive_eviction() {
+        let buffer = HotBuffer::new("cam".to_string(), 6);
+        let mut buf = buffer.write_recover();
+        for (seq, duration_secs) in [1, 2, 3].into_iter().enumerate() {
+            let mut segment = segment(seq as u64 * SEC);
+            segment.duration_ns = duration_secs * SEC;
+            buf.push(segment);
+        }
+
+        assert_eq!(buf.sequence_to_offset_ns(0), Some(0));
+        assert_eq!(buf.sequence_to_offset_ns(1), Some(SEC));
+        assert_eq!(buf.sequence_to_offset_ns(2), Some(3 * SEC));
+        assert_eq!(buf.sequence_to_offset_ns(3), Some(6 * SEC));
+
+        let mut fourth = segment(6 * SEC);
+        fourth.duration_ns = 4 * SEC;
+        buf.push(fourth);
+
+        assert_eq!(buf.first_sequence(), 3);
+        assert_eq!(buf.sequence_to_offset_ns(2), None);
+        assert_eq!(buf.sequence_to_offset_ns(3), Some(0));
+        assert_eq!(buf.sequence_to_offset_ns(4), Some(4 * SEC));
     }
 
     #[test]
