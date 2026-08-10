@@ -10,7 +10,7 @@
 #     The container filesystem is ephemeral and updates flow through Home
 #     Assistant's add-on store, so Camon's GitHub self-updater is disabled.
 #   * http.port = 22666 — the add-on is reached exclusively through ingress,
-#     which is wired to this internal port (ingress_port in config.yaml).
+#     which the catalog manifest wires to this internal port.
 #   * http.bind = 0.0.0.0 — ingress reaches the container over the container
 #     network, so binding loopback (or anything else) silently breaks it.
 #   * storage.data_dir = /data/storage — /data is the add-on's persistent
@@ -24,10 +24,10 @@
 #
 # These are applied with `--set` at startup, overriding whatever the file says.
 #
-# Additionally, if a Supervisor-managed MQTT broker is installed (see the
-# `services: - mqtt:want` block in config.yaml), its connection details are
-# also applied with --set, overriding any [mqtt] section in camon.toml. This
-# one is conditional — camon runs fine without it if no broker is installed.
+# Additionally, if a Supervisor-managed MQTT broker is installed, the external
+# catalog manifest's `mqtt:want` service grant lets us apply its connection
+# details with --set, overriding any [mqtt] section in camon.toml. This is
+# conditional — camon runs fine without it if no broker is installed.
 set -euo pipefail
 
 CONFIG=/config/camon.toml
@@ -66,13 +66,13 @@ fi
 echo "[camon-addon] using $CONFIG (update.enabled/http.port/http.bind/http.allow_open/storage.data_dir forced)"
 
 # --- MQTT auto-configuration from a Supervisor-managed broker --------------
-# config.yaml requests `services: - mqtt:want`, which grants access to the
-# Supervisor's /services/mqtt endpoint if an MQTT broker add-on (e.g.
+# The catalog manifest requests `services: - mqtt:want`, which grants access
+# to the Supervisor's /services/mqtt endpoint if an MQTT broker add-on (e.g.
 # Mosquitto) is installed. When it responds, we force mqtt.enabled/host/port/
-# username/password with --set — these take precedence over any [mqtt]
-# values in camon.toml itself. When no broker is installed the call fails and
-# we start camon as-is: whatever (if anything) camon.toml's [mqtt] section
-# says is used unmodified.
+# username/password with --set — these take precedence over any [mqtt] values
+# in camon.toml itself. When no broker is installed the call fails and we start
+# camon as-is: whatever (if anything) camon.toml's [mqtt] section says is used
+# unmodified.
 MQTT_ARGS=()
 if MQTT_JSON=$(curl -sf -H "Authorization: Bearer ${SUPERVISOR_TOKEN}" http://supervisor/services/mqtt) \
     && [ "$(printf '%s' "$MQTT_JSON" | jq -r '.result')" = "ok" ]; then

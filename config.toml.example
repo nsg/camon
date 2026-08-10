@@ -5,7 +5,8 @@
 #   camon --config /path/to/config.toml --set http.port=9090
 # A --set value is typed from the setting it names, not from how it looks, so
 # a numeric-looking string stays a string (--set mqtt.password=12345).
-# (The Home Assistant add-on uses both; see HOMEASSISTANT.md.)
+# (The Home Assistant add-on uses both; see its documentation at
+# https://github.com/nsg/ha-repo/blob/main/camon/DOCS.md.)
 #
 # The whole file is validated before anything starts, and camon exits with the
 # problem rather than running on defaults: a key it does not know is an error

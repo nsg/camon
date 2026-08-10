@@ -3,15 +3,25 @@ name: Build add-on image
 on:
   push:
     branches: ['master']
+    tags: ['v*']
     paths:
       - camon-addon/**
+      - Cargo.lock
+      - Cargo.toml
+      - build.rs
+      - config.toml.example
+      - src/**
       - .github/workflows/addon.yml
   pull_request:
     branches: ['master']
     paths:
       - camon-addon/**
+      - Cargo.lock
+      - Cargo.toml
+      - build.rs
+      - config.toml.example
+      - src/**
       - .github/workflows/addon.yml
-  workflow_dispatch:
 
 permissions:
   contents: read
@@ -28,33 +38,42 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Read add-on version
+      - name: Read build version
         id: meta
-        run: echo "version=$(yq '.version' camon-addon/config.yaml)" >> "$GITHUB_OUTPUT"
+        run: |
+          cargo=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
+          if [ "${GITHUB_REF_TYPE}" = tag ]; then
+            tagged="${GITHUB_REF_NAME#v}"
+            if [ "$tagged" != "$cargo" ]; then
+              echo "tag ${GITHUB_REF_NAME} does not match Cargo.toml version ${cargo}" >&2
+              exit 1
+            fi
+            echo "version=${tagged}" >> "$GITHUB_OUTPUT"
+            echo "build_version=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=${cargo}" >> "$GITHUB_OUTPUT"
+            echo "build_version=$(git describe --tags --always --dirty)" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Setup buildx
         uses: docker/setup-buildx-action@v3
 
       - name: Log in to GHCR
-        if: github.event_name != 'pull_request'
+        if: github.event_name == 'push' && github.ref_type == 'tag'
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # The Supervisor pulls `image` from config.yaml at the tag equal to the
-      # add-on version, so the `:<version>` tag below is what installs use.
-      # CAMON_VERSION keeps the source clone inside the Dockerfile pinned to
-      # the release tag matching the add-on version.
       - name: Build and push
         uses: docker/build-push-action@v6
         with:
-          context: camon-addon
+          context: .
+          file: camon-addon/Dockerfile
           platforms: linux/amd64
-          push: ${{ github.event_name != 'pull_request' }}
-          build-args: |
-            CAMON_VERSION=v${{ steps.meta.outputs.version }}
+          push: ${{ github.event_name == 'push' && github.ref_type == 'tag' }}
+          build-args: CAMON_BUILD_VERSION=${{ steps.meta.outputs.build_version }}
           tags: |
             ${{ env.IMAGE }}:${{ steps.meta.outputs.version }}
             ${{ env.IMAGE }}:latest

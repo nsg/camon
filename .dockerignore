@@ -1,0 +1,9 @@
+**
+!Cargo.lock
+!Cargo.toml
+!build.rs
+!config.toml.example
+!src
+!src/**
+!camon-addon
+!camon-addon/run.sh

@@ -456,13 +456,13 @@ Reads being open is a wider hole than "somebody on the LAN". A page on a domain 
 | Hot | RAM | ~10 minutes | 1080p @ 30fps | Live playback and real-time analysis |
 | Warm | Disk | 2 days (movement) / 14 days (objects) / 1 day (continuous) | Original quality | Motion-triggered events, or gapless continuous recording when analytics is off |
 
-## Home Assistant add-on
+## Home Assistant
 
-This repository is also a valid [Home Assistant add-on repository](https://developers.home-assistant.io/docs/add-ons/repository), so Camon can be installed as an add-on with its web UI embedded in the Home Assistant sidebar (via ingress).
+Camon can be installed as an ingress add-on from the separate [NSG Home Assistant repository](https://github.com/nsg/ha-repo), with its web UI embedded in the Home Assistant sidebar.
 
-[![Add repository to my Home Assistant](https://my.home-assistant.io/badges/supervisor_add_addon_repository.svg)](https://my.home-assistant.io/redirect/supervisor_add_addon_repository/?repository_url=https%3A%2F%2Fgithub.com%2Fnsg%2Fcamon)
+[![Add repository to my Home Assistant](https://my.home-assistant.io/badges/supervisor_add_addon_repository.svg)](https://my.home-assistant.io/redirect/supervisor_add_addon_repository/?repository_url=https%3A%2F%2Fgithub.com%2Fnsg%2Fha-repo)
 
-See the [add-on documentation](camon-addon/DOCS.md) for install steps, ingress notes, the `camon.toml` configuration, and the amd64-only caveat.
+See the [add-on documentation](https://github.com/nsg/ha-repo/blob/main/camon/DOCS.md) for install steps, ingress notes, the `camon.toml` configuration, and the amd64-only caveat.
 
 With the `[mqtt]` section enabled (automatic in the add-on when the Mosquitto broker add-on is installed), each camera also appears as native Home Assistant entities via MQTT discovery: a motion-gated snapshot camera, a motion sensor, per-class occupancy sensors, and a per-class snapshot camera showing the cropped frame from the last sighting of that class (retained, so it persists across restarts) — no custom integration required.
 

@@ -1,32 +1,31 @@
 # Camon Home Assistant add-on image.
 #
-# Build approach: compile Camon from source (keeps the add-on self-contained —
-# no dependency on a published GitHub release binary), then run it on a slim
-# Debian runtime with ffmpeg installed (Camon spawns ffmpeg/ffprobe).
+# Build approach: compile Camon from the workflow's checked-out source, then
+# run it on a slim Debian runtime with ffmpeg installed (Camon spawns
+# ffmpeg/ffprobe). Release images are built only on v* pushes, so the complete
+# image recipe and its application source come from the same release tag.
 #
 # We deliberately do NOT use a Home Assistant base image here. The HA base
 # images are Alpine/musl, whereas the Rust toolchain image below is glibc; a
 # glibc binary won't run on musl. Debian bookworm on both the build and run
-# stages keeps them ABI-compatible and gives us a well-supported ffmpeg. With
-# `init: false` in config.yaml our CMD runs as PID 1 and receives SIGTERM
-# directly (Camon shuts down gracefully on SIGTERM). amd64 only — see
-# config.yaml `arch`.
+# stages keeps them ABI-compatible and gives us a well-supported ffmpeg. The
+# catalog manifest in nsg/ha-repo sets `init: false`, so our CMD runs as PID 1
+# and receives SIGTERM directly (Camon shuts down gracefully on SIGTERM). The
+# same manifest limits the image to amd64.
 #
 # This Dockerfile is built by GitHub Actions (.github/workflows/addon.yml) and
-# pushed to ghcr.io/nsg/amd64-addon-camon; the Home Assistant supervisor pulls
-# that prebuilt image (config.yaml `image`) rather than building on-device.
+# pushed to ghcr.io/nsg/amd64-addon-camon. The catalog manifest in
+# https://github.com/nsg/ha-repo points Home Assistant at that prebuilt image.
 
 # ---- Build stage -----------------------------------------------------------
 FROM rust:1-bookworm AS builder
-# The image is built with THIS DIRECTORY (camon-addon/) as the Docker
-# context, so the Rust source is not in the context at all. Clone the
-# repository at the version tag matching config.yaml instead (the workflow
-# passes CAMON_VERSION derived from config.yaml) — pinned, so the add-on
-# always builds the exact released source.
-ARG CAMON_VERSION=v0.6.0
-RUN git clone --depth 1 --branch ${CAMON_VERSION} https://github.com/nsg/camon /src
 WORKDIR /src
-RUN cargo build --release --locked --bin camon
+ARG CAMON_BUILD_VERSION=dev
+COPY Cargo.toml Cargo.lock build.rs config.toml.example ./
+COPY src ./src
+# The workflow derives CAMON_BUILD_VERSION from the checkout and validates a
+# release value against Cargo.toml before this build starts.
+RUN CAMON_BUILD_VERSION="${CAMON_BUILD_VERSION}" cargo build --release --locked --bin camon
 
 # ---- Runtime stage ---------------------------------------------------------
 FROM debian:bookworm-slim
@@ -44,11 +43,10 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /src/target/release/camon /usr/local/bin/camon
-# The commented config template from the cloned source — run.sh seeds this into
-# the add-on's config folder (/config/camon.toml.example) on first start.
+# The commented config template from the checked-out source — run.sh seeds it
+# into the add-on's config folder on first start.
 COPY --from=builder /src/config.toml.example /usr/local/share/camon/config.toml.example
-# Context is camon-addon/, so run.sh sits at the context root.
-COPY run.sh /run.sh
+COPY camon-addon/run.sh /run.sh
 RUN chmod a+x /run.sh
 
 LABEL \
