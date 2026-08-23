@@ -48,6 +48,7 @@ let overlayAnimationId = null;
 let isLiveScrubbing = false;
 let isAtLiveEdge = true;
 let detailHls = null;
+let detailPlayingHandler = null;
 
 function trackFraction(e) {
     const rect = tlTrack.getBoundingClientRect();
@@ -143,12 +144,14 @@ function wireLiveView() {
 
     liveBtn.addEventListener('click', () => {
         if (detailHls) {
-            const seekable = detailVideo.seekable;
-            if (seekable.length > 0) {
-                detailVideo.currentTime = seekable.end(seekable.length - 1) - 0.5;
+            const sync = detailHls.liveSyncPosition;
+            if (typeof sync === 'number') {
+                detailVideo.currentTime = sync;
+            } else if (detailVideo.buffered.length > 0) {
+                detailVideo.currentTime = detailVideo.buffered.end(detailVideo.buffered.length - 1) - 0.5;
             }
-            setLiveEdge(true);
         }
+        setLiveEdge(true);
     });
 
     // ResizeObserver covers window changes, rotation, and initial stream sizing.
@@ -176,6 +179,7 @@ function showLiveView(cameraId) {
     currentDetailCameraId = cameraId;
 
     if (!detailHls) {
+        detailLoading.querySelector('p').textContent = 'Loading...';
         detailLoading.hidden = false;
         stabilityOverlay.hidden = !stabilityOverlayEnabled;
         bgOverlay.hidden = !bgOverlayEnabled;
@@ -200,6 +204,10 @@ function cleanupLiveView() {
     if (detectionPoller) { detectionPoller.stop(); detectionPoller = null; }
     if (warmEventPoller) { warmEventPoller.stop(); warmEventPoller = null; }
     if (stabilityPoller) { stabilityPoller.stop(); stabilityPoller = null; }
+    if (detailPlayingHandler) {
+        detailVideo.removeEventListener('playing', detailPlayingHandler);
+        detailPlayingHandler = null;
+    }
     if (detailHls) { detailHls.destroy(); detailHls = null; }
     detailVideo.src = '';
     currentDetections = [];
@@ -251,6 +259,14 @@ function cleanupLiveView() {
 
 function loadDetailCamera(cameraId) {
     const src = `api/stream/${encodeURIComponent(cameraId)}/playlist.m3u8`;
+    if (detailPlayingHandler) {
+        detailVideo.removeEventListener('playing', detailPlayingHandler);
+    }
+    detailPlayingHandler = () => {
+        detailLoading.hidden = true;
+        detailPlayingHandler = null;
+    };
+    detailVideo.addEventListener('playing', detailPlayingHandler, { once: true });
 
     if (typeof Hls !== 'undefined' && Hls.isSupported()) {
         detailHls = new Hls({
@@ -264,7 +280,6 @@ function loadDetailCamera(cameraId) {
         detailHls.attachMedia(detailVideo);
 
         detailHls.on(Hls.Events.MANIFEST_PARSED, () => {
-            detailLoading.hidden = true;
             detailVideo.play().catch(e => console.error(`Play failed for ${cameraId}:`, e));
             startOverlayUpdates();
             fetchMotionSegments(cameraId);
@@ -286,7 +301,6 @@ function loadDetailCamera(cameraId) {
     } else if (detailVideo.canPlayType('application/vnd.apple.mpegurl')) {
         detailVideo.src = authUrl(src);
         detailVideo.addEventListener('loadedmetadata', () => {
-            detailLoading.hidden = true;
             detailVideo.play().catch(e => console.error(`Play failed for ${cameraId}:`, e));
             startOverlayUpdates();
             fetchMotionSegments(cameraId);
@@ -336,9 +350,13 @@ function updateTimeline() {
         const timeToLive = r.end - current;
         if (isAtLiveEdge) {
             tlOffset.textContent = '';
-            if (timeToLive > 10) {
-                // Buffer stalls must not silently leave live mode.
-                detailVideo.currentTime = r.end - 0.5;
+            if (detailHls) {
+                const sync = detailHls.liveSyncPosition;
+                if (typeof sync === 'number' && sync - current > 10) {
+                    // seekable.end is the playlist edge, not buffered media; seeking there stalls
+                    // playback until the next segment arrives.
+                    detailVideo.currentTime = sync;
+                }
             }
         } else if (timeToLive < 3) {
             tlOffset.textContent = '';
