@@ -21,12 +21,14 @@ pub fn generate_playlist(buffer: &HotBuffer, tail_count: Option<usize>) -> Strin
             .to_string();
     }
 
+    // RFC 8216 §4.3.3.1 compares TARGETDURATION with each EXTINF rounded to the nearest integer.
     let max_duration = segments
         .iter()
         .skip(skip)
-        .map(|s| (s.duration_ns as f64 / NANOS_PER_SEC).ceil() as u64)
+        .map(|s| (s.duration_ns as f64 / NANOS_PER_SEC).round() as u64)
         .max()
-        .unwrap_or(2);
+        .unwrap_or(2)
+        .max(1);
 
     let mut playlist = String::new();
     playlist.push_str("#EXTM3U\n");
@@ -141,6 +143,20 @@ mod tests {
         buffer
     }
 
+    fn buffer_with_durations(durations: &[u64]) -> Arc<std::sync::RwLock<HotBuffer>> {
+        let buffer = HotBuffer::new("cam".to_string(), 600);
+        let mut start_pts = 0_u64;
+        for &duration_ns in durations {
+            let mut segment = GopSegment::new(start_pts);
+            segment.duration_ns = duration_ns;
+            segment.frame_count = 1;
+            segment.data = Arc::new(vec![0x47; 188]);
+            buffer.write_recover().push(segment);
+            start_pts = start_pts.saturating_add(duration_ns);
+        }
+        buffer
+    }
+
     fn markers(playlist: &str) -> usize {
         playlist.matches("#EXT-X-DISCONTINUITY").count()
     }
@@ -172,6 +188,21 @@ mod tests {
         let playlist = generate_playlist(&buffer.read_recover(), None);
         assert_eq!(markers(&playlist), 0, "{playlist}");
         assert!(playlist.contains("#EXTINF:2.000"), "{playlist}");
+    }
+
+    #[test]
+    fn target_duration_rounds_to_the_nearest_second() {
+        let buffer = buffer_with_durations(&[2_020_000_000, 2_000_000_000, 1_980_000_000]);
+        let playlist = generate_playlist(&buffer.read_recover(), None);
+        assert!(playlist.contains("#EXT-X-TARGETDURATION:2\n"), "{playlist}");
+
+        let buffer = buffer_with_durations(&[2_600_000_000]);
+        let playlist = generate_playlist(&buffer.read_recover(), None);
+        assert!(playlist.contains("#EXT-X-TARGETDURATION:3\n"), "{playlist}");
+
+        let buffer = buffer_with_durations(&[200_000_000]);
+        let playlist = generate_playlist(&buffer.read_recover(), None);
+        assert!(playlist.contains("#EXT-X-TARGETDURATION:1\n"), "{playlist}");
     }
 
     #[test]
