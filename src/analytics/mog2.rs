@@ -119,7 +119,7 @@ impl Mog2 {
         let model = self
             .nmodes
             .iter_mut()
-            .zip(self.modes.chunks_exact_mut(NMIXTURES));
+            .zip(self.modes.as_chunks_mut::<NMIXTURES>().0);
         for ((&pix, out), (nmodes, g)) in pixels.zip(model) {
             let data = pix as f32;
             let mut nm = *nmodes as usize;
@@ -227,7 +227,11 @@ impl Mog2 {
         }
         out.clear();
         out.reserve(self.width * self.height);
-        for (&nm, g) in self.nmodes.iter().zip(self.modes.chunks_exact(NMIXTURES)) {
+        for (&nm, g) in self
+            .nmodes
+            .iter()
+            .zip(self.modes.as_chunks::<NMIXTURES>().0)
+        {
             let mut total_weight = 0.0f32;
             let mut mean = 0.0f32;
             for m in &g[..nm as usize] {

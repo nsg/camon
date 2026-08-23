@@ -171,7 +171,12 @@ pub fn has_random_access_indicator(packet: &[u8]) -> bool {
 /// random_access_indicator — the same signal the live segmenter cuts on, so a hot-buffer
 /// segment contains exactly one.
 pub fn keyframe_count(data: &[u8]) -> usize {
-    let packets = || data.chunks_exact(TS_PACKET_SIZE);
+    let packets = || {
+        data.as_chunks::<TS_PACKET_SIZE>()
+            .0
+            .iter()
+            .map(<[u8; TS_PACKET_SIZE]>::as_slice)
+    };
     let video_pid = match packets().find(|p| starts_video_pes(p)) {
         Some(packet) => packet_pid(packet),
         None => return 0,
