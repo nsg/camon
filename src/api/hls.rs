@@ -6,7 +6,11 @@ use crate::buffer::HotBuffer;
 
 const NANOS_PER_SEC: f64 = 1_000_000_000.0;
 
-pub fn generate_playlist(buffer: &HotBuffer, tail_count: Option<usize>) -> String {
+pub fn generate_playlist(
+    buffer: &HotBuffer,
+    tail_count: Option<usize>,
+    segment_uri_suffix: &str,
+) -> String {
     let segments = buffer.segments();
     let first_sequence = buffer.first_sequence();
 
@@ -56,7 +60,7 @@ pub fn generate_playlist(buffer: &HotBuffer, tail_count: Option<usize>) -> Strin
         let dt = format_datetime(secs, millis);
         playlist.push_str(&format!("#EXT-X-PROGRAM-DATE-TIME:{}\n", dt));
         playlist.push_str(&format!("#EXTINF:{:.3},\n", duration));
-        playlist.push_str(&format!("segment/{}\n", sequence));
+        playlist.push_str(&format!("segment/{}{}\n", sequence, segment_uri_suffix));
     }
 
     playlist
@@ -164,28 +168,28 @@ mod tests {
     #[test]
     fn segments_stamped_by_an_unset_clock_are_not_all_marked_discontinuous() {
         let buffer = buffer_of(&[0, 0, 0, 0]);
-        let playlist = generate_playlist(&buffer.read_recover(), None);
+        let playlist = generate_playlist(&buffer.read_recover(), None, "");
         assert_eq!(markers(&playlist), 0, "{playlist}");
     }
 
     #[test]
     fn the_segment_stamped_once_the_clock_lands_is_marked_discontinuous() {
         let buffer = buffer_of(&[0, 0, 1_700_000_000 * SEC, 1_700_000_002 * SEC]);
-        let playlist = generate_playlist(&buffer.read_recover(), None);
+        let playlist = generate_playlist(&buffer.read_recover(), None, "");
         assert_eq!(markers(&playlist), 1, "{playlist}");
     }
 
     #[test]
     fn a_gap_between_stamped_segments_is_still_marked_discontinuous() {
         let buffer = buffer_of(&[1_700_000_000 * SEC, 1_700_000_060 * SEC]);
-        let playlist = generate_playlist(&buffer.read_recover(), None);
+        let playlist = generate_playlist(&buffer.read_recover(), None, "");
         assert_eq!(markers(&playlist), 1, "{playlist}");
     }
 
     #[test]
     fn saturated_stamps_do_not_overflow_the_playlist() {
         let buffer = buffer_of(&[u64::MAX, u64::MAX]);
-        let playlist = generate_playlist(&buffer.read_recover(), None);
+        let playlist = generate_playlist(&buffer.read_recover(), None, "");
         assert_eq!(markers(&playlist), 0, "{playlist}");
         assert!(playlist.contains("#EXTINF:2.000"), "{playlist}");
     }
@@ -193,16 +197,47 @@ mod tests {
     #[test]
     fn target_duration_rounds_to_the_nearest_second() {
         let buffer = buffer_with_durations(&[2_020_000_000, 2_000_000_000, 1_980_000_000]);
-        let playlist = generate_playlist(&buffer.read_recover(), None);
+        let playlist = generate_playlist(&buffer.read_recover(), None, "");
         assert!(playlist.contains("#EXT-X-TARGETDURATION:2\n"), "{playlist}");
 
         let buffer = buffer_with_durations(&[2_600_000_000]);
-        let playlist = generate_playlist(&buffer.read_recover(), None);
+        let playlist = generate_playlist(&buffer.read_recover(), None, "");
         assert!(playlist.contains("#EXT-X-TARGETDURATION:3\n"), "{playlist}");
 
         let buffer = buffer_with_durations(&[200_000_000]);
-        let playlist = generate_playlist(&buffer.read_recover(), None);
+        let playlist = generate_playlist(&buffer.read_recover(), None, "");
         assert!(playlist.contains("#EXT-X-TARGETDURATION:1\n"), "{playlist}");
+    }
+
+    #[test]
+    fn an_empty_segment_uri_suffix_preserves_the_existing_playlist_bytes() {
+        let buffer = buffer_of(&[0]);
+        let playlist = generate_playlist(&buffer.read_recover(), None, "");
+        assert_eq!(
+            playlist,
+            "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:2\n\
+             #EXT-X-MEDIA-SEQUENCE:0\n\
+             #EXT-X-PROGRAM-DATE-TIME:1970-01-01T00:00:00.000Z\n\
+             #EXTINF:2.000,\nsegment/0\n"
+        );
+    }
+
+    #[test]
+    fn a_segment_uri_suffix_is_appended_to_every_segment() {
+        let buffer = buffer_of(&[0, 0, 0]);
+        let playlist = generate_playlist(&buffer.read_recover(), None, "?stream=sub");
+        let segment_uris: Vec<&str> = playlist
+            .lines()
+            .filter(|line| line.starts_with("segment/"))
+            .collect();
+        assert_eq!(
+            segment_uris,
+            [
+                "segment/0?stream=sub",
+                "segment/1?stream=sub",
+                "segment/2?stream=sub"
+            ]
+        );
     }
 
     #[test]

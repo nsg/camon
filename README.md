@@ -14,7 +14,7 @@ This is a personal project built for my own cameras, hardware, and use case. It 
 
 ## Pipeline
 
-We keep a single RTSP stream per camera, remux into MPEG-TS, segment at keyframe boundaries, and hold the last 10 minutes in a RAM buffer. We do that to avoid re-encoding to keep it lightweight on CPU usage, and we save it in RAM to spare disk wear.
+We keep each camera's main RTSP stream, remux it into MPEG-TS, segment at keyframe boundaries, and hold the last 10 minutes in a RAM buffer. We do that to avoid re-encoding to keep it lightweight on CPU usage, and we save it in RAM to spare disk wear.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/diagrams/01-capture-dark.svg">
@@ -28,7 +28,7 @@ Each camera runs its own independent pipeline with its own buffer. From the buff
   <img alt="The hot buffer serves HLS to clients and keyframes to the motion analyzer, which feeds the motion store, sends crop jobs to the detection worker (which fills the detection store and post-hoc-upgrades events), and hands finished events to the warm writer" src="docs/diagrams/02-fanout-light.svg">
 </picture>
 
-Clients can stream the raw segments from the buffer directly, the only thing we need to do is to serve a playlist.m3u8 which is a simple text file to the player. Object Detection is heavy on the CPU (or GPU) so most "detections" are filtered in the Motion Analyzer stage.
+Clients can stream the raw segments from the buffer directly, the only thing we need to do is to serve a playlist.m3u8 which is a simple text file to the player. When a camera has an optional low-resolution `sub_url`, a second short in-memory buffer serves only the multi-camera grid. This keeps the grid responsive on constrained links without changing the main stream used by the single-camera view, recording, or analytics. Object Detection is heavy on the CPU (or GPU) so most "detections" are filtered in the Motion Analyzer stage.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/diagrams/03-analyzer-dark.svg">
@@ -403,6 +403,9 @@ occupancy_hold_secs = 60
 [[cameras]]
 id = "front-door"
 url = "rtsp://admin:password@192.168.1.100:554/stream1"
+# Optional low-resolution H.264 stream used only by the multi-camera grid.
+# Recording and analytics always use url.
+# sub_url = "rtsp://admin:password@192.168.1.100:554/stream2"
 ```
 
 ### Camera Requirements
@@ -411,13 +414,15 @@ url = "rtsp://admin:password@192.168.1.100:554/stream1"
 - GOP (keyframe interval) of 1–2 seconds
 - Bitrate ~6 Mbps (CBR or capped VBR)
 
+If the camera exposes a low-resolution H.264 substream, configure it as `sub_url` with the same 1–2 second GOP. Camon uses it only for the multi-camera grid; recording, analytics, and the single-camera live view always use the main `url`.
+
 ## API
 
 | Method | Endpoint | Description |
 |---|---|---|
 | `GET` | `/api/cameras` | List configured cameras |
-| `GET` | `/api/stream/{id}/playlist.m3u8` | Live HLS playlist |
-| `GET` | `/api/stream/{id}/segment/{n}` | Live HLS segment |
+| `GET` | `/api/stream/{id}/playlist.m3u8` | Live HLS playlist; add `?stream=sub` for the configured grid substream |
+| `GET` | `/api/stream/{id}/segment/{n}` | Live HLS segment; add `?stream=sub` for the configured grid substream |
 | `GET` | `/api/cameras/{id}/motion` | Motion segments with timestamps |
 | `GET` | `/api/cameras/{id}/motion/{seq}/mask` | JPEG motion mask for a segment |
 | `GET` | `/api/cameras/{id}/motion/maps/{stage}` | JPEG view of one detector stage (see below) |

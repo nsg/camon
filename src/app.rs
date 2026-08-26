@@ -442,6 +442,10 @@ fn create_ollama_client(config: &Config) -> Option<OllamaClient> {
 /// behind rather than ever dropping an event.
 const EVENT_CHANNEL_CAPACITY: usize = 8;
 
+/// The grid serves only a roughly six-segment live tail, so 60 seconds covers reconnects
+/// without duplicating the long low-resolution history already provided by the main buffer.
+const SUB_HOT_DURATION_SECS: u64 = 60;
+
 struct CameraHandles {
     /// The producers, with the buffer each one fills: phase 1 joins these and
     /// then publishes each buffer's watermark.
@@ -461,6 +465,7 @@ struct CameraHandles {
     /// event upgrades.
     event_sender_map: HashMap<String, tokio::sync::mpsc::Sender<WriterMessage>>,
     buffers_map: HashMap<String, Arc<RwLock<HotBuffer>>>,
+    sub_buffers_map: HashMap<String, Arc<RwLock<HotBuffer>>>,
 }
 
 struct SpawnContext<'a> {
@@ -533,11 +538,13 @@ fn spawn_cameras(ctx: &SpawnContext, cameras: Vec<config::CameraConfig>) -> Came
         event_senders: Vec::new(),
         event_sender_map: HashMap::new(),
         buffers_map: HashMap::new(),
+        sub_buffers_map: HashMap::new(),
     };
 
     let mode = recording_mode(ctx.config);
 
     for cam_config in cameras {
+        let sub_url = cam_config.sub_url.clone();
         let buffer = HotBuffer::new(cam_config.id.clone(), ctx.config.buffer.hot_duration_secs);
         let camera_id = cam_config.id.clone();
 
@@ -600,6 +607,28 @@ fn spawn_cameras(ctx: &SpawnContext, cameras: Vec<config::CameraConfig>) -> Came
         handles
             .pipeline_handles
             .push((camera_id.clone(), handle, Arc::clone(&buffer)));
+
+        if let Some(sub_url) = sub_url {
+            let sub_id = format!("{camera_id}:sub");
+            let sub_buffer = HotBuffer::new(sub_id.clone(), SUB_HOT_DURATION_SECS);
+            handles
+                .sub_buffers_map
+                .insert(camera_id.clone(), Arc::clone(&sub_buffer));
+
+            let sub_config = config::CameraConfig {
+                id: sub_id.clone(),
+                url: sub_url,
+                sub_url: None,
+            };
+            let buffer_clone = Arc::clone(&sub_buffer);
+            let shutdown_clone = ctx.shutdown.clone();
+            let handle = ctx
+                .supervisor
+                .critical(format!("camera:{camera_id}:sub"), async move {
+                    run_camera(sub_config, buffer_clone, shutdown_clone).await;
+                });
+            handles.pipeline_handles.push((sub_id, handle, sub_buffer));
+        }
 
         // Continuous mode rolls fixed-length chunks straight from the hot
         // buffer into the warm writer. Gated on the same mode the watchdog is
@@ -1097,6 +1126,7 @@ where
 
     let app_state = AppState::new(
         camera_handles.buffers_map.clone(),
+        camera_handles.sub_buffers_map.clone(),
         motion_store,
         detection_store,
         debug_store,
@@ -1650,6 +1680,7 @@ mod tests {
             event_senders: vec![tx.clone()],
             event_sender_map: HashMap::from([("cam".to_string(), tx)]),
             buffers_map: HashMap::new(),
+            sub_buffers_map: HashMap::new(),
         };
         tokio::time::timeout(
             Duration::from_secs(30),
@@ -1682,6 +1713,7 @@ mod tests {
             event_senders: Vec::new(),
             event_sender_map: HashMap::new(),
             buffers_map: HashMap::new(),
+            sub_buffers_map: HashMap::new(),
         }
     }
 

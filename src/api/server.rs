@@ -36,6 +36,7 @@ struct Assets;
 #[derive(Clone)]
 pub struct AppState {
     pub buffers: Arc<HashMap<String, Arc<RwLock<HotBuffer>>>>,
+    pub sub_buffers: Arc<HashMap<String, Arc<RwLock<HotBuffer>>>>,
     pub motion_store: MotionStore,
     pub detection_store: DetectionStore,
     pub debug_store: DetectionDebugStore,
@@ -48,6 +49,7 @@ pub struct AppState {
 impl AppState {
     pub fn new(
         buffers: HashMap<String, Arc<RwLock<HotBuffer>>>,
+        sub_buffers: HashMap<String, Arc<RwLock<HotBuffer>>>,
         motion_store: MotionStore,
         detection_store: DetectionStore,
         debug_store: DetectionDebugStore,
@@ -56,6 +58,7 @@ impl AppState {
     ) -> Self {
         Self {
             buffers: Arc::new(buffers),
+            sub_buffers: Arc::new(sub_buffers),
             motion_store,
             detection_store,
             debug_store,
@@ -96,6 +99,12 @@ struct DetectionResponse {
 #[derive(Deserialize)]
 struct PlaylistQuery {
     live: Option<bool>,
+    stream: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct SegmentQuery {
+    stream: Option<String>,
 }
 
 /// The UI shell (`/` and `/assets/*`) stays unauthenticated so the token prompt
@@ -224,10 +233,21 @@ async fn playlist_handler(
     } else {
         None
     };
-    match state.buffers.get(&id) {
+    let (buffer, segment_uri_suffix) = match query.stream.as_deref() {
+        None => (state.buffers.get(&id), ""),
+        Some("sub") => match state.sub_buffers.get(&id) {
+            Some(buffer) => (Some(buffer), "?stream=sub"),
+            // Main and sub buffers have unrelated media-sequence namespaces. A live player
+            // refreshes on every target duration, so content-dependent fallback could switch
+            // namespaces mid-watch; config membership is stable for the process lifetime.
+            None => (state.buffers.get(&id), ""),
+        },
+        Some(_) => return (StatusCode::BAD_REQUEST, "invalid stream").into_response(),
+    };
+    match buffer {
         Some(buffer) => {
             let buf = buffer.read_recover();
-            let playlist = hls::generate_playlist(&buf, tail_count);
+            let playlist = hls::generate_playlist(&buf, tail_count, segment_uri_suffix);
             (
                 [(header::CONTENT_TYPE, "application/vnd.apple.mpegurl")],
                 playlist,
@@ -241,8 +261,14 @@ async fn playlist_handler(
 async fn segment_handler(
     State(state): State<AppState>,
     Path((id, n)): Path<(String, u64)>,
+    Query(query): Query<SegmentQuery>,
 ) -> Response {
-    match state.buffers.get(&id) {
+    let buffer = match query.stream.as_deref() {
+        None => state.buffers.get(&id),
+        Some("sub") => state.sub_buffers.get(&id),
+        Some(_) => return (StatusCode::BAD_REQUEST, "invalid stream").into_response(),
+    };
+    match buffer {
         Some(buffer) => {
             // Take only the segment's Arc under the lock so the ingest thread
             // never waits on a response body; hls::segment_body serves that
@@ -996,6 +1022,7 @@ async fn warm_filmstrip_handler(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::buffer::GopSegment;
     use crate::storage::EventType;
 
     const TOKEN: &str = "s3cr3t token";
@@ -1005,6 +1032,7 @@ mod tests {
         let buffers = HashMap::from([("cam".to_string(), HotBuffer::new("cam".to_string(), 60))]);
         let state = AppState::new(
             buffers,
+            HashMap::new(),
             MotionStore::new(&ids),
             DetectionStore::new(&ids),
             DetectionDebugStore::new(&ids),
@@ -1018,12 +1046,156 @@ mod tests {
         format!("http://{addr}")
     }
 
+    fn stream_buffer(id: &str, bytes: &[u8]) -> Arc<RwLock<HotBuffer>> {
+        let buffer = HotBuffer::new(id.to_string(), 60);
+        let mut segment = GopSegment::new(0);
+        segment.duration_ns = 1_000_000_000;
+        segment.frame_count = 1;
+        segment.data = Arc::new(bytes.to_vec());
+        buffer.write_recover().push(segment);
+        buffer
+    }
+
+    async fn serve_stream_buffers(
+        main: Arc<RwLock<HotBuffer>>,
+        sub: Option<Arc<RwLock<HotBuffer>>>,
+    ) -> String {
+        let ids = vec!["cam".to_string()];
+        let buffers = HashMap::from([("cam".to_string(), main)]);
+        let sub_buffers = sub
+            .map(|buffer| HashMap::from([("cam".to_string(), buffer)]))
+            .unwrap_or_default();
+        let state = AppState::new(
+            buffers,
+            sub_buffers,
+            MotionStore::new(&ids),
+            DetectionStore::new(&ids),
+            DetectionDebugStore::new(&ids),
+            None,
+            None,
+        );
+        let app = build_router(state, &ApiAuth::Open);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn the_substream_playlist_uses_substream_segment_uris() {
+        let base = serve_stream_buffers(
+            stream_buffer("cam", b"main"),
+            Some(stream_buffer("cam:sub", b"sub")),
+        )
+        .await;
+
+        let playlist = reqwest::get(format!(
+            "{base}/api/stream/cam/playlist.m3u8?live=true&stream=sub"
+        ))
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+
+        assert!(playlist.contains("segment/0?stream=sub\n"), "{playlist}");
+        assert!(
+            playlist
+                .lines()
+                .filter(|line| line.starts_with("segment/"))
+                .all(|line| line.ends_with("?stream=sub")),
+            "{playlist}"
+        );
+    }
+
+    #[tokio::test]
+    async fn requesting_a_substream_without_a_sub_buffer_serves_the_main_playlist() {
+        let base = serve_stream_buffers(stream_buffer("cam", b"main"), None).await;
+        let main = reqwest::get(format!("{base}/api/stream/cam/playlist.m3u8"))
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        let fallback = reqwest::get(format!("{base}/api/stream/cam/playlist.m3u8?stream=sub"))
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+
+        assert_eq!(fallback, main);
+        assert!(fallback.contains("segment/0\n"), "{fallback}");
+        assert!(!fallback.contains("?stream=sub"), "{fallback}");
+
+        let segment = reqwest::get(format!("{base}/api/stream/cam/segment/0?stream=sub"))
+            .await
+            .unwrap();
+        assert_eq!(segment.status(), reqwest::StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn an_empty_sub_buffer_does_not_fall_back_to_the_main_playlist() {
+        let empty_sub = HotBuffer::new("cam:sub".to_string(), 60);
+        let base = serve_stream_buffers(stream_buffer("cam", b"main"), Some(empty_sub)).await;
+        let playlist = reqwest::get(format!("{base}/api/stream/cam/playlist.m3u8?stream=sub"))
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            playlist,
+            "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:2\n\
+             #EXT-X-MEDIA-SEQUENCE:0\n"
+        );
+        assert!(!playlist.contains("segment/"), "{playlist}");
+    }
+
+    #[tokio::test]
+    async fn the_same_sequence_number_selects_independent_main_and_substream_segments() {
+        let base = serve_stream_buffers(
+            stream_buffer("cam", b"main bytes"),
+            Some(stream_buffer("cam:sub", b"sub bytes")),
+        )
+        .await;
+
+        let main = reqwest::get(format!("{base}/api/stream/cam/segment/0"))
+            .await
+            .unwrap();
+        assert_eq!(main.status(), reqwest::StatusCode::OK);
+        assert_eq!(main.bytes().await.unwrap().as_ref(), b"main bytes");
+
+        let sub = reqwest::get(format!("{base}/api/stream/cam/segment/0?stream=sub"))
+            .await
+            .unwrap();
+        assert_eq!(sub.status(), reqwest::StatusCode::OK);
+        assert_eq!(sub.bytes().await.unwrap().as_ref(), b"sub bytes");
+    }
+
+    #[tokio::test]
+    async fn an_unknown_stream_selector_is_rejected_for_playlists_and_segments() {
+        let base = serve_stream_buffers(stream_buffer("cam", b"main"), None).await;
+        for path in ["playlist.m3u8?stream=main", "segment/0?stream=main"] {
+            let response = reqwest::get(format!("{base}/api/stream/cam/{path}"))
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                reqwest::StatusCode::BAD_REQUEST,
+                "{path}"
+            );
+        }
+    }
+
     async fn serve_with_motion_store() -> (String, MotionStore) {
         let ids = vec!["cam".to_string()];
         let buffers = HashMap::from([("cam".to_string(), HotBuffer::new("cam".to_string(), 60))]);
         let motion_store = MotionStore::new(&ids);
         let state = AppState::new(
             buffers,
+            HashMap::new(),
             motion_store.clone(),
             DetectionStore::new(&ids),
             DetectionDebugStore::new(&ids),
@@ -1043,6 +1215,7 @@ mod tests {
         let debug_store = DetectionDebugStore::new(&ids);
         let state = AppState::new(
             buffers,
+            HashMap::new(),
             MotionStore::new(&ids),
             DetectionStore::new(&ids),
             debug_store.clone(),
@@ -1203,6 +1376,7 @@ mod tests {
         let buffers = HashMap::from([("cam".to_string(), HotBuffer::new("cam".to_string(), 60))]);
         let state = AppState::new(
             buffers,
+            HashMap::new(),
             MotionStore::new(&ids),
             DetectionStore::new(&ids),
             DetectionDebugStore::new(&ids),
@@ -1288,6 +1462,7 @@ mod tests {
         ));
         let state = AppState::new(
             buffers,
+            HashMap::new(),
             MotionStore::new(&ids),
             DetectionStore::new(&ids),
             DetectionDebugStore::new(&ids),
@@ -1306,6 +1481,7 @@ mod tests {
         let buffers = HashMap::from([("cam".to_string(), HotBuffer::new("cam".to_string(), 60))]);
         AppState::new(
             buffers,
+            HashMap::new(),
             MotionStore::new(&ids),
             DetectionStore::new(&ids),
             DetectionDebugStore::new(&ids),
@@ -1461,6 +1637,7 @@ mod tests {
         }
         let state = AppState::new(
             buffers,
+            HashMap::new(),
             MotionStore::new(&ids),
             DetectionStore::new(&ids),
             DetectionDebugStore::new(&ids),

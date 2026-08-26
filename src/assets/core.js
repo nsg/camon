@@ -246,7 +246,7 @@ function createCameraCell(cameraId) {
 }
 
 function loadGridCamera(cameraId, video) {
-    const src = `api/stream/${encodeURIComponent(cameraId)}/playlist.m3u8?live=true`;
+    const src = `api/stream/${encodeURIComponent(cameraId)}/playlist.m3u8?live=true&stream=sub`;
     const loading = video.parentElement.querySelector('.loading');
 
     if (typeof Hls !== 'undefined' && Hls.isSupported()) {

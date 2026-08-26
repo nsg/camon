@@ -52,6 +52,11 @@ pub enum ConfigError {
     )]
     DuplicateCameraId { id: String },
     #[error(
+        "camera {id:?} has an empty sub_url; remove the key when no substream is available, or \
+         set it to the camera's low-resolution RTSP URL"
+    )]
+    EmptyCameraSubUrl { id: String },
+    #[error(
         "[storage] max_event_duration_secs is 0, which means \"never chunk\" — but with \
          [analytics] disabled camon records continuously and rolls a chunk only when the cap \
          is reached, so nothing would be written until shutdown; set a real cap, e.g. 120"
@@ -270,19 +275,29 @@ fn parse_scalar(raw: &str) -> toml::Value {
 pub struct CameraConfig {
     pub id: String,
     pub url: String,
+    pub sub_url: Option<String>,
 }
 
 impl CameraConfig {
     /// The camera URL with any userinfo password masked, safe for logs.
     pub fn redacted_url(&self) -> String {
-        match url_password_range(&self.url) {
-            Some(range) => {
-                let mut url = self.url.clone();
-                url.replace_range(range, "****");
-                url
-            }
-            None => self.url.clone(),
+        redact_url(&self.url)
+    }
+
+    /// The optional substream URL with any userinfo password masked, safe for logs.
+    pub fn redacted_sub_url(&self) -> Option<String> {
+        self.sub_url.as_deref().map(redact_url)
+    }
+}
+
+fn redact_url(url: &str) -> String {
+    match url_password_range(url) {
+        Some(range) => {
+            let mut redacted = url.to_string();
+            redacted.replace_range(range, "****");
+            redacted
         }
+        None => url.to_string(),
     }
 }
 
@@ -1021,6 +1036,15 @@ impl Config {
         let mut seen: HashSet<&str> = HashSet::new();
         for camera in &self.cameras {
             validate_camera_id(&camera.id)?;
+            if camera
+                .sub_url
+                .as_ref()
+                .is_some_and(|url| url.trim().is_empty())
+            {
+                return Err(ConfigError::EmptyCameraSubUrl {
+                    id: camera.id.clone(),
+                });
+            }
             if !seen.insert(camera.id.as_str()) {
                 return Err(ConfigError::DuplicateCameraId {
                     id: camera.id.clone(),
@@ -1818,6 +1842,39 @@ url = "rtsp://10.0.0.5:554/stream1"
             "..a",
         ] {
             load_cameras(&one_camera(id)).unwrap_or_else(|e| panic!("{id:?} rejected: {e}"));
+        }
+    }
+
+    #[test]
+    fn substream_url_parses() {
+        let with_substream = load_cameras(
+            "[[cameras]]\nid = \"yard\"\nurl = \"rtsp://main/stream\"\n\
+             sub_url = \"rtsp://sub/stream\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            with_substream.cameras[0].sub_url.as_deref(),
+            Some("rtsp://sub/stream")
+        );
+    }
+
+    #[test]
+    fn substream_url_is_optional() {
+        let without_substream = load_cameras(&one_camera("yard")).unwrap();
+        assert_eq!(without_substream.cameras[0].sub_url, None);
+    }
+
+    #[test]
+    fn empty_or_blank_substream_urls_are_rejected() {
+        for sub_url in ["", "   ", "\t"] {
+            let toml = format!(
+                "[[cameras]]\nid = \"yard\"\nurl = \"rtsp://main/stream\"\nsub_url = {sub_url:?}\n"
+            );
+            let err = load_cameras(&toml).unwrap_err();
+            assert!(
+                matches!(err, ConfigError::EmptyCameraSubUrl { .. }),
+                "got {err:?} for {sub_url:?}"
+            );
         }
     }
 
@@ -2684,6 +2741,7 @@ url = "rtsp://10.0.0.5:554/stream1"
         let camera = |url: &str| CameraConfig {
             id: "cam".to_string(),
             url: url.to_string(),
+            sub_url: None,
         };
         assert_eq!(
             camera("rtsp://ubnt:s3cret@10.0.0.5:554/s0").redacted_url(),
@@ -2696,6 +2754,19 @@ url = "rtsp://10.0.0.5:554/stream1"
         assert_eq!(
             camera("rtsp://10.0.0.5:554/s0").redacted_url(),
             "rtsp://10.0.0.5:554/s0"
+        );
+    }
+
+    #[test]
+    fn redacted_substream_url_masks_its_password() {
+        let camera = CameraConfig {
+            id: "cam".to_string(),
+            url: "rtsp://main:secret@10.0.0.5/main".to_string(),
+            sub_url: Some("rtsp://sub:another-secret@10.0.0.5/sub".to_string()),
+        };
+        assert_eq!(
+            camera.redacted_sub_url().as_deref(),
+            Some("rtsp://sub:****@10.0.0.5/sub")
         );
     }
 }

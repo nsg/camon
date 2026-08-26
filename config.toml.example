@@ -397,6 +397,9 @@ occupancy_hold_secs = 60
 [[cameras]]
 id = "front-door"
 url = "rtsp://admin:password@192.168.1.100:554/stream1"
+# Optional low-resolution H.264 substream with a 1–2 second GOP, used only for
+# the multi-camera grid live view. Recording and analytics always use url.
+# sub_url = "rtsp://admin:password@192.168.1.100:554/stream2"
 
 # [[cameras]]
 # id = "backyard"
