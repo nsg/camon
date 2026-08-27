@@ -386,24 +386,33 @@ function drawTimelineBars(r, nowS) {
     }
     tlCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
     tlCtx.clearRect(0, 0, w, h);
-    if (motionSegs.length === 0) return;
 
-    // Motion scores have no fixed scale; normalize within the visible window.
-    let maxScore = 0;
-    motionSegs.forEach(s => { maxScore = Math.max(maxScore, s.intensity); });
-    if (maxScore <= 0) maxScore = 1;
+    const tickH = 13;
+    const y = (h - tickH) / 2;
+    if (motionSegs.length > 0) {
+        // Motion scores have no fixed scale; normalize within the visible window.
+        let maxScore = 0;
+        motionSegs.forEach(s => { maxScore = Math.max(maxScore, s.intensity); });
+        if (maxScore <= 0) maxScore = 1;
 
-    tlCtx.fillStyle = '#d8d78f';
-    motionSegs.forEach(s => {
-        const f0 = timeToFrac(s.tStart, r, nowS);
-        const f1 = timeToFrac(s.tEnd, r, nowS);
-        if (f1 <= 0 || f0 >= 1) return;
-        const x0 = Math.max(0, f0) * w;
-        const x1 = Math.min(1, f1) * w;
-        const norm = Math.min(1, s.intensity / maxScore);
-        const barH = Math.max(3, (0.15 + 0.85 * norm) * (h - 4));
-        tlCtx.globalAlpha = 0.45 + 0.55 * norm;
-        tlCtx.fillRect(x0, h - barH, Math.max(2, x1 - x0 - 1), barH);
+        tlCtx.fillStyle = '#d8d78f';
+        motionSegs.forEach(s => {
+            const f0 = timeToFrac(s.tStart, r, nowS);
+            const f1 = timeToFrac(s.tEnd, r, nowS);
+            if (f1 <= 0 || f0 >= 1) return;
+            const x0 = Math.max(0, f0) * w;
+            const x1 = Math.min(1, f1) * w;
+            const norm = Math.min(1, s.intensity / maxScore);
+            tlCtx.globalAlpha = 0.55 + 0.45 * norm;
+            tlCtx.fillRect(x0, y, Math.max(2, x1 - x0 - 1), tickH);
+        });
+    }
+
+    tlCtx.globalAlpha = 1;
+    tlCtx.fillStyle = '#aa5042';
+    currentDetections.forEach(det => {
+        const frac = timeToFrac(det.t, r, nowS);
+        tlCtx.fillRect(frac * w - 1.5, y, 3, tickH);
     });
     tlCtx.globalAlpha = 1;
 }
@@ -635,7 +644,7 @@ function rebuildMarkers() {
 
         marker.innerHTML = `
             <div class="tl-card">${rows}${more}</div>
-            <div class="tl-dot">${cluster.dets.length > 1 ? cluster.dets.length : ''}</div>
+            <div class="tl-dot"></div>
         `;
 
         marker.querySelectorAll('.tl-card-row').forEach(row => {
@@ -704,58 +713,39 @@ function renderHistoryPanel() {
     }
     historyPanel.hidden = false;
 
+    const sorted = [...warmEvents].sort((a, b) => b.start_ms - a.start_ms).slice(0, 8);
     const groups = new Map();
-    const sorted = [...warmEvents].sort((a, b) => b.start_ms - a.start_ms);
     sorted.forEach(ev => {
-        const d = new Date(ev.start_ms);
-        const key = `${d.getFullYear()}-${d.getMonth()}-${d.getDate()}`;
-        if (!groups.has(key)) groups.set(key, { label: formatDateLabel(d), events: [] });
-        groups.get(key).events.push(ev);
+        const label = formatDateLabel(new Date(ev.start_ms));
+        if (!groups.has(label)) groups.set(label, []);
+        groups.get(label).push(ev);
     });
-
-    const now = new Date();
-    const todayFrac = (now.getHours() * 3600 + now.getMinutes() * 60 + now.getSeconds()) / 86400;
 
     historyDays.innerHTML = '';
-    groups.forEach(group => {
-        const objects = group.events.filter(e => e.event_type === 'object').length;
-        const continuous = group.events.filter(e => e.event_type === 'continuous').length;
-        const row = document.createElement('div');
-        row.className = 'history-day';
+    groups.forEach((events, label) => {
+        const groupEl = document.createElement('div');
+        groupEl.className = 'event-day-group';
+        groupEl.dataset.day = label;
 
-        const ticks = group.events.map(ev => {
-            const d = new Date(ev.start_ms);
-            const frac = (d.getHours() * 3600 + d.getMinutes() * 60 + d.getSeconds()) / 86400;
-            // Continuous chunks render as coverage, not hundreds of incidents.
-            const cls = ev.event_type === 'object' ? ' obj'
-                : ev.event_type === 'continuous' ? ' cont' : '';
-            return `<span class="history-tick${cls}" style="left:${(frac * 100).toFixed(2)}%"></span>`;
-        }).join('');
-        const future = group.label === 'Today'
-            ? `<span class="history-future" style="left:${(todayFrac * 100).toFixed(2)}%"></span>`
-            : '';
+        const dayLabel = document.createElement('div');
+        dayLabel.className = 'event-day-label';
+        dayLabel.textContent = label;
+        groupEl.appendChild(dayLabel);
 
-        let counts = `${group.events.length} event${group.events.length !== 1 ? 's' : ''}`;
-        if (objects > 0) {
-            counts += ` \u00b7 ${objects} object${objects !== 1 ? 's' : ''}`;
-        }
-        if (continuous > 0) {
-            counts += ` \u00b7 ${continuous} continuous chunk${continuous !== 1 ? 's' : ''}`;
-        }
+        events.forEach(ev => {
+            groupEl.appendChild(buildEventListItem(ev));
+        });
 
-        row.innerHTML = `
-            <div class="history-day-head">
-                <span class="history-day-label">${esc(group.label)}</span>
-                <span class="history-day-count">${counts}
-                    <svg viewBox="0 0 24 24" fill="currentColor"><path d="M8.59 16.59L13.17 12 8.59 7.41 10 6l6 6-6 6z"/></svg>
-                </span>
-            </div>
-            <div class="history-map">${ticks}${future}</div>
-        `;
-        row.addEventListener('click', () => {
-            eventsScrollDay = group.label;
+        historyDays.appendChild(groupEl);
+    });
+
+    if (warmEvents.length > 8) {
+        const seeAll = document.createElement('div');
+        seeAll.className = 'history-see-all';
+        seeAll.textContent = `Show all ${warmEvents.length} events ›`;
+        seeAll.addEventListener('click', () => {
             window.location.hash = `/camera/${encodeURIComponent(currentDetailCameraId)}/events`;
         });
-        historyDays.appendChild(row);
-    });
+        historyDays.appendChild(seeAll);
+    }
 }

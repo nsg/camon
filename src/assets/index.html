@@ -47,11 +47,10 @@
                 <canvas id="mask-overlay" hidden></canvas>
                 <div id="detail-loading" class="loading"><p>Loading...</p></div>
             </div>
-            <!-- Hot timeline: the scrubber, motion histogram, and object
-                 detection markers merged into one strip. Its span is exactly
-                 the video's seekable range (= the hot buffer, whatever the
-                 server is configured to keep), so every point on it is
-                 genuinely seekable. -->
+            <!-- Hot timeline: a thin baseline scrubber with flat motion ticks
+                 and detection ticks. Its span is exactly the video's seekable
+                 range (= the hot buffer, whatever the server is configured to
+                 keep), so every point on it is genuinely seekable. -->
             <div class="hot-timeline">
                 <div class="tl-head">
                     <span id="tl-window-label" class="tl-window-label"></span>
@@ -130,11 +129,9 @@
                     <span class="setting-hint" id="mask-layer-hint">Movement mask: nothing ever moves here (ignored by motion detection).</span>
                 </div>
             </div>
-            <!-- Warm history: one 24h map per day that has stored events.
-                 Only navigates (opens the event browser) — the gaps between
-                 events hold no video, so this is deliberately not a scrubber. -->
+            <!-- Recent stored events shown inline using the event-browser rows. -->
             <div id="history-panel" hidden>
-                <div class="history-title">Earlier</div>
+                <div class="history-title">Events</div>
                 <div id="history-days"></div>
             </div>
         </div>
