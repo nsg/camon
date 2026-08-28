@@ -718,12 +718,15 @@ function renderHistoryPanel() {
     }
     historyPanel.hidden = false;
 
-    const sorted = [...warmEvents].sort((a, b) => b.start_ms - a.start_ms).slice(0, 8);
+    const collapsed = collapseEventChains(warmEvents);
+    const sorted = [...collapsed]
+        .sort((a, b) => b.event.start_ms - a.event.start_ms)
+        .slice(0, 8);
     const groups = new Map();
-    sorted.forEach(ev => {
-        const label = formatDateLabel(new Date(ev.start_ms));
+    sorted.forEach(run => {
+        const label = formatDateLabel(new Date(run.event.start_ms));
         if (!groups.has(label)) groups.set(label, []);
-        groups.get(label).push(ev);
+        groups.get(label).push(run);
     });
 
     historyDays.innerHTML = '';
@@ -737,17 +740,17 @@ function renderHistoryPanel() {
         dayLabel.textContent = label;
         groupEl.appendChild(dayLabel);
 
-        events.forEach(ev => {
-            groupEl.appendChild(buildEventListItem(ev));
-        });
+        appendEventCards(groupEl, events, false);
 
         historyDays.appendChild(groupEl);
     });
 
-    if (warmEvents.length > 8) {
+    // Continuous recording can collapse hundreds of chunks into a handful of
+    // cards, so the raw count must also keep the browser entry point alive.
+    if (collapsed.length > 8 || warmEvents.length > 8) {
         const seeAll = document.createElement('div');
         seeAll.className = 'history-see-all';
-        seeAll.textContent = `Show all ${warmEvents.length} events ›`;
+        seeAll.textContent = 'Show all events ›';
         seeAll.addEventListener('click', () => {
             window.location.hash = `/camera/${encodeURIComponent(currentDetailCameraId)}/events`;
         });
