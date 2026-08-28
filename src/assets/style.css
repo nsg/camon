@@ -163,6 +163,14 @@ main {
     color: #666;
 }
 
+/* The label overlays the snapshot poster, so it needs its own contrast. */
+.detail-video-wrapper .loading p {
+    background: rgba(0, 0, 0, 0.55);
+    color: #ccc;
+    padding: 0.25rem 0.75rem;
+    border-radius: 4px;
+}
+
 .detail-video-wrapper .loading[hidden] { display: none; }
 
 .icon-btn {

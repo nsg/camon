@@ -210,6 +210,7 @@ function cleanupLiveView() {
     }
     if (detailHls) { detailHls.destroy(); detailHls = null; }
     detailVideo.src = '';
+    detailVideo.removeAttribute('poster');
     currentDetections = [];
     motionSegs = [];
     lastDetIds = null;
@@ -259,6 +260,10 @@ function cleanupLiveView() {
 
 function loadDetailCamera(cameraId) {
     const src = `api/stream/${encodeURIComponent(cameraId)}/playlist.m3u8`;
+    // The hot buffer's newest keyframe as poster: the browser keeps it up until
+    // the first real frame renders, so the HLS spin-up shows the scene, not black.
+    detailVideo.poster = authUrl(
+        `api/cameras/${encodeURIComponent(cameraId)}/snapshot?t=${Date.now()}`);
     if (detailPlayingHandler) {
         detailVideo.removeEventListener('playing', detailPlayingHandler);
     }

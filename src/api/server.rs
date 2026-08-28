@@ -159,6 +159,7 @@ fn api_routes() -> Router<AppState> {
             "/api/cameras/{id}/detections/{detection_id}/frame",
             get(detection_frame_handler),
         )
+        .route("/api/cameras/{id}/snapshot", get(snapshot_handler))
         .route("/api/cameras/{id}/hot-events", get(hot_events_handler))
         .route("/api/cameras/{id}/events", get(warm_events_handler))
         .route(
@@ -502,6 +503,101 @@ async fn detection_frame_handler(
         Some(frame) => ([(header::CONTENT_TYPE, "image/jpeg")], (*frame).clone()).into_response(),
         None => (StatusCode::NOT_FOUND, "detection not found").into_response(),
     }
+}
+
+/// One snapshot decode has to finish well inside this: the image is a stand-in
+/// while HLS spins up, so an extraction slower than the stream is worthless.
+const SNAPSHOT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The newest keyframe in the hot buffer, as a JPEG. The live view sets it as
+/// the video element's poster, so opening a camera shows the scene immediately
+/// instead of a black box while the full-resolution stream loads.
+async fn snapshot_handler(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+    let Some(buffer) = state.buffers.get(&id) else {
+        return (StatusCode::NOT_FOUND, "camera not found").into_response();
+    };
+    // Take only the segment's Arc under the lock so the ingest thread never
+    // waits on the decode.
+    let newest = {
+        let buf = buffer.read_recover();
+        buf.segments().back().map(|s| Arc::clone(&s.data))
+    };
+    let Some(segment) = newest else {
+        return (StatusCode::NOT_FOUND, "no segments buffered yet").into_response();
+    };
+    match keyframe_jpeg(segment).await {
+        Ok(jpeg) => (
+            [
+                (header::CONTENT_TYPE, "image/jpeg"),
+                (header::CACHE_CONTROL, "no-store"),
+            ],
+            jpeg,
+        )
+            .into_response(),
+        Err(error) => {
+            tracing::warn!(camera = %id, error, "snapshot extraction failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, "snapshot failed").into_response()
+        }
+    }
+}
+
+/// Decode the segment's first frame — a GOP segment starts at its keyframe —
+/// into a JPEG. A one-shot ffmpeg per request rather than a kept child like the
+/// analytics decoders: snapshots happen once per live-view open, and a fresh
+/// process needs none of the PTS-discontinuity handling a long-lived one does.
+async fn keyframe_jpeg(segment: Arc<Vec<u8>>) -> Result<Vec<u8>, String> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut child = tokio::process::Command::new("ffmpeg")
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "quiet",
+            "-skip_frame",
+            "nokey",
+            "-f",
+            "mpegts",
+            "-i",
+            "pipe:0",
+            "-frames:v",
+            "1",
+            "-q:v",
+            "3",
+            "-f",
+            "mjpeg",
+            "pipe:1",
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|e| format!("spawn ffmpeg: {e}"))?;
+
+    let mut stdin = child.stdin.take().expect("stdin piped");
+    let mut stdout = child.stdout.take().expect("stdout piped");
+    // ffmpeg exits after its one frame without draining stdin; the writer's
+    // EPIPE is expected, and the task ends on its own once the child is gone.
+    tokio::spawn(async move {
+        let _ = stdin.write_all(&segment).await;
+    });
+    let decode = async {
+        let mut jpeg = Vec::new();
+        stdout
+            .read_to_end(&mut jpeg)
+            .await
+            .map_err(|e| format!("read ffmpeg output: {e}"))?;
+        let _ = child.wait().await;
+        Ok::<_, String>(jpeg)
+    };
+    // On timeout the child is dropped and kill_on_drop reaps it.
+    let jpeg = tokio::time::timeout(SNAPSHOT_DEADLINE, decode)
+        .await
+        .map_err(|_| "ffmpeg overran the snapshot deadline".to_string())??;
+    if jpeg.is_empty() {
+        return Err("ffmpeg produced no frame".to_string());
+    }
+    Ok(jpeg)
 }
 
 // Hot event types and handler
@@ -1187,6 +1283,85 @@ mod tests {
                 "{path}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn a_snapshot_needs_a_camera_with_something_buffered() {
+        let base = serve_stream_buffers(HotBuffer::new("cam".to_string(), 60), None).await;
+        for url in [
+            format!("{base}/api/cameras/nope/snapshot"),
+            format!("{base}/api/cameras/cam/snapshot"),
+        ] {
+            let status = reqwest::get(&url).await.unwrap().status();
+            assert_eq!(status, reqwest::StatusCode::NOT_FOUND, "{url}");
+        }
+    }
+
+    /// One second of real MPEG-TS, generated the way the decoder tests do it.
+    fn recorded_ts_segment() -> Vec<u8> {
+        let dir = tempfile::tempdir().unwrap();
+        let status = std::process::Command::new("ffmpeg")
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "quiet",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=size=640x480:rate=25",
+                "-t",
+                "1",
+                "-c:v",
+                "libx264",
+                "-g",
+                "25",
+                "-keyint_min",
+                "25",
+                "-sc_threshold",
+                "0",
+                "-f",
+                "segment",
+                "-segment_time",
+                "1",
+            ])
+            .arg(dir.path().join("seg%03d.ts"))
+            .status()
+            .expect("run ffmpeg");
+        assert!(status.success(), "ffmpeg failed to generate a segment");
+        std::fs::read(dir.path().join("seg000.ts")).expect("segment")
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn a_snapshot_is_the_newest_segments_keyframe_as_a_jpeg() {
+        let base = serve_stream_buffers(stream_buffer("cam", &recorded_ts_segment()), None).await;
+        let response = reqwest::get(format!("{base}/api/cameras/cam/snapshot"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert_eq!(
+            response.headers()[reqwest::header::CONTENT_TYPE],
+            "image/jpeg"
+        );
+        let body = response.bytes().await.unwrap();
+        assert!(
+            body.starts_with(&[0xFF, 0xD8, 0xFF]),
+            "not a JPEG: {:?}",
+            &body[..body.len().min(4)]
+        );
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn a_segment_ffmpeg_cannot_decode_is_a_500_not_a_hang() {
+        let base = serve_stream_buffers(stream_buffer("cam", &[0u8; 4096]), None).await;
+        let response = reqwest::get(format!("{base}/api/cameras/cam/snapshot"))
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR
+        );
     }
 
     async fn serve_with_motion_store() -> (String, MotionStore) {
