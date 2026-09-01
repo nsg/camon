@@ -2,6 +2,7 @@
   <img src="logo.svg" alt="Camon" width="80">
   <h1>Camon</h1>
   <p>Multi-camera video surveillance with real-time analytics and tiered storage.</p>
+  <a href="https://nsg.github.io/aibadge/#vibe"><img src="https://nsg.github.io/aibadge/vibe.svg" alt="AI usage: vibe"></a>
 </div>
 
 ---
