@@ -262,8 +262,12 @@ function loadDetailCamera(cameraId) {
     const src = `api/stream/${encodeURIComponent(cameraId)}/playlist.m3u8`;
     // The hot buffer's newest keyframe as poster: the browser keeps it up until
     // the first real frame renders, so the HLS spin-up shows the scene, not black.
+    // Sized to the element so a phone gets a small, fast decode instead of the
+    // camera's full frame; the server never upscales past the source.
+    const posterWidth = Math.ceil(
+        (detailVideo.clientWidth || window.innerWidth) * (window.devicePixelRatio || 1));
     detailVideo.poster = authUrl(
-        `api/cameras/${encodeURIComponent(cameraId)}/snapshot?t=${Date.now()}`);
+        `api/cameras/${encodeURIComponent(cameraId)}/snapshot?w=${posterWidth}&t=${Date.now()}`);
     if (detailPlayingHandler) {
         detailVideo.removeEventListener('playing', detailPlayingHandler);
     }

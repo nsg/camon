@@ -107,6 +107,13 @@ struct SegmentQuery {
     stream: Option<String>,
 }
 
+#[derive(Deserialize)]
+struct SnapshotQuery {
+    /// Max width in device pixels; the frame is downscaled to fit, never
+    /// upscaled. Absent means full camera resolution.
+    w: Option<u32>,
+}
+
 /// The UI shell (`/` and `/assets/*`) stays unauthenticated so the token prompt
 /// can load; what the routes under `/api` ask for is [`ApiAuth`]'s to say.
 pub fn build_router(state: AppState, auth: &ApiAuth) -> Router {
@@ -512,7 +519,11 @@ const SNAPSHOT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5)
 /// The newest keyframe in the hot buffer, as a JPEG. The live view sets it as
 /// the video element's poster, so opening a camera shows the scene immediately
 /// instead of a black box while the full-resolution stream loads.
-async fn snapshot_handler(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+async fn snapshot_handler(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(query): Query<SnapshotQuery>,
+) -> Response {
     let Some(buffer) = state.buffers.get(&id) else {
         return (StatusCode::NOT_FOUND, "camera not found").into_response();
     };
@@ -525,7 +536,7 @@ async fn snapshot_handler(State(state): State<AppState>, Path(id): Path<String>)
     let Some(segment) = newest else {
         return (StatusCode::NOT_FOUND, "no segments buffered yet").into_response();
     };
-    match keyframe_jpeg(segment).await {
+    match keyframe_jpeg(segment, query.w.map(|w| w.clamp(16, 7680))).await {
         Ok(jpeg) => (
             [
                 (header::CONTENT_TYPE, "image/jpeg"),
@@ -545,28 +556,32 @@ async fn snapshot_handler(State(state): State<AppState>, Path(id): Path<String>)
 /// into a JPEG. A one-shot ffmpeg per request rather than a kept child like the
 /// analytics decoders: snapshots happen once per live-view open, and a fresh
 /// process needs none of the PTS-discontinuity handling a long-lived one does.
-async fn keyframe_jpeg(segment: Arc<Vec<u8>>) -> Result<Vec<u8>, String> {
+async fn keyframe_jpeg(segment: Arc<Vec<u8>>, max_width: Option<u32>) -> Result<Vec<u8>, String> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    let mut child = tokio::process::Command::new("ffmpeg")
-        .args([
-            "-hide_banner",
-            "-loglevel",
-            "quiet",
-            "-skip_frame",
-            "nokey",
-            "-f",
-            "mpegts",
-            "-i",
-            "pipe:0",
-            "-frames:v",
-            "1",
-            "-q:v",
-            "3",
-            "-f",
-            "mjpeg",
-            "pipe:1",
-        ])
+    let mut command = tokio::process::Command::new("ffmpeg");
+    command.args([
+        "-hide_banner",
+        "-loglevel",
+        "quiet",
+        "-skip_frame",
+        "nokey",
+        "-f",
+        "mpegts",
+        "-i",
+        "pipe:0",
+        "-frames:v",
+        "1",
+        "-q:v",
+        "3",
+    ]);
+    if let Some(w) = max_width {
+        // min() keeps small frames as-is; -2 keeps the aspect ratio at an even
+        // height. The quotes hide min's comma from the filtergraph parser.
+        command.args(["-vf", &format!("scale=w='min({w},iw)':h=-2")]);
+    }
+    command.args(["-f", "mjpeg", "pipe:1"]);
+    let mut child = command
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
@@ -1349,6 +1364,36 @@ mod tests {
             "not a JPEG: {:?}",
             &body[..body.len().min(4)]
         );
+    }
+
+    /// The frame width from the JPEG's start-of-frame marker.
+    fn jpeg_width(jpeg: &[u8]) -> u16 {
+        let mut i = 2;
+        while i + 9 < jpeg.len() {
+            assert_eq!(jpeg[i], 0xFF, "lost marker sync at byte {i}");
+            let marker = jpeg[i + 1];
+            if matches!(marker, 0xC0..=0xCF) && !matches!(marker, 0xC4 | 0xC8 | 0xCC) {
+                return u16::from_be_bytes([jpeg[i + 7], jpeg[i + 8]]);
+            }
+            i += 2 + u16::from_be_bytes([jpeg[i + 2], jpeg[i + 3]]) as usize;
+        }
+        panic!("no start-of-frame marker");
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn a_snapshot_scales_down_to_the_requested_width_but_never_up() {
+        let base = serve_stream_buffers(stream_buffer("cam", &recorded_ts_segment()), None).await;
+        // The recorded segment is 640 wide; w beyond that must not upscale.
+        for (query, expected) in [("?w=320", 320), ("?w=4000", 640)] {
+            let body = reqwest::get(format!("{base}/api/cameras/cam/snapshot{query}"))
+                .await
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap();
+            assert_eq!(jpeg_width(&body), expected, "{query}");
+        }
     }
 
     #[tokio::test]
