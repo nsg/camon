@@ -15,6 +15,74 @@ function eventKey(ev) {
 // The cap bounds polling and rendering cost; deeper archive history is omitted.
 const MAX_EVENT_PAGES = 10;
 
+const FRAME_CYCLE_MS = 1000;
+const eventCardCycleSubscribers = new Set();
+const eventCardControllers = new WeakMap();
+const prefersReducedMotion = typeof window.matchMedia === 'function' &&
+    window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+let eventCardCycleTimer = null;
+
+function stopEventCardCycle() {
+    if (eventCardCycleTimer === null) return;
+    clearInterval(eventCardCycleTimer);
+    eventCardCycleTimer = null;
+}
+
+function startEventCardCycle() {
+    if (eventCardCycleTimer !== null || eventCardCycleSubscribers.size === 0 || document.hidden) {
+        return;
+    }
+    eventCardCycleTimer = setInterval(() => {
+        eventCardCycleSubscribers.forEach(controller => {
+            if (controller.card.isConnected) return;
+            eventCardCycleSubscribers.delete(controller);
+            eventCardIntersectionObserver.unobserve(controller.card);
+        });
+        if (eventCardCycleSubscribers.size === 0) {
+            stopEventCardCycle();
+            return;
+        }
+        eventCardCycleSubscribers.forEach(controller => controller.advanceFrame());
+    }, FRAME_CYCLE_MS);
+}
+
+function subscribeEventCard(controller) {
+    eventCardCycleSubscribers.add(controller);
+    startEventCardCycle();
+}
+
+function unsubscribeEventCard(controller) {
+    eventCardCycleSubscribers.delete(controller);
+    if (eventCardCycleSubscribers.size === 0) stopEventCardCycle();
+}
+
+const eventCardIntersectionObserver = !prefersReducedMotion &&
+    typeof IntersectionObserver !== 'undefined'
+    ? new IntersectionObserver(entries => {
+        entries.forEach(entry => {
+            const controller = eventCardControllers.get(entry.target);
+            if (!controller) return;
+            if (!controller.card.isConnected) {
+                unsubscribeEventCard(controller);
+                eventCardIntersectionObserver.unobserve(controller.card);
+            } else if (entry.isIntersecting) {
+                controller.preloadFrames();
+                subscribeEventCard(controller);
+            } else {
+                unsubscribeEventCard(controller);
+            }
+        });
+    }, { threshold: 0.25 })
+    : null;
+
+document.addEventListener('visibilitychange', () => {
+    if (document.hidden) {
+        stopEventCardCycle();
+    } else {
+        startEventCardCycle();
+    }
+});
+
 function fetchWarmEvents(cameraId) {
     if (warmEventPoller) warmEventPoller.stop();
     warmEventsSignature = null;
@@ -239,6 +307,7 @@ function buildEventCard(collapsed) {
     let preloadingStarted = false;
     let touchStart = null;
     let suppressClick = false;
+    let interacting = false;
 
     function updateDots(index) {
         dots.forEach((dot, i) => dot.classList.toggle('active', i === index));
@@ -274,6 +343,19 @@ function buildEventCard(collapsed) {
         showFrame(desiredFrame);
     }
 
+    function advanceFrame() {
+        if (interacting || touchStart !== null) return;
+        const currentFrame = shownFrame >= 0 ? shownFrame : middleFrame;
+        for (let offset = 1; offset < frameCount; offset++) {
+            const index = (currentFrame + offset) % frameCount;
+            if (frameStatus[index] !== 1) continue;
+            showFrame(index);
+            desiredFrame = shownFrame;
+            return;
+        }
+        desiredFrame = shownFrame;
+    }
+
     // Both handlers derive the frame index from the src that actually fired,
     // so a stale error from a superseded request cannot poison another frame.
     image.addEventListener('load', () => {
@@ -303,10 +385,14 @@ function buildEventCard(collapsed) {
     image.src = middleFrame >= 0 ? frameUrls[middleFrame] : thumbnailUrl;
 
     if (frameCount >= 2) {
-        card.addEventListener('pointerenter', preloadFrames);
+        card.addEventListener('pointerenter', () => {
+            interacting = true;
+            preloadFrames();
+        });
         card.addEventListener('pointerdown', event => {
             preloadFrames();
             if (event.pointerType === 'touch') {
+                interacting = true;
                 touchStart = { x: event.clientX, y: event.clientY };
             }
         });
@@ -314,20 +400,32 @@ function buildEventCard(collapsed) {
             scrubTo(event.clientX);
         });
         card.addEventListener('pointerleave', () => {
-            desiredFrame = middleFrame;
-            showFrame(middleFrame);
+            interacting = false;
+            desiredFrame = shownFrame;
         });
         card.addEventListener('pointerup', event => {
             if (!touchStart || event.pointerType !== 'touch') return;
             const dx = Math.abs(event.clientX - touchStart.x);
             const dy = Math.abs(event.clientY - touchStart.y);
             touchStart = null;
+            interacting = false;
+            desiredFrame = shownFrame;
             if (dx >= 12 && dx > dy) {
                 suppressClick = true;
                 setTimeout(() => { suppressClick = false; }, 400);
             }
         });
-        card.addEventListener('pointercancel', () => { touchStart = null; });
+        card.addEventListener('pointercancel', () => {
+            touchStart = null;
+            interacting = false;
+            desiredFrame = shownFrame;
+        });
+
+        if (eventCardIntersectionObserver) {
+            const controller = { card, preloadFrames, advanceFrame };
+            eventCardControllers.set(card, controller);
+            eventCardIntersectionObserver.observe(card);
+        }
     }
 
     const openEvent = () => {
