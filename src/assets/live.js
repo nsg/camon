@@ -22,6 +22,13 @@ const stabilityOverlay = document.getElementById('stability-overlay');
 const stabilityCtx = stabilityOverlay.getContext('2d');
 const bgOverlay = document.getElementById('bg-overlay');
 const bgCtx = bgOverlay.getContext('2d');
+const tunerOverlay = document.getElementById('tuner-overlay');
+const tunerCtx = tunerOverlay.getContext('2d');
+const tunerToggleBtn = document.getElementById('tuner-toggle-btn');
+const tunerReadout = document.getElementById('tuner-readout');
+const tunerLegend = document.getElementById('tuner-legend');
+const tunerLegendCeiling = document.getElementById('tuner-legend-ceiling');
+const tunerLegendGlobalEvents = document.getElementById('tuner-legend-global-events');
 const liveBtn = document.getElementById('live-btn');
 
 // Timeline timestamps are wall-clock anchored because hot-buffer offsets slide on eviction.
@@ -44,6 +51,10 @@ let rawMog2Image = null;
 let morphImage = null;
 let bgOverlayEnabled = false;
 let bgImage = null;
+let tunerEnabled = false;
+let tunerSnapshot = null;
+let tunerPoller = null;
+let tunerHoverCell = -1;
 let overlayAnimationId = null;
 let isLiveScrubbing = false;
 let isAtLiveEdge = true;
@@ -107,6 +118,38 @@ function wireLiveView() {
         }
     });
 
+    tunerToggleBtn.addEventListener('click', () => {
+        tunerEnabled = !tunerEnabled;
+        tunerToggleBtn.classList.toggle('active', tunerEnabled);
+        tunerOverlay.hidden = !tunerEnabled;
+        tunerLegend.hidden = !tunerEnabled;
+        updateTunerPointerEvents();
+        if (tunerEnabled) {
+            fetchTunerSnapshot();
+        } else {
+            clearTunerOverlay();
+            tunerSnapshot = null;
+            tunerHoverCell = -1;
+            tunerReadout.hidden = true;
+        }
+    });
+
+    tunerOverlay.addEventListener('pointermove', (e) => {
+        if (!tunerEnabled || maskEditEnabled) return;
+        const idx = tunerCellFromEvent(e);
+        if (idx < 0) {
+            tunerHoverCell = -1;
+            tunerReadout.hidden = true;
+            return;
+        }
+        tunerHoverCell = idx;
+        updateTunerReadout(idx);
+    });
+    tunerOverlay.addEventListener('pointerleave', () => {
+        tunerHoverCell = -1;
+        tunerReadout.hidden = true;
+    });
+
     tlTrack.addEventListener('pointerdown', (e) => {
         if (e.target.closest('.tl-marker')) return;
         closeMarkerCard();
@@ -158,6 +201,7 @@ function wireLiveView() {
     new ResizeObserver(() => {
         drawBackground();
         scheduleStabilityDraw();
+        drawTunerHeatmap();
         drawMask();
     }).observe(detailVideo);
 }
@@ -183,6 +227,8 @@ function showLiveView(cameraId) {
         detailLoading.hidden = false;
         stabilityOverlay.hidden = !stabilityOverlayEnabled;
         bgOverlay.hidden = !bgOverlayEnabled;
+        tunerOverlay.hidden = !tunerEnabled;
+        tunerLegend.hidden = !tunerEnabled;
 
         if (stabilityOverlayEnabled) fetchStabilityMap();
         if (bgOverlayEnabled) fetchBackgroundMap();
@@ -204,6 +250,7 @@ function cleanupLiveView() {
     if (detectionPoller) { detectionPoller.stop(); detectionPoller = null; }
     if (warmEventPoller) { warmEventPoller.stop(); warmEventPoller = null; }
     if (stabilityPoller) { stabilityPoller.stop(); stabilityPoller = null; }
+    if (tunerPoller) { tunerPoller.stop(); tunerPoller = null; }
     if (detailPlayingHandler) {
         detailVideo.removeEventListener('playing', detailPlayingHandler);
         detailPlayingHandler = null;
@@ -233,12 +280,29 @@ function cleanupLiveView() {
     bgToggleBtn.classList.remove('active');
     bgCtx.clearRect(0, 0, bgOverlay.width, bgOverlay.height);
 
+    tunerEnabled = false;
+    tunerSnapshot = null;
+    tunerHoverCell = -1;
+    tunerOverlay.hidden = true;
+    tunerOverlay.classList.remove('active');
+    tunerToggleBtn.classList.remove('active');
+    tunerReadout.hidden = true;
+    tunerReadout.textContent = '';
+    tunerLegend.hidden = true;
+    tunerLegendCeiling.textContent = '2000';
+    tunerLegendGlobalEvents.textContent = '0';
+    clearTunerOverlay();
+
     setMaskEditEnabled(false);
     setActiveMaskLayer('movement');
     maskCtx.clearRect(0, 0, maskOverlay.width, maskOverlay.height);
     motionSettings = null;
     maskCells = [];
     detectionCells = [];
+    sizeCells = [];
+    currentMinContourArea = 0;
+    currentCellContourAreaCeiling = 2000;
+    tunerMode.value = 'off';
     settingsPanel.hidden = true;
     settingsBtn.classList.remove('active');
     clearSettingsError();
@@ -559,6 +623,190 @@ function drawBackground() {
     if (bgImage) bgCtx.drawImage(bgImage, 0, 0, w, h);
 }
 
+function clearTunerOverlay() {
+    tunerCtx.setTransform(1, 0, 0, 1, 0, 0);
+    tunerCtx.clearRect(0, 0, tunerOverlay.width, tunerOverlay.height);
+}
+
+function updateTunerPointerEvents() {
+    const interactive = tunerEnabled && !maskEditEnabled;
+    tunerOverlay.classList.toggle('active', interactive);
+    if (!interactive) {
+        tunerHoverCell = -1;
+        tunerReadout.hidden = true;
+    }
+}
+
+async function fetchTunerSnapshot(signal) {
+    if (!tunerEnabled || !currentDetailCameraId) return;
+    const cameraId = currentDetailCameraId;
+    const response = await apiFetch(
+        `api/cameras/${encodeURIComponent(cameraId)}/motion/tuner`, { signal });
+    if (!tunerEnabled || currentDetailCameraId !== cameraId || !response.ok) return;
+    tunerSnapshot = await response.json();
+    drawTunerHeatmap();
+}
+
+function drawTunerHeatmap() {
+    if (!tunerEnabled || !tunerSnapshot) return;
+    const w = detailVideo.clientWidth;
+    const h = detailVideo.clientHeight;
+    if (w === 0 || h === 0) return;
+
+    const dpr = window.devicePixelRatio || 1;
+    const pixelW = Math.round(w * dpr);
+    const pixelH = Math.round(h * dpr);
+    if (tunerOverlay.width !== pixelW || tunerOverlay.height !== pixelH) {
+        tunerOverlay.width = pixelW;
+        tunerOverlay.height = pixelH;
+    }
+    tunerCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    tunerCtx.clearRect(0, 0, w, h);
+
+    const cols = Number(tunerSnapshot.cols) || maskCols;
+    const rows = Number(tunerSnapshot.rows) || maskRows;
+    if (cols <= 0 || rows <= 0) return;
+    const cellW = w / cols;
+    const cellH = h / rows;
+    const globalValue = Number(currentMinContourArea) ||
+        Number(motionSettings && motionSettings.min_contour_area_min) || 0;
+    const ceiling = Number(currentCellContourAreaCeiling) || 2000;
+    const colorFloor = globalValue;
+    const colorRange = Math.max(1, ceiling - colorFloor);
+    const shadow = tunerSnapshot.mode === 'shadow';
+    const cellCount = cols * rows;
+
+    for (let i = 0; i < cellCount; i++) {
+        const col = i % cols;
+        const row = Math.floor(i / cols);
+        const x = col * cellW;
+        const y = row * cellH;
+        const rawEffective = Number(tunerSnapshot.effective && tunerSnapshot.effective[i]) || 0;
+        const isGlobal = rawEffective === 0;
+        const effective = isGlobal ? globalValue : rawEffective;
+        const t = Math.max(0, Math.min(1, (effective - colorFloor) / colorRange));
+        const red = t < 0.5 ? Math.round(52 + t * 2 * 203) : 255;
+        const green = t < 0.5 ? Math.round(184 + t * 2 * 31) : Math.round(215 - (t - 0.5) * 2 * 155);
+        const alpha = isGlobal ? 0.12 : 0.35 + t * 0.1;
+        tunerCtx.fillStyle = `rgba(${red}, ${green}, 55, ${alpha})`;
+        tunerCtx.fillRect(x, y, cellW, cellH);
+
+        const proposed = Number(tunerSnapshot.proposed && tunerSnapshot.proposed[i]) || 0;
+        if (shadow && proposed > 0) {
+            tunerCtx.save();
+            tunerCtx.setLineDash([5, 3]);
+            tunerCtx.strokeStyle = '#4de8ff';
+            tunerCtx.lineWidth = 2;
+            tunerCtx.strokeRect(x + 1, y + 1, Math.max(0, cellW - 2), Math.max(0, cellH - 2));
+            tunerCtx.restore();
+        }
+
+        const learned = Number(tunerSnapshot.learned && tunerSnapshot.learned[i]) || 0;
+        if (learned > 0) {
+            const marker = Math.min(10, cellW * 0.25, cellH * 0.25);
+            tunerCtx.fillStyle = '#fff';
+            tunerCtx.beginPath();
+            tunerCtx.moveTo(x + cellW, y);
+            tunerCtx.lineTo(x + cellW - marker, y);
+            tunerCtx.lineTo(x + cellW, y + marker);
+            tunerCtx.closePath();
+            tunerCtx.fill();
+        }
+    }
+
+    const fontSize = Math.min(cellH * 0.35, cellW * 0.3, 14);
+    if (fontSize >= 8) {
+        tunerCtx.font = `${fontSize}px monospace`;
+        tunerCtx.textAlign = 'center';
+        tunerCtx.textBaseline = 'middle';
+        for (let i = 0; i < cellCount; i++) {
+            const col = i % cols;
+            const row = Math.floor(i / cols);
+            const rawEffective = Number(tunerSnapshot.effective && tunerSnapshot.effective[i]) || 0;
+            const proposed = Number(tunerSnapshot.proposed && tunerSnapshot.proposed[i]) || 0;
+            const useProposal = shadow && proposed > 0;
+            const value = useProposal ? proposed : (rawEffective || globalValue);
+            const label = `${Math.round(value)}${useProposal ? '?' : ''}`;
+            const cx = col * cellW + cellW / 2;
+            const cy = row * cellH + cellH / 2;
+            const textW = tunerCtx.measureText(label).width;
+            tunerCtx.fillStyle = 'rgba(0, 0, 0, 0.6)';
+            tunerCtx.fillRect(cx - textW / 2 - 2, cy - fontSize / 2 - 1, textW + 4, fontSize + 2);
+            tunerCtx.fillStyle = '#fff';
+            tunerCtx.fillText(label, cx, cy);
+        }
+    }
+
+    tunerCtx.setLineDash([]);
+    tunerCtx.strokeStyle = 'rgba(255, 255, 255, 0.25)';
+    tunerCtx.lineWidth = 1;
+    for (let c = 1; c < cols; c++) {
+        const x = Math.round(c * cellW) + 0.5;
+        tunerCtx.beginPath();
+        tunerCtx.moveTo(x, 0);
+        tunerCtx.lineTo(x, h);
+        tunerCtx.stroke();
+    }
+    for (let r = 1; r < rows; r++) {
+        const y = Math.round(r * cellH) + 0.5;
+        tunerCtx.beginPath();
+        tunerCtx.moveTo(0, y);
+        tunerCtx.lineTo(w, y);
+        tunerCtx.stroke();
+    }
+
+    tunerLegendCeiling.textContent = String(Math.round(ceiling));
+    tunerLegendGlobalEvents.textContent = String(Number(tunerSnapshot.global_events_in_window) || 0);
+    if (tunerHoverCell >= 0) updateTunerReadout(tunerHoverCell);
+}
+
+function tunerCellFromEvent(e) {
+    const rect = tunerOverlay.getBoundingClientRect();
+    if (rect.width === 0 || rect.height === 0 || !tunerSnapshot) return -1;
+    const cols = Number(tunerSnapshot.cols) || maskCols;
+    const rows = Number(tunerSnapshot.rows) || maskRows;
+    const col = Math.floor((e.clientX - rect.left) / rect.width * cols);
+    const row = Math.floor((e.clientY - rect.top) / rect.height * rows);
+    if (col < 0 || col >= cols || row < 0 || row >= rows) return -1;
+    return row * cols + col;
+}
+
+function formatTunerNumber(value) {
+    const number = Number(value) || 0;
+    return String(Math.round(number));
+}
+
+function updateTunerReadout(idx) {
+    if (!tunerSnapshot || idx < 0) {
+        tunerReadout.hidden = true;
+        return;
+    }
+    const cols = Number(tunerSnapshot.cols) || maskCols;
+    const row = Math.floor(idx / cols);
+    const col = idx % cols;
+    const base = Number(tunerSnapshot.base && tunerSnapshot.base[idx]) || 0;
+    const learned = Number(tunerSnapshot.learned && tunerSnapshot.learned[idx]) || 0;
+    const proposed = Number(tunerSnapshot.proposed && tunerSnapshot.proposed[idx]) || 0;
+    const rawEffective = Number(tunerSnapshot.effective && tunerSnapshot.effective[idx]) || 0;
+    const effective = rawEffective || Number(currentMinContourArea) || 0;
+    const effectiveLabel = `${formatTunerNumber(effective)}${rawEffective === 0 ? ' (global)' : ''}`;
+    const triggerFraction = Number(tunerSnapshot.trigger_fraction && tunerSnapshot.trigger_fraction[idx]) || 0;
+    const percent = (triggerFraction * 100).toFixed(1).replace(/\.0$/, '');
+    const windowMinutes = (Number(tunerSnapshot.window_secs) / 60).toFixed(1).replace(/\.0$/, '');
+    const change = tunerSnapshot.last_change && tunerSnapshot.last_change[idx];
+    const last = change
+        ? `${change.reason} (${formatAgo(Math.max(0, (Date.now() - Number(change.wall_unix_ms)) / 1000))})`
+        : 'no changes';
+    tunerReadout.textContent = [
+        `cell ${row + 1},${col + 1} · base ${formatTunerNumber(base)} · learned ${formatTunerNumber(learned)} · proposed ${formatTunerNumber(proposed)} · effective ${effectiveLabel}`,
+        `motion ${percent}% of last ${windowMinutes} min`,
+        `last: ${last}`,
+        `mode: ${tunerSnapshot.mode} · window ${tunerSnapshot.window_full ? 'full' : 'filling'}`,
+        `whole-frame events: ${Number(tunerSnapshot.global_events_in_window) || 0} in window`,
+    ].join('\n');
+    tunerReadout.hidden = false;
+}
+
 function fetchMotionSegments(cameraId) {
     if (motionPoller) motionPoller.stop();
     motionPoller = startPoller('motion data', 5000, async (signal) => {
@@ -580,6 +828,9 @@ function fetchMotionSegments(cameraId) {
     if (stabilityPoller) stabilityPoller.stop();
     stabilityPoller = startPoller('motion overlays', 5000, () =>
         Promise.all([fetchStabilityMap(), fetchBackgroundMap()]));
+
+    if (tunerPoller) tunerPoller.stop();
+    tunerPoller = startPoller('tuner', 5000, fetchTunerSnapshot);
 }
 
 function fetchDetections(cameraId) {
