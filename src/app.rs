@@ -477,6 +477,7 @@ struct SpawnContext<'a> {
     debug_store: &'a DetectionDebugStore,
     storage: &'a Option<Arc<dyn WarmStorageBackend>>,
     motion_settings: &'a Option<analytics::MotionSettingsStore>,
+    tuner_store: &'a Option<analytics::TunerStore>,
     /// Crop-job queue into the global detection worker; `None` when object
     /// detection is off.
     detect_tx: &'a Option<DetectQueueSender>,
@@ -665,6 +666,11 @@ fn spawn_cameras(ctx: &SpawnContext, cameras: Vec<config::CameraConfig>) -> Came
                         .motion_settings
                         .clone()
                         .expect("motion settings initialized when analytics enabled"),
+                    tuner_store: ctx
+                        .tuner_store
+                        .clone()
+                        .expect("tuner store initialized when analytics enabled"),
+                    data_dir: std::path::PathBuf::from(&ctx.config.storage.data_dir),
                     event_tx,
                     mqtt_tx: ctx.mqtt_tx.clone(),
                     pre_padding_ns: ctx.config.storage.pre_padding_secs * 1_000_000_000,
@@ -1009,6 +1015,12 @@ where
         .as_ref()
         .and_then(|backend| backend.volume_anchor().cloned());
     let motion_settings = init_motion_settings(&config, &camera_ids);
+    let tuner_store = config.analytics.enabled.then(|| {
+        analytics::TunerStore::with_params(
+            &camera_ids,
+            analytics::TunerParams::from(&config.analytics.motion),
+        )
+    });
 
     log_recording_mode(&config);
 
@@ -1061,6 +1073,7 @@ where
         debug_store: &debug_store,
         storage: &storage,
         motion_settings: &motion_settings,
+        tuner_store: &tuner_store,
         detect_tx: &detect_tx,
         event_registry: &event_registry,
         mqtt_tx: &mqtt_tx,
@@ -1132,7 +1145,8 @@ where
         debug_store,
         storage,
         motion_settings,
-    );
+    )
+    .with_tuner_store(tuner_store);
     // Serving on the socket startup already took.
     let server_handle = supervisor.critical("http-server", async move {
         if let Err(e) = api::serve(listener, app_state, api_auth).await {

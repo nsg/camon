@@ -40,13 +40,14 @@ To make decoding as lightweight as possible, we only extract keyframes because t
 
 The Motion Analyzer uses a built-in pure-Rust implementation of the Zivkovic MOG2 (Mixture of Gaussians) background subtractor — validated bit-exact against OpenCV's — to detect foreground motion, followed by morphological opening to eliminate noise and connected-component filtering to discard small blobs. The background model spans about 5 minutes at the 1 fps analysis rate, so persistent motion like tree sway gets absorbed into the background.
 
-Motion detection is governed by three deterministic, per-camera controls, editable live from the web UI and persisted to `{data_dir}/{camera}/motion_settings.json`:
+Motion detection is governed by deterministic, per-camera controls persisted to `{data_dir}/{camera}/motion_settings.json`:
 
 - **Sensitivity** — the MOG2 `var_threshold` (range 4–96, default 16; higher = less sensitive).
 - **Min object size** — the minimum connected-component area in foreground pixels (range 50–2000, default 200), which discards small blobs like blowing leaves.
+- **Per-cell min object size** — a 16×12 grid that can override the global minimum in individual cells while leaving zero-valued cells on the global setting.
 - **Movement mask** — a 16×12 grid of cells painted over the camera view; masked cells are zeroed in the MOG2 foreground mask before morphology and connected-component labeling, so they are excluded from detection deterministically. Read it as "nothing ever moves here": paint a busy road or a swaying tree to keep it from producing motion events.
 
-There is no automatic tuning and no learned suppression: MOG2's verdict is the sole gate on what footage persists, so the settings only ever change when a human moves them. Config defaults for the two sliders can be set under `[analytics.motion]`; the per-camera file wins once a camera has been adjusted.
+An optional per-cell tuner watches a 20-minute rolling window and raises only cells with sustained motion, then lowers them again after continuous quiet. It is off by default, can run in shadow mode to expose proposed thresholds without applying them, and in auto mode applies the maximum of the user grid and learned grid. Tightening is rate-limited and capped at 2000 foreground pixels; learned state is persisted separately in `{data_dir}/{camera}/motion_tuner.json`. Tuner timing, bars, and step sizes can be set under `[analytics.motion]`; mode remains a per-camera setting exposed through the motion-settings API.
 
 That file is written like an event: staged, fsynced, renamed into place, and the directory fsynced after — a truncated one loads as defaults, which would quietly un-paint a privacy mask — and saves are serialised per camera so two edits at once cannot share a staging file. A save that fails is reported rather than acknowledged: the API answers with the error and the web UI shows it above the settings panel. The change stays applied to the running detector either way, because a mask exists to stop something being seen and has to take effect even when the disk will not take it; what is lost is only that it survives a restart.
 
@@ -428,7 +429,9 @@ If the camera exposes a low-resolution H.264 substream, configure it as `sub_url
 | `GET` | `/api/cameras/{id}/motion/{seq}/mask` | JPEG motion mask for a segment |
 | `GET` | `/api/cameras/{id}/motion/maps/{stage}` | JPEG view of one detector stage (see below) |
 | `GET` | `/api/cameras/{id}/motion/settings` | Motion settings: sensitivity, min object size, movement mask, detection mask (JSON) |
-| `PUT` | `/api/cameras/{id}/motion/settings` | Update motion settings (partial JSON: `var_threshold`, `min_contour_area`, `mask`, `detection_mask`) |
+| `PUT` | `/api/cameras/{id}/motion/settings` | Update motion settings (partial JSON, including `min_contour_area_grid` and `tuner_mode`) |
+| `GET` | `/api/cameras/{id}/motion/tuner` | Current tuner mode, grids, trigger fractions, parameters, and recent cell changes |
+| `POST` | `/api/cameras/{id}/motion/tuner/reset` | Clear learned/proposed tuner values and rolling statistics |
 | `GET` | `/api/cameras/{id}/detections` | Detected objects with confidence |
 | `GET` | `/api/cameras/{id}/detections/{id}/frame` | JPEG frame of detection |
 | `GET` | `/api/cameras/{id}/hot-events` | Hot buffer motion events |

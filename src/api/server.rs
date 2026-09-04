@@ -14,10 +14,12 @@ use rust_embed::Embed;
 use serde::{Deserialize, Serialize};
 
 use crate::analytics::motion_settings::{
-    MotionSettings, MASK_COLS, MASK_ROWS, MIN_CONTOUR_AREA_MAX, MIN_CONTOUR_AREA_MIN,
-    VAR_THRESHOLD_MAX, VAR_THRESHOLD_MIN,
+    MotionSettings, TunerMode, CELL_CONTOUR_AREA_CEILING, MASK_COLS, MASK_ROWS,
+    MIN_CONTOUR_AREA_MAX, MIN_CONTOUR_AREA_MIN, VAR_THRESHOLD_MAX, VAR_THRESHOLD_MIN,
 };
-use crate::analytics::{MotionSettingsStore, SettingsUpdate, UpdateError};
+use crate::analytics::{
+    MotionSettingsStore, SettingsUpdate, TunerSnapshot, TunerStore, UpdateError,
+};
 use crate::buffer::HotBuffer;
 use crate::locks::LockExt;
 use crate::storage::event_index::MAX_FILMSTRIP_FRAMES;
@@ -44,6 +46,8 @@ pub struct AppState {
     pub storage: Option<Arc<dyn WarmStorageBackend>>,
     /// Per-camera deterministic motion settings. `None` when analytics is off.
     pub motion_settings: Option<MotionSettingsStore>,
+    /// Per-camera tuner snapshots and reset requests. `None` when analytics is off.
+    pub tuner_store: Option<TunerStore>,
 }
 
 impl AppState {
@@ -64,7 +68,13 @@ impl AppState {
             debug_store,
             storage,
             motion_settings,
+            tuner_store: None,
         }
+    }
+
+    pub fn with_tuner_store(mut self, tuner_store: Option<TunerStore>) -> Self {
+        self.tuner_store = tuner_store;
+        self
     }
 }
 
@@ -160,6 +170,14 @@ fn api_routes() -> Router<AppState> {
         .route(
             "/api/cameras/{id}/motion/settings",
             get(motion_settings_get_handler).put(motion_settings_put_handler),
+        )
+        .route(
+            "/api/cameras/{id}/motion/tuner",
+            get(motion_tuner_get_handler),
+        )
+        .route(
+            "/api/cameras/{id}/motion/tuner/reset",
+            axum::routing::post(motion_tuner_reset_handler),
         )
         .route("/api/cameras/{id}/detections", get(detections_handler))
         .route(
@@ -426,6 +444,8 @@ async fn motion_map_handler(
 struct MotionSettingsResponse {
     var_threshold: f64,
     min_contour_area: f64,
+    min_contour_area_grid: Vec<f64>,
+    tuner_mode: TunerMode,
     mask_cols: usize,
     mask_rows: usize,
     mask: Vec<bool>,
@@ -434,6 +454,7 @@ struct MotionSettingsResponse {
     var_threshold_max: f64,
     min_contour_area_min: f64,
     min_contour_area_max: f64,
+    cell_contour_area_ceiling: f64,
 }
 
 impl From<MotionSettings> for MotionSettingsResponse {
@@ -441,6 +462,8 @@ impl From<MotionSettings> for MotionSettingsResponse {
         Self {
             var_threshold: s.var_threshold,
             min_contour_area: s.min_contour_area,
+            min_contour_area_grid: s.min_contour_area_grid,
+            tuner_mode: s.tuner_mode,
             mask_cols: MASK_COLS,
             mask_rows: MASK_ROWS,
             mask: s.mask,
@@ -449,7 +472,42 @@ impl From<MotionSettings> for MotionSettingsResponse {
             var_threshold_max: VAR_THRESHOLD_MAX,
             min_contour_area_min: MIN_CONTOUR_AREA_MIN,
             min_contour_area_max: MIN_CONTOUR_AREA_MAX,
+            cell_contour_area_ceiling: CELL_CONTOUR_AREA_CEILING,
         }
+    }
+}
+
+async fn motion_tuner_get_handler(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Response {
+    let Some(settings) = state
+        .motion_settings
+        .as_ref()
+        .and_then(|store| store.get(&id))
+    else {
+        return (StatusCode::NOT_FOUND, "camera not found").into_response();
+    };
+    let snapshot = match state.tuner_store.as_ref() {
+        Some(store) => store.get(&id).unwrap_or_else(|| {
+            TunerSnapshot::empty_with_params(settings.tuner_mode, store.params())
+        }),
+        None => TunerSnapshot::empty(settings.tuner_mode),
+    };
+    Json(snapshot).into_response()
+}
+
+async fn motion_tuner_reset_handler(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Response {
+    match state
+        .tuner_store
+        .as_ref()
+        .is_some_and(|store| store.request_reset(&id))
+    {
+        true => StatusCode::NO_CONTENT.into_response(),
+        false => (StatusCode::NOT_FOUND, "camera not found").into_response(),
     }
 }
 
@@ -1133,6 +1191,7 @@ async fn warm_filmstrip_handler(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::analytics::TunerParams;
     use crate::buffer::GopSegment;
     use crate::storage::EventType;
 
@@ -1697,6 +1756,13 @@ mod tests {
     }
 
     fn motion_settings_state(data_dir: &std::path::Path) -> AppState {
+        motion_settings_state_with_params(data_dir, TunerParams::default())
+    }
+
+    fn motion_settings_state_with_params(
+        data_dir: &std::path::Path,
+        params: TunerParams,
+    ) -> AppState {
         let ids = vec!["cam".to_string()];
         let buffers = HashMap::from([("cam".to_string(), HotBuffer::new("cam".to_string(), 60))]);
         AppState::new(
@@ -1708,6 +1774,7 @@ mod tests {
             None,
             Some(MotionSettingsStore::new(&ids, data_dir, 16.0, 200.0)),
         )
+        .with_tuner_store(Some(TunerStore::with_params(&ids, params)))
     }
 
     async fn serve_with_motion_settings(data_dir: &std::path::Path) -> String {
@@ -1791,6 +1858,75 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         assert_eq!(store.get("cam").unwrap().var_threshold, 16.0);
+    }
+
+    #[tokio::test]
+    async fn tuner_get_before_first_publish_is_zeroed_and_uses_settings_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let params = TunerParams {
+            window_secs: 600,
+            tighten_bar: 0.75,
+            ..TunerParams::default()
+        };
+        let state = motion_settings_state_with_params(dir.path(), params.clone());
+        state
+            .motion_settings
+            .as_ref()
+            .unwrap()
+            .update(
+                "cam",
+                SettingsUpdate {
+                    tuner_mode: Some(TunerMode::Shadow),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        let response = motion_tuner_get_handler(State(state), Path("cam".to_string())).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["mode"], "shadow");
+        assert_eq!(json["window_secs"], params.window_secs);
+        assert_eq!(json["params"]["tighten_bar"], params.tighten_bar);
+        assert_eq!(json["window_full"], false);
+        assert_eq!(
+            json["base"].as_array().unwrap().len(),
+            crate::analytics::motion_settings::MASK_CELLS
+        );
+        assert!(json["effective"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|value| value == 0.0));
+    }
+
+    #[tokio::test]
+    async fn tuner_get_for_unknown_camera_is_a_404() {
+        let dir = tempfile::tempdir().unwrap();
+        let response = motion_tuner_get_handler(
+            State(motion_settings_state(dir.path())),
+            Path("unknown".to_string()),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn tuner_reset_requests_are_camera_scoped() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = motion_settings_state(dir.path());
+        let tuner_store = state.tuner_store.clone().unwrap();
+
+        let response =
+            motion_tuner_reset_handler(State(state.clone()), Path("cam".to_string())).await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert!(tuner_store.take_reset("cam"));
+
+        let response = motion_tuner_reset_handler(State(state), Path("unknown".to_string())).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

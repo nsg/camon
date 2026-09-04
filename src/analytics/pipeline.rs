@@ -5,10 +5,11 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use crate::analytics::motion_settings::{
-    MotionSettingsStore, DEFAULT_MIN_CONTOUR_AREA, DEFAULT_VAR_THRESHOLD, MASK_CELLS,
+    MotionSettingsStore, DEFAULT_MIN_CONTOUR_AREA, DEFAULT_VAR_THRESHOLD, MASK_CELLS, MASK_COLS,
+    MASK_ROWS,
 };
 use crate::buffer::warm::{assemble_event, EventUpgrade, WriterMessage};
 use crate::buffer::HotBuffer;
@@ -26,8 +27,11 @@ use super::decoder::{
     CropDecoder, DecodeOutcome, FrameDecoder, DETECTION_CROP_SIZE, THUMBNAIL_CROP_SIZE,
 };
 use super::detect_worker::{DetectQueueSender, DetectionJob};
-use super::motion::MotionDetector;
+use super::motion::{MotionBox, MotionDetector};
 use super::run_tracker::{ClosedRun, RunTracker};
+use super::tuner::{
+    load_tuner_state, save_tuner_state, tuner_state_path, MotionTuner, TunerParams, TunerStore,
+};
 
 const ANALYSIS_WIDTH: i32 = 320;
 const ANALYSIS_HEIGHT: i32 = 240;
@@ -93,11 +97,39 @@ struct SegmentAnalysis {
     score: f32,
     crop: Option<NormalizedRect>,
     motion_rects: Vec<NormalizedRect>,
+    motion_cells: [bool; MASK_CELLS],
 }
 
 impl SegmentAnalysis {
     fn has_motion(&self) -> bool {
         self.score >= MOTION_THRESHOLD
+    }
+}
+
+fn mark_cells(bboxes: &[MotionBox], width: usize, height: usize, cells: &mut [bool; MASK_CELLS]) {
+    if width == 0 || height == 0 {
+        return;
+    }
+    for bbox in bboxes {
+        if bbox.width <= 0 || bbox.height <= 0 {
+            continue;
+        }
+        let left = bbox.x.max(0) as usize;
+        let top = bbox.y.max(0) as usize;
+        if left >= width || top >= height {
+            continue;
+        }
+        let right = bbox.x.saturating_add(bbox.width - 1).max(0) as usize;
+        let bottom = bbox.y.saturating_add(bbox.height - 1).max(0) as usize;
+        let first_col = (left * MASK_COLS / width).min(MASK_COLS - 1);
+        let last_col = (right * MASK_COLS / width).min(MASK_COLS - 1);
+        let first_row = (top * MASK_ROWS / height).min(MASK_ROWS - 1);
+        let last_row = (bottom * MASK_ROWS / height).min(MASK_ROWS - 1);
+        for row in first_row..=last_row {
+            for col in first_col..=last_col {
+                cells[row * MASK_COLS + col] = true;
+            }
+        }
     }
 }
 
@@ -130,6 +162,10 @@ pub struct AnalyzerContext {
     /// Deterministic per-camera motion settings (sensitivity, min object size,
     /// ignore mask). Shared so live edits apply without a restart.
     pub motion_settings: MotionSettingsStore,
+    /// Analyzer-owned tuner state published to the HTTP layer.
+    pub tuner_store: TunerStore,
+    /// Root containing each camera's durable tuner state.
+    pub data_dir: std::path::PathBuf,
     /// Finished events go to the warm writer over this channel. `None` when
     /// warm storage is disabled.
     pub event_tx: Option<tokio::sync::mpsc::Sender<WriterMessage>>,
@@ -174,8 +210,13 @@ pub struct MotionAnalyzer {
     observed_sequences: bool,
     skip_reporter: SkipReporter,
     motion_settings: MotionSettingsStore,
+    tuner_store: TunerStore,
+    tuner: MotionTuner,
+    tuner_state_path: std::path::PathBuf,
+    tuner_dirty: bool,
+    last_tuner_eval: Instant,
     /// Per-camera "detection mask": 16x12 row-major cells, `true` = blacked out of every frame
-    /// sent to the vision model. Refreshed each tick in `sync_settings` so paint edits apply
+    /// sent to the vision model. Refreshed each tick in `control_plane` so paint edits apply
     /// live, exactly like the movement mask and the sliders.
     detection_mask: Vec<bool>,
     segment_crops: HashMap<u64, NormalizedRect>,
@@ -199,15 +240,32 @@ impl MotionAnalyzer {
     /// [`FrameDecoder::dead`] — without an ffmpeg on the box.
     fn with_decoder(ctx: AnalyzerContext, decoder: FrameDecoder) -> Self {
         // Seed the detector from the persisted (or default) per-camera settings;
-        // subsequent live edits are picked up each tick in `sync_settings`.
+        // subsequent live edits are picked up each tick in `control_plane`.
         let settings = ctx.motion_settings.get(&ctx.camera_id);
         let (var_threshold, min_contour_area) = settings
             .as_ref()
             .map(|s| (s.var_threshold, s.min_contour_area))
             .unwrap_or((DEFAULT_VAR_THRESHOLD, DEFAULT_MIN_CONTOUR_AREA));
+        let mut tuner = MotionTuner::new(TunerParams::from(&ctx.config.motion));
+        if let Some(settings) = settings.as_ref() {
+            tuner.set_mode(settings.tuner_mode);
+        }
+        let state_path = tuner_state_path(&ctx.data_dir, &ctx.camera_id);
+        match load_tuner_state(&state_path) {
+            Ok(Some(state)) => tuner.load_state(&state),
+            Ok(None) => {}
+            Err(error) => tracing::warn!(
+                camera = %ctx.camera_id,
+                path = %state_path.display(),
+                error = %error,
+                "motion tuner state is corrupt; starting with no learned thresholds"
+            ),
+        }
+
         let mut detector = MotionDetector::new(var_threshold, min_contour_area);
         if let Some(s) = settings.as_ref() {
             detector.set_mask(&s.mask);
+            detector.set_min_contour_area_grid(&tuner.effective_grid(&s.min_contour_area_grid));
         }
         let detection_mask = settings
             .as_ref()
@@ -224,7 +282,7 @@ impl MotionAnalyzer {
             .map(|s| s + 1)
             .unwrap_or(0);
 
-        Self {
+        let mut analyzer = Self {
             camera_id: ctx.camera_id,
             buffer: ctx.buffer,
             motion_store: ctx.motion_store,
@@ -242,6 +300,11 @@ impl MotionAnalyzer {
             observed_sequences: false,
             skip_reporter: SkipReporter::default(),
             motion_settings: ctx.motion_settings,
+            tuner_store: ctx.tuner_store,
+            tuner,
+            tuner_state_path: state_path,
+            tuner_dirty: false,
+            last_tuner_eval: Instant::now(),
             detection_mask,
             segment_crops: HashMap::new(),
             segment_motion_rects: HashMap::new(),
@@ -251,7 +314,16 @@ impl MotionAnalyzer {
             event_tx: ctx.event_tx,
             mqtt_tx: ctx.mqtt_tx,
             pre_padding_ns: ctx.pre_padding_ns,
+        };
+        if let Some(settings) = settings.as_ref() {
+            analyzer.tuner_store.publish(
+                &analyzer.camera_id,
+                analyzer
+                    .tuner
+                    .snapshot(&settings.min_contour_area_grid, Instant::now()),
+            );
         }
+        analyzer
     }
 
     fn run(mut self, shutdown: Arc<AtomicBool>) {
@@ -274,6 +346,25 @@ impl MotionAnalyzer {
     /// One pass of the analyzer. Returns whether the caller should wait out the poll interval
     /// — a pass that gave up on the decoder has already waited its own respawn backoff.
     fn tick(&mut self, shutdown: &AtomicBool) -> bool {
+        self.control_plane(Instant::now());
+        self.tick_after_control_plane(shutdown, FrameDecoder::new)
+    }
+
+    #[cfg(test)]
+    fn tick_with_decoder_spawn(
+        &mut self,
+        shutdown: &AtomicBool,
+        spawn: impl FnOnce() -> Result<FrameDecoder, std::io::Error>,
+    ) -> bool {
+        self.control_plane(Instant::now());
+        self.tick_after_control_plane(shutdown, spawn)
+    }
+
+    fn tick_after_control_plane(
+        &mut self,
+        shutdown: &AtomicBool,
+        spawn: impl FnOnce() -> Result<FrameDecoder, std::io::Error>,
+    ) -> bool {
         if let Some(ref debug_store) = self.debug_store {
             debug_store.expire_unwatched(&self.camera_id);
         }
@@ -282,7 +373,7 @@ impl MotionAnalyzer {
         // This check covers only the frame decoder's fork directly below. The
         // crop decoder forks at the far end of the pass, so it is handed the
         // flag rather than this reading of it; see [`ensure_long_lived`].
-        if shutdown.load(Ordering::Relaxed) || !self.ensure_decoder_alive(shutdown) {
+        if shutdown.load(Ordering::Relaxed) || !self.ensure_decoder_alive_with(shutdown, spawn) {
             return false;
         }
 
@@ -361,10 +452,6 @@ impl MotionAnalyzer {
         }
     }
 
-    fn ensure_decoder_alive(&mut self, shutdown: &AtomicBool) -> bool {
-        self.ensure_decoder_alive_with(shutdown, FrameDecoder::new)
-    }
-
     /// Replace the frame decoder if its child is gone, waiting out the backoff here when the
     /// fork fails — which is why [`MotionAnalyzer::tick`] returns without a poll of its own
     /// afterwards.
@@ -411,15 +498,76 @@ impl MotionAnalyzer {
             .is_some_and(|store| store.wanted(&self.camera_id))
     }
 
-    /// Pull the latest deterministic settings from the shared store and apply
-    /// them to the detector. Cheap (a lock read + a 192-byte mask copy), run
-    /// every tick so slider/mask edits take effect without a restart.
-    fn sync_settings(&mut self) {
+    /// Run settings, tuner and snapshot synchronization independently of frame
+    /// flow. Cheap (a lock read + fixed-size grid copies), so it runs every tick.
+    fn control_plane(&mut self, now: Instant) {
         if let Some(s) = self.motion_settings.get(&self.camera_id) {
+            self.tuner.set_mode(s.tuner_mode);
+            let reset = self.tuner_store.take_reset(&self.camera_id);
+            if reset {
+                self.tuner.reset();
+                self.tuner_dirty = true;
+                tracing::info!(camera = %self.camera_id, "motion tuner reset");
+            }
+
+            let cadence_due =
+                now.saturating_duration_since(self.last_tuner_eval) >= Duration::from_secs(60);
+            if cadence_due {
+                let changes = self.tuner.evaluate(now, SystemTime::now());
+                for change in &changes {
+                    tracing::info!(
+                        camera = %self.camera_id,
+                        cell = change.cell,
+                        row = change.cell / MASK_COLS,
+                        col = change.cell % MASK_COLS,
+                        old = change.old,
+                        new = change.new,
+                        mode = ?self.tuner.mode(),
+                        reason = %change.reason,
+                        "motion tuner threshold changed"
+                    );
+                }
+                if self.tuner.mode() == crate::analytics::motion_settings::TunerMode::Auto
+                    && !changes.is_empty()
+                {
+                    self.tuner_dirty = true;
+                }
+                self.last_tuner_eval = now;
+            }
+
+            if self.tuner_dirty && (reset || cadence_due) {
+                self.persist_tuner_state();
+            }
+
             self.detector.set_var_threshold(s.var_threshold);
             self.detector.set_min_contour_area(s.min_contour_area);
+            let effective = self.tuner.effective_grid(&s.min_contour_area_grid);
+            self.detector.set_min_contour_area_grid(&effective);
             self.detector.set_mask(&s.mask);
             self.detection_mask = s.detection_mask;
+            self.tuner_store.publish(
+                &self.camera_id,
+                self.tuner.snapshot(&s.min_contour_area_grid, now),
+            );
+        }
+    }
+
+    fn persist_tuner_state(&mut self) {
+        match save_tuner_state(&self.tuner_state_path, &self.tuner.state()) {
+            Ok(()) => {
+                self.tuner_dirty = false;
+                tracing::info!(
+                    camera = %self.camera_id,
+                    path = %self.tuner_state_path.display(),
+                    "persisted motion tuner state"
+                );
+            }
+            Err(error) => tracing::warn!(
+                camera = %self.camera_id,
+                path = %self.tuner_state_path.display(),
+                error = %error,
+                "failed to persist motion tuner state; will retry"
+            ),
         }
     }
 
@@ -429,8 +577,6 @@ impl MotionAnalyzer {
         &mut self,
         stop: Option<&AtomicBool>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        self.sync_settings();
-
         let (first_seq, last_seq) = {
             let buffer = self.buffer.read_recover();
             (buffer.first_sequence(), buffer.last_sequence())
@@ -561,10 +707,13 @@ impl MotionAnalyzer {
             publish_debug_maps(&self.motion_store, &self.camera_id, &self.detector);
 
             let has_motion = analysis.has_motion();
+            self.tuner
+                .observe_segment(has_motion, &analysis.motion_cells, now);
             let SegmentAnalysis {
                 score,
                 crop,
                 motion_rects,
+                motion_cells: _,
             } = analysis;
             // Whatever has accumulated belongs to the run that just closed:
             // this batch's own frames are extracted later, in
@@ -784,11 +933,13 @@ impl MotionAnalyzer {
         let mut total_score = 0.0f32;
         let mut frame_count = 0u32;
         let mut all_rects = Vec::new();
+        let mut motion_cells = [false; MASK_CELLS];
 
         for frame_data in &raw_frames {
             let score = self.detector.process_frame(frame_data, w, h);
             total_score += score;
             frame_count += 1;
+            mark_cells(self.detector.motion_bboxes(), w, h, &mut motion_cells);
             for &r in self.detector.motion_bboxes() {
                 all_rects.push(normalize_rect(r, ANALYSIS_WIDTH, ANALYSIS_HEIGHT));
             }
@@ -800,6 +951,7 @@ impl MotionAnalyzer {
             score: total_score / frame_count as f32,
             crop,
             motion_rects: all_rects,
+            motion_cells,
         }))
     }
 

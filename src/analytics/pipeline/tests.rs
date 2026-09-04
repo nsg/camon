@@ -8,7 +8,7 @@ use super::sampling::{
 };
 use super::skips::SKIP_REPORT_INTERVAL;
 use crate::analytics::motion::MotionBox;
-use crate::analytics::motion_settings::MASK_COLS;
+use crate::analytics::motion_settings::{SettingsUpdate, TunerMode, MASK_COLS};
 use std::sync::atomic::AtomicU32;
 
 fn detector_with_masks() -> MotionDetector {
@@ -692,6 +692,78 @@ fn a_pass_that_gives_up_on_its_decoder_still_empties_the_crop_channel() {
 }
 
 #[test]
+fn control_plane_runs_when_decoder_is_dead() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = test_context("cam", dir.path());
+    let settings = ctx.motion_settings.clone();
+    let tuner_store = ctx.tuner_store.clone();
+    let mut analyzer = MotionAnalyzer::with_decoder(ctx, FrameDecoder::dead());
+    let mut learned = vec![0.0; MASK_CELLS];
+    learned[4] = 300.0;
+    analyzer
+        .tuner
+        .load_state(&crate::analytics::tuner::TunerState {
+            version: 2,
+            learned,
+            last_change: vec![None; MASK_CELLS],
+        });
+    settings
+        .update(
+            "cam",
+            SettingsUpdate {
+                tuner_mode: Some(TunerMode::Shadow),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert!(tuner_store.request_reset("cam"));
+    analyzer.decoder_retry = DecoderSpawnRetry::new(RetrySchedule {
+        start: Duration::ZERO,
+        max: Duration::ZERO,
+    });
+
+    assert!(!analyzer
+        .tick_with_decoder_spawn(&running(), || { Err(std::io::Error::other("no ffmpeg")) }));
+
+    let snapshot = tuner_store
+        .get("cam")
+        .expect("control plane did not publish");
+    assert_eq!(snapshot.mode, TunerMode::Shadow);
+    assert!(snapshot.learned.iter().all(|&value| value == 0.0));
+    assert!(!tuner_store.take_reset("cam"), "reset was not consumed");
+}
+
+#[test]
+fn failed_tuner_save_is_retried() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = test_context("cam", dir.path());
+    let tuner_store = ctx.tuner_store.clone();
+    let mut analyzer = MotionAnalyzer::with_decoder(ctx, FrameDecoder::dead());
+    let blocked_parent = dir.path().join("not-a-directory");
+    std::fs::write(&blocked_parent, b"file").unwrap();
+    analyzer.tuner_state_path = blocked_parent.join("motion_tuner.json");
+    assert!(tuner_store.request_reset("cam"));
+    let now = Instant::now();
+
+    analyzer.control_plane(now);
+    assert!(analyzer.tuner_dirty, "failed save cleared the dirty bit");
+    analyzer.control_plane(now + Duration::from_secs(1));
+    assert!(
+        analyzer.tuner_dirty,
+        "dirty state was retried on the per-tick path"
+    );
+
+    std::fs::remove_file(&blocked_parent).unwrap();
+    std::fs::create_dir(&blocked_parent).unwrap();
+    analyzer.control_plane(now + Duration::from_secs(61));
+    assert!(!analyzer.tuner_dirty, "successful retry stayed dirty");
+    assert!(
+        analyzer.tuner_state_path.exists(),
+        "successful retry did not persist state"
+    );
+}
+
+#[test]
 fn frames_arriving_during_the_respawn_backoff_are_released_before_the_pass_returns() {
     let dir = tempfile::tempdir().unwrap();
     let ctx = test_context("cam", dir.path());
@@ -745,12 +817,37 @@ fn test_context(camera_id: &str, data_dir: &std::path::Path) -> AnalyzerContext 
             DEFAULT_VAR_THRESHOLD,
             DEFAULT_MIN_CONTOUR_AREA,
         ),
+        tuner_store: crate::analytics::tuner::TunerStore::with_params(
+            &ids,
+            crate::analytics::tuner::TunerParams::default(),
+        ),
+        data_dir: data_dir.to_path_buf(),
         event_tx: None,
         mqtt_tx: None,
         pre_padding_ns: 0,
         post_padding: Duration::from_secs(10),
         max_event_duration: Duration::from_secs(120),
     }
+}
+
+#[test]
+fn motion_bbox_marks_every_spanned_cell() {
+    let mut cells = [false; MASK_CELLS];
+    mark_cells(
+        &[MotionBox {
+            x: 19,
+            y: 5,
+            width: 2,
+            height: 10,
+        }],
+        ANALYSIS_WIDTH as usize,
+        ANALYSIS_HEIGHT as usize,
+        &mut cells,
+    );
+
+    assert!(cells[0]);
+    assert!(cells[1]);
+    assert_eq!(cells.iter().filter(|&&marked| marked).count(), 2);
 }
 
 #[derive(Clone, Default)]
@@ -2057,6 +2154,7 @@ fn motion_verdict_needs_the_threshold() {
         score,
         crop: None,
         motion_rects: Vec::new(),
+        motion_cells: [false; MASK_CELLS],
     };
     assert!(!scored(0.0).has_motion());
     assert!(!scored(MOTION_THRESHOLD - 0.001).has_motion());

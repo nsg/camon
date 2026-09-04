@@ -35,12 +35,13 @@ pub struct MotionBox {
 }
 
 /// Pure-Rust motion detector: Zivkovic MOG2 background subtraction → static ignore-mask →
-/// morphological opening → connected-component area filtering.
+/// morphological opening → global/per-cell connected-component area filtering.
 pub struct MotionDetector {
     mog2: Mog2,
     learning_rate: f64,
     kernel: StructuringElement,
     min_contour_area: f64,
+    min_contour_area_grid: Vec<f64>,
     /// Ignore mask: one bool per 16x12 cell (row-major), `true` = excluded.
     /// Applied to the raw MOG2 foreground mask before scene-change evaluation,
     /// morphology, and connected-component labeling.
@@ -80,6 +81,7 @@ impl MotionDetector {
             learning_rate: LEARNING_RATE,
             kernel,
             min_contour_area,
+            min_contour_area_grid: vec![0.0; MASK_CELLS],
             mask: vec![false; MASK_CELLS],
             mask_active: false,
             frames_since_stable: 0,
@@ -104,6 +106,16 @@ impl MotionDetector {
     /// Minimum connected-component area (foreground pixels) to report as motion.
     pub fn set_min_contour_area(&mut self, min_contour_area: f64) {
         self.min_contour_area = min_contour_area;
+    }
+
+    /// Replace the per-cell minimum component areas (one value per 16x12 cell,
+    /// row-major). Zero uses the global minimum. A wrong-length slice is
+    /// ignored.
+    pub fn set_min_contour_area_grid(&mut self, grid: &[f64]) {
+        if grid.len() != MASK_CELLS {
+            return;
+        }
+        self.min_contour_area_grid.copy_from_slice(grid);
     }
 
     /// Replace the ignore mask (one bool per 16x12 cell, row-major). Cells set
@@ -172,7 +184,22 @@ impl MotionDetector {
         self.retained.resize(self.components.len(), false);
         self.bboxes.clear();
         for (i, c) in self.components.iter().enumerate() {
-            if f64::from(c.area) >= self.min_contour_area {
+            let effective = if self.width > 0 && self.height > 0 {
+                let centroid_x = (c.min_x + c.max_x) / 2;
+                let centroid_y = (c.min_y + c.max_y) / 2;
+                let col = (centroid_x as usize * MASK_COLS / self.width).min(MASK_COLS - 1);
+                let row = (centroid_y as usize * MASK_ROWS / self.height).min(MASK_ROWS - 1);
+                let cell = row * MASK_COLS + col;
+                let per_cell = self.min_contour_area_grid[cell];
+                if per_cell > 0.0 {
+                    per_cell.max(self.min_contour_area)
+                } else {
+                    self.min_contour_area
+                }
+            } else {
+                self.min_contour_area
+            };
+            if f64::from(c.area) >= effective {
                 self.retained[i] = true;
                 self.bboxes.push(MotionBox {
                     x: c.min_x as i32,
@@ -328,6 +355,14 @@ mod tests {
         mask
     }
 
+    fn grid_covering(px: usize, py: usize, value: f64) -> Vec<f64> {
+        let mut grid = vec![0.0; MASK_CELLS];
+        let col = (px * MASK_COLS / W).min(MASK_COLS - 1);
+        let row = (py * MASK_ROWS / H).min(MASK_ROWS - 1);
+        grid[row * MASK_COLS + col] = value;
+        grid
+    }
+
     #[test]
     fn detector_suppresses_scores_during_warmup() {
         let mut det = detector();
@@ -365,6 +400,43 @@ mod tests {
         warm_up(&mut det);
 
         let score = det.process_frame(&frame_with_blob(50, 50, 12), W, H);
+        assert_eq!(score, 0.0);
+        assert!(det.motion_bboxes().is_empty());
+    }
+
+    #[test]
+    fn detector_per_cell_override_suppresses_blob_in_tuned_cell() {
+        let mut det = detector();
+        det.set_min_contour_area_grid(&grid_covering(111, 91, 2000.0));
+        warm_up(&mut det);
+
+        let frame = frame_with_blob(100, 80, 24);
+        assert_eq!(det.process_frame(&frame, W, H), 0.0);
+        assert!(det.motion_bboxes().is_empty());
+
+        det.set_min_contour_area_grid(&[0.0; MASK_CELLS]);
+        assert!(det.process_frame(&frame, W, H) > 0.0);
+        assert_eq!(det.motion_bboxes().len(), 1);
+    }
+
+    #[test]
+    fn detector_per_cell_override_leaves_untuned_cell_unchanged() {
+        let mut det = detector();
+        det.set_min_contour_area_grid(&grid_covering(300, 220, 2000.0));
+        warm_up(&mut det);
+
+        let score = det.process_frame(&frame_with_blob(100, 80, 24), W, H);
+        assert!(score > 0.0);
+        assert_eq!(det.motion_bboxes().len(), 1);
+    }
+
+    #[test]
+    fn detector_per_cell_override_cannot_lower_global_floor() {
+        let mut det = detector();
+        det.set_min_contour_area_grid(&grid_covering(55, 55, 60.0));
+        warm_up(&mut det);
+
+        let score = det.process_frame(&frame_with_blob(50, 50, 11), W, H);
         assert_eq!(score, 0.0);
         assert!(det.motion_bboxes().is_empty());
     }
@@ -481,5 +553,17 @@ mod tests {
         warm_up(&mut det);
         let score = det.process_frame(&frame_with_blob(100, 80, 24), W, H);
         assert_eq!(score, 0.0, "wrong-length mask must not disturb the mask");
+    }
+
+    #[test]
+    fn detector_rejects_wrong_length_min_contour_area_grid() {
+        let mut det = detector();
+        det.set_min_contour_area_grid(&grid_covering(111, 91, 2000.0));
+        det.set_min_contour_area_grid(&[0.0, 0.0, 0.0]);
+        warm_up(&mut det);
+
+        let score = det.process_frame(&frame_with_blob(100, 80, 24), W, H);
+        assert_eq!(score, 0.0, "wrong-length grid must not disturb the grid");
+        assert!(det.motion_bboxes().is_empty());
     }
 }

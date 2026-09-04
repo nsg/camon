@@ -122,9 +122,9 @@ sample_fps = 5
 # file — edited live from the web UI (sensitivity slider, min-object-size
 # slider, and two paintable 16x12 masks: the movement mask, which excludes
 # cells from motion detection, and the detection mask, which blacks cells out
-# of every frame sent to the vision model) — takes over. Detection is fully
-# deterministic: there is no auto-tuning. Only the two sliders have config
-# defaults; both masks default to all-off and are painted per camera.
+# of every frame sent to the vision model) — takes over. The optional per-cell
+# tuner mode is also stored there and defaults to off; its control-loop
+# parameters below are global defaults. Both masks default to all-off.
 # A number outside its range is clamped into it at startup, with a warning
 # naming the field and the value being used. A value that is not a number at
 # all — TOML accepts the literals nan, inf and -inf — is refused instead: no
@@ -135,6 +135,20 @@ sample_fps = 5
 var_threshold = 16
 # Minimum object size in foreground pixels. Range 50-2000 (default: 200).
 min_contour_area = 200
+# Rolling observation window in seconds (default: 1200; >=120, multiple of 60).
+# tuner_window_secs = 1200
+# Fraction of cells above which a triggered segment is treated as whole-frame.
+# tuner_global_event_cell_fraction = 0.5
+# Fraction of analyzed segments that must hit a cell before tightening it.
+# tuner_tighten_bar = 0.60
+# Foreground pixels added to a noisy cell per tuning step.
+# tuner_tighten_step = 150
+# A cell below this fraction is quiet and starts its relaxation dwell.
+# tuner_relax_bar = 0.10
+# Continuous quiet seconds required before each relaxation step.
+# tuner_relax_dwell_secs = 2400
+# Foreground pixels removed from a quiet cell per relaxation step.
+# tuner_relax_step = 100
 
 # Object detection via Ollama (requires analytics enabled).
 # All cameras share ONE detection worker that sends at most one request to

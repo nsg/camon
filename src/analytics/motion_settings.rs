@@ -22,6 +22,7 @@ pub const DEFAULT_VAR_THRESHOLD: f64 = 16.0;
 /// Minimum-object-size (`min_contour_area`, foreground pixel count) bounds.
 pub const MIN_CONTOUR_AREA_MIN: f64 = 50.0;
 pub const MIN_CONTOUR_AREA_MAX: f64 = 2000.0;
+pub const CELL_CONTOUR_AREA_CEILING: f64 = 2000.0;
 pub const DEFAULT_MIN_CONTOUR_AREA: f64 = 200.0;
 
 fn default_var_threshold() -> f64 {
@@ -36,7 +37,20 @@ fn default_mask() -> Vec<bool> {
     vec![false; MASK_CELLS]
 }
 
-/// The three deterministic controls for one camera's motion detection.
+fn default_min_contour_area_grid() -> Vec<f64> {
+    vec![0.0; MASK_CELLS]
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TunerMode {
+    #[default]
+    Off,
+    Shadow,
+    Auto,
+}
+
+/// Deterministic controls for one camera's motion detection.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct MotionSettings {
     /// MOG2 var_threshold. Higher = less sensitive.
@@ -45,6 +59,13 @@ pub struct MotionSettings {
     /// Minimum connected-component area (foreground pixels).
     #[serde(default = "default_min_contour_area")]
     pub min_contour_area: f64,
+    /// Per-cell minimum component area, row-major. `0.0` uses the global
+    /// `min_contour_area` for that cell.
+    #[serde(default = "default_min_contour_area_grid")]
+    pub min_contour_area_grid: Vec<f64>,
+    /// Per-cell automatic tuner behavior. Off is the safe default for old files.
+    #[serde(default)]
+    pub tuner_mode: TunerMode,
     /// One bool per 16x12 cell, row-major. `true` = ignored: the cell is
     /// excluded from motion detection deterministically. This is the
     /// "movement mask": nothing ever moves here.
@@ -60,6 +81,8 @@ impl Default for MotionSettings {
         Self {
             var_threshold: DEFAULT_VAR_THRESHOLD,
             min_contour_area: DEFAULT_MIN_CONTOUR_AREA,
+            min_contour_area_grid: default_min_contour_area_grid(),
+            tuner_mode: TunerMode::Off,
             mask: default_mask(),
             detection_mask: default_mask(),
         }
@@ -72,6 +95,8 @@ impl MotionSettings {
         let mut s = Self {
             var_threshold,
             min_contour_area,
+            min_contour_area_grid: default_min_contour_area_grid(),
+            tuner_mode: TunerMode::Off,
             mask: default_mask(),
             detection_mask: default_mask(),
         };
@@ -95,6 +120,16 @@ impl MotionSettings {
             MIN_CONTOUR_AREA_MIN,
             MIN_CONTOUR_AREA_MAX,
         );
+        if self.min_contour_area_grid.len() != MASK_CELLS {
+            self.min_contour_area_grid.resize(MASK_CELLS, 0.0);
+        }
+        for value in &mut self.min_contour_area_grid {
+            *value = if !value.is_finite() || *value <= 0.0 {
+                0.0
+            } else {
+                value.clamp(MIN_CONTOUR_AREA_MIN, CELL_CONTOUR_AREA_CEILING)
+            };
+        }
         if self.mask.len() != MASK_CELLS {
             self.mask.resize(MASK_CELLS, false);
         }
@@ -134,6 +169,8 @@ pub enum UpdateError {
 pub struct SettingsUpdate {
     pub var_threshold: Option<f64>,
     pub min_contour_area: Option<f64>,
+    pub min_contour_area_grid: Option<Vec<f64>>,
+    pub tuner_mode: Option<TunerMode>,
     pub mask: Option<Vec<bool>>,
     pub detection_mask: Option<Vec<bool>>,
 }
@@ -158,8 +195,8 @@ pub struct MotionSettingsStore {
 }
 
 impl MotionSettingsStore {
-    /// Load each camera's settings from disk (falling back to the configured defaults) and
-    /// delete any stale learned-state files left by the removed auto-tuner / detection grid.
+    /// Load each camera's settings from disk (falling back to the configured defaults), remove
+    /// obsolete tuner formats, and delete the retired detection-grid state.
     pub fn new(
         camera_ids: &[String],
         data_dir: &Path,
@@ -176,6 +213,7 @@ impl MotionSettingsStore {
                 Persisted::Settings(settings) => settings,
                 Persisted::Absent => defaults(),
                 Persisted::Corrupt => MotionSettings {
+                    min_contour_area_grid: default_min_contour_area_grid(),
                     detection_mask: vec![true; MASK_CELLS],
                     ..defaults()
                 },
@@ -229,6 +267,12 @@ impl MotionSettingsStore {
             }
             if let Some(v) = update.min_contour_area {
                 state.settings.min_contour_area = v;
+            }
+            if let Some(grid) = update.min_contour_area_grid {
+                state.settings.min_contour_area_grid = grid;
+            }
+            if let Some(mode) = update.tuner_mode {
+                state.settings.tuner_mode = mode;
             }
             if let Some(m) = update.mask {
                 state.settings.mask = m;
@@ -310,24 +354,86 @@ fn save(path: &Path, settings: &MotionSettings) -> std::io::Result<()> {
     sync_dir(dir)
 }
 
-/// Delete the persisted state of the removed auto-tuner and detection grid.
-/// Called once per camera at startup so stale self-blinding state cannot linger.
-fn remove_stale_learned_state(data_dir: &Path, camera_id: &str) {
-    for name in ["motion_tuner.json", "detection_grid.json"] {
-        let path = data_dir.join(camera_id).join(name);
-        if !path.exists() {
-            continue;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LearnedStateClassification {
+    Current,
+    Obsolete,
+    Corrupt,
+}
+
+fn classify_tuner_state(json: &str) -> LearnedStateClassification {
+    match serde_json::from_str::<serde_json::Value>(json) {
+        Ok(value) if value.get("version").and_then(serde_json::Value::as_u64) == Some(2) => {
+            LearnedStateClassification::Current
         }
-        match std::fs::remove_file(&path) {
+        Ok(_) => LearnedStateClassification::Obsolete,
+        Err(_) => LearnedStateClassification::Corrupt,
+    }
+}
+
+/// Delete obsolete learned-state formats while preserving the current v2 tuner state.
+fn remove_stale_learned_state(data_dir: &Path, camera_id: &str) {
+    let tuner_path = data_dir.join(camera_id).join("motion_tuner.json");
+    if tuner_path.exists() {
+        let (classification, corrupt_reported) = match std::fs::read_to_string(&tuner_path) {
+            Ok(json) => (classify_tuner_state(&json), false),
+            Err(error) => {
+                tracing::warn!(
+                    camera = %camera_id,
+                    path = %tuner_path.display(),
+                    error = %error,
+                    "corrupt learned state, starting from zero"
+                );
+                (LearnedStateClassification::Corrupt, true)
+            }
+        };
+        match classification {
+            LearnedStateClassification::Current => {}
+            LearnedStateClassification::Obsolete => match std::fs::remove_file(&tuner_path) {
+                Ok(()) => tracing::info!(
+                    camera = %camera_id,
+                    file = "motion_tuner.json",
+                    "removed obsolete learned-state file"
+                ),
+                Err(error) => tracing::warn!(
+                    camera = %camera_id,
+                    path = %tuner_path.display(),
+                    error = %error,
+                    "failed to remove stale learned-state file"
+                ),
+            },
+            LearnedStateClassification::Corrupt => {
+                if !corrupt_reported {
+                    tracing::warn!(
+                        camera = %camera_id,
+                        path = %tuner_path.display(),
+                        "corrupt learned state, starting from zero"
+                    );
+                }
+                if let Err(error) = std::fs::remove_file(&tuner_path) {
+                    tracing::warn!(
+                        camera = %camera_id,
+                        path = %tuner_path.display(),
+                        error = %error,
+                        "failed to remove corrupt learned-state file"
+                    );
+                }
+            }
+        }
+    }
+
+    let grid_path = data_dir.join(camera_id).join("detection_grid.json");
+    if grid_path.exists() {
+        match std::fs::remove_file(&grid_path) {
             Ok(()) => tracing::info!(
                 camera = %camera_id,
-                file = name,
-                "removed stale learned-state file (feature removed)"
+                file = "detection_grid.json",
+                "removed obsolete learned-state file"
             ),
-            Err(e) => tracing::warn!(
+            Err(error) => tracing::warn!(
                 camera = %camera_id,
-                file = name,
-                error = %e,
+                path = %grid_path.display(),
+                error = %error,
                 "failed to remove stale learned-state file"
             ),
         }
@@ -344,6 +450,8 @@ mod tests {
         let s = MotionSettings::default();
         assert_eq!(s.var_threshold, DEFAULT_VAR_THRESHOLD);
         assert_eq!(s.min_contour_area, DEFAULT_MIN_CONTOUR_AREA);
+        assert_eq!(s.min_contour_area_grid.len(), MASK_CELLS);
+        assert!(s.min_contour_area_grid.iter().all(|&value| value == 0.0));
         assert_eq!(s.mask.len(), MASK_CELLS);
         assert!(s.mask.iter().all(|&m| !m));
     }
@@ -353,6 +461,8 @@ mod tests {
         let mut s = MotionSettings {
             var_threshold: 1000.0,
             min_contour_area: 0.0,
+            min_contour_area_grid: default_min_contour_area_grid(),
+            tuner_mode: TunerMode::Off,
             mask: vec![true; 3],
             detection_mask: vec![true; 5],
         };
@@ -369,6 +479,8 @@ mod tests {
         let mut low = MotionSettings {
             var_threshold: -5.0,
             min_contour_area: 99999.0,
+            min_contour_area_grid: default_min_contour_area_grid(),
+            tuner_mode: TunerMode::Off,
             mask: default_mask(),
             detection_mask: default_mask(),
         };
@@ -378,10 +490,33 @@ mod tests {
     }
 
     #[test]
+    fn sanitize_resizes_and_clamps_min_contour_area_grid() {
+        for grid in [vec![5000.0, -3.0, f64::NAN, 10.0], {
+            let mut grid = vec![0.0; MASK_CELLS + 2];
+            grid[..4].copy_from_slice(&[5000.0, -3.0, f64::NAN, 10.0]);
+            grid
+        }] {
+            let mut settings = MotionSettings {
+                min_contour_area_grid: grid,
+                ..Default::default()
+            };
+            settings.sanitize();
+
+            assert_eq!(settings.min_contour_area_grid.len(), MASK_CELLS);
+            assert_eq!(
+                &settings.min_contour_area_grid[..4],
+                &[CELL_CONTOUR_AREA_CEILING, 0.0, 0.0, MIN_CONTOUR_AREA_MIN]
+            );
+        }
+    }
+
+    #[test]
     fn json_roundtrip() {
         let mut s = MotionSettings {
             var_threshold: 24.0,
             min_contour_area: 350.0,
+            min_contour_area_grid: default_min_contour_area_grid(),
+            tuner_mode: TunerMode::Auto,
             mask: default_mask(),
             detection_mask: default_mask(),
         };
@@ -394,6 +529,40 @@ mod tests {
         assert_eq!(s, back);
         assert!(back.mask[5] && back.mask[MASK_CELLS - 1]);
         assert!(back.detection_mask[7] && !back.detection_mask[5]);
+        assert_eq!(back.tuner_mode, TunerMode::Auto);
+    }
+
+    #[test]
+    fn old_json_defaults_min_contour_area_grid_to_all_global() {
+        let json = r#"{
+            "var_threshold": 20.0,
+            "min_contour_area": 300.0,
+            "mask": [true, false, true],
+            "detection_mask": [false, true, false]
+        }"#;
+        let settings: MotionSettings = serde_json::from_str(json).unwrap();
+
+        assert_eq!(settings.min_contour_area_grid.len(), MASK_CELLS);
+        assert!(settings
+            .min_contour_area_grid
+            .iter()
+            .all(|&value| value == 0.0));
+        assert_eq!(settings.tuner_mode, TunerMode::Off);
+    }
+
+    #[test]
+    fn save_then_load_preserves_min_contour_area_grid() {
+        let dir = TempDir::new().unwrap();
+        let path = settings_path(dir.path(), "cam1");
+        let mut settings = MotionSettings::default();
+        settings.min_contour_area_grid[42] = 750.0;
+
+        save(&path, &settings).unwrap();
+        let Persisted::Settings(loaded) = load(&path) else {
+            panic!("saved settings did not load");
+        };
+
+        assert_eq!(loaded.min_contour_area_grid, settings.min_contour_area_grid);
     }
 
     #[test]
@@ -465,6 +634,8 @@ mod tests {
                 SettingsUpdate {
                     var_threshold: Some(48.0),
                     min_contour_area: Some(500.0),
+                    min_contour_area_grid: None,
+                    tuner_mode: Some(TunerMode::Shadow),
                     mask: Some(mask),
                     detection_mask: None,
                 },
@@ -472,12 +643,14 @@ mod tests {
             .unwrap();
         assert_eq!(updated.var_threshold, 48.0);
         assert!(updated.mask[10]);
+        assert_eq!(updated.tuner_mode, TunerMode::Shadow);
 
         let store2 = MotionSettingsStore::new(&ids, dir.path(), 16.0, 200.0);
         let loaded = store2.get("cam1").unwrap();
         assert_eq!(loaded.var_threshold, 48.0);
         assert_eq!(loaded.min_contour_area, 500.0);
         assert!(loaded.mask[10]);
+        assert_eq!(loaded.tuner_mode, TunerMode::Shadow);
     }
 
     #[test]
@@ -491,6 +664,8 @@ mod tests {
                 SettingsUpdate {
                     var_threshold: Some(9999.0),
                     min_contour_area: Some(1.0),
+                    min_contour_area_grid: None,
+                    tuner_mode: None,
                     mask: None,
                     detection_mask: None,
                 },
@@ -506,6 +681,8 @@ mod tests {
             let mut s = MotionSettings {
                 var_threshold: bad,
                 min_contour_area: bad,
+                min_contour_area_grid: default_min_contour_area_grid(),
+                tuner_mode: TunerMode::Off,
                 mask: default_mask(),
                 detection_mask: default_mask(),
             };
@@ -852,5 +1029,36 @@ mod tests {
         let _ = MotionSettingsStore::new(&["cam1".to_string()], dir.path(), 16.0, 200.0);
         assert!(!tuner.exists(), "motion_tuner.json should be deleted");
         assert!(!grid.exists(), "detection_grid.json should be deleted");
+    }
+
+    #[test]
+    fn keeps_v2_tuner_state_but_removes_detection_grid() {
+        let dir = TempDir::new().unwrap();
+        let cam_dir = dir.path().join("cam1");
+        std::fs::create_dir_all(&cam_dir).unwrap();
+        let tuner = cam_dir.join("motion_tuner.json");
+        let grid = cam_dir.join("detection_grid.json");
+        std::fs::write(&tuner, r#"{"version":2,"learned":[],"last_change":[]}"#).unwrap();
+        std::fs::write(&grid, "{}").unwrap();
+
+        let _ = MotionSettingsStore::new(&["cam1".to_string()], dir.path(), 16.0, 200.0);
+        assert!(tuner.exists(), "v2 motion_tuner.json should survive");
+        assert!(!grid.exists(), "detection_grid.json should be deleted");
+    }
+
+    #[test]
+    fn corrupt_tuner_file_is_removed_with_a_warning() {
+        let dir = TempDir::new().unwrap();
+        let tuner = dir.path().join("cam1").join("motion_tuner.json");
+        std::fs::create_dir_all(tuner.parent().unwrap()).unwrap();
+        let corrupt = r#"{"version":2,"learned":["#;
+        std::fs::write(&tuner, corrupt).unwrap();
+
+        assert_eq!(
+            classify_tuner_state(corrupt),
+            LearnedStateClassification::Corrupt
+        );
+        remove_stale_learned_state(dir.path(), "cam1");
+        assert!(!tuner.exists(), "corrupt tuner state was not removed");
     }
 }

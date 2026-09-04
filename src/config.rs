@@ -100,6 +100,24 @@ pub enum ConfigError {
     )]
     NonFiniteMotionDefault { key: &'static str, value: f64 },
     #[error(
+        "[analytics.motion] tuner_window_secs must be at least 120 and a multiple of 60, got {value}"
+    )]
+    InvalidTunerWindow { value: u64 },
+    #[error(
+        "[analytics.motion] tuner_global_event_cell_fraction must be a finite number in (0, 1], got {value}"
+    )]
+    InvalidTunerGlobalEventCellFraction { value: f64 },
+    #[error(
+        "[analytics.motion] {key} must be a finite number strictly between 0 and 1, got {value}"
+    )]
+    InvalidTunerBar { key: &'static str, value: f64 },
+    #[error(
+        "[analytics.motion] tuner_relax_bar ({relax}) must be below tuner_tighten_bar ({tighten})"
+    )]
+    InvalidTunerBarOrder { relax: f64, tighten: f64 },
+    #[error("[analytics.motion] {key} must be a finite number greater than 0, got {value}")]
+    InvalidTunerStep { key: &'static str, value: f64 },
+    #[error(
         "[analytics.object_detection] confidence_threshold is {value}, which is not a number. \
          The filter is `confidence < threshold`, and that is false for every detection when \
          the threshold is not one — so instead of a stricter detector you get no filtering at \
@@ -484,6 +502,34 @@ fn default_motion_min_contour_area() -> f64 {
     200.0 // min object size in foreground pixels; range 50..=2000
 }
 
+fn default_tuner_window_secs() -> u64 {
+    1_200
+}
+
+fn default_tuner_global_event_cell_fraction() -> f64 {
+    0.5
+}
+
+fn default_tuner_tighten_bar() -> f64 {
+    0.60
+}
+
+fn default_tuner_tighten_step() -> f64 {
+    150.0
+}
+
+fn default_tuner_relax_bar() -> f64 {
+    0.10
+}
+
+fn default_tuner_relax_dwell_secs() -> u64 {
+    2_400
+}
+
+fn default_tuner_relax_step() -> f64 {
+    100.0
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MotionConfig {
@@ -493,6 +539,20 @@ pub struct MotionConfig {
     /// Minimum connected-component area (foreground pixels) to count as motion.
     #[serde(default = "default_motion_min_contour_area")]
     pub min_contour_area: f64,
+    #[serde(default = "default_tuner_window_secs")]
+    pub tuner_window_secs: u64,
+    #[serde(default = "default_tuner_global_event_cell_fraction")]
+    pub tuner_global_event_cell_fraction: f64,
+    #[serde(default = "default_tuner_tighten_bar")]
+    pub tuner_tighten_bar: f64,
+    #[serde(default = "default_tuner_tighten_step")]
+    pub tuner_tighten_step: f64,
+    #[serde(default = "default_tuner_relax_bar")]
+    pub tuner_relax_bar: f64,
+    #[serde(default = "default_tuner_relax_dwell_secs")]
+    pub tuner_relax_dwell_secs: u64,
+    #[serde(default = "default_tuner_relax_step")]
+    pub tuner_relax_step: f64,
 }
 
 impl Default for MotionConfig {
@@ -500,6 +560,13 @@ impl Default for MotionConfig {
         Self {
             var_threshold: default_motion_var_threshold(),
             min_contour_area: default_motion_min_contour_area(),
+            tuner_window_secs: default_tuner_window_secs(),
+            tuner_global_event_cell_fraction: default_tuner_global_event_cell_fraction(),
+            tuner_tighten_bar: default_tuner_tighten_bar(),
+            tuner_tighten_step: default_tuner_tighten_step(),
+            tuner_relax_bar: default_tuner_relax_bar(),
+            tuner_relax_dwell_secs: default_tuner_relax_dwell_secs(),
+            tuner_relax_step: default_tuner_relax_step(),
         }
     }
 }
@@ -1109,6 +1176,43 @@ impl Config {
         ] {
             if !value.is_finite() {
                 return Err(ConfigError::NonFiniteMotionDefault { key, value });
+            }
+        }
+
+        let motion = &self.analytics.motion;
+        if motion.tuner_window_secs < 120 || !motion.tuner_window_secs.is_multiple_of(60) {
+            return Err(ConfigError::InvalidTunerWindow {
+                value: motion.tuner_window_secs,
+            });
+        }
+        if !motion.tuner_global_event_cell_fraction.is_finite()
+            || motion.tuner_global_event_cell_fraction <= 0.0
+            || motion.tuner_global_event_cell_fraction > 1.0
+        {
+            return Err(ConfigError::InvalidTunerGlobalEventCellFraction {
+                value: motion.tuner_global_event_cell_fraction,
+            });
+        }
+        for (key, value) in [
+            ("tuner_tighten_bar", motion.tuner_tighten_bar),
+            ("tuner_relax_bar", motion.tuner_relax_bar),
+        ] {
+            if !value.is_finite() || !(0.0..1.0).contains(&value) || value == 0.0 {
+                return Err(ConfigError::InvalidTunerBar { key, value });
+            }
+        }
+        if motion.tuner_relax_bar >= motion.tuner_tighten_bar {
+            return Err(ConfigError::InvalidTunerBarOrder {
+                relax: motion.tuner_relax_bar,
+                tighten: motion.tuner_tighten_bar,
+            });
+        }
+        for (key, value) in [
+            ("tuner_tighten_step", motion.tuner_tighten_step),
+            ("tuner_relax_step", motion.tuner_relax_step),
+        ] {
+            if !value.is_finite() || value <= 0.0 {
+                return Err(ConfigError::InvalidTunerStep { key, value });
             }
         }
 
@@ -2263,6 +2367,71 @@ url = "rtsp://10.0.0.5:554/stream1"
             load_cameras(&toml).unwrap().analytics.motion.var_threshold,
             motion_settings::VAR_THRESHOLD_MAX
         );
+    }
+
+    #[test]
+    fn tuner_defaults_and_valid_overrides_load() {
+        let defaults = load_cameras(&one_camera("yard")).unwrap().analytics.motion;
+        assert_eq!(defaults.tuner_window_secs, 1_200);
+        assert_eq!(defaults.tuner_global_event_cell_fraction, 0.5);
+        assert_eq!(defaults.tuner_tighten_bar, 0.60);
+        assert_eq!(defaults.tuner_tighten_step, 150.0);
+        assert_eq!(defaults.tuner_relax_bar, 0.10);
+        assert_eq!(defaults.tuner_relax_dwell_secs, 2_400);
+        assert_eq!(defaults.tuner_relax_step, 100.0);
+
+        let toml = format!(
+            "[analytics]\nenabled = true\n[analytics.motion]\n\
+             tuner_window_secs = 180\ntuner_tighten_bar = 0.7\n\
+             tuner_global_event_cell_fraction = 1.0\n\
+             tuner_tighten_step = 25\ntuner_relax_bar = 0.2\n\
+             tuner_relax_dwell_secs = 300\ntuner_relax_step = 10\n{}",
+            one_camera("yard")
+        );
+        let tuner = load_cameras(&toml).unwrap().analytics.motion;
+        assert_eq!(tuner.tuner_window_secs, 180);
+        assert_eq!(tuner.tuner_global_event_cell_fraction, 1.0);
+        assert_eq!(tuner.tuner_relax_dwell_secs, 300);
+    }
+
+    #[test]
+    fn invalid_tuner_parameters_are_rejected() {
+        let cameras = one_camera("yard");
+        for (setting, expected) in [
+            ("tuner_window_secs = 119", "tuner_window_secs"),
+            ("tuner_window_secs = 121", "tuner_window_secs"),
+            (
+                "tuner_global_event_cell_fraction = 0",
+                "tuner_global_event_cell_fraction",
+            ),
+            (
+                "tuner_global_event_cell_fraction = 1.5",
+                "tuner_global_event_cell_fraction",
+            ),
+            (
+                "tuner_global_event_cell_fraction = nan",
+                "tuner_global_event_cell_fraction",
+            ),
+            ("tuner_tighten_bar = 0", "tuner_tighten_bar"),
+            ("tuner_tighten_bar = 1", "tuner_tighten_bar"),
+            ("tuner_relax_bar = -0.1", "tuner_relax_bar"),
+            ("tuner_tighten_step = 0", "tuner_tighten_step"),
+            ("tuner_relax_step = -1", "tuner_relax_step"),
+        ] {
+            let toml =
+                format!("[analytics]\nenabled = true\n[analytics.motion]\n{setting}\n{cameras}");
+            let error = load_cameras(&toml).unwrap_err();
+            assert!(error.to_string().contains(expected), "{setting}: {error}");
+        }
+
+        let toml = format!(
+            "[analytics]\nenabled = true\n[analytics.motion]\n\
+             tuner_relax_bar = 0.7\ntuner_tighten_bar = 0.6\n{cameras}"
+        );
+        assert!(matches!(
+            load_cameras(&toml).unwrap_err(),
+            ConfigError::InvalidTunerBarOrder { .. }
+        ));
     }
 
     #[test]
