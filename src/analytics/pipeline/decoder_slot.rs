@@ -152,7 +152,7 @@ pub(super) fn ensure_long_lived<D>(
     if slot.decoder.as_mut().is_some_and(is_alive) {
         return true;
     }
-    if !stop.is_some_and(|stop| !stop.load(Ordering::Relaxed)) {
+    if stop.is_none_or(|stop| stop.load(Ordering::Relaxed)) {
         return false;
     }
     match spawn() {
