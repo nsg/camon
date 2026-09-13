@@ -22,7 +22,7 @@ use crate::analytics::motion_settings::{
 use crate::analytics::{
     MotionSettingsStore, SettingsUpdate, TunerSnapshot, TunerStore, UpdateError,
 };
-use crate::buffer::{HotBuffer, StreamHealth};
+use crate::buffer::{wall_clock_ns, HotBuffer, StreamHealth};
 use crate::locks::LockExt;
 use crate::storage::event_index::MAX_FILMSTRIP_FRAMES;
 use crate::storage::{
@@ -303,11 +303,8 @@ async fn playlist_handler(
     Path(id): Path<String>,
     Query(query): Query<PlaylistQuery>,
 ) -> impl IntoResponse {
-    let tail_count = if query.live.unwrap_or(false) {
-        Some(6)
-    } else {
-        None
-    };
+    let live = query.live.unwrap_or(false);
+    let tail_count = if live { Some(6) } else { None };
     let (buffer, segment_uri_suffix) = match query.stream.as_deref() {
         None => (state.buffers.get(&id), ""),
         Some("sub") => match state.sub_buffers.get(&id) {
@@ -322,7 +319,11 @@ async fn playlist_handler(
     match buffer {
         Some(buffer) => {
             let buf = buffer.read_recover();
-            let playlist = hls::generate_playlist(&buf, tail_count, segment_uri_suffix);
+            let playlist = if live && hls::live_tail_is_stale(&buf, wall_clock_ns()) {
+                hls::EMPTY_PLAYLIST.to_string()
+            } else {
+                hls::generate_playlist(&buf, tail_count, segment_uri_suffix)
+            };
             (
                 [(header::CONTENT_TYPE, "application/vnd.apple.mpegurl")],
                 playlist,
@@ -1370,8 +1371,12 @@ mod tests {
     }
 
     fn stream_buffer(id: &str, bytes: &[u8]) -> Arc<RwLock<HotBuffer>> {
+        stamped_stream_buffer(id, bytes, 0)
+    }
+
+    fn stamped_stream_buffer(id: &str, bytes: &[u8], start_pts: u64) -> Arc<RwLock<HotBuffer>> {
         let buffer = HotBuffer::new(id.to_string(), 60);
-        let mut segment = GopSegment::new(0);
+        let mut segment = GopSegment::new(start_pts);
         segment.duration_ns = 1_000_000_000;
         segment.frame_count = 1;
         segment.data = Arc::new(bytes.to_vec());
@@ -1429,6 +1434,29 @@ mod tests {
                 .all(|line| line.ends_with("?stream=sub")),
             "{playlist}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_stale_segment_is_hidden_only_from_the_live_playlist() {
+        let hours_ago = wall_clock_ns().saturating_sub(2 * 60 * 60 * 1_000_000_000);
+        let base = serve_stream_buffers(
+            stamped_stream_buffer("cam", b"old footage", hours_ago),
+            None,
+        )
+        .await;
+
+        let live = reqwest::get(format!("{base}/api/stream/cam/playlist.m3u8?live=true"))
+            .await
+            .unwrap();
+        assert_eq!(live.status(), reqwest::StatusCode::OK);
+        assert_eq!(live.text().await.unwrap(), hls::EMPTY_PLAYLIST);
+
+        let dvr = reqwest::get(format!("{base}/api/stream/cam/playlist.m3u8"))
+            .await
+            .unwrap();
+        assert_eq!(dvr.status(), reqwest::StatusCode::OK);
+        let dvr = dvr.text().await.unwrap();
+        assert!(dvr.contains("segment/0\n"), "{dvr}");
     }
 
     #[tokio::test]

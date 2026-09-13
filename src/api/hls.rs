@@ -6,6 +6,28 @@ use crate::buffer::HotBuffer;
 
 const NANOS_PER_SEC: f64 = 1_000_000_000.0;
 
+pub const EMPTY_PLAYLIST: &str =
+    "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:2\n#EXT-X-MEDIA-SEQUENCE:0\n";
+
+/// GOPs are normally 1–2 seconds and the ingest data watchdog is 30 seconds, so a tail this
+/// old means the stream is gone rather than merely late.
+pub const LIVE_STALE_AFTER_SECS: u64 = 30;
+
+/// Whether the hot buffer's newest segment is too old to pass off as live. A dead camera's
+/// buffer keeps its last GOPs indefinitely, and replaying them would show hours-old footage as
+/// the present.
+pub fn live_tail_is_stale(buffer: &HotBuffer, now_ns: u64) -> bool {
+    let Some(newest) = buffer.segments().back() else {
+        return false;
+    };
+    if newest.start_pts == 0 {
+        return false;
+    }
+
+    let newest_end = newest.start_pts.saturating_add(newest.duration_ns);
+    now_ns.saturating_sub(newest_end) > LIVE_STALE_AFTER_SECS.saturating_mul(1_000_000_000)
+}
+
 pub fn generate_playlist(
     buffer: &HotBuffer,
     tail_count: Option<usize>,
@@ -21,8 +43,7 @@ pub fn generate_playlist(
     let base_sequence = first_sequence + skip as u64;
 
     if segments.len() <= skip {
-        return "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:2\n#EXT-X-MEDIA-SEQUENCE:0\n"
-            .to_string();
+        return EMPTY_PLAYLIST.to_string();
     }
 
     // RFC 8216 §4.3.3.1 compares TARGETDURATION with each EXTINF rounded to the nearest integer.
@@ -170,6 +191,54 @@ mod tests {
         let buffer = buffer_of(&[0, 0, 0, 0]);
         let playlist = generate_playlist(&buffer.read_recover(), None, "");
         assert_eq!(markers(&playlist), 0, "{playlist}");
+    }
+
+    #[test]
+    fn a_fresh_live_tail_is_not_stale() {
+        let buffer = buffer_of(&[100 * SEC]);
+        let newest_end = 102 * SEC;
+        assert!(!live_tail_is_stale(
+            &buffer.read_recover(),
+            newest_end + LIVE_STALE_AFTER_SECS * SEC - 1
+        ));
+    }
+
+    #[test]
+    fn a_live_tail_older_than_the_threshold_is_stale() {
+        let buffer = buffer_of(&[100 * SEC]);
+        let newest_end = 102 * SEC;
+        assert!(live_tail_is_stale(
+            &buffer.read_recover(),
+            newest_end + LIVE_STALE_AFTER_SECS * SEC + 1
+        ));
+    }
+
+    #[test]
+    fn a_live_tail_at_exactly_the_threshold_is_not_stale() {
+        let buffer = buffer_of(&[100 * SEC]);
+        let newest_end = 102 * SEC;
+        assert!(!live_tail_is_stale(
+            &buffer.read_recover(),
+            newest_end + LIVE_STALE_AFTER_SECS * SEC
+        ));
+    }
+
+    #[test]
+    fn an_unset_clock_does_not_make_a_live_tail_stale() {
+        let buffer = buffer_of(&[0]);
+        assert!(!live_tail_is_stale(&buffer.read_recover(), u64::MAX));
+    }
+
+    #[test]
+    fn an_empty_buffer_does_not_have_a_stale_live_tail() {
+        let buffer = HotBuffer::new("cam".to_string(), 600);
+        assert!(!live_tail_is_stale(&buffer.read_recover(), u64::MAX));
+    }
+
+    #[test]
+    fn clock_skew_before_the_segment_end_does_not_make_a_live_tail_stale() {
+        let buffer = buffer_of(&[100 * SEC]);
+        assert!(!live_tail_is_stale(&buffer.read_recover(), 101 * SEC));
     }
 
     #[test]
