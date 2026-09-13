@@ -4,14 +4,15 @@ use std::sync::{Arc, RwLock};
 
 use axum::body::Body;
 use axum::extract::{Path, Query, State};
-use axum::http::{header, HeaderMap, StatusCode};
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::middleware;
-use axum::response::{Html, IntoResponse, Response};
+use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use bytes::Bytes;
 use rust_embed::Embed;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::analytics::motion_settings::{
     MotionSettings, TunerMode, CELL_CONTOUR_AREA_CEILING, MASK_COLS, MASK_ROWS,
@@ -219,29 +220,70 @@ fn api_routes() -> Router<AppState> {
         .route("/api/stream/{id}/segment/{n}", get(segment_handler))
 }
 
-async fn index_handler() -> impl IntoResponse {
+async fn index_handler(headers: HeaderMap) -> Response {
     match Assets::get("index.html") {
         Some(content) => {
             let html = String::from_utf8_lossy(&content.data)
                 .replace("__VERSION__", env!("CAMON_VERSION"));
-            Html(html).into_response()
+            cached_asset_response(Bytes::from(html), "text/html; charset=utf-8", &headers)
         }
         None => (StatusCode::NOT_FOUND, "index.html not found").into_response(),
     }
 }
 
-async fn static_handler(Path(path): Path<String>) -> impl IntoResponse {
+async fn static_handler(Path(path): Path<String>, headers: HeaderMap) -> Response {
     match Assets::get(&path) {
         Some(content) => {
             let mime = mime_guess::from_path(&path).first_or_octet_stream();
-            (
-                [(header::CONTENT_TYPE, mime.as_ref())],
-                Bytes::from_owner(content.data),
-            )
-                .into_response()
+            cached_asset_response(Bytes::from_owner(content.data), mime.as_ref(), &headers)
         }
         None => (StatusCode::NOT_FOUND, "not found").into_response(),
     }
+}
+
+fn cached_asset_response(
+    content: Bytes,
+    content_type: &str,
+    request_headers: &HeaderMap,
+) -> Response {
+    let etag = format!("\"{:x}\"", Sha256::digest(&content));
+    let mut response = if if_none_match_matches(request_headers, &etag) {
+        StatusCode::NOT_MODIFIED.into_response()
+    } else {
+        ([(header::CONTENT_TYPE, content_type)], content).into_response()
+    };
+    let headers = response.headers_mut();
+    headers.insert(header::ETAG, etag.parse().expect("SHA-256 ETag is valid"));
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+    response
+}
+
+fn if_none_match_matches(headers: &HeaderMap, etag: &str) -> bool {
+    headers.get_all(header::IF_NONE_MATCH).iter().any(|value| {
+        let Ok(value) = value.to_str() else {
+            return false;
+        };
+        let mut in_quotes = false;
+        let mut start = 0;
+        for (index, byte) in value.bytes().enumerate() {
+            match byte {
+                b'"' => in_quotes = !in_quotes,
+                b',' if !in_quotes => {
+                    if matches_etag(&value[start..index], etag) {
+                        return true;
+                    }
+                    start = index + 1;
+                }
+                _ => {}
+            }
+        }
+        matches_etag(&value[start..], etag)
+    })
+}
+
+fn matches_etag(candidate: &str, etag: &str) -> bool {
+    let candidate = candidate.trim();
+    candidate == "*" || candidate.strip_prefix("W/").unwrap_or(candidate) == etag
 }
 
 async fn cameras_handler(State(state): State<AppState>) -> impl IntoResponse {
@@ -1214,6 +1256,81 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn embedded_assets_revalidate_without_serving_stale_bytes() {
+        let base = serve(&ApiAuth::Open).await;
+        let url = format!("{base}/assets/app.js");
+        let client = reqwest::Client::new();
+
+        let first = client.get(&url).send().await.unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        assert_eq!(first.headers()[header::CACHE_CONTROL], "no-cache");
+        assert!(first.headers()[header::CONTENT_TYPE]
+            .to_str()
+            .unwrap()
+            .contains("javascript"));
+        let etag = first.headers()[header::ETAG].to_str().unwrap().to_string();
+        let body = first.bytes().await.unwrap();
+        assert_eq!(etag, format!("\"{:x}\"", Sha256::digest(&body)));
+
+        let unchanged = client
+            .get(&url)
+            .header(header::IF_NONE_MATCH, etag.as_str())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(unchanged.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(unchanged.headers()[header::CACHE_CONTROL], "no-cache");
+        assert_eq!(unchanged.headers()[header::ETAG], etag.as_str());
+        assert!(unchanged.bytes().await.unwrap().is_empty());
+
+        let weak_list = client
+            .get(&url)
+            .header(header::IF_NONE_MATCH, format!("\"old\", W/{etag}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(weak_list.status(), StatusCode::NOT_MODIFIED);
+
+        let changed = client
+            .get(&url)
+            .header(header::IF_NONE_MATCH, "\"old\"")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(changed.status(), StatusCode::OK);
+        assert_eq!(changed.bytes().await.unwrap(), body);
+    }
+
+    #[tokio::test]
+    async fn rendered_index_revalidates_and_includes_the_version() {
+        let base = serve(&ApiAuth::Open).await;
+        let client = reqwest::Client::new();
+        let first = client.get(&base).send().await.unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        assert_eq!(first.headers()[header::CACHE_CONTROL], "no-cache");
+        assert_eq!(
+            first.headers()[header::CONTENT_TYPE],
+            "text/html; charset=utf-8"
+        );
+        let etag = first.headers()[header::ETAG].to_str().unwrap().to_string();
+        let body = first.text().await.unwrap();
+        assert!(!body.contains("__VERSION__"));
+        assert!(body.contains(env!("CAMON_VERSION")));
+        assert_eq!(etag, format!("\"{:x}\"", Sha256::digest(body.as_bytes())));
+
+        let unchanged = client
+            .get(&base)
+            .header(header::IF_NONE_MATCH, etag.as_str())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(unchanged.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(unchanged.headers()[header::CACHE_CONTROL], "no-cache");
+        assert_eq!(unchanged.headers()[header::ETAG], etag.as_str());
+        assert!(unchanged.bytes().await.unwrap().is_empty());
     }
 
     fn stream_buffer(id: &str, bytes: &[u8]) -> Arc<RwLock<HotBuffer>> {
