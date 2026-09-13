@@ -1499,7 +1499,10 @@ url = "rtsp://user:pass@10.0.0.6:554/stream1"
             .iter()
             .map(|spec| Override::parse(spec).unwrap())
             .collect();
-        Config::load_from_with_overrides(dir.path().join("config.toml"), &overrides)
+        capture_warnings(|| {
+            Config::load_from_with_overrides(dir.path().join("config.toml"), &overrides)
+        })
+        .0
     }
 
     #[test]
@@ -1871,8 +1874,13 @@ url = "rtsp://10.0.0.5:554/stream1"
     }
 
     fn load_cameras(cameras: &str) -> Result<Config, ConfigError> {
+        // Tracing caches callsite interest across parallel tests, so even ignored logs need a subscriber.
+        load_cameras_with_warnings(cameras).0
+    }
+
+    fn load_cameras_with_warnings(cameras: &str) -> (Result<Config, ConfigError>, String) {
         let dir = write_temp("config.toml", cameras);
-        Config::load_from_with_overrides(dir.path().join("config.toml"), &[])
+        capture_warnings(|| Config::load_from_with_overrides(dir.path().join("config.toml"), &[]))
     }
 
     fn one_camera(id: &str) -> String {
@@ -2007,9 +2015,11 @@ url = "rtsp://10.0.0.5:554/stream1"
         for cap in [600, 900] {
             let overrides =
                 [Override::parse(&format!("storage.max_event_duration_secs={cap}")).unwrap()];
-            let config =
+            let config = capture_warnings(|| {
                 Config::load_from_with_overrides(dir.path().join("config.toml"), &overrides)
-                    .unwrap_or_else(|e| panic!("cap {cap} rejected: {e}"));
+            })
+            .0
+            .unwrap_or_else(|e| panic!("cap {cap} rejected: {e}"));
             assert_eq!(config.storage.max_event_duration_secs, cap);
         }
     }
@@ -2524,9 +2534,9 @@ url = "rtsp://10.0.0.5:554/stream1"
         }
     }
 
-    fn warnings_from(toml: &str) -> String {
+    fn capture_warnings<T>(load: impl FnOnce() -> T) -> (T, String) {
         let logs = CapturedLog::default();
-        {
+        let result = {
             let _reader = tracing::subscriber::set_default(
                 tracing_subscriber::fmt()
                     .with_writer(logs.clone())
@@ -2534,10 +2544,16 @@ url = "rtsp://10.0.0.5:554/stream1"
                     .with_ansi(false)
                     .finish(),
             );
-            load_cameras(toml).expect("config under test must load");
-        }
+            load()
+        };
         let written = logs.0.lock().unwrap().clone();
-        String::from_utf8(written).unwrap()
+        (result, String::from_utf8(written).unwrap())
+    }
+
+    fn warnings_from(toml: &str) -> String {
+        let (result, written) = load_cameras_with_warnings(toml);
+        result.expect("config under test must load");
+        written
     }
 
     #[test]
