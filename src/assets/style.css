@@ -96,6 +96,16 @@ main {
 
 .camera-cell .loading[hidden] { display: none; }
 
+.camera-cell .loading p {
+    max-width: calc(100% - 2rem);
+    margin: 0;
+    padding: 0.5rem 0.75rem;
+    border-radius: 4px;
+    background: rgba(0, 0, 0, 0.72);
+    color: #eee;
+    text-align: center;
+}
+
 #no-cameras {
     display: flex;
     align-items: center;
@@ -165,13 +175,18 @@ main {
 
 /* The label overlays the snapshot poster, so it needs its own contrast. */
 .detail-video-wrapper .loading p {
+    max-width: calc(100% - 2rem);
     background: rgba(0, 0, 0, 0.55);
     color: #ccc;
     padding: 0.25rem 0.75rem;
     border-radius: 4px;
+    text-align: center;
 }
 
 .detail-video-wrapper .loading[hidden] { display: none; }
+
+.loading p strong, .loading p small { display: block; }
+.loading p small { margin-top: 0.25rem; font-size: 0.8rem; line-height: 1.35; }
 
 .icon-btn {
     display: flex;

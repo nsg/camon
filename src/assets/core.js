@@ -88,6 +88,44 @@ function hlsAuthConfig() {
     };
 }
 
+async function fetchStreamStatus(cameraId, stream, signal) {
+    const suffix = stream === 'sub' ? '?stream=sub' : '';
+    try {
+        const response = await apiFetch(
+            `api/stream/${encodeURIComponent(cameraId)}/status${suffix}`, { signal, cache: 'no-store' });
+        if (response.status === 401) return { status: 'unavailable', message: 'Authentication required' };
+        if (response.status === 404) return { status: 'unavailable', message: 'Camera not found' };
+        if (!response.ok) return { status: 'unavailable', message: 'Cannot check stream; retrying' };
+        let result;
+        try { result = await response.json(); }
+        catch (_) { return { status: 'unavailable', message: 'Cannot check stream; retrying' }; }
+        if (!['starting', 'receiving', 'no_video', 'interrupted'].includes(result.status)) {
+            return { status: 'unavailable', message: 'Cannot check stream; retrying' };
+        }
+        return result;
+    } catch (error) {
+        if (error.name === 'AbortError') throw error;
+        return { status: 'unavailable', message: 'Cannot reach camon; retrying' };
+    }
+}
+
+function streamHasFailed(status) {
+    return status === 'no_video' || status === 'interrupted';
+}
+
+function showStreamFailure(loading, status) {
+    const title = status === 'interrupted' ? 'Stream interrupted' : 'No video received';
+    const explanation = status === 'interrupted' ?
+        'Video is no longer reaching Camon. Check camera power and network. Retrying automatically.' :
+        'Check camera power, network and RTSP stream. Retrying automatically.';
+    const heading = document.createElement('strong');
+    heading.textContent = title;
+    const detail = document.createElement('small');
+    detail.textContent = explanation;
+    loading.querySelector('p').replaceChildren(heading, detail);
+    loading.hidden = false;
+}
+
 function showTokenPrompt() {
     if (!tokenPrompt.hidden) return;
     tokenPrompt.hidden = false;
@@ -295,17 +333,28 @@ function getGridCamera(cameraId, video) {
     const src = `api/stream/${encodeURIComponent(cameraId)}/playlist.m3u8?live=true&stream=sub`;
     const loading = video.parentElement.querySelector('.loading');
     const entry = { cameraId, video, loading, src, hls: null, active: false,
-        initialized: false, nativeHls: false, generation: 0 };
+        initialized: false, nativeHls: false, generation: 0, statusPoller: null,
+        streamStatus: null, statusMessage: null, browserError: null, hasPlayed: false };
     gridHlsInstances.set(cameraId, entry);
 
     video.addEventListener('playing', () => {
-        if (entry.active && !gridView.hidden && !document.hidden) loading.hidden = true;
+        if (entry.active) {
+            entry.hasPlayed = true;
+            entry.browserError = null;
+        }
+        renderGridCameraLoading(entry);
     });
     video.addEventListener('waiting', () => {
-        if (entry.active) loading.hidden = false;
+        if (entry.active) {
+            entry.hasPlayed = false;
+            renderGridCameraLoading(entry);
+        }
     });
     video.addEventListener('error', () => {
-        if (entry.active) showGridCameraError(entry, 'Stream error');
+        if (entry.active) {
+            entry.browserError = 'Cannot play stream; retrying';
+            renderGridCameraLoading(entry);
+        }
     });
 
     if (typeof Hls !== 'undefined' && Hls.isSupported()) {
@@ -335,10 +384,17 @@ function getGridCamera(cameraId, video) {
             console.error(`HLS error for ${cameraId}:`, data.type, data.details);
             if (entry.active && data.fatal) {
                 switch (data.type) {
-                    case Hls.ErrorTypes.NETWORK_ERROR: hls.startLoad(); break;
-                    case Hls.ErrorTypes.MEDIA_ERROR: hls.recoverMediaError(); break;
-                    default: showGridCameraError(entry, 'Stream error');
+                    case Hls.ErrorTypes.NETWORK_ERROR:
+                        entry.browserError = 'Cannot load stream; retrying';
+                        hls.startLoad();
+                        break;
+                    case Hls.ErrorTypes.MEDIA_ERROR:
+                        entry.browserError = 'Cannot play stream; retrying';
+                        hls.recoverMediaError();
+                        break;
+                    default: entry.browserError = 'Stream error';
                 }
+                renderGridCameraLoading(entry);
             }
         });
     } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
@@ -347,7 +403,8 @@ function getGridCamera(cameraId, video) {
             if (entry.active) playGridCamera(entry);
         });
     } else {
-        showGridCameraError(entry, 'HLS not supported');
+        entry.browserError = 'HLS not supported';
+        renderGridCameraLoading(entry);
     }
     return entry;
 }
@@ -357,13 +414,46 @@ function showGridCameraError(entry, message) {
     entry.loading.hidden = false;
 }
 
+function renderGridCameraLoading(entry) {
+    if (!entry.active) return;
+    if (entry.streamStatus === 'unavailable') {
+        showGridCameraError(entry, entry.statusMessage);
+    } else if (streamHasFailed(entry.streamStatus)) {
+        showStreamFailure(entry.loading, entry.streamStatus);
+    } else if (entry.browserError) {
+        const message = entry.browserError;
+        showGridCameraError(entry, message);
+    } else if (entry.hasPlayed) {
+        entry.loading.hidden = true;
+    } else {
+        showGridCameraError(entry, 'Loading...');
+    }
+}
+
+function startGridStatusPoller(entry) {
+    if (entry.statusPoller) return;
+    const generation = entry.generation;
+    entry.statusPoller = startPoller(`stream status for ${entry.cameraId}`, 5000,
+        async (signal) => {
+            const result = await fetchStreamStatus(entry.cameraId, 'sub', signal);
+            if (!entry.active || entry.generation !== generation) return;
+            if (streamHasFailed(result.status) && !streamHasFailed(entry.streamStatus)) {
+                entry.hasPlayed = false;
+            }
+            entry.streamStatus = result.status;
+            entry.statusMessage = result.message || null;
+            renderGridCameraLoading(entry);
+        });
+}
+
 function playGridCamera(entry) {
     const { video, cameraId } = entry;
     const generation = entry.generation;
     seekGridCameraToLive(entry);
     video.play().catch(e => {
         if (entry.active && entry.generation === generation) {
-            showGridCameraError(entry, 'Playback blocked');
+            entry.browserError = 'Playback blocked';
+            renderGridCameraLoading(entry);
         }
         console.error(`Play failed for ${cameraId}:`, e);
     });
@@ -383,6 +473,7 @@ function setGridCameraActive(entry, active) {
     entry.active = active;
     entry.generation++;
     if (!active) {
+        if (entry.statusPoller) { entry.statusPoller.stop(); entry.statusPoller = null; }
         entry.video.pause();
         if (entry.hls) entry.hls.stopLoad();
         else if (entry.nativeHls) {
@@ -392,8 +483,10 @@ function setGridCameraActive(entry, active) {
         return;
     }
 
-    entry.loading.querySelector('p').textContent = 'Loading...';
-    entry.loading.hidden = false;
+    entry.hasPlayed = false;
+    if (entry.browserError !== 'HLS not supported') entry.browserError = null;
+    renderGridCameraLoading(entry);
+    if (entry.hls || entry.nativeHls) startGridStatusPoller(entry);
     if (entry.hls) {
         if (!entry.initialized) {
             entry.initialized = true;
@@ -407,7 +500,8 @@ function setGridCameraActive(entry, active) {
         entry.video.src = authUrl(entry.src);
         entry.video.load();
     } else {
-        showGridCameraError(entry, 'HLS not supported');
+        entry.browserError = 'HLS not supported';
+        renderGridCameraLoading(entry);
     }
 }
 

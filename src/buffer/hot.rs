@@ -1,10 +1,22 @@
 use std::collections::VecDeque;
 use std::sync::{Arc, RwLock};
+use std::time::{Duration, Instant};
 
 use super::GopSegment;
 use crate::shutdown::Watermark;
 
 const NANOS_PER_SEC: u64 = 1_000_000_000;
+
+/// Allow a newly started stream one segment watchdog interval to produce video.
+const NO_VIDEO_TIMEOUT: Duration = Duration::from_secs(60);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamHealth {
+    Starting,
+    Receiving,
+    NoVideo,
+    Interrupted,
+}
 
 pub struct HotBuffer {
     segments: VecDeque<GopSegment>,
@@ -18,6 +30,8 @@ pub struct HotBuffer {
     /// The camera's terminal watermark, or `None` while it is still producing.
     /// See [`HotBuffer::seal`].
     terminal: Option<Watermark>,
+    started_at: Instant,
+    last_segment_at: Option<Instant>,
 }
 
 impl HotBuffer {
@@ -31,6 +45,8 @@ impl HotBuffer {
             camera_id,
             first_sequence: 0,
             terminal: None,
+            started_at: Instant::now(),
+            last_segment_at: None,
         }))
     }
 
@@ -47,6 +63,7 @@ impl HotBuffer {
         self.next_offset_ns = self.next_offset_ns.wrapping_add(segment.duration_ns);
         self.current_duration_ns += segment.duration_ns;
         self.segments.push_back(segment);
+        self.last_segment_at = Some(Instant::now());
 
         self.evict_old();
     }
@@ -73,6 +90,21 @@ impl HotBuffer {
 
     pub fn segment_count(&self) -> usize {
         self.segments.len()
+    }
+
+    /// A completed segment is the proof of video. Buffer contents alone can be old after a
+    /// stream stops, so use the monotonic time of the most recent push.
+    pub fn stream_health(&self, now: Instant) -> StreamHealth {
+        match self.last_segment_at {
+            Some(at) if now.saturating_duration_since(at) < NO_VIDEO_TIMEOUT => {
+                StreamHealth::Receiving
+            }
+            Some(_) => StreamHealth::Interrupted,
+            None if now.saturating_duration_since(self.started_at) < NO_VIDEO_TIMEOUT => {
+                StreamHealth::Starting
+            }
+            None => StreamHealth::NoVideo,
+        }
     }
 
     pub fn current_duration_secs(&self) -> f64 {
@@ -167,6 +199,33 @@ mod tests {
             data: Arc::new(vec![0; 4]),
             frame_count: 1,
         }
+    }
+
+    #[test]
+    fn stream_health_waits_for_video_and_expires_old_segments() {
+        let buffer = HotBuffer::new("cam".to_string(), 60);
+        let mut buf = buffer.write_recover();
+        let started = buf.started_at;
+        assert_eq!(buf.stream_health(started), StreamHealth::Starting);
+        assert_eq!(
+            buf.stream_health(started + NO_VIDEO_TIMEOUT),
+            StreamHealth::NoVideo
+        );
+
+        buf.push(segment(0));
+        let pushed = buf.last_segment_at.unwrap();
+        assert_eq!(buf.stream_health(pushed), StreamHealth::Receiving);
+        assert_eq!(
+            buf.stream_health(pushed + NO_VIDEO_TIMEOUT),
+            StreamHealth::Interrupted
+        );
+        assert_eq!(buf.segment_count(), 1, "old buffered video remains present");
+
+        buf.push(segment(1));
+        assert_eq!(
+            buf.stream_health(buf.last_segment_at.unwrap()),
+            StreamHealth::Receiving
+        );
     }
 
     #[test]

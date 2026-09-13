@@ -63,6 +63,11 @@ let detailNative = false;
 let detailPlayingHandler = null;
 let detailMetadataHandler = null;
 let detailSuspended = false;
+let detailStatusPoller = null;
+let detailStreamStatus = null;
+let detailStatusMessage = null;
+let detailBrowserError = null;
+let detailHasPlayed = false;
 
 function trackFraction(e) {
     const rect = tlTrack.getBoundingClientRect();
@@ -86,6 +91,12 @@ function setLiveEdge(atEdge) {
 }
 
 function wireLiveView() {
+    detailVideo.addEventListener('error', () => {
+        if (currentDetailCameraId && !liveView.hidden) {
+            detailBrowserError = 'Cannot play stream; retrying';
+            renderDetailLoading();
+        }
+    });
     backBtn.addEventListener('click', () => {
         window.location.hash = '/';
     });
@@ -243,6 +254,7 @@ function showLiveView(cameraId) {
 }
 
 function cleanupLiveView() {
+    if (detailStatusPoller) { detailStatusPoller.stop(); detailStatusPoller = null; }
     if (overlayAnimationId) {
         cancelAnimationFrame(overlayAnimationId);
         overlayAnimationId = null;
@@ -263,6 +275,10 @@ function cleanupLiveView() {
     if (detailHls) { detailHls.destroy(); detailHls = null; }
     detailNative = false;
     detailSuspended = false;
+    detailStreamStatus = null;
+    detailStatusMessage = null;
+    detailBrowserError = null;
+    detailHasPlayed = false;
     detailVideo.src = '';
     detailVideo.removeAttribute('poster');
     currentDetections = [];
@@ -329,6 +345,42 @@ function cleanupLiveView() {
     historyDays.innerHTML = '';
 }
 
+function renderDetailLoading() {
+    if (!currentDetailCameraId || liveView.hidden || document.hidden) return;
+    if (detailStreamStatus === 'unavailable') {
+        detailLoading.querySelector('p').textContent = detailStatusMessage;
+        detailLoading.hidden = false;
+    } else if (streamHasFailed(detailStreamStatus)) {
+        showStreamFailure(detailLoading, detailStreamStatus);
+    } else if (detailBrowserError) {
+        detailLoading.querySelector('p').textContent = detailBrowserError;
+        detailLoading.hidden = false;
+    } else if (detailHasPlayed) {
+        detailLoading.hidden = true;
+    } else {
+        detailLoading.querySelector('p').textContent = 'Loading...';
+        detailLoading.hidden = false;
+    }
+}
+
+function startDetailStatusPoller() {
+    if (detailStatusPoller || detailSuspended || !currentDetailCameraId ||
+        liveView.hidden || document.hidden) return;
+    const cameraId = currentDetailCameraId;
+    detailStatusPoller = startPoller(`stream status for ${cameraId}`, 5000,
+        async (signal) => {
+            const result = await fetchStreamStatus(cameraId, null, signal);
+            if (currentDetailCameraId !== cameraId || detailSuspended ||
+                liveView.hidden || document.hidden) return;
+            if (streamHasFailed(result.status) && !streamHasFailed(detailStreamStatus)) {
+                detailHasPlayed = false;
+            }
+            detailStreamStatus = result.status;
+            detailStatusMessage = result.message || null;
+            renderDetailLoading();
+        });
+}
+
 function loadDetailCamera(cameraId) {
     const src = `api/stream/${encodeURIComponent(cameraId)}/playlist.m3u8`;
     // The hot buffer's newest keyframe as poster: the browser keeps it up until
@@ -343,10 +395,11 @@ function loadDetailCamera(cameraId) {
         detailVideo.removeEventListener('playing', detailPlayingHandler);
     }
     detailPlayingHandler = () => {
-        detailLoading.hidden = true;
-        detailPlayingHandler = null;
+        detailHasPlayed = true;
+        detailBrowserError = null;
+        renderDetailLoading();
     };
-    detailVideo.addEventListener('playing', detailPlayingHandler, { once: true });
+    detailVideo.addEventListener('playing', detailPlayingHandler);
 
     if (typeof Hls !== 'undefined' && Hls.isSupported()) {
         detailHls = new Hls({
@@ -374,12 +427,18 @@ function loadDetailCamera(cameraId) {
             console.error(`HLS error for ${cameraId}:`, data.type, data.details);
             if (data.fatal && !detailSuspended && !document.hidden && !liveView.hidden) {
                 switch (data.type) {
-                    case Hls.ErrorTypes.NETWORK_ERROR: detailHls.startLoad(); break;
-                    case Hls.ErrorTypes.MEDIA_ERROR: detailHls.recoverMediaError(); break;
+                    case Hls.ErrorTypes.NETWORK_ERROR:
+                        detailBrowserError = 'Cannot load stream; retrying';
+                        detailHls.startLoad();
+                        break;
+                    case Hls.ErrorTypes.MEDIA_ERROR:
+                        detailBrowserError = 'Cannot play stream; retrying';
+                        detailHls.recoverMediaError();
+                        break;
                     default:
-                        detailLoading.querySelector('p').textContent = 'Stream error';
-                        detailLoading.hidden = false;
+                        detailBrowserError = 'Stream error';
                 }
+                renderDetailLoading();
             }
         });
     } else if (detailVideo.canPlayType('application/vnd.apple.mpegurl')) {
@@ -397,9 +456,11 @@ function loadDetailCamera(cameraId) {
         };
         detailVideo.addEventListener('loadedmetadata', detailMetadataHandler, { once: true });
     } else {
-        detailLoading.querySelector('p').textContent = 'HLS not supported';
+        detailBrowserError = 'HLS not supported';
+        renderDetailLoading();
     }
     if (document.hidden) syncDetailCameraVisibility();
+    else if (detailHls || detailNative) startDetailStatusPoller();
 }
 
 function syncDetailCameraVisibility() {
@@ -407,6 +468,8 @@ function syncDetailCameraVisibility() {
     const suspend = document.hidden || liveView.hidden;
     if (suspend && !detailSuspended) {
         detailSuspended = true;
+        detailHasPlayed = false;
+        if (detailStatusPoller) { detailStatusPoller.stop(); detailStatusPoller = null; }
         detailVideo.pause();
         if (detailHls) detailHls.stopLoad();
     } else if (!suspend && detailSuspended) {
@@ -420,6 +483,8 @@ function syncDetailCameraVisibility() {
         if (detailHls || detailVideo.readyState >= 2) {
             detailVideo.play().catch(e => console.error('Play failed after resume:', e));
         }
+        renderDetailLoading();
+        startDetailStatusPoller();
     }
 }
 

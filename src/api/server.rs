@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, RwLock};
+use std::time::Instant;
 
 use axum::body::Body;
 use axum::extract::{Path, Query, State};
@@ -21,7 +22,7 @@ use crate::analytics::motion_settings::{
 use crate::analytics::{
     MotionSettingsStore, SettingsUpdate, TunerSnapshot, TunerStore, UpdateError,
 };
-use crate::buffer::HotBuffer;
+use crate::buffer::{HotBuffer, StreamHealth};
 use crate::locks::LockExt;
 use crate::storage::event_index::MAX_FILMSTRIP_FRAMES;
 use crate::storage::{
@@ -125,6 +126,11 @@ struct SnapshotQuery {
     w: Option<u32>,
 }
 
+#[derive(Serialize)]
+struct StreamStatusResponse {
+    status: &'static str,
+}
+
 /// The UI shell (`/` and `/assets/*`) stays unauthenticated so the token prompt
 /// can load; what the routes under `/api` ask for is [`ApiAuth`]'s to say.
 pub fn build_router(state: AppState, auth: &ApiAuth) -> Router {
@@ -217,6 +223,7 @@ fn api_routes() -> Router<AppState> {
             get(detection_debug_full_frame_handler),
         )
         .route("/api/stream/{id}/playlist.m3u8", get(playlist_handler))
+        .route("/api/stream/{id}/status", get(stream_status_handler))
         .route("/api/stream/{id}/segment/{n}", get(segment_handler))
 }
 
@@ -324,6 +331,35 @@ async fn playlist_handler(
         }
         None => (StatusCode::NOT_FOUND, "camera not found").into_response(),
     }
+}
+
+async fn stream_status_handler(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(query): Query<SegmentQuery>,
+) -> Response {
+    let buffer = match query.stream.as_deref() {
+        None => state.buffers.get(&id),
+        Some("sub") => state
+            .sub_buffers
+            .get(&id)
+            .or_else(|| state.buffers.get(&id)),
+        Some(_) => return (StatusCode::BAD_REQUEST, "invalid stream").into_response(),
+    };
+    let Some(buffer) = buffer else {
+        return (StatusCode::NOT_FOUND, "camera not found").into_response();
+    };
+    let status = match buffer.read_recover().stream_health(Instant::now()) {
+        StreamHealth::Starting => "starting",
+        StreamHealth::Receiving => "receiving",
+        StreamHealth::NoVideo => "no_video",
+        StreamHealth::Interrupted => "interrupted",
+    };
+    (
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(StreamStatusResponse { status }),
+    )
+        .into_response()
 }
 
 async fn segment_handler(
@@ -1438,6 +1474,65 @@ mod tests {
              #EXT-X-MEDIA-SEQUENCE:0\n"
         );
         assert!(!playlist.contains("segment/"), "{playlist}");
+    }
+
+    #[tokio::test]
+    async fn stream_status_reports_the_selected_buffer_without_caching() {
+        let base = serve_stream_buffers(
+            stream_buffer("cam", b"main"),
+            Some(HotBuffer::new("cam:sub".to_string(), 60)),
+        )
+        .await;
+        let main = reqwest::get(format!("{base}/api/stream/cam/status"))
+            .await
+            .unwrap();
+        assert_eq!(main.status(), StatusCode::OK);
+        assert_eq!(main.headers()[header::CACHE_CONTROL], "no-store");
+        assert_eq!(
+            main.json::<serde_json::Value>().await.unwrap()["status"],
+            "receiving"
+        );
+
+        let sub = reqwest::get(format!("{base}/api/stream/cam/status?stream=sub"))
+            .await
+            .unwrap();
+        assert_eq!(
+            sub.json::<serde_json::Value>().await.unwrap()["status"],
+            "starting"
+        );
+
+        let bad = reqwest::get(format!("{base}/api/stream/cam/status?stream=other"))
+            .await
+            .unwrap();
+        assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
+        let missing = reqwest::get(format!("{base}/api/stream/missing/status"))
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn stream_status_falls_back_to_main_and_requires_auth() {
+        let base = serve_stream_buffers(stream_buffer("cam", b"main"), None).await;
+        let fallback = reqwest::get(format!("{base}/api/stream/cam/status?stream=sub"))
+            .await
+            .unwrap();
+        assert_eq!(
+            fallback.json::<serde_json::Value>().await.unwrap()["status"],
+            "receiving"
+        );
+
+        let protected = serve(&ApiAuth::Everything(TOKEN.to_string())).await;
+        let unauthorized = reqwest::get(format!("{protected}/api/stream/cam/status"))
+            .await
+            .unwrap();
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+        let authorized = reqwest::get(format!(
+            "{protected}/api/stream/cam/status?token=s3cr3t%20token"
+        ))
+        .await
+        .unwrap();
+        assert_eq!(authorized.status(), StatusCode::OK);
     }
 
     #[tokio::test]
