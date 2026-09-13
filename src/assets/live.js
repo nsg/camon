@@ -59,7 +59,10 @@ let overlayAnimationId = null;
 let isLiveScrubbing = false;
 let isAtLiveEdge = true;
 let detailHls = null;
+let detailNative = false;
 let detailPlayingHandler = null;
+let detailMetadataHandler = null;
+let detailSuspended = false;
 
 function trackFraction(e) {
     const rect = tlTrack.getBoundingClientRect();
@@ -214,15 +217,13 @@ function showLiveView(cameraId) {
         cleanupLiveView();
     }
 
-    gridHlsInstances.forEach((hls) => hls.destroy());
-    gridHlsInstances.clear();
-
     hideAllViews();
     liveView.hidden = false;
+    syncDetailCameraVisibility();
     detailCameraName.textContent = cameraId;
     currentDetailCameraId = cameraId;
 
-    if (!detailHls) {
+    if (!detailHls && !detailNative) {
         detailLoading.querySelector('p').textContent = 'Loading...';
         detailLoading.hidden = false;
         stabilityOverlay.hidden = !stabilityOverlayEnabled;
@@ -255,7 +256,13 @@ function cleanupLiveView() {
         detailVideo.removeEventListener('playing', detailPlayingHandler);
         detailPlayingHandler = null;
     }
+    if (detailMetadataHandler) {
+        detailVideo.removeEventListener('loadedmetadata', detailMetadataHandler);
+        detailMetadataHandler = null;
+    }
     if (detailHls) { detailHls.destroy(); detailHls = null; }
+    detailNative = false;
+    detailSuspended = false;
     detailVideo.src = '';
     detailVideo.removeAttribute('poster');
     currentDetections = [];
@@ -343,7 +350,8 @@ function loadDetailCamera(cameraId) {
 
     if (typeof Hls !== 'undefined' && Hls.isSupported()) {
         detailHls = new Hls({
-            enableWorker: false,
+            enableWorker: true,
+            autoStartLoad: false,
             liveBackBufferLength: 600,
             backBufferLength: 600,
             liveDurationInfinity: false,
@@ -353,7 +361,10 @@ function loadDetailCamera(cameraId) {
         detailHls.attachMedia(detailVideo);
 
         detailHls.on(Hls.Events.MANIFEST_PARSED, () => {
-            detailVideo.play().catch(e => console.error(`Play failed for ${cameraId}:`, e));
+            if (!document.hidden && !liveView.hidden) {
+                detailHls.startLoad(-1);
+                detailVideo.play().catch(e => console.error(`Play failed for ${cameraId}:`, e));
+            }
             startOverlayUpdates();
             fetchMotionSegments(cameraId);
             fetchDetections(cameraId);
@@ -361,7 +372,7 @@ function loadDetailCamera(cameraId) {
 
         detailHls.on(Hls.Events.ERROR, (event, data) => {
             console.error(`HLS error for ${cameraId}:`, data.type, data.details);
-            if (data.fatal) {
+            if (data.fatal && !detailSuspended && !document.hidden && !liveView.hidden) {
                 switch (data.type) {
                     case Hls.ErrorTypes.NETWORK_ERROR: detailHls.startLoad(); break;
                     case Hls.ErrorTypes.MEDIA_ERROR: detailHls.recoverMediaError(); break;
@@ -372,15 +383,43 @@ function loadDetailCamera(cameraId) {
             }
         });
     } else if (detailVideo.canPlayType('application/vnd.apple.mpegurl')) {
+        detailNative = true;
         detailVideo.src = authUrl(src);
-        detailVideo.addEventListener('loadedmetadata', () => {
-            detailVideo.play().catch(e => console.error(`Play failed for ${cameraId}:`, e));
+        detailMetadataHandler = () => {
+            detailMetadataHandler = null;
+            if (!detailNative || currentDetailCameraId !== cameraId) return;
+            if (!document.hidden && !liveView.hidden) {
+                detailVideo.play().catch(e => console.error(`Play failed for ${cameraId}:`, e));
+            }
             startOverlayUpdates();
             fetchMotionSegments(cameraId);
             fetchDetections(cameraId);
-        }, { once: true });
+        };
+        detailVideo.addEventListener('loadedmetadata', detailMetadataHandler, { once: true });
     } else {
         detailLoading.querySelector('p').textContent = 'HLS not supported';
+    }
+    if (document.hidden) syncDetailCameraVisibility();
+}
+
+function syncDetailCameraVisibility() {
+    if (!detailHls && !detailNative) return;
+    const suspend = document.hidden || liveView.hidden;
+    if (suspend && !detailSuspended) {
+        detailSuspended = true;
+        detailVideo.pause();
+        if (detailHls) detailHls.stopLoad();
+    } else if (!suspend && detailSuspended) {
+        detailSuspended = false;
+        if (detailHls) {
+            detailHls.startLoad(-1);
+            if (isAtLiveEdge && typeof detailHls.liveSyncPosition === 'number') {
+                detailVideo.currentTime = detailHls.liveSyncPosition;
+            }
+        }
+        if (detailHls || detailVideo.readyState >= 2) {
+            detailVideo.play().catch(e => console.error('Play failed after resume:', e));
+        }
     }
 }
 

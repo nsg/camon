@@ -10,6 +10,7 @@ const tokenSubmit = document.getElementById('token-submit');
 
 let cameras = [];
 const gridHlsInstances = new Map();
+let gridObserver = null;
 let currentView = null;
 let isFirstLoad = true;
 let currentDetailCameraId = null;
@@ -205,11 +206,13 @@ function updateMuteIcon(btn, video) {
 }
 
 function hideAllViews() {
+    stopGridObservation();
     gridView.hidden = true;
     liveView.hidden = true;
     eventsView.hidden = true;
     playbackView.hidden = true;
     debugView.hidden = true;
+    if (typeof syncDetailCameraVisibility === 'function') syncDetailCameraVisibility();
 }
 
 function showGridView() {
@@ -218,14 +221,55 @@ function showGridView() {
     cleanupDebugView();
     hideAllViews();
     gridView.hidden = false;
+    startGridObservation();
+}
 
-    cameras.forEach(cameraId => {
-        if (!gridHlsInstances.has(cameraId)) {
-            // Avoid interpolating camera ids into selectors.
-            const cell = Array.from(grid.children).find(c => c.dataset.cameraId === cameraId);
-            if (cell) {
-                loadGridCamera(cameraId, cell.querySelector('video'));
-            }
+function stopGridObservation() {
+    if (gridObserver) { gridObserver.disconnect(); gridObserver = null; }
+    gridHlsInstances.forEach((entry) => setGridCameraActive(entry, false));
+}
+
+function startGridObservation() {
+    if (gridObserver || document.hidden || gridView.hidden) return;
+    if (typeof IntersectionObserver !== 'undefined') {
+        const observer = new IntersectionObserver((entries) => {
+            if (gridObserver !== observer || gridView.hidden || document.hidden) return;
+            entries.forEach(({ target, isIntersecting }) => {
+                const cameraId = target.dataset.cameraId;
+                if (isIntersecting) {
+                    setGridCameraActive(getGridCamera(cameraId, target.querySelector('video')), true);
+                } else {
+                    const entry = gridHlsInstances.get(cameraId);
+                    if (entry) setGridCameraActive(entry, false);
+                }
+            });
+        });
+        gridObserver = observer;
+        Array.from(grid.children).forEach(cell => gridObserver.observe(cell));
+    } else {
+        // Older WebViews still load only tiles on screen.
+        updateGridVisibility();
+    }
+}
+
+function syncCameraVisibility() {
+    if (document.hidden) stopGridObservation();
+    else if (!gridView.hidden) startGridObservation();
+    if (typeof syncDetailCameraVisibility === 'function') syncDetailCameraVisibility();
+}
+
+function updateGridVisibility() {
+    if (typeof IntersectionObserver !== 'undefined' || gridView.hidden || document.hidden) return;
+    Array.from(grid.children).forEach(cell => {
+        const rect = cell.getBoundingClientRect();
+        const visible = rect.bottom > 0 && rect.top < window.innerHeight &&
+            rect.right > 0 && rect.left < window.innerWidth;
+        const cameraId = cell.dataset.cameraId;
+        if (visible) {
+            setGridCameraActive(getGridCamera(cameraId, cell.querySelector('video')), true);
+        } else {
+            const entry = gridHlsInstances.get(cameraId);
+            if (entry) setGridCameraActive(entry, false);
         }
     });
 }
@@ -245,41 +289,125 @@ function createCameraCell(cameraId) {
     return cell;
 }
 
-function loadGridCamera(cameraId, video) {
+function getGridCamera(cameraId, video) {
+    const existing = gridHlsInstances.get(cameraId);
+    if (existing) return existing;
     const src = `api/stream/${encodeURIComponent(cameraId)}/playlist.m3u8?live=true&stream=sub`;
     const loading = video.parentElement.querySelector('.loading');
+    const entry = { cameraId, video, loading, src, hls: null, active: false,
+        initialized: false, nativeHls: false, generation: 0 };
+    gridHlsInstances.set(cameraId, entry);
+
+    video.addEventListener('playing', () => {
+        if (entry.active && !gridView.hidden && !document.hidden) loading.hidden = true;
+    });
+    video.addEventListener('waiting', () => {
+        if (entry.active) loading.hidden = false;
+    });
+    video.addEventListener('error', () => {
+        if (entry.active) showGridCameraError(entry, 'Stream error');
+    });
 
     if (typeof Hls !== 'undefined' && Hls.isSupported()) {
-        const hls = new Hls({ enableWorker: false, ...hlsAuthConfig() });
-        gridHlsInstances.set(cameraId, hls);
-        hls.loadSource(src);
-        hls.attachMedia(video);
+        const hls = new Hls({
+            enableWorker: true,
+            autoStartLoad: false,
+            // Grid tiles have no history controls; keep only a short buffer on phones.
+            backBufferLength: 15,
+            liveBackBufferLength: 15,
+            maxBufferLength: 15,
+            maxMaxBufferLength: 15,
+            ...hlsAuthConfig(),
+        });
+        entry.hls = hls;
 
         hls.on(Hls.Events.MANIFEST_PARSED, () => {
-            loading.hidden = true;
-            video.play().catch(e => console.error(`Play failed for ${cameraId}:`, e));
+            if (entry.active) {
+                hls.startLoad(-1);
+                playGridCamera(entry);
+            }
+        });
+        hls.on(Hls.Events.LEVEL_UPDATED, () => {
+            if (entry.active && !video.paused) seekGridCameraToLive(entry);
         });
 
         hls.on(Hls.Events.ERROR, (event, data) => {
             console.error(`HLS error for ${cameraId}:`, data.type, data.details);
-            if (data.fatal) {
+            if (entry.active && data.fatal) {
                 switch (data.type) {
                     case Hls.ErrorTypes.NETWORK_ERROR: hls.startLoad(); break;
                     case Hls.ErrorTypes.MEDIA_ERROR: hls.recoverMediaError(); break;
-                    default:
-                        loading.querySelector('p').textContent = 'Stream error';
-                        loading.hidden = false;
+                    default: showGridCameraError(entry, 'Stream error');
                 }
             }
         });
     } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
-        video.src = authUrl(src);
+        entry.nativeHls = true;
         video.addEventListener('loadedmetadata', () => {
-            loading.hidden = true;
-            video.play().catch(e => console.error(`Play failed for ${cameraId}:`, e));
+            if (entry.active) playGridCamera(entry);
         });
     } else {
-        loading.querySelector('p').textContent = 'HLS not supported';
+        showGridCameraError(entry, 'HLS not supported');
+    }
+    return entry;
+}
+
+function showGridCameraError(entry, message) {
+    entry.loading.querySelector('p').textContent = message;
+    entry.loading.hidden = false;
+}
+
+function playGridCamera(entry) {
+    const { video, cameraId } = entry;
+    const generation = entry.generation;
+    seekGridCameraToLive(entry);
+    video.play().catch(e => {
+        if (entry.active && entry.generation === generation) {
+            showGridCameraError(entry, 'Playback blocked');
+        }
+        console.error(`Play failed for ${cameraId}:`, e);
+    });
+}
+
+function seekGridCameraToLive(entry) {
+    const { video } = entry;
+    // A retained MSE buffer can lag behind the live edge after visiting detail.
+    if (entry.hls && typeof entry.hls.liveSyncPosition === 'number' &&
+        entry.hls.liveSyncPosition - video.currentTime > 10) {
+        video.currentTime = entry.hls.liveSyncPosition;
+    }
+}
+
+function setGridCameraActive(entry, active) {
+    if (entry.active === active) return;
+    entry.active = active;
+    entry.generation++;
+    if (!active) {
+        entry.video.pause();
+        if (entry.hls) entry.hls.stopLoad();
+        else if (entry.nativeHls) {
+            entry.video.removeAttribute('src');
+            entry.video.load();
+        }
+        return;
+    }
+
+    entry.loading.querySelector('p').textContent = 'Loading...';
+    entry.loading.hidden = false;
+    if (entry.hls) {
+        if (!entry.initialized) {
+            entry.initialized = true;
+            entry.hls.loadSource(entry.src);
+            entry.hls.attachMedia(entry.video);
+        } else {
+            entry.hls.startLoad(-1);
+            playGridCamera(entry);
+        }
+    } else if (entry.nativeHls) {
+        entry.video.src = authUrl(entry.src);
+        entry.video.load();
+    } else {
+        showGridCameraError(entry, 'HLS not supported');
     }
 }
 

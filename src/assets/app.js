@@ -4,6 +4,9 @@ document.addEventListener('DOMContentLoaded', async () => {
     await loadCameras();
 
     window.addEventListener('hashchange', router);
+    document.addEventListener('visibilitychange', syncCameraVisibility);
+    window.addEventListener('scroll', updateGridVisibility, { passive: true, capture: true });
+    window.addEventListener('resize', updateGridVisibility);
     router();
 
     wireLiveView();
