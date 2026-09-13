@@ -173,7 +173,8 @@ main {
     color: #666;
 }
 
-/* The label overlays the snapshot poster, so it needs its own contrast. */
+/* The labels overlay video or a snapshot poster, so they need their own contrast. */
+.camera-cell .loading p,
 .detail-video-wrapper .loading p {
     max-width: calc(100% - 2rem);
     background: rgba(0, 0, 0, 0.55);
