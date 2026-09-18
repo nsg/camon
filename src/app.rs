@@ -620,6 +620,7 @@ fn spawn_cameras(ctx: &SpawnContext, cameras: Vec<config::CameraConfig>) -> Came
                 id: sub_id.clone(),
                 url: sub_url,
                 sub_url: None,
+                order: None,
             };
             let buffer_clone = Arc::clone(&sub_buffer);
             let shutdown_clone = ctx.shutdown.clone();
@@ -1146,6 +1147,7 @@ where
         storage,
         motion_settings,
     )
+    .with_camera_order(config.display_order())
     .with_tuner_store(tuner_store);
     // Serving on the socket startup already took.
     let server_handle = supervisor.critical("http-server", async move {

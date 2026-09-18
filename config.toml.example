@@ -414,6 +414,9 @@ url = "rtsp://admin:password@192.168.1.100:554/stream1"
 # Optional low-resolution H.264 substream with a 1–2 second GOP, used only for
 # the multi-camera grid live view. Recording and analytics always use url.
 # sub_url = "rtsp://admin:password@192.168.1.100:554/stream2"
+# Optional position in the UI's camera list: lower numbers first. Cameras
+# without an order follow those with one, in the order they appear here.
+# order = 1
 
 # [[cameras]]
 # id = "backyard"

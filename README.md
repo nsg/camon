@@ -408,6 +408,9 @@ url = "rtsp://admin:password@192.168.1.100:554/stream1"
 # Optional low-resolution H.264 stream used only by the multi-camera grid.
 # Recording and analytics always use url.
 # sub_url = "rtsp://admin:password@192.168.1.100:554/stream2"
+# Optional position in the UI's camera list, lower first. Cameras without an
+# order follow those with one, in config file order.
+# order = 1
 ```
 
 ### Camera Requirements

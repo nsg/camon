@@ -294,6 +294,7 @@ pub struct CameraConfig {
     pub id: String,
     pub url: String,
     pub sub_url: Option<String>,
+    pub order: Option<i64>,
 }
 
 impl CameraConfig {
@@ -840,6 +841,14 @@ pub struct Config {
 const API_TOKEN_FILE: &str = "api-token";
 
 impl Config {
+    /// Camera ids in the order the UI lists them: by `order` ascending, cameras
+    /// without one after those with, ties in config file order.
+    pub fn display_order(&self) -> Vec<String> {
+        let mut cameras: Vec<&CameraConfig> = self.cameras.iter().collect();
+        cameras.sort_by_key(|camera| (camera.order.is_none(), camera.order));
+        cameras.into_iter().map(|c| c.id.clone()).collect()
+    }
+
     /// The file a generated API token is read from and written to: beside the config file, so
     /// `/etc/camon/config.toml` puts it at `/etc/camon/api-token`.
     pub fn token_file_path(&self) -> Option<PathBuf> {
@@ -1971,6 +1980,36 @@ url = "rtsp://10.0.0.5:554/stream1"
     }
 
     #[test]
+    fn display_order_sorts_by_order_then_config_position() {
+        let camera = |id: &str, order: &str| {
+            format!("[[cameras]]\nid = {id:?}\nurl = \"rtsp://main/stream\"\n{order}\n")
+        };
+        let config = load_cameras(
+            &[
+                camera("unordered-a", ""),
+                camera("last", "order = 5"),
+                camera("tie-a", "order = 1"),
+                camera("unordered-b", ""),
+                camera("tie-b", "order = 1"),
+                camera("first", "order = -2"),
+            ]
+            .concat(),
+        )
+        .unwrap();
+        assert_eq!(
+            config.display_order(),
+            [
+                "first",
+                "tie-a",
+                "tie-b",
+                "last",
+                "unordered-a",
+                "unordered-b"
+            ]
+        );
+    }
+
+    #[test]
     fn substream_url_is_optional() {
         let without_substream = load_cameras(&one_camera("yard")).unwrap();
         assert_eq!(without_substream.cameras[0].sub_url, None);
@@ -2927,6 +2966,7 @@ url = "rtsp://10.0.0.5:554/stream1"
             id: "cam".to_string(),
             url: url.to_string(),
             sub_url: None,
+            order: None,
         };
         assert_eq!(
             camera("rtsp://ubnt:s3cret@10.0.0.5:554/s0").redacted_url(),
@@ -2948,6 +2988,7 @@ url = "rtsp://10.0.0.5:554/stream1"
             id: "cam".to_string(),
             url: "rtsp://main:secret@10.0.0.5/main".to_string(),
             sub_url: Some("rtsp://sub:another-secret@10.0.0.5/sub".to_string()),
+            order: None,
         };
         assert_eq!(
             camera.redacted_sub_url().as_deref(),

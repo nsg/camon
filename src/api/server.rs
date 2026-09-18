@@ -41,6 +41,8 @@ struct Assets;
 pub struct AppState {
     pub buffers: Arc<HashMap<String, Arc<RwLock<HotBuffer>>>>,
     pub sub_buffers: Arc<HashMap<String, Arc<RwLock<HotBuffer>>>>,
+    /// Camera ids in the order `/api/cameras` lists them.
+    pub camera_order: Arc<Vec<String>>,
     pub motion_store: MotionStore,
     pub detection_store: DetectionStore,
     pub debug_store: DetectionDebugStore,
@@ -62,7 +64,10 @@ impl AppState {
         storage: Option<Arc<dyn WarmStorageBackend>>,
         motion_settings: Option<MotionSettingsStore>,
     ) -> Self {
+        let mut camera_order: Vec<String> = buffers.keys().cloned().collect();
+        camera_order.sort();
         Self {
+            camera_order: Arc::new(camera_order),
             buffers: Arc::new(buffers),
             sub_buffers: Arc::new(sub_buffers),
             motion_store,
@@ -72,6 +77,11 @@ impl AppState {
             motion_settings,
             tuner_store: None,
         }
+    }
+
+    pub fn with_camera_order(mut self, camera_order: Vec<String>) -> Self {
+        self.camera_order = Arc::new(camera_order);
+        self
     }
 
     pub fn with_tuner_store(mut self, tuner_store: Option<TunerStore>) -> Self {
@@ -294,8 +304,7 @@ fn matches_etag(candidate: &str, etag: &str) -> bool {
 }
 
 async fn cameras_handler(State(state): State<AppState>) -> impl IntoResponse {
-    let cameras: Vec<String> = state.buffers.keys().cloned().collect();
-    axum::Json(cameras)
+    axum::Json(state.camera_order.as_ref().clone())
 }
 
 async fn playlist_handler(
