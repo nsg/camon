@@ -200,12 +200,14 @@ function wireLiveView() {
     });
 
     liveBtn.addEventListener('click', () => {
-        if (detailHls) {
-            const sync = detailHls.liveSyncPosition;
-            if (typeof sync === 'number') {
-                detailVideo.currentTime = sync;
-            } else if (detailVideo.buffered.length > 0) {
-                detailVideo.currentTime = detailVideo.buffered.end(detailVideo.buffered.length - 1) - 0.5;
+        if (detailHls && !seekTowardLive(detailVideo, detailHls.liveSyncPosition)) {
+            try {
+                if (detailVideo.buffered.length > 0) {
+                    detailVideo.currentTime =
+                        detailVideo.buffered.end(detailVideo.buffered.length - 1) - 0.5;
+                }
+            } catch (_) {
+                // Detached media elements can reject buffered access.
             }
         }
         setLiveEdge(true);
@@ -476,9 +478,7 @@ function syncDetailCameraVisibility() {
         detailSuspended = false;
         if (detailHls) {
             detailHls.startLoad(-1);
-            if (isAtLiveEdge && typeof detailHls.liveSyncPosition === 'number') {
-                detailVideo.currentTime = detailHls.liveSyncPosition;
-            }
+            if (isAtLiveEdge) seekTowardLive(detailVideo, detailHls.liveSyncPosition);
         }
         if (detailHls || detailVideo.readyState >= 2) {
             detailVideo.play().catch(e => console.error('Play failed after resume:', e));
@@ -527,14 +527,7 @@ function updateTimeline() {
         const timeToLive = r.end - current;
         if (isAtLiveEdge) {
             tlOffset.textContent = '';
-            if (detailHls) {
-                const sync = detailHls.liveSyncPosition;
-                if (typeof sync === 'number' && sync - current > 10) {
-                    // seekable.end is the playlist edge, not buffered media; seeking there stalls
-                    // playback until the next segment arrives.
-                    detailVideo.currentTime = sync;
-                }
-            }
+            if (detailHls) seekTowardLive(detailVideo, detailHls.liveSyncPosition);
         } else if (timeToLive < 3) {
             tlOffset.textContent = '';
             setLiveEdge(true);

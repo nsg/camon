@@ -10,6 +10,7 @@ const tokenSubmit = document.getElementById('token-submit');
 
 let cameras = [];
 const gridHlsInstances = new Map();
+const GRID_PLAYER_REUSE_MS = 10_000;
 let gridObserver = null;
 let currentView = null;
 let isFirstLoad = true;
@@ -86,6 +87,32 @@ function hlsAuthConfig() {
             if (apiToken) xhr.setRequestHeader('Authorization', `Bearer ${apiToken}`);
         },
     };
+}
+
+// Move the playhead toward the live edge without leaving buffered media.
+// Returns true when it seeked.
+function seekTowardLive(video, syncPosition) {
+    if (!Number.isFinite(syncPosition) || syncPosition - video.currentTime <= 10) return false;
+    try {
+        const buffered = video.buffered;
+        for (let i = 0; i < buffered.length; i++) {
+            if (syncPosition >= buffered.start(i) - 0.25 &&
+                syncPosition <= buffered.end(i) + 0.25) {
+                video.currentTime = syncPosition;
+                return true;
+            }
+        }
+        if (buffered.length > 0) {
+            const bufferedTarget = buffered.end(buffered.length - 1) - 0.5;
+            if (bufferedTarget - video.currentTime > 1) {
+                video.currentTime = bufferedTarget;
+                return true;
+            }
+        }
+    } catch (_) {
+        // Detached media elements can reject buffered access.
+    }
+    return false;
 }
 
 async function fetchStreamStatus(cameraId, stream, signal) {
@@ -334,7 +361,8 @@ function getGridCamera(cameraId, video) {
     const loading = video.parentElement.querySelector('.loading');
     const entry = { cameraId, video, loading, src, hls: null, active: false,
         initialized: false, nativeHls: false, generation: 0, statusPoller: null,
-        streamStatus: null, statusMessage: null, browserError: null, hasPlayed: false };
+        streamStatus: null, statusMessage: null, browserError: null, hasPlayed: false,
+        deactivatedAt: null };
     gridHlsInstances.set(cameraId, entry);
 
     video.addEventListener('playing', () => {
@@ -358,45 +386,45 @@ function getGridCamera(cameraId, video) {
     });
 
     if (typeof Hls !== 'undefined' && Hls.isSupported()) {
-        const hls = new Hls({
-            enableWorker: true,
-            autoStartLoad: false,
-            // Grid tiles have no history controls; keep only a short buffer on phones.
-            backBufferLength: 15,
-            liveBackBufferLength: 15,
-            maxBufferLength: 15,
-            maxMaxBufferLength: 15,
-            ...hlsAuthConfig(),
-        });
-        entry.hls = hls;
+        entry.createHls = function createGridHls() {
+            const hls = new Hls({
+                enableWorker: true,
+                autoStartLoad: false,
+                // Grid tiles have no history controls; keep only a short buffer on phones.
+                backBufferLength: 15,
+                liveBackBufferLength: 15,
+                maxBufferLength: 15,
+                maxMaxBufferLength: 15,
+                ...hlsAuthConfig(),
+            });
+            entry.hls = hls;
 
-        hls.on(Hls.Events.MANIFEST_PARSED, () => {
-            if (entry.active) {
-                hls.startLoad(-1);
-                playGridCamera(entry);
-            }
-        });
-        hls.on(Hls.Events.LEVEL_UPDATED, () => {
-            if (entry.active && !video.paused) seekGridCameraToLive(entry);
-        });
-
-        hls.on(Hls.Events.ERROR, (event, data) => {
-            console.error(`HLS error for ${cameraId}:`, data.type, data.details);
-            if (entry.active && data.fatal) {
-                switch (data.type) {
-                    case Hls.ErrorTypes.NETWORK_ERROR:
-                        entry.browserError = 'Cannot load stream; retrying';
-                        hls.startLoad();
-                        break;
-                    case Hls.ErrorTypes.MEDIA_ERROR:
-                        entry.browserError = 'Cannot play stream; retrying';
-                        hls.recoverMediaError();
-                        break;
-                    default: entry.browserError = 'Stream error';
+            hls.on(Hls.Events.MANIFEST_PARSED, () => {
+                if (entry.active) {
+                    hls.startLoad(-1);
+                    playGridCamera(entry);
                 }
-                renderGridCameraLoading(entry);
-            }
-        });
+            });
+
+            hls.on(Hls.Events.ERROR, (event, data) => {
+                console.error(`HLS error for ${cameraId}:`, data.type, data.details);
+                if (entry.active && data.fatal) {
+                    switch (data.type) {
+                        case Hls.ErrorTypes.NETWORK_ERROR:
+                            entry.browserError = 'Cannot load stream; retrying';
+                            hls.startLoad();
+                            break;
+                        case Hls.ErrorTypes.MEDIA_ERROR:
+                            entry.browserError = 'Cannot play stream; retrying';
+                            hls.recoverMediaError();
+                            break;
+                        default: entry.browserError = 'Stream error';
+                    }
+                    renderGridCameraLoading(entry);
+                }
+            });
+        };
+        entry.createHls();
     } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
         entry.nativeHls = true;
         video.addEventListener('loadedmetadata', () => {
@@ -460,12 +488,8 @@ function playGridCamera(entry) {
 }
 
 function seekGridCameraToLive(entry) {
-    const { video } = entry;
     // A retained MSE buffer can lag behind the live edge after visiting detail.
-    if (entry.hls && typeof entry.hls.liveSyncPosition === 'number' &&
-        entry.hls.liveSyncPosition - video.currentTime > 10) {
-        video.currentTime = entry.hls.liveSyncPosition;
-    }
+    if (entry.hls) seekTowardLive(entry.video, entry.hls.liveSyncPosition);
 }
 
 function setGridCameraActive(entry, active) {
@@ -473,6 +497,7 @@ function setGridCameraActive(entry, active) {
     entry.active = active;
     entry.generation++;
     if (!active) {
+        entry.deactivatedAt = performance.now();
         if (entry.statusPoller) { entry.statusPoller.stop(); entry.statusPoller = null; }
         entry.video.pause();
         if (entry.hls) entry.hls.stopLoad();
@@ -483,6 +508,9 @@ function setGridCameraActive(entry, active) {
         return;
     }
 
+    const reuseExpired = entry.deactivatedAt !== null &&
+        performance.now() - entry.deactivatedAt > GRID_PLAYER_REUSE_MS;
+    entry.deactivatedAt = null;
     entry.hasPlayed = false;
     if (entry.browserError !== 'HLS not supported') entry.browserError = null;
     renderGridCameraLoading(entry);
@@ -490,6 +518,11 @@ function setGridCameraActive(entry, active) {
     if (entry.hls) {
         if (!entry.initialized) {
             entry.initialized = true;
+            entry.hls.loadSource(entry.src);
+            entry.hls.attachMedia(entry.video);
+        } else if (reuseExpired) {
+            entry.hls.destroy();
+            entry.createHls();
             entry.hls.loadSource(entry.src);
             entry.hls.attachMedia(entry.video);
         } else {
