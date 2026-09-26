@@ -214,6 +214,8 @@ pub struct StathostBackend {
     http: Http,
     /// Client-side storage budget in bytes; 0 means unlimited.
     budget: ByteBudget,
+    /// Serializes candidate selection and deletion across every budget-enforcement caller.
+    budget_enforcement: tokio::sync::Mutex<()>,
     /// Shutdown, as the drain raises it. Every request-issuing loop here reads
     /// it before sending, so a stop costs at most the one request already in
     /// flight — which is exactly what the drain's phase 3 is sized for.
@@ -253,6 +255,7 @@ impl StathostBackend {
                 token: config.token.clone(),
             },
             budget: ByteBudget::new(config.max_stored_bytes),
+            budget_enforcement: tokio::sync::Mutex::new(()),
             stop,
             events: EventIndex::new(camera_ids),
             scanned: std::sync::atomic::AtomicBool::new(false),
@@ -1144,6 +1147,12 @@ impl StathostBackend {
             return;
         }
         // Nothing to enforce *for*, either, once shutdown has been asked for.
+        if self.stop.stopped() {
+            return;
+        }
+        let _enforcement = self.budget_enforcement.lock().await;
+        // A pass may have waited for another pass to finish. Recheck both shutdown and the
+        // budget before taking a fresh candidate snapshot.
         if self.stop.stopped() {
             return;
         }

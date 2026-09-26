@@ -2460,6 +2460,61 @@ async fn two_writes_in_flight_cannot_both_walk_through_the_budget() {
 }
 
 #[tokio::test]
+async fn concurrent_budget_passes_delete_each_object_key_once() {
+    let (url, stub) = spawn_stub("secret").await;
+    let cost = cost_of(&movement_event(0, 40));
+    let backend = over_budget_backend(
+        &url,
+        &[movement_event(1_000, 40), movement_event(2_000, 40)],
+        cost * 2,
+    )
+    .await;
+    stub.take_deletes();
+    stub.hold(&stub.hold_deletes);
+
+    let (third, fourth) = (movement_event(3_000, 40), movement_event(4_000, 40));
+    tokio::join!(
+        backend.write_event("cam", &third),
+        backend.write_event("cam", &fourth),
+        async {
+            wait_until(|| backend.budget.committed(backend.used()) == cost * 4).await;
+            wait_until(|| !stub.deletes.lock().unwrap().is_empty()).await;
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            stub.release(&stub.hold_deletes);
+        },
+    );
+
+    let deletes = stub.take_deletes();
+    let expected = HashSet::from([
+        "cam/1000_1000_thumb_1.jpg".to_string(),
+        "cam/1000_1000_thumb_0.jpg".to_string(),
+        "cam/1000_1000.ts".to_string(),
+        "cam/1000_1000.json".to_string(),
+        "cam/2000_1000_thumb_1.jpg".to_string(),
+        "cam/2000_1000_thumb_0.jpg".to_string(),
+        "cam/2000_1000.ts".to_string(),
+        "cam/2000_1000.json".to_string(),
+    ]);
+    assert_eq!(
+        deletes.iter().cloned().collect::<HashSet<_>>(),
+        expected,
+        "the wrong object keys were deleted: {deletes:?}"
+    );
+    assert_eq!(
+        deletes.len(),
+        expected.len(),
+        "a concurrent pass issued a duplicate DELETE: {deletes:?}"
+    );
+    assert!(
+        backend.used() <= cost * 2,
+        "the store is {} bytes over a budget of {}",
+        backend.used() - cost * 2,
+        cost * 2
+    );
+    assert_eq!(backend.used(), stub.stored_bytes());
+}
+
+#[tokio::test]
 async fn a_refused_upload_is_not_sent_a_second_time() {
     let (url, stub) = spawn_stub("secret").await;
     let backend = backend_for(&url, "secret", 0);
