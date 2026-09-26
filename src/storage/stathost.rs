@@ -174,11 +174,11 @@ const SCAN_ATTEMPTS: u32 = 5;
 /// Wall clock a *startup* scan may spend listing and walking the archive, including sidecar
 /// reads and the orphan sweep. Whichever runs out first — this or [`SCAN_ATTEMPTS`] — ends the
 /// series. Healing scans run in the background and have no whole-scan deadline.
-/// Long enough under test that a series of fast refusals never runs into it
-/// (five of those cost about 15ms of waits), short enough that the test which
-/// pins the startup deadline finishes in it.
+/// Under test, long enough that a full archive walk over the in-process stub
+/// fits inside it on a loaded runner; the tests that pin the deadline run on
+/// a paused clock, so its length costs them nothing.
 const SCAN_STARTUP_BUDGET: Duration = if cfg!(test) {
-    Duration::from_millis(500)
+    Duration::from_secs(5)
 } else {
     Duration::from_secs(45)
 };

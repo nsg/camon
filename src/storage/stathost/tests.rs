@@ -1128,7 +1128,7 @@ async fn a_healing_rescan_leaves_orphaned_metadata_for_the_next_startup() {
     assert!(!stub.has("cam/5000_1000.json"), "orphan sidecar kept");
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_listing_that_never_answers_gives_up_on_the_clock_not_the_attempt_count() {
     let (url, stub) = spawn_stub("secret").await;
     stub.hang_lists(Duration::from_secs(30));
