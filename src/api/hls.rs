@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 
-use crate::buffer::HotBuffer;
+use crate::buffer::{GopSegment, HotBuffer};
 
 const NANOS_PER_SEC: f64 = 1_000_000_000.0;
 
@@ -61,21 +61,16 @@ pub fn generate_playlist(
     playlist.push_str(&format!("#EXT-X-TARGETDURATION:{}\n", max_duration));
     playlist.push_str(&format!("#EXT-X-MEDIA-SEQUENCE:{}\n", base_sequence));
 
-    // Previous segment's stamp and end: the gap test needs both, see
-    // [`discontinuous`].
-    let mut previous: Option<(u64, u64)> = None;
+    let mut previous: Option<&GopSegment> = None;
     for (i, segment) in segments.iter().skip(skip).enumerate() {
         let sequence = base_sequence + i as u64;
         let duration = segment.duration_ns as f64 / NANOS_PER_SEC;
-        if let Some((prev_start, prev_end)) = previous {
-            if discontinuous(prev_start, prev_end, segment.start_pts) {
+        if let Some(previous) = previous {
+            if discontinuous(previous, segment) {
                 playlist.push_str("#EXT-X-DISCONTINUITY\n");
             }
         }
-        previous = Some((
-            segment.start_pts,
-            segment.start_pts.saturating_add(segment.duration_ns),
-        ));
+        previous = Some(segment);
         let secs = (segment.start_pts / 1_000_000_000) as i64;
         let millis = ((segment.start_pts % 1_000_000_000) / 1_000_000) as u32;
         let dt = format_datetime(secs, millis);
@@ -87,14 +82,33 @@ pub fn generate_playlist(
     playlist
 }
 
-/// Whether a segment fails to continue the one before it — a gap between the previous end and
-/// this stamp — so the player re-aligns its decoder.
-fn discontinuous(prev_start: u64, prev_end: u64, start: u64) -> bool {
+/// Whether a segment fails to continue the one before it, so the player re-aligns its decoder:
+/// a new ffmpeg run, a media clock that jumped, or — when the media clock is unknown — a gap
+/// between the previous end and this stamp.
+fn discontinuous(previous: &GopSegment, segment: &GopSegment) -> bool {
     const MAX_GAP_NS: u64 = 100_000_000;
-    if prev_start == 0 && start == 0 {
+    /// Within one run the media clock and the wall clock advance together; arrival jitter
+    /// keeps them within a fraction of a GOP, a PTS jump in either direction does not.
+    const MAX_SKEW_NS: u64 = 1_000_000_000;
+
+    if previous.ingest_run != segment.ingest_run {
+        return true;
+    }
+    if let (Some(previous_pts), Some(segment_pts)) =
+        (previous.first_media_pts, segment.first_media_pts)
+    {
+        if previous.start_pts != 0 && segment.start_pts != 0 {
+            let media_ns = crate::mpegts::pts_forward_ns(previous_pts, segment_pts);
+            let wall_ns = segment.start_pts.saturating_sub(previous.start_pts);
+            return media_ns.abs_diff(wall_ns) > MAX_SKEW_NS;
+        }
+    }
+
+    if previous.start_pts == 0 && segment.start_pts == 0 {
         return false;
     }
-    start.abs_diff(prev_end) > MAX_GAP_NS
+    let previous_end = previous.start_pts.saturating_add(previous.duration_ns);
+    segment.start_pts.abs_diff(previous_end) > MAX_GAP_NS
 }
 
 /// Format unix timestamp as ISO 8601 for EXT-X-PROGRAM-DATE-TIME
@@ -182,8 +196,33 @@ mod tests {
         buffer
     }
 
+    fn buffer_with_media_timeline(
+        segments: &[(u64, u64, u64)],
+    ) -> Arc<std::sync::RwLock<HotBuffer>> {
+        let buffer = HotBuffer::new("cam".to_string(), 600);
+        for &(start_pts, first_media_pts, ingest_run) in segments {
+            let mut segment =
+                GopSegment::new(start_pts).with_media_timeline(Some(first_media_pts), ingest_run);
+            segment.duration_ns = 2 * SEC;
+            segment.frame_count = 1;
+            segment.data = Arc::new(vec![0x47; 188]);
+            buffer.write_recover().push(segment);
+        }
+        buffer
+    }
+
     fn markers(playlist: &str) -> usize {
         playlist.matches("#EXT-X-DISCONTINUITY").count()
+    }
+
+    fn assert_only_marker_precedes(playlist: &str, sequence: u64) {
+        assert_eq!(markers(playlist), 1, "{playlist}");
+        let previous = playlist
+            .find(&format!("segment/{}\n", sequence - 1))
+            .unwrap();
+        let marker = playlist.find("#EXT-X-DISCONTINUITY\n").unwrap();
+        let target = playlist.find(&format!("segment/{sequence}\n")).unwrap();
+        assert!(previous < marker && marker < target, "{playlist}");
     }
 
     #[test]
@@ -253,6 +292,74 @@ mod tests {
         let buffer = buffer_of(&[1_700_000_000 * SEC, 1_700_000_060 * SEC]);
         let playlist = generate_playlist(&buffer.read_recover(), None, "");
         assert_eq!(markers(&playlist), 1, "{playlist}");
+    }
+
+    #[test]
+    fn continuous_media_pts_ignore_wall_clock_arrival_jitter() {
+        let buffer = buffer_with_media_timeline(&[
+            (100 * SEC, 0, 7),
+            (102 * SEC + 300_000_000, 180_000, 7),
+            (105 * SEC + 100_000_000, 360_000, 7),
+            (107 * SEC + 600_000_000, 540_000, 7),
+        ]);
+
+        let playlist = generate_playlist(&buffer.read_recover(), None, "");
+
+        assert_eq!(markers(&playlist), 0, "{playlist}");
+    }
+
+    #[test]
+    fn a_media_pts_gap_marks_only_the_segment_where_it_occurs() {
+        let buffer = buffer_with_media_timeline(&[
+            (100 * SEC, 0, 7),
+            (102 * SEC, 180_000, 7),
+            (104 * SEC, 540_000, 7),
+            (106 * SEC, 720_000, 7),
+        ]);
+
+        let playlist = generate_playlist(&buffer.read_recover(), None, "");
+
+        assert_only_marker_precedes(&playlist, 2);
+    }
+
+    #[test]
+    fn a_media_clock_that_runs_backwards_marks_the_segment_it_jumped_on() {
+        let buffer = buffer_with_media_timeline(&[
+            (100 * SEC, 360_000, 7),
+            (102 * SEC, 540_000, 7),
+            (104 * SEC, 180_000, 7),
+            (106 * SEC, 360_000, 7),
+        ]);
+
+        let playlist = generate_playlist(&buffer.read_recover(), None, "");
+
+        assert_only_marker_precedes(&playlist, 2);
+    }
+
+    #[test]
+    fn a_new_ingest_run_marks_one_discontinuity_on_an_otherwise_continuous_timeline() {
+        let buffer = buffer_with_media_timeline(&[
+            (100 * SEC, 0, 7),
+            (102 * SEC, 180_000, 7),
+            (104 * SEC, 360_000, 8),
+            (106 * SEC, 540_000, 8),
+        ]);
+
+        let playlist = generate_playlist(&buffer.read_recover(), None, "");
+
+        assert_only_marker_precedes(&playlist, 2);
+    }
+
+    #[test]
+    fn media_pts_continuity_survives_the_33_bit_wrap() {
+        let buffer = buffer_with_media_timeline(&[
+            (100 * SEC, crate::mpegts::PTS_MODULUS - 90_000, 7),
+            (102 * SEC, 90_000, 7),
+        ]);
+
+        let playlist = generate_playlist(&buffer.read_recover(), None, "");
+
+        assert_eq!(markers(&playlist), 0, "{playlist}");
     }
 
     #[test]

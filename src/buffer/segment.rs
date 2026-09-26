@@ -14,6 +14,10 @@ pub struct GopSegment {
     /// Wall clock nanoseconds at which the segmenter cut this GOP: the event's
     /// identity on disk, not a duration anchor.
     pub start_pts: u64,
+    /// The 90 kHz PTS of the keyframe that opened this GOP, when available.
+    pub first_media_pts: Option<u64>,
+    /// Process-local identity of the ffmpeg run that produced this GOP.
+    pub ingest_run: u64,
     pub duration_ns: u64,
     /// Shared MPEG-TS bytes; cloning a segment only bumps the refcount.
     pub data: Arc<Vec<u8>>,
@@ -24,10 +28,22 @@ impl GopSegment {
     pub fn new(start_pts: u64) -> Self {
         Self {
             start_pts,
+            first_media_pts: None,
+            ingest_run: 0,
             duration_ns: 0,
             data: Arc::new(Vec::new()),
             frame_count: 0,
         }
+    }
+
+    pub(crate) fn with_media_timeline(
+        mut self,
+        first_media_pts: Option<u64>,
+        ingest_run: u64,
+    ) -> Self {
+        self.first_media_pts = first_media_pts;
+        self.ingest_run = ingest_run;
+        self
     }
 
     /// Close the segment, measuring how long it ran.

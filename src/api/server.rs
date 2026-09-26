@@ -1876,6 +1876,8 @@ mod tests {
             for seq in 0..10u64 {
                 buf.push(GopSegment {
                     start_pts: seq * 1_000_000_000,
+                    first_media_pts: None,
+                    ingest_run: 0,
                     duration_ns: 1_000_000_000,
                     data: Arc::new(vec![seq as u8; 4]),
                     frame_count: 1,

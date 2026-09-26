@@ -1684,6 +1684,8 @@ mod tests {
         let event = FinishedEvent {
             segments: vec![GopSegment {
                 start_pts: 0,
+                first_media_pts: None,
+                ingest_run: 0,
                 duration_ns: 1_000_000_000,
                 data: Arc::new(vec![0x47; 188]),
                 frame_count: 1,
@@ -1727,6 +1729,8 @@ mod tests {
     fn gop(index: u64) -> crate::buffer::GopSegment {
         crate::buffer::GopSegment {
             start_pts: index * SEC,
+            first_media_pts: None,
+            ingest_run: 0,
             duration_ns: SEC,
             data: Arc::new(vec![0x47; 188]),
             frame_count: 1,

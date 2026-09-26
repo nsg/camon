@@ -1,6 +1,7 @@
 use std::io::{BufRead, BufReader, Read};
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
@@ -27,6 +28,8 @@ const MIN_KEYFRAME_WINDOW_SECS: u64 = 30;
 /// A run that kept going this long was a working stream that hiccupped, not a
 /// camera that never gets going, so its next stop is worth a line again.
 const SETTLED_RUN_SECS: u64 = 600;
+
+static NEXT_INGEST_RUN: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Error)]
 pub enum RtspError {
@@ -466,6 +469,7 @@ struct OpenSegment {
 struct MpegTsSegmenter {
     camera_id: String,
     buffer: Arc<RwLock<HotBuffer>>,
+    ingest_run: u64,
     current_segment: Option<OpenSegment>,
     /// Incremental byte buffer for the in-progress segment; wrapped in an Arc
     /// once at finalize time so readers share it without copying.
@@ -499,6 +503,9 @@ impl MpegTsSegmenter {
         Self {
             camera_id,
             buffer,
+            ingest_run: NEXT_INGEST_RUN
+                .fetch_add(1, Ordering::Relaxed)
+                .wrapping_add(1),
             current_segment: None,
             current_data: Vec::new(),
             video_pid: None,
@@ -663,9 +670,16 @@ impl MpegTsSegmenter {
                 self.first_keyframe_at.get_or_insert(now);
                 self.last_keyframe_at = Some(now);
             }
+            let packet_pts = if pusi {
+                crate::mpegts::extract_pes_pts(packet)
+            } else {
+                None
+            };
+            if is_keyframe || packet_pts.is_some() {
+                self.current_media_pts = packet_pts;
+            }
             if pusi {
-                if let Some(pts) = crate::mpegts::extract_pes_pts(packet) {
-                    self.current_media_pts = Some(pts);
+                if let Some(pts) = packet_pts {
                     if self.first_video_pts.is_none() {
                         self.first_video_pts = Some(pts);
                         self.report_av_offset();
@@ -699,7 +713,8 @@ impl MpegTsSegmenter {
     }
 
     fn start_segment(&mut self, pts_ns: u64, opened_at: Instant) {
-        let segment = GopSegment::new(pts_ns);
+        let segment =
+            GopSegment::new(pts_ns).with_media_timeline(self.current_media_pts, self.ingest_run);
 
         // Prepend PAT and PMT for segment independence
         // Reset continuity counters to 0 for clean segment start
@@ -1528,6 +1543,51 @@ mod tests {
         let segment = buffer.segments().back().unwrap();
         assert_eq!(crate::mpegts::keyframe_count(&segment.data), 1);
         assert_eq!(segment.duration_ns, 6_000 * 1_000_000_000 / 90_000);
+    }
+
+    #[test]
+    fn gops_keep_their_opening_pts_and_share_only_their_segmenters_run_id() {
+        let mut first_segmenter = segmenter();
+        for packet in [pat(PMT_PID), pmt(H264, VIDEO_PID)] {
+            first_segmenter.process(&packet);
+        }
+        first_segmenter.process(&keyframe_packet(VIDEO_PID, 0, VIDEO_STREAM_ID));
+        first_segmenter.process(&pes_packet(VIDEO_PID, 3_000));
+        first_segmenter.process(&keyframe_packet(VIDEO_PID, 90_000, VIDEO_STREAM_ID));
+        for pts in [93_000, 96_000] {
+            first_segmenter.process(&pes_packet(VIDEO_PID, pts));
+        }
+        first_segmenter.flush_end_of_stream();
+
+        let ingest_run = first_segmenter.ingest_run;
+        let buffer = first_segmenter.buffer.read_recover();
+        assert_eq!(buffer.segment_count(), 2);
+        assert_eq!(buffer.segments()[0].first_media_pts, Some(0));
+        assert_eq!(buffer.segments()[1].first_media_pts, Some(90_000));
+        assert!(buffer
+            .segments()
+            .iter()
+            .all(|segment| segment.ingest_run == ingest_run));
+        drop(buffer);
+
+        assert_ne!(segmenter().ingest_run, ingest_run);
+    }
+
+    #[test]
+    fn a_keyframe_without_pts_does_not_inherit_an_earlier_pts() {
+        let mut segmenter = segmenter();
+        for packet in [pat(PMT_PID), pmt(H264, VIDEO_PID)] {
+            segmenter.process(&packet);
+        }
+        segmenter.process(&keyframe_packet(VIDEO_PID, 0, VIDEO_STREAM_ID));
+        segmenter.process(&pes_packet(VIDEO_PID, 3_000));
+
+        let mut keyframe_without_pts = keyframe_packet(VIDEO_PID, 90_000, VIDEO_STREAM_ID);
+        keyframe_without_pts[13] &= 0x3F;
+        segmenter.process(&keyframe_without_pts);
+
+        let open = segmenter.current_segment.as_ref().unwrap();
+        assert_eq!(open.segment.first_media_pts, None);
     }
 
     #[test]

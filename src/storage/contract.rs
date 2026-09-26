@@ -213,6 +213,8 @@ pub(crate) mod contract_tests {
         FinishedEvent {
             segments: vec![GopSegment {
                 start_pts: first_pts,
+                first_media_pts: None,
+                ingest_run: 0,
                 duration_ns: 1_000_000_000,
                 data: Arc::new(vec![0xab; size]),
                 frame_count: 1,

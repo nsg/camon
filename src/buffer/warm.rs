@@ -516,6 +516,8 @@ mod tests {
     fn segment(start_pts: u64, duration_ns: u64, byte: u8) -> GopSegment {
         GopSegment {
             start_pts,
+            first_media_pts: None,
+            ingest_run: 0,
             duration_ns,
             data: Arc::new(vec![byte; 4]),
             frame_count: 1,

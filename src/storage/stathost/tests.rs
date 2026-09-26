@@ -450,6 +450,8 @@ async fn scanned_backend_for(url: &str, token: &str, max_stored_bytes: u64) -> S
 fn segment(start_pts: u64, byte: u8, len: usize) -> GopSegment {
     GopSegment {
         start_pts,
+        first_media_pts: None,
+        ingest_run: 0,
         duration_ns: 1_000_000_000,
         data: Arc::new(vec![byte; len]),
         frame_count: 1,

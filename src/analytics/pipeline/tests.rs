@@ -895,6 +895,8 @@ const SEC: u64 = 1_000_000_000;
 fn gop(index: u64) -> crate::buffer::GopSegment {
     crate::buffer::GopSegment {
         start_pts: index * SEC,
+        first_media_pts: None,
+        ingest_run: 0,
         duration_ns: SEC,
         data: Arc::new(vec![0x47; 188]),
         frame_count: 1,
@@ -1406,6 +1408,8 @@ fn two_motion_batches_are_extracted_through_one_crop_decoder() {
         for (i, data) in recorded.iter().enumerate() {
             buf.push(crate::buffer::GopSegment {
                 start_pts: i as u64 * SEC,
+                first_media_pts: None,
+                ingest_run: 0,
                 duration_ns: SEC,
                 data: Arc::clone(data),
                 frame_count: 25,
@@ -1463,6 +1467,8 @@ fn a_batch_leaves_frames_behind_and_the_next_pass_takes_them() {
         for (i, data) in recorded.iter().enumerate() {
             buf.push(crate::buffer::GopSegment {
                 start_pts: i as u64 * SEC,
+                first_media_pts: None,
+                ingest_run: 0,
                 duration_ns: SEC,
                 data: Arc::clone(data),
                 frame_count: 25,

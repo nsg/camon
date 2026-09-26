@@ -10,7 +10,16 @@ pub const SYNC_BYTE: u8 = 0x47;
 const NULL_PID: u16 = 0x1FFF;
 
 /// 33-bit PTS values wrap at this modulus (~26.5 hours at 90 kHz).
-const PTS_MODULUS: u64 = 1 << 33;
+pub(crate) const PTS_MODULUS: u64 = 1 << 33;
+
+/// Nanoseconds from `first` forward to `second` on the 33-bit PTS ring: a
+/// `second` behind `first` reads as almost a full wrap ahead.
+pub fn pts_forward_ns(first: u64, second: u64) -> u64 {
+    const PTS_HZ: u128 = 90_000;
+    const NANOS_PER_SEC: u128 = 1_000_000_000;
+    let ticks = second.wrapping_sub(first) & (PTS_MODULUS - 1);
+    (u128::from(ticks) * NANOS_PER_SEC / PTS_HZ) as u64
+}
 
 /// Whole TS packets one [`scan_ts_stream`] buffer holds — about 64 KiB, and a
 /// multiple of the packet size so a full buffer never splits a packet.

@@ -804,6 +804,8 @@ async fn snapshots_are_not_queued_while_disconnected() {
         for i in 0..2 {
             buf.push(crate::buffer::GopSegment {
                 start_pts: i * 1_000_000_000,
+                first_media_pts: None,
+                ingest_run: 0,
                 duration_ns: 1_000_000_000,
                 data: Arc::new(vec![0u8; 16]),
                 frame_count: 1,
@@ -976,6 +978,8 @@ async fn a_transition_during_the_drain_is_published_but_forks_no_snapshot() {
     let buffer = HotBuffer::new("yard".to_string(), 30);
     buffer.write_recover().push(GopSegment {
         start_pts: 0,
+        first_media_pts: None,
+        ingest_run: 0,
         duration_ns: 1_000_000_000,
         data: Arc::new(vec![0x47; 188]),
         frame_count: 1,
@@ -1482,6 +1486,8 @@ async fn a_snapshot_charges_the_budget_before_it_publishes() {
         for i in 0..2 {
             buf.push(crate::buffer::GopSegment {
                 start_pts: i * 1_000_000_000,
+                first_media_pts: None,
+                ingest_run: 0,
                 duration_ns: 1_000_000_000,
                 data: Arc::clone(&segment),
                 frame_count: 25,
