@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 
 use axum::body::Body;
@@ -23,7 +23,7 @@ use crate::analytics::{
     MotionSettingsStore, SettingsUpdate, TunerSnapshot, TunerStore, UpdateError,
 };
 use crate::buffer::{wall_clock_ns, HotBuffer, StreamHealth};
-use crate::locks::LockExt;
+use crate::locks::{LockExt, MutexExt};
 use crate::storage::event_index::MAX_FILMSTRIP_FRAMES;
 use crate::storage::{
     DetectionDebugStore, DetectionStore, EventCursor, EventPage, EventRef, MapKind, MotionStore,
@@ -52,6 +52,9 @@ pub struct AppState {
     pub motion_settings: Option<MotionSettingsStore>,
     /// Per-camera tuner snapshots and reset requests. `None` when analytics is off.
     pub tuner_store: Option<TunerStore>,
+    /// Shared process limit for snapshot ffmpeg decodes across every camera.
+    snapshot_decodes: Arc<tokio::sync::Semaphore>,
+    snapshot_flights: SnapshotFlights,
 }
 
 impl AppState {
@@ -76,6 +79,8 @@ impl AppState {
             storage,
             motion_settings,
             tuner_store: None,
+            snapshot_decodes: Arc::new(tokio::sync::Semaphore::new(SNAPSHOT_DECODE_PERMITS)),
+            snapshot_flights: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -662,6 +667,49 @@ async fn detection_frame_handler(
 /// while HLS spins up, so an extraction slower than the stream is worthless.
 const SNAPSHOT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// Two decoders keep snapshots responsive without letting ffmpeg processes
+/// multiply under a burst of live-view opens.
+const SNAPSHOT_DECODE_PERMITS: usize = 2;
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct SnapshotKey {
+    camera_id: String,
+    segment_sequence: u64,
+    max_width: Option<u32>,
+}
+
+type SnapshotResult = Arc<Result<Bytes, String>>;
+type SnapshotFlight = tokio::sync::watch::Receiver<Option<SnapshotResult>>;
+type SnapshotFlights = Arc<Mutex<HashMap<SnapshotKey, SnapshotFlight>>>;
+
+struct SnapshotFlightCleanup {
+    flights: SnapshotFlights,
+    key: SnapshotKey,
+    armed: bool,
+}
+
+impl SnapshotFlightCleanup {
+    fn publish_and_remove(
+        mut self,
+        sender: &tokio::sync::watch::Sender<Option<SnapshotResult>>,
+        result: SnapshotResult,
+    ) {
+        let mut flights = self.flights.lock_recover();
+        sender.send_replace(Some(result));
+        flights.remove(&self.key);
+        drop(flights);
+        self.armed = false;
+    }
+}
+
+impl Drop for SnapshotFlightCleanup {
+    fn drop(&mut self) {
+        if self.armed {
+            self.flights.lock_recover().remove(&self.key);
+        }
+    }
+}
+
 /// The newest keyframe in the hot buffer, as a JPEG. The live view sets it as
 /// the video element's poster, so opening a camera shows the scene immediately
 /// instead of a black box while the full-resolution stream loads.
@@ -670,6 +718,7 @@ async fn snapshot_handler(
     Path(id): Path<String>,
     Query(query): Query<SnapshotQuery>,
 ) -> Response {
+    let deadline = tokio::time::Instant::now() + SNAPSHOT_DEADLINE;
     let Some(buffer) = state.buffers.get(&id) else {
         return (StatusCode::NOT_FOUND, "camera not found").into_response();
     };
@@ -677,32 +726,101 @@ async fn snapshot_handler(
     // waits on the decode.
     let newest = {
         let buf = buffer.read_recover();
-        buf.segments().back().map(|s| Arc::clone(&s.data))
+        buf.segments()
+            .back()
+            .map(|s| (buf.last_sequence() - 1, Arc::clone(&s.data)))
     };
-    let Some(segment) = newest else {
+    let Some((segment_sequence, segment)) = newest else {
         return (StatusCode::NOT_FOUND, "no segments buffered yet").into_response();
     };
-    match keyframe_jpeg(segment, query.w.map(|w| w.clamp(16, 7680))).await {
+    let max_width = query.w.map(|w| w.clamp(16, 7680));
+    let key = SnapshotKey {
+        camera_id: id.clone(),
+        segment_sequence,
+        max_width,
+    };
+    let decodes = Arc::clone(&state.snapshot_decodes);
+    let result = coalesce_snapshot_decode(Arc::clone(&state.snapshot_flights), key, move || {
+        bounded_keyframe_jpeg(decodes, segment, max_width, deadline)
+    })
+    .await;
+    match result.as_ref() {
         Ok(jpeg) => (
             [
                 (header::CONTENT_TYPE, "image/jpeg"),
                 (header::CACHE_CONTROL, "no-store"),
             ],
-            jpeg,
+            jpeg.clone(),
         )
             .into_response(),
         Err(error) => {
-            tracing::warn!(camera = %id, error, "snapshot extraction failed");
+            tracing::warn!(camera = %id, error = %error, "snapshot extraction failed");
             (StatusCode::INTERNAL_SERVER_ERROR, "snapshot failed").into_response()
         }
     }
+}
+
+async fn coalesce_snapshot_decode<F, Fut>(
+    flights: SnapshotFlights,
+    key: SnapshotKey,
+    decode: F,
+) -> SnapshotResult
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = Result<Bytes, String>> + Send + 'static,
+{
+    let mut receiver = {
+        let mut current = flights.lock_recover();
+        if let Some(receiver) = current.get(&key) {
+            receiver.clone()
+        } else {
+            let (sender, receiver) = tokio::sync::watch::channel(None);
+            current.insert(key.clone(), receiver.clone());
+            let cleanup = SnapshotFlightCleanup {
+                flights: Arc::clone(&flights),
+                key,
+                armed: true,
+            };
+            drop(tokio::spawn(async move {
+                let result = Arc::new(decode().await);
+                cleanup.publish_and_remove(&sender, result);
+            }));
+            receiver
+        }
+    };
+
+    loop {
+        if let Some(result) = receiver.borrow_and_update().clone() {
+            return result;
+        }
+        if receiver.changed().await.is_err() {
+            return Arc::new(Err("snapshot decode task failed".to_string()));
+        }
+    }
+}
+
+async fn bounded_keyframe_jpeg(
+    decodes: Arc<tokio::sync::Semaphore>,
+    segment: Arc<Vec<u8>>,
+    max_width: Option<u32>,
+    deadline: tokio::time::Instant,
+) -> Result<Bytes, String> {
+    tokio::time::timeout_at(deadline, async {
+        let _permit = decodes
+            .acquire_owned()
+            .await
+            .map_err(|_| "snapshot decoder semaphore closed".to_string())?;
+        keyframe_jpeg(segment, max_width).await
+    })
+    .await
+    .map_err(|_| "ffmpeg overran the snapshot deadline".to_string())?
 }
 
 /// Decode the segment's first frame — a GOP segment starts at its keyframe —
 /// into a JPEG. A one-shot ffmpeg per request rather than a kept child like the
 /// analytics decoders: snapshots happen once per live-view open, and a fresh
 /// process needs none of the PTS-discontinuity handling a long-lived one does.
-async fn keyframe_jpeg(segment: Arc<Vec<u8>>, max_width: Option<u32>) -> Result<Vec<u8>, String> {
+async fn keyframe_jpeg(segment: Arc<Vec<u8>>, max_width: Option<u32>) -> Result<Bytes, String> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let mut command = tokio::process::Command::new("ffmpeg");
@@ -742,23 +860,16 @@ async fn keyframe_jpeg(segment: Arc<Vec<u8>>, max_width: Option<u32>) -> Result<
     tokio::spawn(async move {
         let _ = stdin.write_all(&segment).await;
     });
-    let decode = async {
-        let mut jpeg = Vec::new();
-        stdout
-            .read_to_end(&mut jpeg)
-            .await
-            .map_err(|e| format!("read ffmpeg output: {e}"))?;
-        let _ = child.wait().await;
-        Ok::<_, String>(jpeg)
-    };
-    // On timeout the child is dropped and kill_on_drop reaps it.
-    let jpeg = tokio::time::timeout(SNAPSHOT_DEADLINE, decode)
+    let mut jpeg = Vec::new();
+    stdout
+        .read_to_end(&mut jpeg)
         .await
-        .map_err(|_| "ffmpeg overran the snapshot deadline".to_string())??;
+        .map_err(|e| format!("read ffmpeg output: {e}"))?;
+    let _ = child.wait().await;
     if jpeg.is_empty() {
         return Err("ffmpeg produced no frame".to_string());
     }
-    Ok(jpeg)
+    Ok(jpeg.into())
 }
 
 // Hot event types and handler
@@ -1639,6 +1750,141 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn identical_snapshot_decodes_are_coalesced_while_different_keys_run() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        const SAME_CALLERS: usize = 8;
+        let flights: SnapshotFlights = Arc::new(Mutex::new(HashMap::new()));
+        let starts = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(tokio::sync::Notify::new());
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let same_key = SnapshotKey {
+            camera_id: "cam".to_string(),
+            segment_sequence: 7,
+            max_width: Some(320),
+        };
+
+        let mut same_calls: Vec<_> = (0..SAME_CALLERS)
+            .map(|_| {
+                let (flights, starts, started, gate, key) = (
+                    Arc::clone(&flights),
+                    Arc::clone(&starts),
+                    Arc::clone(&started),
+                    Arc::clone(&gate),
+                    same_key.clone(),
+                );
+                Box::pin(async move {
+                    coalesce_snapshot_decode(flights, key, move || async move {
+                        starts.fetch_add(1, Ordering::SeqCst);
+                        started.notify_one();
+                        let permit = gate.acquire().await.unwrap();
+                        permit.forget();
+                        Ok(Bytes::from_static(b"same"))
+                    })
+                    .await
+                })
+            })
+            .collect();
+
+        let mut different_call = {
+            let (flights, starts, started, gate) = (
+                Arc::clone(&flights),
+                Arc::clone(&starts),
+                Arc::clone(&started),
+                Arc::clone(&gate),
+            );
+            Box::pin(async move {
+                let key = SnapshotKey {
+                    camera_id: "cam".to_string(),
+                    segment_sequence: 7,
+                    max_width: Some(321),
+                };
+                coalesce_snapshot_decode(flights, key, move || async move {
+                    starts.fetch_add(1, Ordering::SeqCst);
+                    started.notify_one();
+                    let permit = gate.acquire().await.unwrap();
+                    permit.forget();
+                    Ok(Bytes::from_static(b"different"))
+                })
+                .await
+            })
+        };
+
+        std::future::poll_fn(|context| {
+            for call in &mut same_calls {
+                assert!(std::future::Future::poll(call.as_mut(), context).is_pending());
+            }
+            assert!(std::future::Future::poll(different_call.as_mut(), context).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        assert_eq!(flights.lock_recover().len(), 2);
+
+        while starts.load(Ordering::SeqCst) < 2 {
+            started.notified().await;
+        }
+        assert_eq!(starts.load(Ordering::SeqCst), 2);
+
+        gate.add_permits(2);
+        for call in same_calls {
+            let result = call.await;
+            assert_eq!(result.as_ref().as_ref().unwrap().as_ref(), b"same");
+        }
+        let different = different_call.await;
+        assert_eq!(different.as_ref().as_ref().unwrap().as_ref(), b"different");
+        assert_eq!(starts.load(Ordering::SeqCst), 2);
+        assert!(flights.lock_recover().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn snapshot_decode_permit_wait_obeys_the_request_deadline() {
+        let ids = vec!["cam".to_string()];
+        let buffers = HashMap::from([("cam".to_string(), stream_buffer("cam", &[0; 4]))]);
+        let state = AppState::new(
+            buffers,
+            HashMap::new(),
+            MotionStore::new(&ids),
+            DetectionStore::new(&ids),
+            DetectionDebugStore::new(&ids),
+            None,
+            None,
+        );
+        let held_permits = Arc::clone(&state.snapshot_decodes)
+            .acquire_many_owned(SNAPSHOT_DECODE_PERMITS as u32)
+            .await
+            .unwrap();
+        let flights = Arc::clone(&state.snapshot_flights);
+        let started_at = tokio::time::Instant::now();
+        let request = tokio::spawn(snapshot_handler(
+            State(state),
+            Path("cam".to_string()),
+            Query(SnapshotQuery { w: None }),
+        ));
+        tokio::task::yield_now().await;
+
+        tokio::time::advance(SNAPSHOT_DEADLINE - std::time::Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+        assert!(!request.is_finished());
+        tokio::time::advance(std::time::Duration::from_millis(1)).await;
+        let response = request.await.unwrap();
+
+        assert_eq!(started_at.elapsed(), SNAPSHOT_DEADLINE);
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], b"snapshot failed");
+        for _ in 0..32 {
+            if flights.lock_recover().is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(flights.lock_recover().is_empty());
+        drop(held_permits);
+    }
+
     /// One second of real MPEG-TS, generated the way the decoder tests do it.
     fn recorded_ts_segment() -> Vec<u8> {
         let dir = tempfile::tempdir().unwrap();
@@ -1677,20 +1923,25 @@ mod tests {
     #[ignore]
     async fn a_snapshot_is_the_newest_segments_keyframe_as_a_jpeg() {
         let base = serve_stream_buffers(stream_buffer("cam", &recorded_ts_segment()), None).await;
-        let response = reqwest::get(format!("{base}/api/cameras/cam/snapshot"))
-            .await
-            .unwrap();
-        assert_eq!(response.status(), reqwest::StatusCode::OK);
-        assert_eq!(
-            response.headers()[reqwest::header::CONTENT_TYPE],
-            "image/jpeg"
-        );
-        let body = response.bytes().await.unwrap();
-        assert!(
-            body.starts_with(&[0xFF, 0xD8, 0xFF]),
-            "not a JPEG: {:?}",
-            &body[..body.len().min(4)]
-        );
+        let url = format!("{base}/api/cameras/cam/snapshot");
+        let (first, second) = tokio::join!(reqwest::get(&url), reqwest::get(&url));
+        for response in [first.unwrap(), second.unwrap()] {
+            assert_eq!(response.status(), reqwest::StatusCode::OK);
+            assert_eq!(
+                response.headers()[reqwest::header::CONTENT_TYPE],
+                "image/jpeg"
+            );
+            assert_eq!(
+                response.headers()[reqwest::header::CACHE_CONTROL],
+                "no-store"
+            );
+            let body = response.bytes().await.unwrap();
+            assert!(
+                body.starts_with(&[0xFF, 0xD8, 0xFF]),
+                "not a JPEG: {:?}",
+                &body[..body.len().min(4)]
+            );
+        }
     }
 
     /// The frame width from the JPEG's start-of-frame marker.
