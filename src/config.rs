@@ -126,6 +126,11 @@ pub enum ConfigError {
     )]
     ConfidenceThresholdNotANumber { value: f32 },
     #[error(
+        "[analytics.object_detection.tpue] threshold must be a finite number strictly between \
+         0 and 1, got {value}. Omit it to use tpue's tuned per-class thresholds"
+    )]
+    InvalidTpueThreshold { value: f32 },
+    #[error(
         "[buffer] hot_duration_secs is 0, so every segment is evicted by the same push that \
          added it: the analyzer is handed nothing to look at, no event can be cut from a \
          buffer holding no footage, and nothing says why. Set the seconds of video to keep in \
@@ -435,6 +440,26 @@ fn default_ollama_timeout_secs() -> u64 {
     90
 }
 
+fn default_tpue_url() -> String {
+    "http://localhost:8700".to_string()
+}
+
+fn default_tpue_timeout_secs() -> u64 {
+    10
+}
+
+fn default_tpue_max_detections() -> usize {
+    15
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum DetectionBackend {
+    #[default]
+    Ollama,
+    Tpue,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OllamaServerConfig {
@@ -470,24 +495,55 @@ impl Default for OllamaConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct TpueConfig {
+    #[serde(default = "default_tpue_url")]
+    pub url: String,
+    pub model: Option<String>,
+    #[serde(default = "default_tpue_timeout_secs")]
+    pub timeout_secs: u64,
+    pub threshold: Option<f32>,
+    #[serde(default = "default_tpue_max_detections")]
+    pub max_detections: usize,
+}
+
+impl Default for TpueConfig {
+    fn default() -> Self {
+        Self {
+            url: default_tpue_url(),
+            model: None,
+            timeout_secs: default_tpue_timeout_secs(),
+            threshold: None,
+            max_detections: default_tpue_max_detections(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ObjectDetectionConfig {
     #[serde(default)]
     pub enabled: bool,
+    #[serde(default)]
+    pub backend: DetectionBackend,
     #[serde(default = "default_confidence_threshold")]
     pub confidence_threshold: f32,
     #[serde(default = "default_classes")]
     pub classes: Vec<String>,
     #[serde(default)]
     pub ollama: OllamaConfig,
+    #[serde(default)]
+    pub tpue: TpueConfig,
 }
 
 impl Default for ObjectDetectionConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            backend: DetectionBackend::default(),
             confidence_threshold: default_confidence_threshold(),
             classes: default_classes(),
             ollama: OllamaConfig::default(),
+            tpue: TpueConfig::default(),
         }
     }
 }
@@ -1233,6 +1289,11 @@ impl Config {
         if !confidence.is_finite() {
             return Err(ConfigError::ConfidenceThresholdNotANumber { value: confidence });
         }
+        if let Some(threshold) = self.analytics.object_detection.tpue.threshold {
+            if !threshold.is_finite() || threshold <= 0.0 || threshold >= 1.0 {
+                return Err(ConfigError::InvalidTpueThreshold { value: threshold });
+            }
+        }
 
         Ok(())
     }
@@ -1300,6 +1361,26 @@ impl Config {
                  timeout\" here but a deadline every request misses; using {timeout}s"
             );
         }
+
+        let timeout = &mut self.analytics.object_detection.tpue.timeout_secs;
+        if *timeout == 0 {
+            *timeout = default_tpue_timeout_secs();
+            tracing::warn!(
+                using = *timeout,
+                "[analytics.object_detection.tpue] timeout_secs is 0, which is not \"no \
+                 timeout\" here but a deadline every request misses; using {timeout}s"
+            );
+        }
+
+        let max_detections = &mut self.analytics.object_detection.tpue.max_detections;
+        if *max_detections == 0 {
+            *max_detections = default_tpue_max_detections();
+            tracing::warn!(
+                using = *max_detections,
+                "[analytics.object_detection.tpue] max_detections is 0, which cannot return \
+                 a detection; using {max_detections}"
+            );
+        }
     }
 
     /// Seconds that are multiplied out to nanoseconds somewhere downstream, and the one
@@ -1354,18 +1435,11 @@ fn event_span_overrun(cap: u64, pre: u64, hot: u64) -> Option<u64> {
 }
 
 /// Keys camon itself shipped and later removed, with the advice to print when one turns up.
-const RETIRED_KEYS: &[(&[&str], &str)] = &[
-    (
-        &["analytics", "object_detection", "backend"],
-        "object detection has been Ollama-only since 0.2.1; the server is configured under \
-         [analytics.object_detection.ollama]",
-    ),
-    (
-        &["analytics", "object_detection", "model_path"],
-        "the bundled ONNX model was removed in 0.2.1; set `model` under \
+const RETIRED_KEYS: &[(&[&str], &str)] = &[(
+    &["analytics", "object_detection", "model_path"],
+    "the bundled ONNX model was removed in 0.2.1; set `model` under \
          [analytics.object_detection.ollama] instead",
-    ),
-];
+)];
 
 /// Remove every [`RETIRED_KEYS`] entry present in `root`, returning the dotted
 /// key and its advice for each one actually found.
@@ -2239,7 +2313,7 @@ url = "rtsp://10.0.0.5:554/stream1"
     #[test]
     fn retired_keys_are_dropped_with_advice_instead_of_rejected() {
         let toml = format!(
-            "[analytics.object_detection]\nenabled = true\nbackend = \"onnx\"\n\
+            "[analytics.object_detection]\nenabled = true\n\
              model_path = \"/opt/yolo26.onnx\"\n{}",
             one_camera("yard")
         );
@@ -2249,13 +2323,7 @@ url = "rtsp://10.0.0.5:554/stream1"
         let mut value: toml::Value = toml::from_str(&toml).unwrap();
         let found = strip_retired_keys(&mut value);
         let keys: Vec<&str> = found.iter().map(|(key, _)| key.as_str()).collect();
-        assert_eq!(
-            keys,
-            [
-                "analytics.object_detection.backend",
-                "analytics.object_detection.model_path"
-            ]
-        );
+        assert_eq!(keys, ["analytics.object_detection.model_path"]);
         for (_, advice) in &found {
             assert!(advice.contains("ollama"), "got {advice}");
         }
@@ -2522,6 +2590,83 @@ url = "rtsp://10.0.0.5:554/stream1"
                 "{literal}"
             );
         }
+    }
+
+    #[test]
+    fn tpue_detection_backend_parses() {
+        let toml = format!(
+            "[analytics.object_detection]\nbackend = \"tpue\"\n{}",
+            one_camera("yard")
+        );
+        let config = load_cameras(&toml).unwrap();
+        assert_eq!(
+            config.analytics.object_detection.backend,
+            DetectionBackend::Tpue
+        );
+    }
+
+    #[test]
+    fn unknown_detection_backend_is_rejected() {
+        let toml = format!(
+            "[analytics.object_detection]\nbackend = \"coral\"\n{}",
+            one_camera("yard")
+        );
+        let error = load_cameras(&toml).unwrap_err();
+        assert!(matches!(error, ConfigError::Parse(_)), "got {error:?}");
+        assert!(error.to_string().contains("coral"), "got {error}");
+    }
+
+    #[test]
+    fn tpue_section_fields_parse() {
+        let toml = format!(
+            "[analytics.object_detection.tpue]\nurl = \"http://edge:8700/\"\n\
+             model = \"yolov9s-512\"\ntimeout_secs = 4\nthreshold = 0.2\n\
+             max_detections = 9\n{}",
+            one_camera("yard")
+        );
+        let tpue = load_cameras(&toml).unwrap().analytics.object_detection.tpue;
+        assert_eq!(tpue.url, "http://edge:8700/");
+        assert_eq!(tpue.model.as_deref(), Some("yolov9s-512"));
+        assert_eq!(tpue.timeout_secs, 4);
+        assert_eq!(tpue.threshold, Some(0.2));
+        assert_eq!(tpue.max_detections, 9);
+    }
+
+    #[test]
+    fn a_zero_tpue_timeout_becomes_the_default() {
+        let toml = format!(
+            "[analytics]\nenabled = true\n[analytics.object_detection]\nenabled = true\n\
+             [analytics.object_detection.tpue]\ntimeout_secs = 0\n{}",
+            one_camera("yard")
+        );
+        let config = load_cameras(&toml).unwrap();
+        assert_eq!(
+            config.analytics.object_detection.tpue.timeout_secs,
+            default_tpue_timeout_secs()
+        );
+    }
+
+    #[test]
+    fn an_invalid_tpue_threshold_is_rejected() {
+        let toml = format!(
+            "[analytics]\nenabled = true\n[analytics.object_detection]\nenabled = true\n\
+             [analytics.object_detection.tpue]\nthreshold = 1.5\n{}",
+            one_camera("yard")
+        );
+        let error = load_cameras(&toml).unwrap_err();
+        assert!(
+            matches!(error, ConfigError::InvalidTpueThreshold { .. }),
+            "got {error:?}"
+        );
+    }
+
+    #[test]
+    fn omitted_detection_backend_defaults_to_ollama() {
+        let config = load_cameras(&one_camera("yard")).unwrap();
+        assert_eq!(
+            config.analytics.object_detection.backend,
+            DetectionBackend::Ollama
+        );
     }
 
     #[test]

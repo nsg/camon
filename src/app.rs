@@ -8,13 +8,13 @@ use std::sync::{Arc, RwLock};
 use tracing_subscriber::EnvFilter;
 
 use crate::analytics::{
-    self, detect_queue, AnalyzerContext, DetectQueueSender, DetectionWorker, OllamaClient,
+    self, detect_queue, AnalyzerContext, DetectQueueSender, DetectionWorker, Detector,
 };
 use crate::api::{self, AppState};
 use crate::buffer::warm::{run_continuous_recorder, RetentionTask, WarmWriter, WriterMessage};
 use crate::buffer::{wall_clock_ns, HotBuffer};
 use crate::camera::{self, FfmpegPipeline};
-use crate::config::{self, Config};
+use crate::config::{self, Config, DetectionBackend};
 use crate::locks::LockExt;
 use crate::mqtt::{self, BridgeContext, MqttEvent, MQTT_EVENT_CAPACITY};
 use crate::retry::{apply_jitter, jitter_source};
@@ -301,17 +301,40 @@ fn log_object_detection_config(config: &Config) -> bool {
         return false;
     }
     let od = &config.analytics.object_detection;
-    tracing::info!(
-        url = %od.ollama.url,
-        model = %od.ollama.model,
-        "object detection configured (ollama)"
-    );
-    if let Some(ref fb) = od.ollama.fallback {
-        tracing::info!(
-            url = %fb.url,
-            model = %fb.model,
-            "ollama fallback server configured"
-        );
+    match od.backend {
+        DetectionBackend::Ollama => {
+            tracing::info!(
+                url = %od.ollama.url,
+                model = %od.ollama.model,
+                "object detection configured (ollama)"
+            );
+            if let Some(ref fallback) = od.ollama.fallback {
+                tracing::info!(
+                    url = %fallback.url,
+                    model = %fallback.model,
+                    "ollama fallback server configured"
+                );
+            }
+        }
+        DetectionBackend::Tpue => {
+            let model = od.tpue.model.as_deref().unwrap_or("server default");
+            let threshold = od
+                .tpue
+                .threshold
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "server per-class defaults".to_string());
+            tracing::info!(
+                url = %od.tpue.url,
+                model = %model,
+                threshold = %threshold,
+                "object detection configured (tpue)"
+            );
+            tracing::info!(
+                "confidence_threshold applies to the ollama backend only; tpue uses the \
+                 server's per-class thresholds unless [analytics.object_detection.tpue] \
+                 threshold is set"
+            );
+        }
     }
     true
 }
@@ -402,7 +425,7 @@ fn init_motion_settings(
 /// The classes the MQTT bridge publishes occupancy entities for: read off the
 /// detector itself, so an entity can never exist for a class nothing looks
 /// for or the other way round. No client, no detections, no entities.
-fn mqtt_object_classes(client: Option<&OllamaClient>) -> Vec<String> {
+fn mqtt_object_classes(client: Option<&Detector>) -> Vec<String> {
     client
         .map(|c| c.allowed_classes().to_vec())
         .unwrap_or_default()
@@ -414,24 +437,43 @@ fn mqtt_entities_path(config: &Config) -> std::path::PathBuf {
     std::path::PathBuf::from(&config.storage.data_dir).join("mqtt_entities.json")
 }
 
-fn create_ollama_client(config: &Config) -> Option<OllamaClient> {
+fn create_detector(config: &Config) -> Option<Detector> {
     let od = &config.analytics.object_detection;
-    let fallback = od
-        .ollama
-        .fallback
-        .as_ref()
-        .map(|fb| (fb.url.as_str(), fb.model.as_str()));
-    match OllamaClient::new(
-        &od.ollama.url,
-        &od.ollama.model,
-        od.ollama.timeout_secs,
-        od.confidence_threshold,
-        od.classes.clone(),
-        fallback,
-    ) {
-        Ok(client) => Some(client),
+    let detector = match od.backend {
+        DetectionBackend::Ollama => {
+            let fallback = od
+                .ollama
+                .fallback
+                .as_ref()
+                .map(|fallback| (fallback.url.as_str(), fallback.model.as_str()));
+            analytics::OllamaClient::new(
+                &od.ollama.url,
+                &od.ollama.model,
+                od.ollama.timeout_secs,
+                od.confidence_threshold,
+                od.classes.clone(),
+                fallback,
+            )
+            .map(Detector::Ollama)
+        }
+        DetectionBackend::Tpue => analytics::TpueClient::new(
+            &od.tpue.url,
+            od.tpue.model.as_deref(),
+            od.tpue.timeout_secs,
+            od.tpue.threshold,
+            od.tpue.max_detections,
+            od.classes.clone(),
+        )
+        .map(Detector::Tpue),
+    };
+    match detector {
+        Ok(detector) => Some(detector),
         Err(e) => {
-            tracing::error!(error = %e, "failed to create ollama client, object detection disabled");
+            tracing::error!(
+                backend = ?od.backend,
+                error = %e,
+                "failed to create object detector, object detection disabled"
+            );
             None
         }
     }
@@ -865,7 +907,7 @@ async fn graceful_shutdown(
     .await;
 
     // The detection worker is aborted, not drained: losing a queued job or an
-    // in-flight Ollama request costs only an object upgrade, never footage.
+    // in-flight detector request costs only an object upgrade, never footage.
     // Aborting also releases its warm-writer senders for the drain below.
     if let Some(handle) = detect_worker_handle {
         handle.abort();
@@ -1038,20 +1080,19 @@ where
     log_recording_mode(&config);
 
     // Object detection runs on ONE global worker: at most one in-flight
-    // Ollama request across all cameras (the GPU degrades badly under
-    // parallel load).
-    let ollama_client = if object_detection_ready {
-        create_ollama_client(&config)
+    // detector request across all cameras.
+    let detector = if object_detection_ready {
+        create_detector(&config)
     } else {
         None
     };
-    let object_classes = mqtt_object_classes(ollama_client.as_ref());
-    let event_registry = if ollama_client.is_some() && config.storage.enabled {
+    let object_classes = mqtt_object_classes(detector.as_ref());
+    let event_registry = if detector.is_some() && config.storage.enabled {
         Some(EventRegistry::new(&camera_ids))
     } else {
         None
     };
-    let (detect_tx, detect_rx) = match ollama_client {
+    let (detect_tx, detect_rx) = match detector {
         Some(_) => {
             let (tx, queue) = detect_queue(event_registry.clone());
             (Some(tx), Some(queue))
@@ -1117,7 +1158,7 @@ where
         })
     });
 
-    let detect_worker_handle = match (ollama_client, detect_rx) {
+    let detect_worker_handle = match (detector, detect_rx) {
         (Some(client), Some(rx)) => {
             let worker = DetectionWorker::new(
                 client,
@@ -2279,7 +2320,7 @@ mod tests {
             "[analytics]\nenabled = true\n\n[analytics.object_detection]\nenabled = true\n\
              classes = [\"Person\", \"cat\"]\n{ONE_CAMERA}"
         ));
-        let client = create_ollama_client(&config).expect("client");
+        let client = create_detector(&config).expect("client");
         let expected = vec!["person".to_string(), "cat".to_string()];
         assert_eq!(client.allowed_classes(), expected);
         assert_eq!(mqtt_object_classes(Some(&client)), expected);

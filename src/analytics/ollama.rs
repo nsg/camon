@@ -3,6 +3,8 @@
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 
+use super::detector::{validate_bbox, Detection, FrameDetectResult};
+
 /// TCP connect timeout. A down or unreachable server fails in seconds instead
 /// of eating the whole request timeout.
 const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
@@ -14,21 +16,6 @@ const NUM_PREDICT: u32 = 768;
 /// Cap on the detections array in the response schema. Keeps a degenerate
 /// "everything is a person" response bounded in both tokens and latency.
 const MAX_DETECTIONS: usize = 15;
-
-#[derive(Debug, Clone)]
-pub struct Detection {
-    pub class_name: String,
-    pub confidence: f32,
-    /// Normalized bounding box (x, y, w, h) in 0.0-1.0 image coordinates.
-    pub bbox: Option<(f32, f32, f32, f32)>,
-}
-
-/// Result from a single frame detection call.
-pub struct FrameDetectResult {
-    pub detections: Vec<Detection>,
-    pub raw_response: String,
-    pub model: String,
-}
 
 #[derive(Serialize)]
 struct ChatRequest {
@@ -367,27 +354,6 @@ fn salvage_truncated(content: &str) -> Option<DetectionsPayload> {
         }
     }
     None
-}
-
-/// Validate and normalize a bounding box. The origin must lie inside the
-/// frame and the size must be positive; a box slightly overhanging the right
-/// or bottom edge (model slop) is clamped back in. Anything else is garbage.
-fn validate_bbox(x: f32, y: f32, w: f32, h: f32) -> Option<(f32, f32, f32, f32)> {
-    if ![x, y, w, h].iter().all(|v| v.is_finite()) {
-        return None;
-    }
-    if !(0.0..=1.0).contains(&x) || !(0.0..=1.0).contains(&y) || w <= 0.0 || h <= 0.0 {
-        return None;
-    }
-    if w > 1.0 || h > 1.0 {
-        return None;
-    }
-    let w = w.min(1.0 - x);
-    let h = h.min(1.0 - y);
-    if w <= 0.0 || h <= 0.0 {
-        return None;
-    }
-    Some((x, y, w, h))
 }
 
 #[cfg(test)]

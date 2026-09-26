@@ -30,7 +30,7 @@ RUN CAMON_BUILD_VERSION="${CAMON_BUILD_VERSION}" cargo build --release --locked 
 # ---- Runtime stage ---------------------------------------------------------
 FROM debian:bookworm-slim
 
-# ffmpeg/ffprobe are spawned by Camon; ca-certificates for HTTPS (Ollama,
+# ffmpeg/ffprobe are spawned by Camon; ca-certificates for HTTPS (Ollama, tpue,
 # stathost, update checks); curl + jq for run.sh to query and parse the
 # Supervisor's /services/mqtt response (MQTT auto-configuration) — the slim
 # base image ships neither.

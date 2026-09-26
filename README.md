@@ -51,16 +51,18 @@ An optional per-cell tuner watches a 20-minute rolling window and raises only ce
 
 That file is written like an event: staged, fsynced, renamed into place, and the directory fsynced after — a truncated one loads as defaults, which would quietly un-paint a privacy mask — and saves are serialised per camera so two edits at once cannot share a staging file. A save that fails is reported rather than acknowledged: the API answers with the error and the web UI shows it above the settings panel. The change stays applied to the running detector either way, because a mask exists to stop something being seen and has to take effect even when the disk will not take it; what is lost is only that it survives a restart.
 
-A fourth per-camera control, the **detection mask**, is painted on the same 16×12 grid but works one stage later and independently of motion detection. Its cells read as "the vision model never sees these pixels": every cell painted here is blacked out of every frame handed to the Ollama vision model before JPEG encoding, in the crop's own coordinate space (the cell rectangle is intersected with each crop and translated, so masked pixels are removed no matter how the frame was cropped — including the full-frame crop a lighting change can force). Motion detection is untouched; only classification is suppressed. Use it for a stationary nuisance object — a parked car that would otherwise be reported as "car" whenever a full-frame crop briefly includes it. The web UI's mask editor paints both layers on one grid, switching between the movement mask (red) and detection mask (orange) with a layer toggle. The detection mask defaults to all-off and is persisted alongside the other settings in `motion_settings.json`.
+A fourth per-camera control, the **detection mask**, is painted on the same 16×12 grid but works one stage later and independently of motion detection. Its cells read as "the vision model never sees these pixels": every cell painted here is blacked out of every frame handed to the object detector (the Ollama vision model or the tpue service) before JPEG encoding, in the crop's own coordinate space (the cell rectangle is intersected with each crop and translated, so masked pixels are removed no matter how the frame was cropped — including the full-frame crop a lighting change can force). Motion detection is untouched; only classification is suppressed. Use it for a stationary nuisance object — a parked car that would otherwise be reported as "car" whenever a full-frame crop briefly includes it. The web UI's mask editor paints both layers on one grid, switching between the movement mask (red) and detection mask (orange) with a layer toggle. The detection mask defaults to all-off and is persisted alongside the other settings in `motion_settings.json`.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/diagrams/04-detection-dark.svg">
-  <img alt="A motion event is subsampled to four frames, cropped using motion bounding boxes, JPEG-encoded, and queued to the single global serial detection worker, which talks to Ollama one request at a time, records verdicts in the detection store, and upgrades events via the warm writer" src="docs/diagrams/04-detection-light.svg">
+  <img alt="A motion event is subsampled to four frames, cropped using motion bounding boxes, JPEG-encoded, and queued to the single global serial detection worker, which talks to the detection backend (Ollama or tpue) one request at a time, records verdicts in the detection store, and upgrades events via the warm writer" src="docs/diagrams/04-detection-light.svg">
 </picture>
 
-The Motion Store keeps track of motion events. If there are several segments in sequence that have movements, they are considered a single motion event. We sample four frames from each event at 0/3, 1/3, 2/3 and 3/3 — one from each of four segments spread across the run, each carrying the motion bounding boxes measured on that segment. Only four ever reach the model, and only a handful are ever held: frames are thinned as they are decoded rather than collected and then reduced, so what a run costs in memory follows the four it keeps rather than the length of the run or the `sample_fps` it was decoded at. At the model's input resolution one raw frame is 6 MB, and collecting a run's worth first put hundreds of megabytes live at once. The few segments preceding the run are still fed to the decoder — ffmpeg emits nothing until it has probed that much input — but their footage predates the motion, so it is decoded and dropped, and the pipe is drained before the run's own segments are read so that late-arriving probe frames are not taken for the run's. That drain reaches what has arrived, not what is still inside ffmpeg, so each segment also keeps a spare frame: a decoder running a beat behind its segments costs the strip a frame rather than the whole strip. Using bounding boxes from the motion event, we crop the image to "zoom in" to the action, JPEG-encode the crops, and enqueue them as a job for a single global detection worker shared by all cameras. The worker is strictly serial — at most one in-flight Ollama request at any time — so a modest GPU is never hit with parallel load, and the analyzer never waits for the model: if the small queue is full the job is simply dropped with a warning (the motion event still records; only the object classification is lost).
+The Motion Store keeps track of motion events. If there are several segments in sequence that have movements, they are considered a single motion event. We sample four frames from each event at 0/3, 1/3, 2/3 and 3/3 — one from each of four segments spread across the run, each carrying the motion bounding boxes measured on that segment. Only four ever reach the model, and only a handful are ever held: frames are thinned as they are decoded rather than collected and then reduced, so what a run costs in memory follows the four it keeps rather than the length of the run or the `sample_fps` it was decoded at. At the model's input resolution one raw frame is 6 MB, and collecting a run's worth first put hundreds of megabytes live at once. The few segments preceding the run are still fed to the decoder — ffmpeg emits nothing until it has probed that much input — but their footage predates the motion, so it is decoded and dropped, and the pipe is drained before the run's own segments are read so that late-arriving probe frames are not taken for the run's. That drain reaches what has arrived, not what is still inside ffmpeg, so each segment also keeps a spare frame: a decoder running a beat behind its segments costs the strip a frame rather than the whole strip. Using bounding boxes from the motion event, we crop the image to "zoom in" to the action, JPEG-encode the crops, and enqueue them as a job for a single global detection worker shared by all cameras. The worker is strictly serial — at most one in-flight detector request at any time — so a modest GPU or Edge TPU is never hit with parallel load, and the analyzer never waits for the model: if the small queue is full the job is simply dropped with a warning (the motion event still records; only the object classification is lost).
 
-The model is asked for structured output: the request carries a JSON schema (via Ollama's `format` field) with the configured class list as an enum, so the response is machine-parseable JSON with per-detection class, confidence, and a normalized bounding box. Responses are validated — out-of-range confidences, garbage boxes, and unknown classes are dropped. Every valid detection is recorded — there is no learned suppression that could silently drop a real detection. To stop a persistently busy area (a tree, a road) from generating events, paint it into the per-camera movement mask; to stop a stationary object (a parked car) from being classified without suppressing motion there, paint it into the per-camera detection mask, which blacks those cells out of every frame sent to the vision model.
+With `backend = "tpue"`, the crops go to a [tpue](https://github.com/nsg/tpue) Coral Edge TPU service as raw JPEG bodies instead, and the configured class list is passed as the request allowlist. tpue answers in tens of milliseconds rather than tens of seconds and applies its own per-class confidence thresholds, tuned for its quantized models, so camon's `confidence_threshold` is not applied to its results; the same validation of classes and boxes is.
+
+With the Ollama backend the model is asked for structured output: the request carries a JSON schema (via Ollama's `format` field) with the configured class list as an enum, so the response is machine-parseable JSON with per-detection class, confidence, and a normalized bounding box. Responses are validated — out-of-range confidences, garbage boxes, and unknown classes are dropped. Every valid detection is recorded — there is no learned suppression that could silently drop a real detection. To stop a persistently busy area (a tree, a road) from generating events, paint it into the per-camera movement mask; to stop a stationary object (a parked car) from being classified without suppressing motion there, paint it into the per-camera detection mask, which blacks those cells out of every frame sent to the vision model.
 
 We are still running in RAM, our 10 minute video buffer and some metadata stored in the motion and detection stores. At this stage we should have enough information to only save events that we care about on disk!
 
@@ -71,7 +73,7 @@ We are still running in RAM, our 10 minute video buffer and some metadata stored
 
 The moment a motion run ends (post-padding elapsed), the analyzer assembles the complete event — pre-padding, motion, and post-padding pulled straight from the hot buffer, plus metadata from the motion and detection stores — and hands it to the warm writer, which persists it to disk immediately. This way an event only stays at risk in RAM for seconds after it ends, not until its segments age out of the buffer. The writer also saves metadata and thumbnails that is used by the web UI. User can stream saved video events via HLS.
 
-Event writes never wait for the vision model. If an Ollama verdict arrives while the run is still open, it is picked up during assembly as before; if it arrives after the event is already on disk, the detection worker asks the warm writer to upgrade it post-hoc — the sidecar is rewritten with the detections and the files move from `movements/` to `objects/`, which switches the event to the longer object retention. All file mutations go through the warm writer, so writes and upgrades can never race. If a verdict lands in the tiny window while the event is being assembled, worst case the event simply stays movement-classified with the detections still visible in the detection store and API.
+Event writes never wait for the vision model. If a verdict arrives while the run is still open, it is picked up during assembly as before; if it arrives after the event is already on disk, the detection worker asks the warm writer to upgrade it post-hoc — the sidecar is rewritten with the detections and the files move from `movements/` to `objects/`, which switches the event to the longer object retention. All file mutations go through the warm writer, so writes and upgrades can never race. If a verdict lands in the tiny window while the event is being assembled, worst case the event simply stays movement-classified with the detections still visible in the detection store and API.
 
 ### Recording modes
 
@@ -262,22 +264,25 @@ var_threshold = 16
 # Minimum object size in foreground pixels. Range 50-2000 (default: 200).
 min_contour_area = 200
 
-# Object detection via Ollama (requires analytics enabled).
+# Object detection via Ollama or a tpue Edge TPU service (requires analytics enabled).
 # One global worker serves all cameras, strictly serially (max one in-flight
-# request); events never wait for the model.
+# request); events never wait for the detector.
 [analytics.object_detection]
 # Enable object detection on motion segments (default: false)
 enabled = true
-# Minimum confidence threshold (default: 0.5). Between 0.0 and 1.0; outside
-# that it is clamped with a warning. TOML's nan is refused at startup — it
-# filters nothing rather than everything, silently.
+# Backend to use: "ollama" (default) or "tpue".
+# backend = "ollama"
+# Minimum confidence threshold for the Ollama backend only (default: 0.5).
+# Between 0.0 and 1.0; outside that it is clamped with a warning. TOML's nan is
+# refused at startup — it filters nothing rather than everything, silently.
 confidence_threshold = 0.5
 # Object classes to detect. Omit the key for the defaults (person, car,
 # truck, dog, cat). While detection is enabled the list may not be empty and
 # no entry may be blank — "detect nothing" is what enabled = false says.
-# Also constrains the model's structured JSON output. Trimmed, lower-cased
-# and deduplicated at load, and while [mqtt] is enabled a class may not
-# contain "+" or "#" — it reaches the occupancy topic verbatim.
+# Constrains Ollama's structured JSON output and is sent to tpue as its request
+# allowlist. Trimmed, lower-cased and deduplicated at load, and while [mqtt] is
+# enabled a class may not contain "+" or "#" — it reaches the occupancy topic
+# verbatim.
 classes = ["person", "car", "truck", "dog", "cat"]
 
 [analytics.object_detection.ollama]
@@ -294,6 +299,14 @@ timeout_secs = 90
 # [analytics.object_detection.ollama.fallback]
 # url = "http://backup:11434"
 # model = "gemma3:4b"
+
+# [analytics.object_detection.tpue]
+# url = "http://localhost:8700"
+# model = "yolov9s-512" # Omit to use the server default.
+# timeout_secs = 10
+# threshold = 0.2 # Only set deliberately: quantized models' per-class
+#                 # thresholds are tuned server-side.
+# max_detections = 15
 
 [storage]
 # Enable warm storage — write video to disk (default: true).

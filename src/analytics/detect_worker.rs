@@ -13,7 +13,9 @@ use crate::storage::{
     DetectionDebugStore, DetectionEntry, DetectionStore, EventRegistry, Verdict, VerdictId,
 };
 
-use super::ollama::{Detection, OllamaClient};
+use super::detector::{Detection, Detector};
+#[cfg(test)]
+use super::{OllamaClient, TpueClient};
 
 /// Jobs held per camera before the oldest is evicted.
 pub const DETECT_QUEUE_PER_CAMERA_CAP: usize = 32;
@@ -46,7 +48,7 @@ pub struct DetectionJob {
 }
 
 pub struct DetectionWorker {
-    client: OllamaClient,
+    client: Detector,
     detection_store: DetectionStore,
     debug_store: Option<DetectionDebugStore>,
     /// Registry + writer channels are only present when warm storage is
@@ -59,7 +61,7 @@ pub struct DetectionWorker {
 
 impl DetectionWorker {
     pub fn new(
-        client: OllamaClient,
+        client: Detector,
         detection_store: DetectionStore,
         debug_store: Option<DetectionDebugStore>,
         event_registry: Option<EventRegistry>,
@@ -82,8 +84,8 @@ impl DetectionWorker {
     pub async fn run(self, queue: Arc<DetectQueue>) {
         // Surface a typo'd model name in seconds rather than as a string of
         // silent detection failures.
-        self.client.check_models().await;
-        tracing::info!(model = %self.client.model(), "detection worker started (serial, one in-flight request)");
+        self.client.check_ready().await;
+        tracing::info!(backend = self.client.backend(), model = %self.client.model(), "detection worker started (serial, one in-flight request)");
         while let Some(job) = queue.recv().await {
             self.process_job(job).await;
         }
@@ -134,9 +136,10 @@ impl DetectionWorker {
         }
         tracing::debug!(
             camera = %job.camera_id,
+            backend = self.client.backend(),
             count = detections.len(),
             classes = ?detections.iter().map(|d| &d.class_name).collect::<Vec<_>>(),
-            "ollama detections"
+            "detections"
         );
 
         let (classes, confidences) = deduplicate_by_class(&detections);
@@ -188,7 +191,7 @@ impl DetectionWorker {
                         object_class: class.clone(),
                         confidence,
                         frame_jpeg: Arc::clone(&frame_jpeg),
-                        backend: "ollama".to_string(),
+                        backend: self.client.backend().to_string(),
                         model: model.to_string(),
                     },
                 );
@@ -217,7 +220,7 @@ impl DetectionWorker {
                     confidence: d.confidence,
                 })
                 .collect(),
-            backend: "ollama".to_string(),
+            backend: self.client.backend().to_string(),
             model: model.to_string(),
         };
         let targets = registry.deliver_verdict(&job.camera_id, &job.seqs, &verdict);
@@ -265,7 +268,7 @@ impl DetectionWorker {
         if job.crop_jpegs.is_empty() {
             return;
         }
-        // Map ollama bboxes from crop space back to full-frame space.
+        // Map detector bboxes from crop space back to full-frame space.
         let ollama_rects: Vec<(String, f32, f32, f32, f32)> = detections
             .iter()
             .filter_map(|d| {
@@ -589,15 +592,17 @@ mod tests {
     #[tokio::test]
     async fn a_job_the_model_answered_nothing_for_is_still_reported_back() {
         let registry = EventRegistry::new(&["cam".to_string()]);
-        let client = OllamaClient::new(
-            "http://127.0.0.1:1",
-            "test-model",
-            1,
-            0.5,
-            vec!["person".to_string()],
-            None,
-        )
-        .expect("client");
+        let client = Detector::Ollama(
+            OllamaClient::new(
+                "http://127.0.0.1:1",
+                "test-model",
+                1,
+                0.5,
+                vec!["person".to_string()],
+                None,
+            )
+            .expect("client"),
+        );
         let worker = DetectionWorker::new(
             client,
             DetectionStore::new(&["cam".to_string()]),
@@ -648,6 +653,59 @@ mod tests {
         format!("http://{addr}")
     }
 
+    #[tokio::test]
+    async fn tpue_worker_records_its_backend() {
+        let app = axum::Router::new()
+            .route(
+                "/v1/detect",
+                axum::routing::post(|| async {
+                    axum::Json(serde_json::json!({
+                        "detections": [{
+                            "class":"person", "confidence":0.9,
+                            "x":0.1, "y":0.1, "w":0.2, "h":0.2
+                        }],
+                        "model":"yolov9s-512"
+                    }))
+                }),
+            )
+            .route(
+                "/healthz",
+                axum::routing::get(|| async {
+                    axum::Json(serde_json::json!({
+                        "status":"ok", "model":"yolov9s-512", "device":"usb"
+                    }))
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let store = DetectionStore::new(&["cam".to_string()]);
+        let detector = Detector::Tpue(
+            TpueClient::new(
+                &format!("http://{address}"),
+                None,
+                5,
+                None,
+                15,
+                vec!["person".to_string()],
+            )
+            .unwrap(),
+        );
+        let worker =
+            DetectionWorker::new(detector, store.clone(), None, None, HashMap::new(), None);
+        let (tx, queue) = detect_queue(None);
+        tx.send(job("cam", vec![7]));
+        drop(tx);
+
+        worker.run(queue).await;
+
+        let entries = store.get_detection_info("cam", 7);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].backend, "tpue");
+        assert_eq!(entries[0].model, "yolov9s-512");
+    }
+
     fn worker_for(
         url: &str,
         cameras: &[&str],
@@ -655,8 +713,10 @@ mod tests {
         event_senders: HashMap<String, mpsc::Sender<WriterMessage>>,
     ) -> DetectionWorker {
         let ids: Vec<String> = cameras.iter().map(|c| (*c).to_string()).collect();
-        let client = OllamaClient::new(url, "test-model", 5, 0.5, vec!["person".to_string()], None)
-            .expect("client");
+        let client = Detector::Ollama(
+            OllamaClient::new(url, "test-model", 5, 0.5, vec!["person".to_string()], None)
+                .expect("client"),
+        );
         DetectionWorker::new(
             client,
             DetectionStore::new(&ids),
@@ -912,15 +972,17 @@ mod tests {
     }
 
     fn worker_with(debug_store: &DetectionDebugStore) -> DetectionWorker {
-        let client = OllamaClient::new(
-            "http://127.0.0.1:1",
-            "test-model",
-            1,
-            0.5,
-            vec!["person".to_string()],
-            None,
-        )
-        .expect("client");
+        let client = Detector::Ollama(
+            OllamaClient::new(
+                "http://127.0.0.1:1",
+                "test-model",
+                1,
+                0.5,
+                vec!["person".to_string()],
+                None,
+            )
+            .expect("client"),
+        );
         DetectionWorker::new(
             client,
             DetectionStore::new(&["cam".to_string()]),

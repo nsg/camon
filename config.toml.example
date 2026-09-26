@@ -150,29 +150,31 @@ min_contour_area = 200
 # Foreground pixels removed from a quiet cell per relaxation step.
 # tuner_relax_step = 100
 
-# Object detection via Ollama (requires analytics enabled).
+# Object detection via Ollama or a tpue Edge TPU service (requires analytics enabled).
 # All cameras share ONE detection worker that sends at most one request to
-# Ollama at a time (strictly serial — kind to modest GPUs). Motion detection
-# and event recording never wait for the model: events are written the moment
-# a motion run ends and upgraded to object events when a verdict arrives.
+# the selected backend at a time (strictly serial). Motion detection and event
+# recording never wait for the detector: events are written the moment a
+# motion run ends and upgraded to object events when a verdict arrives.
 [analytics.object_detection]
 # Enable object detection on motion segments (default: false)
 enabled = true
-# Minimum confidence threshold (default: 0.5). Between 0.0 (keep every
-# detection the model reports) and 1.0 (keep only a certain one). A number
-# outside that range is clamped into it with a warning, the same as the motion
-# sliders above. A value that is not a number at all is refused at startup:
-# the filter is "confidence < threshold", which is false for every detection
-# when the threshold is nan, so instead of a stricter detector you would get no
-# filtering whatsoever and never hear about it.
+# Backend to use: "ollama" (default) or "tpue".
+# backend = "ollama"
+# Minimum confidence threshold for the Ollama backend only (default: 0.5).
+# Between 0.0 (keep every detection the model reports) and 1.0 (keep only a
+# certain one). A number outside that range is clamped into it with a warning,
+# the same as the motion sliders above. A value that is not a number at all is
+# refused at startup: the filter is "confidence < threshold", which is false
+# for every detection when the threshold is nan, so instead of a stricter
+# detector you would get no filtering whatsoever and never hear about it.
 confidence_threshold = 0.5
 # Object classes to detect. Omit the key for the defaults (person, car,
 # truck, dog, cat). While enabled = true above, the list may not be empty and
 # no entry may be blank: "detect nothing" is what enabled = false says, and
 # camon will not guess which of the two an empty list meant.
-# Also constrains the model's structured JSON output — only these classes can
-# be returned. Trimmed, folded to lower case and deduplicated at load, so the
-# Home Assistant entities and the model prompt always agree on the spelling.
+# Constrains Ollama's structured JSON output and is sent to tpue as its request
+# allowlist. Trimmed, folded to lower case and deduplicated at load, so the Home
+# Assistant entities and the selected backend always agree on the spelling.
 classes = ["person", "car", "truck", "dog", "cat"]
 
 [analytics.object_detection.ollama]
@@ -191,6 +193,14 @@ timeout_secs = 90
 # [analytics.object_detection.ollama.fallback]
 # url = "http://backup:11434"
 # model = "gemma3:4b"
+
+# [analytics.object_detection.tpue]
+# url = "http://localhost:8700"
+# model = "yolov9s-512" # Omit to use the server default.
+# timeout_secs = 10
+# threshold = 0.2 # Only set deliberately: quantized models' per-class
+#                 # thresholds are tuned server-side.
+# max_detections = 15
 
 [storage]
 # Enable warm storage — write video to disk (default: true).
