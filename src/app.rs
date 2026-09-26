@@ -603,7 +603,13 @@ fn spawn_cameras(ctx: &SpawnContext, cameras: Vec<config::CameraConfig>) -> Came
         let handle = ctx
             .supervisor
             .critical(format!("camera:{camera_id}"), async move {
-                run_camera(cam_config, buffer_clone, shutdown_clone).await;
+                run_camera(
+                    cam_config,
+                    camera::StreamTracks::VideoAndAudio,
+                    buffer_clone,
+                    shutdown_clone,
+                )
+                .await;
             });
         handles
             .pipeline_handles
@@ -627,7 +633,13 @@ fn spawn_cameras(ctx: &SpawnContext, cameras: Vec<config::CameraConfig>) -> Came
             let handle = ctx
                 .supervisor
                 .critical(format!("camera:{camera_id}:sub"), async move {
-                    run_camera(sub_config, buffer_clone, shutdown_clone).await;
+                    run_camera(
+                        sub_config,
+                        camera::StreamTracks::VideoOnly,
+                        buffer_clone,
+                        shutdown_clone,
+                    )
+                    .await;
                 });
             handles.pipeline_handles.push((sub_id, handle, sub_buffer));
         }
@@ -1231,6 +1243,7 @@ fn next_backoff_secs(current: u64) -> u64 {
 
 async fn run_camera(
     config: config::CameraConfig,
+    tracks: camera::StreamTracks,
     buffer: Arc<RwLock<HotBuffer>>,
     shutdown: ShutdownSignal,
 ) {
@@ -1260,7 +1273,7 @@ async fn run_camera(
     while !shutdown.requested() {
         tracing::info!(camera = %camera_id, url = %config.redacted_url(), "connecting to camera");
 
-        let pipeline = FfmpegPipeline::new(&config, Arc::clone(&buffer));
+        let pipeline = FfmpegPipeline::new(&config, tracks, Arc::clone(&buffer));
         let shutdown_ref = Arc::clone(&shutdown.flag);
 
         let started = std::time::Instant::now();

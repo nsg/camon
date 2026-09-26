@@ -419,7 +419,7 @@ url = "rtsp://admin:password@192.168.1.100:554/stream1"
 - GOP (keyframe interval) of 1–2 seconds
 - Bitrate ~6 Mbps (CBR or capped VBR)
 
-If the camera exposes a low-resolution H.264 substream, configure it as `sub_url` with the same 1–2 second GOP. Camon uses it only for the multi-camera grid; recording, analytics, and the single-camera live view always use the main `url`.
+If the camera exposes a low-resolution H.264 substream, configure it as `sub_url` with the same 1–2 second GOP. Camon uses it only for the multi-camera grid and ingests it without audio, since the grid is muted and a camera's audio clock can drift far enough from its video over a long session to stall playback. Recording, analytics, and the single-camera live view always use the main `url`.
 
 ## API
 

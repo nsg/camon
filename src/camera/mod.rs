@@ -2,4 +2,4 @@
 // (`rtsp::StreamFailure`), which a re-export cannot make nameable on its own.
 pub mod rtsp;
 
-pub use rtsp::{FfmpegPipeline, NoRecordingTracker, RtspError};
+pub use rtsp::{FfmpegPipeline, NoRecordingTracker, RtspError, StreamTracks};

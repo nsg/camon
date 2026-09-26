@@ -324,17 +324,39 @@ impl NoRecordingTracker {
     }
 }
 
+/// Which elementary streams a pipeline copies out of the camera.
+///
+/// The grid substream is `VideoOnly`: the grid is always muted, and a camera's
+/// audio clock can drift tens of seconds from its video over a long session.
+/// hls.js does not realign such audio when live playback starts mid-playlist,
+/// so the tile never gets a playable range and stalls at `readyState = 1`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamTracks {
+    VideoAndAudio,
+    VideoOnly,
+}
+
+/// Audio further than this from video at stream start is worth a warning: a
+/// browser can no longer hide the gap behind its startup buffer.
+const AV_OFFSET_WARN_MS: i64 = 1_000;
+
 pub struct FfmpegPipeline {
     camera_id: String,
     url: String,
+    tracks: StreamTracks,
     buffer: Arc<RwLock<HotBuffer>>,
 }
 
 impl FfmpegPipeline {
-    pub fn new(config: &CameraConfig, buffer: Arc<RwLock<HotBuffer>>) -> Self {
+    pub fn new(
+        config: &CameraConfig,
+        tracks: StreamTracks,
+        buffer: Arc<RwLock<HotBuffer>>,
+    ) -> Self {
         Self {
             camera_id: config.id.clone(),
             url: config.url.clone(),
+            tracks,
             buffer,
         }
     }
@@ -382,24 +404,7 @@ impl FfmpegPipeline {
 
     fn spawn_ffmpeg(&self) -> Result<Child, RtspError> {
         Command::new("ffmpeg")
-            .args([
-                "-hide_banner",
-                "-loglevel",
-                "warning",
-                "-rtsp_transport",
-                "tcp",
-                "-timeout",
-                "10000000",
-                "-i",
-                &self.url,
-                "-c:v",
-                "copy",
-                "-c:a",
-                "copy",
-                "-f",
-                "mpegts",
-                "-",
-            ])
+            .args(ffmpeg_args(&self.url, self.tracks))
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -426,6 +431,30 @@ impl FfmpegPipeline {
     }
 }
 
+/// Arguments for the ffmpeg process that copies a camera's stream into MPEG-TS
+/// on stdout. Video is always stream-copied; audio is copied or dropped.
+fn ffmpeg_args(url: &str, tracks: StreamTracks) -> Vec<&str> {
+    let mut args = vec![
+        "-hide_banner",
+        "-loglevel",
+        "warning",
+        "-rtsp_transport",
+        "tcp",
+        "-timeout",
+        "10000000",
+        "-i",
+        url,
+        "-c:v",
+        "copy",
+    ];
+    match tracks {
+        StreamTracks::VideoAndAudio => args.extend(["-c:a", "copy"]),
+        StreamTracks::VideoOnly => args.push("-an"),
+    }
+    args.extend(["-f", "mpegts", "-"]);
+    args
+}
+
 /// The GOP being filled, paired with the monotonic instant the segmenter opened it at.
 struct OpenSegment {
     segment: GopSegment,
@@ -442,6 +471,13 @@ struct MpegTsSegmenter {
     /// once at finalize time so readers share it without copying.
     current_data: Vec<u8>,
     video_pid: Option<u16>,
+    audio_pid: Option<u16>,
+    /// First PTS seen on each track, kept until both are known and their
+    /// separation has been reported once per run.
+    first_video_pts: Option<u64>,
+    first_audio_pts: Option<u64>,
+    /// Audio's first PTS relative to video's, positive when audio leads.
+    av_offset_ms: Option<i64>,
     pat_packet: Option<[u8; 188]>,
     pmt_packet: Option<[u8; 188]>,
     pmt_pid: Option<u16>,
@@ -466,6 +502,10 @@ impl MpegTsSegmenter {
             current_segment: None,
             current_data: Vec::new(),
             video_pid: None,
+            audio_pid: None,
+            first_video_pts: None,
+            first_audio_pts: None,
+            av_offset_ms: None,
             pat_packet: None,
             pmt_packet: None,
             pmt_pid: None,
@@ -626,7 +666,16 @@ impl MpegTsSegmenter {
             if pusi {
                 if let Some(pts) = crate::mpegts::extract_pes_pts(packet) {
                     self.current_media_pts = Some(pts);
+                    if self.first_video_pts.is_none() {
+                        self.first_video_pts = Some(pts);
+                        self.report_av_offset();
+                    }
                 }
+            }
+        } else if Some(pid) == self.audio_pid && pusi && self.first_audio_pts.is_none() {
+            if let Some(pts) = crate::mpegts::extract_pes_pts(packet) {
+                self.first_audio_pts = Some(pts);
+                self.report_av_offset();
             }
         }
 
@@ -699,6 +748,33 @@ impl MpegTsSegmenter {
         }
     }
 
+    /// Log how far the audio timeline sits from the video one, once the first
+    /// PTS of each is known. Only the first pair is compared: what a player
+    /// sees at startup is what decides whether the stream plays at all.
+    fn report_av_offset(&mut self) {
+        let (Some(video), Some(audio)) = (self.first_video_pts, self.first_audio_pts) else {
+            return;
+        };
+        if self.av_offset_ms.is_some() {
+            return;
+        }
+        let ahead = crate::mpegts::pts_delta_ms(video, audio) as i64;
+        let behind = crate::mpegts::pts_delta_ms(audio, video) as i64;
+        let offset_ms = if ahead <= behind { ahead } else { -behind };
+        self.av_offset_ms = Some(offset_ms);
+        if offset_ms.abs() > AV_OFFSET_WARN_MS {
+            tracing::warn!(
+                camera = %self.camera_id,
+                offset_ms,
+                "audio timeline starts {:.1}s {} video; players may fail to align the tracks",
+                offset_ms.abs() as f64 / 1000.0,
+                if offset_ms > 0 { "ahead of" } else { "behind" }
+            );
+        } else {
+            tracing::debug!(camera = %self.camera_id, offset_ms, "audio/video start offset");
+        }
+    }
+
     /// Take the PMT PID from the first entry the PAT lists.
     fn parse_pat(&mut self, packet: &[u8]) {
         let start = match table_section_start(packet) {
@@ -758,10 +834,20 @@ impl MpegTsSegmenter {
                 self.video_pid_at = Some(Instant::now());
                 tracing::debug!(camera = %self.camera_id, video_pid = elem_pid, "detected H.264 video PID");
             }
+            if is_audio_stream_type(stream_type) && self.audio_pid.is_none() {
+                self.audio_pid = Some(elem_pid);
+                tracing::debug!(camera = %self.camera_id, audio_pid = elem_pid, "detected audio PID");
+            }
 
             pos += 5 + es_info_len;
         }
     }
+}
+
+/// MPEG-1/2 audio, AAC (ADTS and LATM) and AC-3, the audio codecs an IP camera
+/// is likely to put next to its H.264.
+fn is_audio_stream_type(stream_type: u8) -> bool {
+    matches!(stream_type, 0x03 | 0x04 | 0x0F | 0x11 | 0x81)
 }
 
 /// Where the contents of the PSI section beginning at `start` end: one past the last byte a
@@ -913,8 +999,68 @@ mod tests {
         p
     }
 
+    /// A program map listing H.264 video and AAC audio.
+    fn pmt_av() -> [u8; TS_PACKET_SIZE] {
+        let mut p = pmt(H264, VIDEO_PID);
+        p[7] = 0x17; // section length: one more five-byte stream entry
+        p[22..27].copy_from_slice(&[
+            0x0F,
+            0xE0 | (AUDIO_PID >> 8) as u8,
+            AUDIO_PID as u8,
+            0xF0,
+            0x00,
+        ]);
+        p
+    }
+
     fn segmenter() -> MpegTsSegmenter {
         MpegTsSegmenter::new("cam".to_string(), HotBuffer::new("cam".to_string(), 60))
+    }
+
+    fn av_offset(video_pts: u64, audio_pts: u64) -> Option<i64> {
+        let mut segmenter = segmenter();
+        for packet in [pat(PMT_PID), pmt_av()] {
+            segmenter.process(&packet);
+        }
+        segmenter.process(&pes_packet(AUDIO_PID, audio_pts));
+        segmenter.process(&pes_packet(VIDEO_PID, video_pts));
+        segmenter.process(&pes_packet(AUDIO_PID, audio_pts + 90_000));
+        segmenter.process(&pes_packet(VIDEO_PID, video_pts + 90_000));
+        segmenter.av_offset_ms
+    }
+
+    #[test]
+    fn the_substream_is_copied_without_audio() {
+        let args = ffmpeg_args("rtsp://cam/sub", StreamTracks::VideoOnly);
+        assert!(args.contains(&"-an"), "{args:?}");
+        assert!(!args.contains(&"-c:a"), "{args:?}");
+        assert!(args.windows(2).any(|w| w == ["-c:v", "copy"]), "{args:?}");
+        assert_eq!(args.last(), Some(&"-"));
+    }
+
+    #[test]
+    fn the_main_stream_keeps_its_audio() {
+        let args = ffmpeg_args("rtsp://cam/main", StreamTracks::VideoAndAudio);
+        assert!(args.windows(2).any(|w| w == ["-c:a", "copy"]), "{args:?}");
+        assert!(!args.contains(&"-an"), "{args:?}");
+    }
+
+    #[test]
+    fn audio_leading_video_is_measured_from_the_first_pts_of_each() {
+        assert_eq!(av_offset(0, 36 * 90_000), Some(36_000));
+        assert_eq!(av_offset(90_000, 0), Some(-1_000));
+        assert_eq!(av_offset(0, 0), Some(0));
+    }
+
+    #[test]
+    fn a_stream_without_audio_reports_no_offset() {
+        let mut segmenter = segmenter();
+        for packet in [pat(PMT_PID), pmt(H264, VIDEO_PID)] {
+            segmenter.process(&packet);
+        }
+        segmenter.process(&pes_packet(VIDEO_PID, 0));
+        segmenter.process(&pes_packet(AUDIO_PID, 90_000));
+        assert_eq!(segmenter.av_offset_ms, None);
     }
 
     fn segment_stats(packets: &[[u8; TS_PACKET_SIZE]]) -> StreamStats {
