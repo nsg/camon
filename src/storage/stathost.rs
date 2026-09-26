@@ -1667,7 +1667,8 @@ impl WarmStorageBackend for StathostBackend {
         self.http
             .get(&thumb_key(camera_id, &stem, 0))
             .await
-            .map_err(|_| ThumbnailError::ReadFailed)
+            .map_err(reqwest_io)
+            .map_err(ThumbnailError::ReadFailed)
     }
 
     async fn read_filmstrip(
@@ -1936,7 +1937,16 @@ fn recoverable(e: &reqwest::Error) -> Recovery {
 }
 
 fn reqwest_io(e: reqwest::Error) -> std::io::Error {
-    std::io::Error::other(e)
+    let kind = if e.is_timeout() {
+        std::io::ErrorKind::TimedOut
+    } else if e.is_connect() {
+        std::io::ErrorKind::ConnectionRefused
+    } else if e.status() == Some(reqwest::StatusCode::NOT_FOUND) {
+        std::io::ErrorKind::NotFound
+    } else {
+        std::io::ErrorKind::Other
+    };
+    std::io::Error::new(kind, e)
 }
 
 /// Parse a `206` `Content-Range: bytes start-end/total` into its three numbers.

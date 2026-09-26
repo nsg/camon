@@ -3137,6 +3137,60 @@ async fn read_thumbnail_errors_when_no_filmstrip() {
 }
 
 #[tokio::test]
+async fn read_video_reports_not_found_for_a_missing_object() {
+    let (url, stub) = spawn_stub("secret").await;
+    let backend = backend_for(&url, "secret", 0);
+    backend.write_event("cam", &movement_event(7_100, 30)).await;
+    let entry = backend.find_event("cam", url_key(7_100, 1000)).unwrap();
+    stub.files.lock().unwrap().remove("cam/7100_1000.ts");
+
+    let error = backend
+        .read_video("cam", &entry, None)
+        .await
+        .err()
+        .expect("a missing object was served");
+
+    assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+}
+
+#[tokio::test(start_paused = true)]
+async fn read_video_reports_timed_out_when_the_store_does_not_answer() {
+    let (url, stub) = spawn_stub("secret").await;
+    let backend = backend_for(&url, "secret", 0);
+    backend.write_event("cam", &movement_event(7_200, 30)).await;
+    let entry = backend.find_event("cam", url_key(7_200, 1000)).unwrap();
+    stub.get_delay_ms.store(
+        (STREAM_READ_TIMEOUT + Duration::from_secs(1)).as_millis() as u64,
+        Ordering::SeqCst,
+    );
+
+    let error = backend
+        .read_video("cam", &entry, None)
+        .await
+        .err()
+        .expect("a request beyond the read timeout succeeded");
+
+    assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+}
+
+#[tokio::test]
+async fn read_video_reports_other_for_a_server_error() {
+    let (url, stub) = spawn_stub("secret").await;
+    let backend = backend_for(&url, "secret", 0);
+    backend.write_event("cam", &movement_event(7_300, 30)).await;
+    let entry = backend.find_event("cam", url_key(7_300, 1000)).unwrap();
+    stub.fail_gets(".ts");
+
+    let error = backend
+        .read_video("cam", &entry, None)
+        .await
+        .err()
+        .expect("a 500 response was served");
+
+    assert_eq!(error.kind(), std::io::ErrorKind::Other);
+}
+
+#[tokio::test]
 async fn read_video_serves_partial_and_suffix_ranges() {
     let (url, _stub) = spawn_stub("secret").await;
     let backend = backend_for(&url, "secret", 0);

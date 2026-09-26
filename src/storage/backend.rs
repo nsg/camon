@@ -32,15 +32,15 @@ pub enum WriteOutcome {
     Failed,
 }
 
-/// Why a thumbnail could not be produced. Every variant is an internal error; a missing *event*
-/// is a not-found decided by the caller, not a thumbnail error. The `&'static str` messages
-/// match the pre-refactor API responses byte-for-byte.
+/// Why a thumbnail could not be produced. Generation failures are internal errors; read failures
+/// retain their I/O kind so callers can distinguish a missing object from an unavailable archive.
+/// The `&'static str` messages match the pre-refactor internal-error responses byte-for-byte.
 #[derive(Debug)]
 pub enum ThumbnailError {
     SpawnFailed,
     ProcessError,
     GenerationFailed,
-    ReadFailed,
+    ReadFailed(std::io::Error),
 }
 
 impl ThumbnailError {
@@ -49,7 +49,7 @@ impl ThumbnailError {
             ThumbnailError::SpawnFailed => "failed to spawn ffmpeg",
             ThumbnailError::ProcessError => "ffmpeg process error",
             ThumbnailError::GenerationFailed => "thumbnail generation failed",
-            ThumbnailError::ReadFailed => "failed to read thumbnail",
+            ThumbnailError::ReadFailed(_) => "failed to read thumbnail",
         }
     }
 }
@@ -867,7 +867,7 @@ where
     generate().await?;
     tokio::fs::read(thumb_path)
         .await
-        .map_err(|_| ThumbnailError::ReadFailed)
+        .map_err(ThumbnailError::ReadFailed)
 }
 
 /// How long one poster render may take before its ffmpeg is killed.
@@ -2176,6 +2176,6 @@ mod tests {
         let err = read_or_generate_thumbnail(&flight, &path, || async { Ok(()) })
             .await
             .unwrap_err();
-        assert!(matches!(err, ThumbnailError::ReadFailed));
+        assert!(matches!(err, ThumbnailError::ReadFailed(_)));
     }
 }

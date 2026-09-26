@@ -1058,14 +1058,28 @@ async fn warm_segment_handler(
 
 /// What a failed read of an indexed event answers.
 fn video_error_response(error: &std::io::Error) -> Response {
-    if error.kind() == std::io::ErrorKind::InvalidData {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "storage could not serve the event",
+    archive_read_error_response(error, "event file not found")
+}
+
+/// Map an archive read failure without returning its potentially sensitive source text.
+fn archive_read_error_response(error: &std::io::Error, missing_message: &'static str) -> Response {
+    let kind = error.kind();
+    tracing::warn!(?kind, "archive read failed");
+
+    match kind {
+        std::io::ErrorKind::NotFound => (StatusCode::NOT_FOUND, missing_message).into_response(),
+        std::io::ErrorKind::TimedOut => (
+            StatusCode::GATEWAY_TIMEOUT,
+            "archive timed out while serving the event",
         )
-            .into_response();
+            .into_response(),
+        std::io::ErrorKind::InvalidData => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "archive returned invalid event data",
+        )
+            .into_response(),
+        _ => (StatusCode::BAD_GATEWAY, "archive could not serve the event").into_response(),
     }
-    (StatusCode::NOT_FOUND, "event file not found").into_response()
 }
 
 /// Turn a streamed [`VideoStream`] into an HTTP response: `206` for a satisfied
@@ -1159,7 +1173,12 @@ async fn warm_thumbnail_handler(
 }
 
 fn thumbnail_error_response(e: ThumbnailError) -> Response {
-    (StatusCode::INTERNAL_SERVER_ERROR, e.message()).into_response()
+    match e {
+        ThumbnailError::ReadFailed(error) => {
+            archive_read_error_response(&error, "event thumbnail not found")
+        }
+        error => (StatusCode::INTERNAL_SERVER_ERROR, error.message()).into_response(),
+    }
 }
 
 // Detection debug handlers
@@ -1272,7 +1291,7 @@ async fn warm_filmstrip_handler(
             data,
         )
             .into_response(),
-        Err(_) => (StatusCode::NOT_FOUND, "filmstrip frame not found").into_response(),
+        Err(error) => archive_read_error_response(&error, "filmstrip frame not found"),
     }
 }
 
@@ -2748,21 +2767,48 @@ mod tests {
     }
 
     #[test]
-    fn a_store_that_answered_with_something_else_is_not_a_missing_event() {
-        let refused = video_error_response(&std::io::Error::new(
+    fn a_missing_archive_event_is_not_found() {
+        let response = video_error_response(&std::io::Error::from(std::io::ErrorKind::NotFound));
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn an_archive_timeout_is_a_gateway_timeout() {
+        let response = video_error_response(&std::io::Error::from(std::io::ErrorKind::TimedOut));
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+    }
+
+    #[test]
+    fn an_unavailable_archive_is_a_bad_gateway() {
+        let response =
+            video_error_response(&std::io::Error::from(std::io::ErrorKind::ConnectionRefused));
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[test]
+    fn invalid_archive_data_is_an_internal_error() {
+        let response = video_error_response(&std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "206 without a usable Content-Range",
         ));
-        assert_eq!(refused.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
 
-        for kind in [
-            std::io::ErrorKind::NotFound,
-            std::io::ErrorKind::PermissionDenied,
-            std::io::ErrorKind::ConnectionReset,
-        ] {
-            let missing = video_error_response(&std::io::Error::from(kind));
-            assert_eq!(missing.status(), StatusCode::NOT_FOUND, "{kind:?}");
-        }
+    #[test]
+    fn an_unexpected_archive_failure_is_a_bad_gateway() {
+        let response = video_error_response(&std::io::Error::from(std::io::ErrorKind::Other));
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[test]
+    fn thumbnail_read_failures_use_the_archive_status_mapping() {
+        let response = thumbnail_error_response(ThumbnailError::ReadFailed(
+            std::io::ErrorKind::TimedOut.into(),
+        ));
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+
+        let response = thumbnail_error_response(ThumbnailError::GenerationFailed);
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
     #[test]
