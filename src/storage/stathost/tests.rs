@@ -1029,7 +1029,7 @@ async fn a_listing_that_comes_back_before_the_attempts_run_out_scans_normally() 
         .is_empty());
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn the_retention_tick_heals_an_index_the_startup_scan_never_built() {
     let (url, stub) = spawn_stub("secret").await;
     seed_events(&stub, 1_000_000_000, 2, 1000, "movement");
@@ -1041,10 +1041,19 @@ async fn the_retention_tick_heals_an_index_the_startup_scan_never_built() {
         .is_empty());
 
     stub.serve_lists_again();
+    stub.get_delay_ms.store(
+        (SCAN_STARTUP_BUDGET * 2).as_millis() as u64,
+        Ordering::SeqCst,
+    );
 
+    let started = tokio::time::Instant::now();
     backend
         .prune(1, u64::MAX, u64::MAX, &AtomicBool::new(false))
         .await;
+    assert!(
+        started.elapsed() > SCAN_STARTUP_BUDGET,
+        "the healing scan was cut off by the startup deadline"
+    );
 
     assert!(
         backend
@@ -1128,12 +1137,50 @@ async fn a_listing_that_never_answers_gives_up_on_the_clock_not_the_attempt_coun
     let elapsed = started.elapsed();
 
     assert!(
-        elapsed < SCAN_LISTING_BUDGET * 4,
+        elapsed < SCAN_STARTUP_BUDGET * 4,
         "the startup scan held the cameras for {elapsed:?}"
     );
     assert!(
         stub.lists() < SCAN_ATTEMPTS as usize,
         "spent the attempt count on a host that answers nothing"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_startup_scan_whose_sidecars_never_answer_expires_unscanned() {
+    let (url, stub) = spawn_stub("secret").await;
+    let backend = backend_for(&url, "secret", 1);
+    backend
+        .write_event("cam", &movement_event(1_000_000_000, 30))
+        .await;
+    stub.hold(&stub.hold_gets);
+
+    let started = tokio::time::Instant::now();
+    let error = backend.scan().await.unwrap_err();
+
+    assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+    assert!(
+        stub.gets
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|path| path.ends_with(".json")),
+        "the startup deadline expired before a sidecar read began"
+    );
+    assert!(
+        started.elapsed() <= SCAN_STARTUP_BUDGET,
+        "the startup scan outlived its {SCAN_STARTUP_BUDGET:?} budget"
+    );
+    assert!(
+        backend.scanned_events().is_none(),
+        "a scan that did not finish its sidecar reads enabled retention"
+    );
+    let stored = stub.files.lock().unwrap().len();
+    backend.guard_free_space("cam", 0).await;
+    assert_eq!(stub.files.lock().unwrap().len(), stored);
+    assert!(
+        stub.take_deletes().is_empty(),
+        "budget enforcement deleted against the partial index"
     );
 }
 
@@ -1655,7 +1702,7 @@ async fn a_startup_pass_that_stops_part_way_keeps_what_it_had_read() {
         walked.get() > 4
     };
     let pass = backend
-        .scan_once(ScanKind::Startup, &stop, REQUEST_TIMEOUT)
+        .scan_once(ScanKind::Startup, &stop, REQUEST_TIMEOUT, None)
         .await
         .unwrap();
 
@@ -1973,6 +2020,57 @@ async fn the_sweep_probes_an_orphaned_stem_once() {
         stub.files.lock().unwrap().is_empty(),
         "an orphaned object survived the sweep"
     );
+}
+
+#[tokio::test]
+async fn a_startup_scan_abandons_the_orphan_sweep_at_its_deadline() {
+    let (url, stub) = spawn_stub("secret").await;
+    let backend = Arc::new(backend_for(&url, "secret", 0));
+    backend
+        .write_event("cam", &movement_event(1_000_000_000, 30))
+        .await;
+    {
+        let mut files = stub.files.lock().unwrap();
+        for i in 0..64 {
+            files.insert(format!("cam/{i}_1000.json"), b"{}".to_vec());
+        }
+    }
+    stub.hold(&stub.hold_deletes);
+    let scan = tokio::spawn({
+        let backend = Arc::clone(&backend);
+        async move { backend.scan().await }
+    });
+    wait_until(|| !stub.deletes.lock().unwrap().is_empty()).await;
+    tokio::time::pause();
+    tokio::time::advance(SCAN_STARTUP_BUDGET).await;
+    tokio::task::yield_now().await;
+
+    assert!(
+        scan.is_finished(),
+        "the orphan sweep outlived the startup budget"
+    );
+    scan.await.unwrap().unwrap();
+    assert!(
+        backend.scanned_events().is_some(),
+        "a fully read index was left unscanned because its orphan sweep timed out"
+    );
+    let probes = stub
+        .take_gets()
+        .into_iter()
+        .filter(|path| path.ends_with(".ts"))
+        .count();
+    assert!(probes > 0, "the orphan sweep never started");
+    assert!(
+        probes <= SCAN_CONCURRENCY,
+        "the abandoned sweep issued {probes} probes, beyond its {SCAN_CONCURRENCY}-request \
+         window"
+    );
+    assert!(
+        !stub.take_deletes().is_empty(),
+        "the orphan deletes did not hang"
+    );
+    assert!(stub.has("cam/0_1000.json"), "a hanging delete completed");
+    stub.release(&stub.hold_deletes);
 }
 
 #[tokio::test]

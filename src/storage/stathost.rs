@@ -171,15 +171,17 @@ const SCAN_RETRY: RetrySchedule = RetrySchedule {
 /// series again until one succeeds.
 const SCAN_ATTEMPTS: u32 = 5;
 
-/// Wall clock a *startup* scan may spend failing: listings that never arrived and the waits
-/// between them. Whichever runs out first — this or [`SCAN_ATTEMPTS`] — ends the series.
-#[cfg(not(test))]
-const SCAN_LISTING_BUDGET: Duration = Duration::from_secs(45);
+/// Wall clock a *startup* scan may spend listing and walking the archive, including sidecar
+/// reads and the orphan sweep. Whichever runs out first — this or [`SCAN_ATTEMPTS`] — ends the
+/// series. Healing scans run in the background and have no whole-scan deadline.
 /// Long enough under test that a series of fast refusals never runs into it
 /// (five of those cost about 15ms of waits), short enough that the test which
-/// pins the deadline against a listing that never answers finishes in it.
-#[cfg(test)]
-const SCAN_LISTING_BUDGET: Duration = Duration::from_millis(500);
+/// pins the startup deadline finishes in it.
+const SCAN_STARTUP_BUDGET: Duration = if cfg!(test) {
+    Duration::from_millis(500)
+} else {
+    Duration::from_secs(45)
+};
 
 /// Which scan this is, and so whether it may collect orphaned metadata.
 #[derive(Clone, Copy, PartialEq)]
@@ -201,6 +203,10 @@ enum ScanPass {
     /// inserted are true — they came from the listing — but the archive was not
     /// walked to the end, so the pass says nothing about what else is there.
     Interrupted,
+    /// The startup deadline arrived part-way through the archive walk. As with
+    /// [`Self::Interrupted`], entries already collected remain useful but the
+    /// index is not complete and must not enable retention.
+    TimedOut,
 }
 
 /// The remote warm store: an HTTP client over the shared in-RAM index.
@@ -443,7 +449,12 @@ impl StathostBackend {
 
     /// Delete metadata whose video is not on the host: the sidecar (and any thumbnails) of an
     /// event whose `.ts` upload never landed.
-    async fn sweep_orphaned_metadata(&self, items: &[ListEntry], sizes: &HashMap<&str, u64>) {
+    async fn sweep_orphaned_metadata(
+        &self,
+        items: &[ListEntry],
+        sizes: &HashMap<&str, u64>,
+        deadline: Option<tokio::time::Instant>,
+    ) {
         // Grouped by stem before anything is asked of the host: a failed upload orphans a
         // sidecar and every filmstrip frame together, and all of them turn on the one question
         // the probe answers — is the video there?
@@ -469,15 +480,42 @@ impl StathostBackend {
             }
         }
 
-        // Unordered: these tallies are sums, and one stem's outcome never
-        // depends on another's.
-        let (deleted, landed, failed) = futures_util::stream::iter(orphans)
-            .map(|(ts_key, paths)| self.sweep_one_stem(ts_key, paths))
-            .buffer_unordered(SCAN_CONCURRENCY)
-            .fold((0usize, 0usize, 0usize), |acc, one| async move {
-                (acc.0 + one.0, acc.1 + one.1, acc.2 + one.2)
-            })
-            .await;
+        let total = orphans.len();
+        let mut sweeps = futures_util::stream::iter(orphans)
+            .map(|(ts_key, paths)| self.sweep_one_stem(ts_key, paths, deadline))
+            .buffer_unordered(SCAN_CONCURRENCY);
+        let (mut deleted, mut landed, mut failed) = (0usize, 0usize, 0usize);
+        let mut completed = 0usize;
+        loop {
+            let next = match deadline {
+                Some(deadline) => {
+                    if tokio::time::Instant::now() >= deadline {
+                        None
+                    } else {
+                        tokio::time::timeout_at(deadline, sweeps.next())
+                            .await
+                            .ok()
+                            .flatten()
+                    }
+                }
+                None => sweeps.next().await,
+            };
+            let Some(one) = next else {
+                break;
+            };
+            completed += usize::from(one.3);
+            deleted += one.0;
+            landed += one.1;
+            failed += one.2;
+        }
+        let unswept = total - completed;
+        if unswept > 0 {
+            tracing::warn!(
+                unswept,
+                "startup scan deadline reached during the orphan sweep; remaining stathost \
+                 metadata stems are left for a later startup"
+            );
+        }
         if deleted > 0 {
             tracing::info!(
                 deleted,
@@ -500,25 +538,36 @@ impl StathostBackend {
 
     /// One stem's share of [`Self::sweep_orphaned_metadata`]: probe the video once, and delete
     /// this stem's metadata objects only if the probe came back with a confirmed absence.
-    /// Returns `(deleted, landed, failed)`.
-    async fn sweep_one_stem(&self, ts_key: String, paths: Vec<String>) -> (usize, usize, usize) {
+    /// Returns `(deleted, landed, failed, completed)`.
+    async fn sweep_one_stem(
+        &self,
+        ts_key: String,
+        paths: Vec<String>,
+        deadline: Option<tokio::time::Instant>,
+    ) -> (usize, usize, usize, bool) {
+        if deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
+            return (0, 0, 0, false);
+        }
         match self.http.probe_exists(&ts_key).await {
             // Confirmed absent: an orphan, as of one request ago.
             Ok(false) => {
                 let (mut deleted, mut failed) = (0usize, 0usize);
                 for path in &paths {
+                    if deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
+                        return (deleted, 0, failed, false);
+                    }
                     match self.http.delete(path).await {
                         DeleteOutcome::Deleted => deleted += 1,
                         DeleteOutcome::Missing => {}
                         DeleteOutcome::Failed => failed += 1,
                     }
                 }
-                (deleted, 0, failed)
+                (deleted, 0, failed, true)
             }
             // It landed after the listing was taken — not an orphan at all.
-            Ok(true) => (0, 1, 0),
+            Ok(true) => (0, 1, 0, true),
             // Could not find out. Nothing is deleted on a maybe.
-            Err(_) => (0, 0, 1),
+            Err(_) => (0, 0, 1, true),
         }
     }
 
@@ -676,7 +725,7 @@ impl StathostBackend {
         // Only startup is spending footage on this; a heal is a background task
         // and takes the ordinary per-request ceiling instead.
         let deadline = match kind {
-            ScanKind::Startup => Some(tokio::time::Instant::now() + SCAN_LISTING_BUDGET),
+            ScanKind::Startup => Some(tokio::time::Instant::now() + SCAN_STARTUP_BUDGET),
             ScanKind::Heal => None,
         };
         let left = || {
@@ -696,7 +745,7 @@ impl StathostBackend {
             // What is left of the budget is what this attempt's listing gets, so the series
             // cannot outlast it by a whole request timeout.
             let listing_timeout = left().unwrap_or(REQUEST_TIMEOUT).min(REQUEST_TIMEOUT);
-            match self.scan_once(kind, &stop, listing_timeout).await {
+            match self.scan_once(kind, &stop, listing_timeout, deadline).await {
                 Ok(ScanPass::Complete) => return Ok(()),
                 // Keep partial entries but leave the index unready, preventing retention until a
                 // complete startup scan.
@@ -705,6 +754,17 @@ impl StathostBackend {
                         std::io::ErrorKind::Interrupted,
                         "shutdown",
                     ))
+                }
+                Ok(ScanPass::TimedOut) => {
+                    tracing::warn!(
+                        "stathost startup scan reached its deadline: the warm index does not \
+                         describe the store, so retention and the byte budget stay paused until \
+                         a later scan succeeds"
+                    );
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "stathost startup scan deadline reached",
+                    ));
                 }
                 Err(e) => {
                     // Decided before the wait rather than after it: a budget with no room left
@@ -794,7 +854,11 @@ impl StathostBackend {
         kind: ScanKind,
         stop: &impl Fn() -> bool,
         listing_timeout: Duration,
+        deadline: Option<tokio::time::Instant>,
     ) -> Result<ScanPass, reqwest::Error> {
+        if deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
+            return Ok(ScanPass::TimedOut);
+        }
         let start = std::time::Instant::now();
         let items = self.http.list(listing_timeout).await?;
 
@@ -863,7 +927,42 @@ impl StathostBackend {
         // (`take_collected`).
         let mut collected: HashMap<String, Vec<WarmEventEntry>> = HashMap::new();
 
-        while let Some((event, read)) = reads.next().await {
+        while indexed + yielded < total {
+            if deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
+                self.take_collected(collected);
+                if stop() {
+                    tracing::info!(
+                        indexed,
+                        of = total,
+                        "stathost warm index scan stopped by shutdown; the index is not marked \
+                         as describing the store and the next start scans again"
+                    );
+                    return Ok(ScanPass::Interrupted);
+                }
+                return Ok(ScanPass::TimedOut);
+            }
+            let next = match deadline {
+                Some(deadline) => match tokio::time::timeout_at(deadline, reads.next()).await {
+                    Ok(next) => next,
+                    Err(_) => {
+                        self.take_collected(collected);
+                        if stop() {
+                            tracing::info!(
+                                indexed,
+                                of = total,
+                                "stathost warm index scan stopped by shutdown; the index is not \
+                                 marked as describing the store and the next start scans again"
+                            );
+                            return Ok(ScanPass::Interrupted);
+                        }
+                        return Ok(ScanPass::TimedOut);
+                    }
+                },
+                None => reads.next().await,
+            };
+            let Some((event, read)) = next else {
+                break;
+            };
             // One archive's worth of round trips is a long time to hold a
             // shutdown drain that is measured in one event's deletes, and an
             // index nobody is going to use is not worth finishing.
@@ -957,7 +1056,7 @@ impl StathostBackend {
         self.mark_scanned();
 
         if kind == ScanKind::Startup {
-            self.sweep_orphaned_metadata(&items, &sizes).await;
+            self.sweep_orphaned_metadata(&items, &sizes, deadline).await;
         }
 
         if unknown_type > 0 {
