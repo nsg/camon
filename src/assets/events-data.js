@@ -4,6 +4,7 @@ let warmEvents = [];
 let eventChains = new Map();
 let warmEventPoller = null;
 let warmEventsSignature = null;
+let warmEventsMayHaveMore = false;
 
 // Duration and type disambiguate events sharing a start PTS. Keep start_pts_ns as a string:
 // epoch nanoseconds exceed JavaScript's exact integer range.
@@ -11,16 +12,80 @@ function eventKey(ev) {
     return `${ev.start_pts_ns}_${ev.duration_ms}_${ev.event_type}`;
 }
 
-// Stop only on an empty page: the client must not assume the server's page size.
-// The cap bounds polling and rendering cost; deeper archive history is omitted.
 const MAX_EVENT_PAGES = 10;
+const INLINE_EVENT_PAGE_SIZE = 64;
+const INLINE_EVENT_MAX_PAGES = 4;
+const INLINE_EVENT_CARD_TARGET = 9;
 
 const FRAME_CYCLE_MS = 1000;
+const FRAME_PRELOAD_CONCURRENCY = 4;
+// One FIFO bounds filmstrip fan-out across cards; overlay loads use it too.
+const framePreloadQueue = [];
+const framePreloadsInFlight = new Set();
 const eventCardCycleSubscribers = new Set();
 const eventCardControllers = new WeakMap();
 const prefersReducedMotion = typeof window.matchMedia === 'function' &&
     window.matchMedia('(prefers-reduced-motion: reduce)').matches;
 let eventCardCycleTimer = null;
+
+function createImagePreloadOwner() {
+    return { cancelled: false, loads: new Set() };
+}
+
+function finishImagePreload(entry, loaded) {
+    if (entry.state !== 'loading') return;
+    const loader = entry.loader;
+    loader.onload = null;
+    loader.onerror = null;
+    entry.state = 'done';
+    entry.loader = null;
+    entry.owner.loads.delete(entry);
+    framePreloadsInFlight.delete(entry);
+    pumpImagePreloads();
+    if (entry.owner.cancelled) return;
+    (loaded ? entry.onLoad : entry.onError)(loader);
+}
+
+function pumpImagePreloads() {
+    while (framePreloadsInFlight.size < FRAME_PRELOAD_CONCURRENCY && framePreloadQueue.length > 0) {
+        const entry = framePreloadQueue.shift();
+        if (entry.owner.cancelled) continue;
+        entry.state = 'loading';
+        entry.loader = new Image();
+        framePreloadsInFlight.add(entry);
+        entry.loader.onload = () => finishImagePreload(entry, true);
+        entry.loader.onerror = () => finishImagePreload(entry, false);
+        entry.loader.src = entry.url;
+    }
+}
+
+function enqueueImagePreload(owner, url, onLoad, onError) {
+    if (owner.cancelled) return;
+    const entry = { owner, url, onLoad, onError, loader: null, state: 'queued' };
+    owner.loads.add(entry);
+    framePreloadQueue.push(entry);
+    pumpImagePreloads();
+}
+
+function cancelImagePreloads(owner) {
+    if (owner.cancelled) return;
+    owner.cancelled = true;
+    owner.loads.forEach(entry => {
+        if (entry.state === 'queued') {
+            const index = framePreloadQueue.indexOf(entry);
+            if (index >= 0) framePreloadQueue.splice(index, 1);
+        } else if (entry.state === 'loading') {
+            entry.loader.onload = null;
+            entry.loader.onerror = null;
+            entry.loader.src = '';
+            framePreloadsInFlight.delete(entry);
+            entry.loader = null;
+        }
+        entry.state = 'cancelled';
+    });
+    owner.loads.clear();
+    pumpImagePreloads();
+}
 
 function stopEventCardCycle() {
     if (eventCardCycleTimer === null) return;
@@ -35,8 +100,7 @@ function startEventCardCycle() {
     eventCardCycleTimer = setInterval(() => {
         eventCardCycleSubscribers.forEach(controller => {
             if (controller.card.isConnected) return;
-            eventCardCycleSubscribers.delete(controller);
-            eventCardIntersectionObserver.unobserve(controller.card);
+            disposeEventCard(controller);
         });
         if (eventCardCycleSubscribers.size === 0) {
             stopEventCardCycle();
@@ -56,6 +120,21 @@ function unsubscribeEventCard(controller) {
     if (eventCardCycleSubscribers.size === 0) stopEventCardCycle();
 }
 
+function disposeEventCard(controller) {
+    if (!controller || controller.disposed) return;
+    controller.disposed = true;
+    unsubscribeEventCard(controller);
+    if (eventCardIntersectionObserver) eventCardIntersectionObserver.unobserve(controller.card);
+    cancelImagePreloads(controller.preloadOwner);
+    eventCardControllers.delete(controller.card);
+}
+
+function disposeEventCards(container) {
+    container.querySelectorAll('.event-card').forEach(card => {
+        disposeEventCard(eventCardControllers.get(card));
+    });
+}
+
 const eventCardIntersectionObserver = !prefersReducedMotion &&
     typeof IntersectionObserver !== 'undefined'
     ? new IntersectionObserver(entries => {
@@ -63,8 +142,7 @@ const eventCardIntersectionObserver = !prefersReducedMotion &&
             const controller = eventCardControllers.get(entry.target);
             if (!controller) return;
             if (!controller.card.isConnected) {
-                unsubscribeEventCard(controller);
-                eventCardIntersectionObserver.unobserve(controller.card);
+                disposeEventCard(controller);
             } else if (entry.isIntersecting) {
                 controller.preloadFrames();
                 subscribeEventCard(controller);
@@ -83,40 +161,76 @@ document.addEventListener('visibilitychange', () => {
     }
 });
 
-function fetchWarmEvents(cameraId) {
+function mapWarmEvents(events) {
+    return events.map(ev => ({
+        ...ev,
+        key: eventKey(ev),
+        start_ms: Number(BigInt(ev.start_pts_ns) / 1_000_000n),
+    }));
+}
+
+function fetchWarmEvents(cameraId, { depth = 'inline' } = {}) {
+    if (warmEventPoller && warmEventPoller.cameraId === cameraId &&
+        warmEventPoller.depth === depth) {
+        return warmEventPoller.first;
+    }
     if (warmEventPoller) warmEventPoller.stop();
     warmEventsSignature = null;
     warmEventPoller = startPoller('warm events', 15000, async (signal) => {
         let raw = [];
         let cursor = null;
-        for (let page = 0; page < MAX_EVENT_PAGES; page++) {
-            const before = cursor === null ? '' : `?before=${encodeURIComponent(cursor)}`;
-            const url = `api/cameras/${encodeURIComponent(cameraId)}/events${before}`;
+        let mayHaveMore = false;
+        const pageLimit = depth === 'inline' ? INLINE_EVENT_PAGE_SIZE : null;
+        const pageCap = depth === 'inline' ? INLINE_EVENT_MAX_PAGES : MAX_EVENT_PAGES;
+        for (let page = 0; page < pageCap; page++) {
+            const params = new URLSearchParams();
+            if (cursor !== null) params.set('before', cursor);
+            if (pageLimit !== null) params.set('limit', pageLimit);
+            const query = params.toString();
+            const url = `api/cameras/${encodeURIComponent(cameraId)}/events${query ? `?${query}` : ''}`;
             const response = await apiFetch(url, { signal });
             if (currentDetailCameraId !== cameraId || !response.ok) return;
             const events = await response.json();
-            if (events.length === 0) break;
+            if (events.length === 0) {
+                mayHaveMore = false;
+                break;
+            }
             raw = events.concat(raw);
             cursor = eventKey(events[0]);
+            const shortPage = pageLimit !== null && events.length < pageLimit;
+            if (shortPage) {
+                mayHaveMore = false;
+                break;
+            }
+            mayHaveMore = page + 1 === pageCap;
+            if (depth === 'inline') {
+                const partial = mapWarmEvents(raw);
+                const partialChains = buildEventChains(partial);
+                // A ninth collapsed card proves the eighth card's chain ended;
+                // a short page or four-page cap also bounds the walk.
+                if (collapseEventChains(partial, partialChains).length >= INLINE_EVENT_CARD_TARGET) {
+                    mayHaveMore = true;
+                    break;
+                }
+            }
         }
-        const mapped = raw.map(ev => ({
-            ...ev,
-            key: eventKey(ev),
-            start_ms: Number(BigInt(ev.start_pts_ns) / 1_000_000n),
-        }));
+        const mapped = mapWarmEvents(raw);
         // Re-rendering identical data every poll would wipe in-progress
         // filmstrip scrubbing, so unchanged results are dropped here.
-        const signature = mapped
+        const signature = `${mayHaveMore}\n${mapped
             .map(ev => `${ev.key}:${ev.filmstrip_frames}:${ev.recovered}`)
-            .join('\n');
+            .join('\n')}`;
         if (signature === warmEventsSignature) return;
         warmEventsSignature = signature;
+        warmEventsMayHaveMore = mayHaveMore;
         warmEvents = mapped;
         eventChains = buildEventChains(warmEvents);
         renderHistoryPanel();
         if (!eventsView.hidden) renderEventList();
         if (!playbackView.hidden) updatePlaybackNav();
     });
+    warmEventPoller.cameraId = cameraId;
+    warmEventPoller.depth = depth;
     return warmEventPoller.first;
 }
 
@@ -168,11 +282,11 @@ function buildEventChains(events) {
     return chains;
 }
 
-function collapseEventChains(events) {
+function collapseEventChains(events, chains = eventChains) {
     const collapsed = [];
     const seen = new Set();
     events.forEach(ev => {
-        const chain = eventChains.get(ev.key);
+        const chain = chains.get(ev.key);
         const members = chain ? chain.members : [ev];
         if (seen.has(members)) return;
         seen.add(members);
@@ -300,6 +414,7 @@ function buildEventCard(collapsed) {
     const image = card.querySelector('.event-card-image');
     const dots = [...card.querySelectorAll('.event-card-frames i')];
     const frameStatus = Array(frameCount).fill(0);
+    const preloadOwner = createImagePreloadOwner();
     let shownFrame = middleFrame;
     let desiredFrame = middleFrame;
     let lastGoodFrame = -1;
@@ -308,6 +423,7 @@ function buildEventCard(collapsed) {
     let touchStart = null;
     let suppressClick = false;
     let interacting = false;
+    let controller = null;
 
     function updateDots(index) {
         dots.forEach((dot, i) => dot.classList.toggle('active', i === index));
@@ -324,15 +440,27 @@ function buildEventCard(collapsed) {
     function preloadFrames() {
         if (preloadingStarted) return;
         preloadingStarted = true;
-        frameUrls.forEach((url, index) => {
+        const indices = frameUrls.map((_, index) => index);
+        if (desiredFrame >= 0) {
+            indices.splice(indices.indexOf(desiredFrame), 1);
+            indices.unshift(desiredFrame);
+        }
+        indices.forEach(index => {
             if (frameStatus[index] !== 0) return;
-            const loader = new Image();
-            loader.addEventListener('load', () => {
+            enqueueImagePreload(preloadOwner, frameUrls[index], () => {
+                if (!card.isConnected) {
+                    disposeEventCard(controller);
+                    return;
+                }
                 frameStatus[index] = 1;
                 if (desiredFrame === index) showFrame(index);
+            }, () => {
+                if (!card.isConnected) {
+                    disposeEventCard(controller);
+                    return;
+                }
+                frameStatus[index] = -1;
             });
-            loader.addEventListener('error', () => { frameStatus[index] = -1; });
-            loader.src = url;
         });
     }
 
@@ -421,9 +549,9 @@ function buildEventCard(collapsed) {
             desiredFrame = shownFrame;
         });
 
+        controller = { card, preloadFrames, advanceFrame, preloadOwner, disposed: false };
+        eventCardControllers.set(card, controller);
         if (eventCardIntersectionObserver) {
-            const controller = { card, preloadFrames, advanceFrame };
-            eventCardControllers.set(card, controller);
             eventCardIntersectionObserver.observe(card);
         }
     }

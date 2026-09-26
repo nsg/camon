@@ -28,10 +28,8 @@ function showEventsView(cameraId) {
     cleanupPlaybackView();
     cleanupDebugView();
 
-    if (currentDetailCameraId !== cameraId) {
-        currentDetailCameraId = cameraId;
-        fetchWarmEvents(cameraId);
-    }
+    currentDetailCameraId = cameraId;
+    fetchWarmEvents(cameraId, { depth: 'full' });
 
     hideAllViews();
     eventsView.hidden = false;
@@ -44,6 +42,7 @@ function showEventsView(cameraId) {
 }
 
 function renderEventList() {
+    disposeEventCards(eventList);
     eventList.innerHTML = '';
 
     const collapsed = collapseEventChains(warmEvents);

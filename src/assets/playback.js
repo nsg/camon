@@ -68,12 +68,10 @@ function wirePlaybackView() {
 function showPlaybackView(cameraId, key) {
     cleanupDebugView();
 
-    if (currentDetailCameraId !== cameraId) {
-        currentDetailCameraId = cameraId;
-        fetchWarmEvents(cameraId).then(() => {
-            updatePlaybackNav();
-        });
-    }
+    currentDetailCameraId = cameraId;
+    fetchWarmEvents(cameraId, { depth: 'full' }).then(() => {
+        updatePlaybackNav();
+    });
 
     hideAllViews();
     playbackView.hidden = false;

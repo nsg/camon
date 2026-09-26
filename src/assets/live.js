@@ -249,10 +249,10 @@ function showLiveView(cameraId) {
         fetchMotionSettings(cameraId);
 
         loadDetailCamera(cameraId);
-        fetchWarmEvents(cameraId);
     } else {
         renderHistoryPanel();
     }
+    fetchWarmEvents(cameraId, { depth: 'inline' });
 }
 
 function cleanupLiveView() {
@@ -290,6 +290,7 @@ function cleanupLiveView() {
     bufferDuration = 0;
     warmEvents = [];
     eventChains = new Map();
+    warmEventsMayHaveMore = false;
 
     stabilityImage = null;
     rawMog2Image = null;
@@ -344,6 +345,7 @@ function cleanupLiveView() {
     tlTicks.innerHTML = '';
     lastTickKey = null;
     historyPanel.hidden = true;
+    disposeEventCards(historyDays);
     historyDays.innerHTML = '';
 }
 
@@ -614,12 +616,19 @@ const OVERLAY_IMAGE_TIMEOUT_MS = 15000;
 
 function loadOverlayImage(url) {
     return new Promise(resolve => {
-        const img = new Image();
-        const done = (value) => { clearTimeout(timer); resolve(value); };
-        const timer = setTimeout(() => done(null), OVERLAY_IMAGE_TIMEOUT_MS);
-        img.onload = () => done(img);
-        img.onerror = () => done(null);
-        img.src = authUrl(url);
+        const owner = createImagePreloadOwner();
+        let settled = false;
+        const done = (value) => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timer);
+            resolve(value);
+        };
+        const timer = setTimeout(() => {
+            cancelImagePreloads(owner);
+            done(null);
+        }, OVERLAY_IMAGE_TIMEOUT_MS);
+        enqueueImagePreload(owner, authUrl(url), done, () => done(null));
     });
 }
 
@@ -1064,8 +1073,10 @@ function formatAgo(secs) {
 }
 
 function renderHistoryPanel() {
+    disposeEventCards(historyDays);
     if (warmEvents.length === 0) {
         historyPanel.hidden = true;
+        historyDays.innerHTML = '';
         return;
     }
     historyPanel.hidden = false;
@@ -1099,7 +1110,7 @@ function renderHistoryPanel() {
 
     // Continuous recording can collapse hundreds of chunks into a handful of
     // cards, so the raw count must also keep the browser entry point alive.
-    if (collapsed.length > 8 || warmEvents.length > 8) {
+    if (collapsed.length > 8 || warmEvents.length > 8 || warmEventsMayHaveMore) {
         const seeAll = document.createElement('div');
         seeAll.className = 'history-see-all';
         seeAll.textContent = 'Show all events ›';
