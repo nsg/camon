@@ -358,13 +358,14 @@ impl MotionSettingsStore {
         for id in camera_ids {
             remove_stale_learned_state(data_dir, id);
             let path = settings_path(data_dir, id);
-            let settings = match load(&path) {
+            let camera_defaults = defaults();
+            let settings = match load(&path, &camera_defaults) {
                 Persisted::Settings(settings) => settings,
-                Persisted::Absent => defaults(),
+                Persisted::Absent => camera_defaults.clone(),
                 Persisted::Corrupt => MotionSettings {
                     min_contour_area_grid: default_min_contour_area_grid(),
                     detection_mask: vec![true; MASK_CELLS],
-                    ..defaults()
+                    ..camera_defaults
                 },
             };
             cameras.insert(
@@ -485,7 +486,7 @@ enum Persisted {
 }
 
 /// Read one camera's persisted settings.
-fn load(path: &Path) -> Persisted {
+fn load(path: &Path, defaults: &MotionSettings) -> Persisted {
     let data = match std::fs::read_to_string(path) {
         Ok(data) => data,
         // A camera seen for the first time has no file yet; that is the
@@ -501,7 +502,19 @@ fn load(path: &Path) -> Persisted {
             return Persisted::Corrupt;
         }
     };
-    let mut settings: MotionSettings = match serde_json::from_str(&data) {
+    let value: serde_json::Value = match serde_json::from_str(&data) {
+        Ok(value) => value,
+        Err(e) => {
+            tracing::warn!(
+                path = %path.display(), error = %e,
+                "motion settings file cannot be parsed; starting this camera from the \
+                 configured defaults with its detection mask fully painted, so no frame \
+                 reaches the vision model until the mask is set again"
+            );
+            return Persisted::Corrupt;
+        }
+    };
+    let mut settings: MotionSettings = match serde_json::from_value(value.clone()) {
         Ok(settings) => settings,
         Err(e) => {
             tracing::warn!(
@@ -513,6 +526,29 @@ fn load(path: &Path) -> Persisted {
             return Persisted::Corrupt;
         }
     };
+    if let Some(object) = value.as_object() {
+        if !object.contains_key("tuner_tighten_bar") {
+            settings.tuner_tighten_bar = defaults.tuner_tighten_bar;
+        }
+        if !object.contains_key("tuner_relax_bar") {
+            settings.tuner_relax_bar = defaults.tuner_relax_bar;
+        }
+        if !object.contains_key("tuner_window_secs") {
+            settings.tuner_window_secs = defaults.tuner_window_secs;
+        }
+        if !object.contains_key("tuner_tighten_step") {
+            settings.tuner_tighten_step = defaults.tuner_tighten_step;
+        }
+        if !object.contains_key("tuner_relax_step") {
+            settings.tuner_relax_step = defaults.tuner_relax_step;
+        }
+        if !object.contains_key("tuner_min_step_interval_secs") {
+            settings.tuner_min_step_interval_secs = defaults.tuner_min_step_interval_secs;
+        }
+        if !object.contains_key("tuner_relax_dwell_secs") {
+            settings.tuner_relax_dwell_secs = defaults.tuner_relax_dwell_secs;
+        }
+    }
     settings.sanitize();
     tracing::info!(path = %path.display(), "loaded motion settings");
     Persisted::Settings(settings)
@@ -740,6 +776,39 @@ mod tests {
     }
 
     #[test]
+    fn old_settings_file_inherits_configured_tuner_defaults() {
+        let dir = TempDir::new().unwrap();
+        let path = settings_path(dir.path(), "cam1");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            r#"{"var_threshold":24,"min_contour_area":450,"mask":[],"detection_mask":[]}"#,
+        )
+        .unwrap();
+        let mut config = MotionConfig::default();
+        config.tuner_tighten_bar = 0.08;
+        config.tuner_relax_bar = 0.03;
+        config.tuner_window_secs = 1_800;
+        config.tuner_tighten_step = 175.0;
+        config.tuner_relax_step = 75.0;
+        config.tuner_min_step_interval_secs = 600;
+        config.tuner_relax_dwell_secs = 3_000;
+
+        let store =
+            MotionSettingsStore::from_motion_config(&["cam1".to_string()], dir.path(), &config);
+        let settings = store.get("cam1").unwrap();
+
+        assert_eq!(settings.min_contour_area, 450.0);
+        assert_eq!(settings.tuner_tighten_bar, 0.08);
+        assert_eq!(settings.tuner_relax_bar, 0.03);
+        assert_eq!(settings.tuner_window_secs, 1_800);
+        assert_eq!(settings.tuner_tighten_step, 175.0);
+        assert_eq!(settings.tuner_relax_step, 75.0);
+        assert_eq!(settings.tuner_min_step_interval_secs, 600);
+        assert_eq!(settings.tuner_relax_dwell_secs, 3_000);
+    }
+
+    #[test]
     fn save_then_load_preserves_min_contour_area_grid() {
         let dir = TempDir::new().unwrap();
         let path = settings_path(dir.path(), "cam1");
@@ -747,7 +816,7 @@ mod tests {
         settings.min_contour_area_grid[42] = 750.0;
 
         save(&path, &settings).unwrap();
-        let Persisted::Settings(loaded) = load(&path) else {
+        let Persisted::Settings(loaded) = load(&path, &MotionSettings::default()) else {
             panic!("saved settings did not load");
         };
 
@@ -877,6 +946,63 @@ mod tests {
         assert_eq!(settings.min_contour_area, 200.0);
         assert_eq!(settings.tuner_tighten_bar, 0.05);
         assert_eq!(settings.tuner_relax_bar, 0.01);
+    }
+
+    #[test]
+    fn tuner_validation_rejects_each_invalid_setting_shape() {
+        for update in [
+            SettingsUpdate {
+                tuner_relax_bar: Some(0.05),
+                ..Default::default()
+            },
+            SettingsUpdate {
+                tuner_window_secs: Some(121),
+                ..Default::default()
+            },
+            SettingsUpdate {
+                tuner_min_step_interval_secs: Some(0),
+                ..Default::default()
+            },
+            SettingsUpdate {
+                tuner_relax_dwell_secs: Some(61),
+                ..Default::default()
+            },
+            SettingsUpdate {
+                tuner_tighten_step: Some(0.0),
+                ..Default::default()
+            },
+            SettingsUpdate {
+                tuner_relax_step: Some(-1.0),
+                ..Default::default()
+            },
+        ] {
+            let dir = TempDir::new().unwrap();
+            let store = MotionSettingsStore::new(&["cam1".to_string()], dir.path(), 16.0, 200.0);
+            assert!(matches!(
+                store.update("cam1", update),
+                Err(UpdateError::InvalidTunerSettings(_))
+            ));
+            assert_eq!(store.get("cam1").unwrap(), MotionSettings::default());
+        }
+    }
+
+    #[test]
+    fn tuner_updates_are_camera_scoped() {
+        let dir = TempDir::new().unwrap();
+        let ids = ["cam1".to_string(), "cam2".to_string()];
+        let store = MotionSettingsStore::new(&ids, dir.path(), 16.0, 200.0);
+        store
+            .update(
+                "cam1",
+                SettingsUpdate {
+                    tuner_tighten_bar: Some(0.08),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        assert_eq!(store.get("cam1").unwrap().tuner_tighten_bar, 0.08);
+        assert_eq!(store.get("cam2").unwrap().tuner_tighten_bar, 0.05);
     }
 
     #[test]
@@ -1212,7 +1338,10 @@ mod tests {
             w.join().unwrap();
         }
 
-        let Persisted::Settings(persisted) = load(&settings_path(dir.path(), "cam1")) else {
+        let Persisted::Settings(persisted) = load(
+            &settings_path(dir.path(), "cam1"),
+            &MotionSettings::default(),
+        ) else {
             panic!("no readable settings file");
         };
         let i = (persisted.var_threshold - 20.0) as usize;
