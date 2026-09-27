@@ -408,7 +408,7 @@ impl MotionTuner {
                     TunerMode::Off => unreachable!(),
                 };
                 let quiet_long_enough = now.saturating_duration_since(quiet_since) >= relax_dwell;
-                if quiet_long_enough && current > baseline && step_ready {
+                if quiet_long_enough && stored > 0.0 && step_ready {
                     let target = (current - self.params.relax_step).max(baseline);
                     let percent = (fraction * 100.0).round() as u64;
                     Some((
@@ -724,7 +724,7 @@ impl MotionTuner {
                     }
                     return CellAdaptationStatus::Ready;
                 }
-                if fractions[cell] < self.params.relax_bar && current > base[cell] {
+                if fractions[cell] < self.params.relax_bar && stored > 0.0 {
                     let dwell_ready = quiet_since.is_some_and(|quiet_since| {
                         now.saturating_duration_since(quiet_since) >= relax_dwell
                     });
@@ -1363,6 +1363,44 @@ mod tests {
             100.0,
             "a later manual decrease must not be held up by a fully relaxed value"
         );
+    }
+
+    #[test]
+    fn quiet_clears_a_learned_value_hidden_below_a_raised_manual_baseline() {
+        let start = Instant::now();
+        let mut configured = params();
+        configured.cell_ceiling = 1_000.0;
+        let mut tuner = MotionTuner::new(configured);
+        tuner.set_mode(TunerMode::Auto);
+        let mut learned = vec![0.0; MASK_CELLS];
+        learned[0] = 350.0;
+        tuner.load_state(&TunerState {
+            version: 2,
+            learned,
+            last_change: vec![None; MASK_CELLS],
+        });
+        let mut manual = vec![0.0; MASK_CELLS];
+        manual[0] = 500.0;
+
+        observe(&mut tuner, start, 0..=120, false, 0);
+        tuner.evaluate_with_baseline(
+            200.0,
+            &manual,
+            start + Duration::from_secs(120),
+            SystemTime::now(),
+        );
+        observe(&mut tuner, start, 121..=240, false, 0);
+        let changes = tuner.evaluate_with_baseline(
+            200.0,
+            &manual,
+            start + Duration::from_secs(240),
+            SystemTime::now(),
+        );
+
+        assert!(changes.iter().any(|change| change.cell == 0));
+        assert_eq!(tuner.state().learned[0], 0.0);
+        manual[0] = 0.0;
+        assert_eq!(tuner.effective_grid_from_baseline(200.0, &manual)[0], 200.0);
     }
 
     #[test]
