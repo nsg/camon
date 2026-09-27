@@ -285,6 +285,23 @@ impl MotionTuner {
         expected_duration: Duration,
         now: Instant,
     ) {
+        self.observe_segment_with_coverage(
+            triggered,
+            motion_cells,
+            motion_cells,
+            expected_duration,
+            now,
+        );
+    }
+
+    pub fn observe_segment_with_coverage(
+        &mut self,
+        triggered: bool,
+        motion_cells: &[bool; MASK_CELLS],
+        coverage_cells: &[bool; MASK_CELLS],
+        expected_duration: Duration,
+        now: Instant,
+    ) {
         if self.started.is_none() {
             self.started = Some(now);
         }
@@ -306,7 +323,7 @@ impl MotionTuner {
         };
         bucket.segments = bucket.segments.saturating_add(1);
         if triggered {
-            let marked_cells = motion_cells.iter().filter(|&&present| present).count();
+            let marked_cells = coverage_cells.iter().filter(|&&present| present).count();
             if marked_cells as f64 > self.params.global_event_cell_fraction * MASK_CELLS as f64 {
                 bucket.global_events = bucket.global_events.saturating_add(1);
                 return;
@@ -862,6 +879,31 @@ mod tests {
             .iter()
             .all(|&fraction| fraction == 1.0));
         assert!(snapshot.trigger_fraction[40..]
+            .iter()
+            .all(|&fraction| fraction == 0.0));
+    }
+
+    #[test]
+    fn broad_coverage_only_classifies_global_events() {
+        let start = Instant::now();
+        let mut tuner = MotionTuner::new(params());
+        let mut midpoint = [false; MASK_CELLS];
+        midpoint[17] = true;
+        let mut coverage = [false; MASK_CELLS];
+        coverage[..120].fill(true);
+
+        tuner.observe_segment_with_coverage(
+            true,
+            &midpoint,
+            &coverage,
+            Duration::from_secs(1),
+            start,
+        );
+
+        let snapshot = tuner.snapshot(&[], start);
+        assert_eq!(snapshot.global_events_in_window, 1);
+        assert!(snapshot
+            .trigger_fraction
             .iter()
             .all(|&fraction| fraction == 0.0));
     }

@@ -42,6 +42,7 @@ pub struct MotionDetector {
     kernel: StructuringElement,
     min_contour_area: f64,
     min_contour_area_grid: Vec<f64>,
+    learning_min_contour_area_grid: Vec<f64>,
     /// Ignore mask: one bool per 16x12 cell (row-major), `true` = excluded.
     /// Applied to the raw MOG2 foreground mask before scene-change evaluation,
     /// morphology, and connected-component labeling.
@@ -65,7 +66,10 @@ pub struct MotionDetector {
     ccl: ConnectedComponents,
     components: Vec<Component>,
     retained: Vec<bool>,
+    learning_retained: Vec<bool>,
     bboxes: Vec<MotionBox>,
+    learning_bboxes: Vec<MotionBox>,
+    learning_score: f32,
 }
 
 impl MotionDetector {
@@ -82,6 +86,7 @@ impl MotionDetector {
             kernel,
             min_contour_area,
             min_contour_area_grid: vec![0.0; MASK_CELLS],
+            learning_min_contour_area_grid: vec![0.0; MASK_CELLS],
             mask: vec![false; MASK_CELLS],
             mask_active: false,
             frames_since_stable: 0,
@@ -94,7 +99,10 @@ impl MotionDetector {
             ccl: ConnectedComponents::new(),
             components: Vec::new(),
             retained: Vec::new(),
+            learning_retained: Vec::new(),
             bboxes: Vec::new(),
+            learning_bboxes: Vec::new(),
+            learning_score: 0.0,
         }
     }
 
@@ -116,6 +124,16 @@ impl MotionDetector {
             return;
         }
         self.min_contour_area_grid.copy_from_slice(grid);
+    }
+
+    /// Replace the untuned per-cell minimum areas used only as tuner input.
+    /// Keeping this separate prevents an automatic threshold from suppressing
+    /// the evidence that would later let it relax.
+    pub fn set_learning_min_contour_area_grid(&mut self, grid: &[f64]) {
+        if grid.len() != MASK_CELLS {
+            return;
+        }
+        self.learning_min_contour_area_grid.copy_from_slice(grid);
     }
 
     /// Replace the ignore mask (one bool per 16x12 cell, row-major). Cells set
@@ -155,6 +173,8 @@ impl MotionDetector {
         if raw_ratio >= SCENE_CHANGE_RATIO {
             self.frames_since_stable = 0;
             self.bboxes.clear();
+            self.learning_bboxes.clear();
+            self.learning_score = 0.0;
             return 0.0;
         }
 
@@ -162,6 +182,8 @@ impl MotionDetector {
 
         if self.frames_since_stable < WARMUP_FRAMES {
             self.bboxes.clear();
+            self.learning_bboxes.clear();
+            self.learning_score = 0.0;
             return 0.0;
         }
 
@@ -182,45 +204,56 @@ impl MotionDetector {
             .label(&self.morph_mask, width, height, &mut self.components);
         self.retained.clear();
         self.retained.resize(self.components.len(), false);
+        self.learning_retained.clear();
+        self.learning_retained.resize(self.components.len(), false);
         self.bboxes.clear();
+        self.learning_bboxes.clear();
         for (i, c) in self.components.iter().enumerate() {
-            let effective = if self.width > 0 && self.height > 0 {
-                let centroid_x = (c.min_x + c.max_x) / 2;
-                let centroid_y = (c.min_y + c.max_y) / 2;
-                let col = (centroid_x as usize * MASK_COLS / self.width).min(MASK_COLS - 1);
-                let row = (centroid_y as usize * MASK_ROWS / self.height).min(MASK_ROWS - 1);
-                let cell = row * MASK_COLS + col;
-                let per_cell = self.min_contour_area_grid[cell];
-                if per_cell > 0.0 {
-                    per_cell.max(self.min_contour_area)
-                } else {
-                    self.min_contour_area
-                }
-            } else {
-                self.min_contour_area
+            let cell = component_cell(c, self.width, self.height);
+            let effective = cell.map_or(self.min_contour_area, |cell| {
+                grid_threshold(self.min_contour_area, self.min_contour_area_grid[cell])
+            });
+            let learning_effective = cell.map_or(self.min_contour_area, |cell| {
+                grid_threshold(
+                    self.min_contour_area,
+                    self.learning_min_contour_area_grid[cell],
+                )
+            });
+            let bbox = MotionBox {
+                x: c.min_x as i32,
+                y: c.min_y as i32,
+                width: (c.max_x - c.min_x + 1) as i32,
+                height: (c.max_y - c.min_y + 1) as i32,
             };
+            if f64::from(c.area) >= learning_effective {
+                self.learning_retained[i] = true;
+                self.learning_bboxes.push(bbox);
+            }
             if f64::from(c.area) >= effective {
                 self.retained[i] = true;
-                self.bboxes.push(MotionBox {
-                    x: c.min_x as i32,
-                    y: c.min_y as i32,
-                    width: (c.max_x - c.min_x + 1) as i32,
-                    height: (c.max_y - c.min_y + 1) as i32,
-                });
+                self.bboxes.push(bbox);
             }
         }
 
         self.final_mask.clear();
         self.final_mask.resize(total_pixels, 0);
         let mut fg_pixels = 0u32;
+        let mut learning_fg_pixels = 0u32;
         for (out, &label) in self.final_mask.iter_mut().zip(self.ccl.labels()) {
-            if label != 0 && self.retained[(label - 1) as usize] {
-                *out = 255;
-                fg_pixels += 1;
+            if label != 0 {
+                let component = (label - 1) as usize;
+                if self.retained[component] {
+                    *out = 255;
+                    fg_pixels += 1;
+                }
+                if self.learning_retained[component] {
+                    learning_fg_pixels += 1;
+                }
             }
         }
 
         let foreground_ratio = fg_pixels as f32 / total_pixels as f32;
+        self.learning_score = (learning_fg_pixels as f32 / total_pixels as f32 * 10.0).min(1.0);
         (foreground_ratio * 10.0).min(1.0)
     }
 
@@ -303,12 +336,41 @@ impl MotionDetector {
         &self.bboxes
     }
 
+    /// Bounding boxes and score retained by the camera's manual baseline,
+    /// before automatic cell thresholds are applied.
+    pub fn learning_bboxes(&self) -> &[MotionBox] {
+        &self.learning_bboxes
+    }
+
+    pub fn learning_score(&self) -> f32 {
+        self.learning_score
+    }
+
     /// Whether the last frame was fully processed. False during model warmup
     /// and right after a scene change, while scores are suppressed to 0 and
     /// the final/morph masks are not refreshed.
     #[allow(dead_code)] // used through the library crate root (examples/)
     pub fn is_warmed_up(&self) -> bool {
         self.frames_since_stable >= WARMUP_FRAMES
+    }
+}
+
+fn component_cell(component: &Component, width: usize, height: usize) -> Option<usize> {
+    if width == 0 || height == 0 {
+        return None;
+    }
+    let midpoint_x = (component.min_x + component.max_x) / 2;
+    let midpoint_y = (component.min_y + component.max_y) / 2;
+    let col = (midpoint_x as usize * MASK_COLS / width).min(MASK_COLS - 1);
+    let row = (midpoint_y as usize * MASK_ROWS / height).min(MASK_ROWS - 1);
+    Some(row * MASK_COLS + col)
+}
+
+fn grid_threshold(global: f64, cell: f64) -> f64 {
+    if cell > 0.0 {
+        cell.max(global)
+    } else {
+        global
     }
 }
 
@@ -413,6 +475,8 @@ mod tests {
         let frame = frame_with_blob(100, 80, 24);
         assert_eq!(det.process_frame(&frame, W, H), 0.0);
         assert!(det.motion_bboxes().is_empty());
+        assert!(det.learning_score() > 0.0);
+        assert_eq!(det.learning_bboxes().len(), 1);
 
         det.set_min_contour_area_grid(&[0.0; MASK_CELLS]);
         assert!(det.process_frame(&frame, W, H) > 0.0);

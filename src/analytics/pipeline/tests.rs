@@ -831,9 +831,9 @@ fn test_context(camera_id: &str, data_dir: &std::path::Path) -> AnalyzerContext 
 }
 
 #[test]
-fn motion_bbox_marks_every_spanned_cell() {
+fn motion_bbox_coverage_marks_every_spanned_cell() {
     let mut cells = [false; MASK_CELLS];
-    mark_cells(
+    mark_covered_cells(
         &[MotionBox {
             x: 19,
             y: 5,
@@ -848,6 +848,25 @@ fn motion_bbox_marks_every_spanned_cell() {
     assert!(cells[0]);
     assert!(cells[1]);
     assert_eq!(cells.iter().filter(|&&marked| marked).count(), 2);
+}
+
+#[test]
+fn motion_learning_uses_the_same_midpoint_cell_as_filtering() {
+    let mut cells = [false; MASK_CELLS];
+    mark_midpoint_cells(
+        &[MotionBox {
+            x: 19,
+            y: 5,
+            width: 2,
+            height: 10,
+        }],
+        ANALYSIS_WIDTH as usize,
+        ANALYSIS_HEIGHT as usize,
+        &mut cells,
+    );
+
+    assert!(cells[0]);
+    assert_eq!(cells.iter().filter(|&&marked| marked).count(), 1);
 }
 
 #[derive(Clone, Default)]
@@ -2158,9 +2177,11 @@ fn skip_reporter_totals_everything_it_held_back() {
 fn motion_verdict_needs_the_threshold() {
     let scored = |score| SegmentAnalysis {
         score,
+        tuner_score: score,
         crop: None,
         motion_rects: Vec::new(),
         motion_cells: [false; MASK_CELLS],
+        motion_coverage_cells: [false; MASK_CELLS],
     };
     assert!(!scored(0.0).has_motion());
     assert!(!scored(MOTION_THRESHOLD - 0.001).has_motion());

@@ -95,18 +95,29 @@ impl FrameUse {
 /// One segment's motion verdict.
 struct SegmentAnalysis {
     score: f32,
+    tuner_score: f32,
     crop: Option<NormalizedRect>,
     motion_rects: Vec<NormalizedRect>,
     motion_cells: [bool; MASK_CELLS],
+    motion_coverage_cells: [bool; MASK_CELLS],
 }
 
 impl SegmentAnalysis {
     fn has_motion(&self) -> bool {
         self.score >= MOTION_THRESHOLD
     }
+
+    fn has_tuner_motion(&self) -> bool {
+        self.tuner_score >= MOTION_THRESHOLD
+    }
 }
 
-fn mark_cells(bboxes: &[MotionBox], width: usize, height: usize, cells: &mut [bool; MASK_CELLS]) {
+fn mark_covered_cells(
+    bboxes: &[MotionBox],
+    width: usize,
+    height: usize,
+    cells: &mut [bool; MASK_CELLS],
+) {
     if width == 0 || height == 0 {
         return;
     }
@@ -130,6 +141,30 @@ fn mark_cells(bboxes: &[MotionBox], width: usize, height: usize, cells: &mut [bo
                 cells[row * MASK_COLS + col] = true;
             }
         }
+    }
+}
+
+fn mark_midpoint_cells(
+    bboxes: &[MotionBox],
+    width: usize,
+    height: usize,
+    cells: &mut [bool; MASK_CELLS],
+) {
+    if width == 0 || height == 0 {
+        return;
+    }
+    for bbox in bboxes {
+        if bbox.width <= 0 || bbox.height <= 0 {
+            continue;
+        }
+        let midpoint_x = bbox.x.saturating_add((bbox.width - 1) / 2).max(0) as usize;
+        let midpoint_y = bbox.y.saturating_add((bbox.height - 1) / 2).max(0) as usize;
+        if midpoint_x >= width || midpoint_y >= height {
+            continue;
+        }
+        let col = (midpoint_x * MASK_COLS / width).min(MASK_COLS - 1);
+        let row = (midpoint_y * MASK_ROWS / height).min(MASK_ROWS - 1);
+        cells[row * MASK_COLS + col] = true;
     }
 }
 
@@ -269,6 +304,7 @@ impl MotionAnalyzer {
         let mut detector = MotionDetector::new(var_threshold, min_contour_area);
         if let Some(s) = settings.as_ref() {
             detector.set_mask(&s.mask);
+            detector.set_learning_min_contour_area_grid(&s.min_contour_area_grid);
             detector.set_min_contour_area_grid(
                 &tuner.effective_grid_from_baseline(s.min_contour_area, &s.min_contour_area_grid),
             );
@@ -558,6 +594,8 @@ impl MotionAnalyzer {
 
             self.detector.set_var_threshold(s.var_threshold);
             self.detector.set_min_contour_area(s.min_contour_area);
+            self.detector
+                .set_learning_min_contour_area_grid(&s.min_contour_area_grid);
             let effective = self
                 .tuner
                 .effective_grid_from_baseline(s.min_contour_area, &s.min_contour_area_grid);
@@ -730,9 +768,10 @@ impl MotionAnalyzer {
             publish_debug_maps(&self.motion_store, &self.camera_id, &self.detector);
 
             let has_motion = analysis.has_motion();
-            self.tuner.observe_segment_with_duration(
-                has_motion,
+            self.tuner.observe_segment_with_coverage(
+                analysis.has_tuner_motion(),
                 &analysis.motion_cells,
+                &analysis.motion_coverage_cells,
                 Duration::from_nanos(seg.duration_ns),
                 now,
             );
@@ -741,6 +780,8 @@ impl MotionAnalyzer {
                 crop,
                 motion_rects,
                 motion_cells: _,
+                motion_coverage_cells: _,
+                tuner_score: _,
             } = analysis;
             // Whatever has accumulated belongs to the run that just closed:
             // this batch's own frames are extracted later, in
@@ -958,15 +999,24 @@ impl MotionAnalyzer {
 
         let (w, h) = (ANALYSIS_WIDTH as usize, ANALYSIS_HEIGHT as usize);
         let mut total_score = 0.0f32;
+        let mut tuner_total_score = 0.0f32;
         let mut frame_count = 0u32;
         let mut all_rects = Vec::new();
         let mut motion_cells = [false; MASK_CELLS];
+        let mut motion_coverage_cells = [false; MASK_CELLS];
 
         for frame_data in &raw_frames {
             let score = self.detector.process_frame(frame_data, w, h);
             total_score += score;
+            tuner_total_score += self.detector.learning_score();
             frame_count += 1;
-            mark_cells(self.detector.motion_bboxes(), w, h, &mut motion_cells);
+            mark_midpoint_cells(self.detector.learning_bboxes(), w, h, &mut motion_cells);
+            mark_covered_cells(
+                self.detector.learning_bboxes(),
+                w,
+                h,
+                &mut motion_coverage_cells,
+            );
             for &r in self.detector.motion_bboxes() {
                 all_rects.push(normalize_rect(r, ANALYSIS_WIDTH, ANALYSIS_HEIGHT));
             }
@@ -976,9 +1026,11 @@ impl MotionAnalyzer {
 
         Ok(Some(SegmentAnalysis {
             score: total_score / frame_count as f32,
+            tuner_score: tuner_total_score / frame_count as f32,
             crop,
             motion_rects: all_rects,
             motion_cells,
+            motion_coverage_cells,
         }))
     }
 
