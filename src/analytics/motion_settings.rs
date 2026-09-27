@@ -184,6 +184,10 @@ impl MotionSettings {
     /// and on every update so out-of-range API/config input and stale on-disk state can never
     /// reach the detector.
     pub fn sanitize(&mut self) {
+        self.sanitize_with_tuner_defaults(&Self::default());
+    }
+
+    fn sanitize_with_tuner_defaults(&mut self, tuner_defaults: &Self) {
         self.var_threshold = bounded(
             self.var_threshold,
             DEFAULT_VAR_THRESHOLD,
@@ -207,13 +211,13 @@ impl MotionSettings {
             };
         }
         if self.validate_tuner().is_err() {
-            self.tuner_tighten_bar = DEFAULT_TUNER_TIGHTEN_BAR;
-            self.tuner_relax_bar = DEFAULT_TUNER_RELAX_BAR;
-            self.tuner_window_secs = DEFAULT_TUNER_WINDOW_SECS;
-            self.tuner_tighten_step = DEFAULT_TUNER_TIGHTEN_STEP;
-            self.tuner_relax_step = DEFAULT_TUNER_RELAX_STEP;
-            self.tuner_min_step_interval_secs = DEFAULT_TUNER_MIN_STEP_INTERVAL_SECS;
-            self.tuner_relax_dwell_secs = DEFAULT_TUNER_RELAX_DWELL_SECS;
+            self.tuner_tighten_bar = tuner_defaults.tuner_tighten_bar;
+            self.tuner_relax_bar = tuner_defaults.tuner_relax_bar;
+            self.tuner_window_secs = tuner_defaults.tuner_window_secs;
+            self.tuner_tighten_step = tuner_defaults.tuner_tighten_step;
+            self.tuner_relax_step = tuner_defaults.tuner_relax_step;
+            self.tuner_min_step_interval_secs = tuner_defaults.tuner_min_step_interval_secs;
+            self.tuner_relax_dwell_secs = tuner_defaults.tuner_relax_dwell_secs;
         }
         if self.mask.len() != MASK_CELLS {
             self.mask.resize(MASK_CELLS, false);
@@ -549,7 +553,7 @@ fn load(path: &Path, defaults: &MotionSettings) -> Persisted {
             settings.tuner_relax_dwell_secs = defaults.tuner_relax_dwell_secs;
         }
     }
-    settings.sanitize();
+    settings.sanitize_with_tuner_defaults(defaults);
     tracing::info!(path = %path.display(), "loaded motion settings");
     Persisted::Settings(settings)
 }
@@ -799,6 +803,49 @@ mod tests {
         let settings = store.get("cam1").unwrap();
 
         assert_eq!(settings.min_contour_area, 450.0);
+        assert_eq!(settings.tuner_tighten_bar, 0.08);
+        assert_eq!(settings.tuner_relax_bar, 0.03);
+        assert_eq!(settings.tuner_window_secs, 1_800);
+        assert_eq!(settings.tuner_tighten_step, 175.0);
+        assert_eq!(settings.tuner_relax_step, 75.0);
+        assert_eq!(settings.tuner_min_step_interval_secs, 600);
+        assert_eq!(settings.tuner_relax_dwell_secs, 3_000);
+    }
+
+    #[test]
+    fn invalid_saved_tuner_fields_use_configured_defaults_without_losing_manual_settings() {
+        let dir = TempDir::new().unwrap();
+        let path = settings_path(dir.path(), "cam1");
+        let mut saved = MotionSettings {
+            var_threshold: 24.0,
+            min_contour_area: 450.0,
+            tuner_tighten_bar: 0.2,
+            tuner_relax_bar: 0.1,
+            tuner_window_secs: 90,
+            ..MotionSettings::default()
+        };
+        saved.min_contour_area_grid[12] = 900.0;
+        saved.mask[3] = true;
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, serde_json::to_vec(&saved).unwrap()).unwrap();
+
+        let mut config = MotionConfig::default();
+        config.tuner_tighten_bar = 0.08;
+        config.tuner_relax_bar = 0.03;
+        config.tuner_window_secs = 1_800;
+        config.tuner_tighten_step = 175.0;
+        config.tuner_relax_step = 75.0;
+        config.tuner_min_step_interval_secs = 600;
+        config.tuner_relax_dwell_secs = 3_000;
+
+        let store =
+            MotionSettingsStore::from_motion_config(&["cam1".to_string()], dir.path(), &config);
+        let settings = store.get("cam1").unwrap();
+
+        assert_eq!(settings.var_threshold, 24.0);
+        assert_eq!(settings.min_contour_area, 450.0);
+        assert_eq!(settings.min_contour_area_grid[12], 900.0);
+        assert!(settings.mask[3]);
         assert_eq!(settings.tuner_tighten_bar, 0.08);
         assert_eq!(settings.tuner_relax_bar, 0.03);
         assert_eq!(settings.tuner_window_secs, 1_800);
