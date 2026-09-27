@@ -103,6 +103,8 @@ pub enum ConfigError {
         "[analytics.motion] tuner_window_secs must be at least 120 and a multiple of 60, got {value}"
     )]
     InvalidTunerWindow { value: u64 },
+    #[error("[analytics.motion] {key} must be at least 60 and a multiple of 60, got {value}")]
+    InvalidTunerDuration { key: &'static str, value: u64 },
     #[error(
         "[analytics.motion] tuner_global_event_cell_fraction must be a finite number in (0, 1], got {value}"
     )]
@@ -568,7 +570,7 @@ fn default_tuner_global_event_cell_fraction() -> f64 {
 }
 
 fn default_tuner_tighten_bar() -> f64 {
-    0.60
+    0.05
 }
 
 fn default_tuner_tighten_step() -> f64 {
@@ -576,7 +578,7 @@ fn default_tuner_tighten_step() -> f64 {
 }
 
 fn default_tuner_relax_bar() -> f64 {
-    0.10
+    0.01
 }
 
 fn default_tuner_relax_dwell_secs() -> u64 {
@@ -585,6 +587,10 @@ fn default_tuner_relax_dwell_secs() -> u64 {
 
 fn default_tuner_relax_step() -> f64 {
     100.0
+}
+
+fn default_tuner_min_step_interval_secs() -> u64 {
+    1_200
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -610,6 +616,8 @@ pub struct MotionConfig {
     pub tuner_relax_dwell_secs: u64,
     #[serde(default = "default_tuner_relax_step")]
     pub tuner_relax_step: f64,
+    #[serde(default = "default_tuner_min_step_interval_secs")]
+    pub tuner_min_step_interval_secs: u64,
 }
 
 impl Default for MotionConfig {
@@ -624,6 +632,7 @@ impl Default for MotionConfig {
             tuner_relax_bar: default_tuner_relax_bar(),
             tuner_relax_dwell_secs: default_tuner_relax_dwell_secs(),
             tuner_relax_step: default_tuner_relax_step(),
+            tuner_min_step_interval_secs: default_tuner_min_step_interval_secs(),
         }
     }
 }
@@ -1249,6 +1258,17 @@ impl Config {
             return Err(ConfigError::InvalidTunerWindow {
                 value: motion.tuner_window_secs,
             });
+        }
+        for (key, value) in [
+            ("tuner_relax_dwell_secs", motion.tuner_relax_dwell_secs),
+            (
+                "tuner_min_step_interval_secs",
+                motion.tuner_min_step_interval_secs,
+            ),
+        ] {
+            if value < 60 || !value.is_multiple_of(60) {
+                return Err(ConfigError::InvalidTunerDuration { key, value });
+            }
         }
         if !motion.tuner_global_event_cell_fraction.is_finite()
             || motion.tuner_global_event_cell_fraction <= 0.0
@@ -2491,24 +2511,27 @@ url = "rtsp://10.0.0.5:554/stream1"
         let defaults = load_cameras(&one_camera("yard")).unwrap().analytics.motion;
         assert_eq!(defaults.tuner_window_secs, 1_200);
         assert_eq!(defaults.tuner_global_event_cell_fraction, 0.5);
-        assert_eq!(defaults.tuner_tighten_bar, 0.60);
+        assert_eq!(defaults.tuner_tighten_bar, 0.05);
         assert_eq!(defaults.tuner_tighten_step, 150.0);
-        assert_eq!(defaults.tuner_relax_bar, 0.10);
+        assert_eq!(defaults.tuner_relax_bar, 0.01);
         assert_eq!(defaults.tuner_relax_dwell_secs, 2_400);
         assert_eq!(defaults.tuner_relax_step, 100.0);
+        assert_eq!(defaults.tuner_min_step_interval_secs, 1_200);
 
         let toml = format!(
             "[analytics]\nenabled = true\n[analytics.motion]\n\
              tuner_window_secs = 180\ntuner_tighten_bar = 0.7\n\
              tuner_global_event_cell_fraction = 1.0\n\
              tuner_tighten_step = 25\ntuner_relax_bar = 0.2\n\
-             tuner_relax_dwell_secs = 300\ntuner_relax_step = 10\n{}",
+             tuner_relax_dwell_secs = 300\ntuner_relax_step = 10\n\
+             tuner_min_step_interval_secs = 600\n{}",
             one_camera("yard")
         );
         let tuner = load_cameras(&toml).unwrap().analytics.motion;
         assert_eq!(tuner.tuner_window_secs, 180);
         assert_eq!(tuner.tuner_global_event_cell_fraction, 1.0);
         assert_eq!(tuner.tuner_relax_dwell_secs, 300);
+        assert_eq!(tuner.tuner_min_step_interval_secs, 600);
     }
 
     #[test]
@@ -2534,6 +2557,11 @@ url = "rtsp://10.0.0.5:554/stream1"
             ("tuner_relax_bar = -0.1", "tuner_relax_bar"),
             ("tuner_tighten_step = 0", "tuner_tighten_step"),
             ("tuner_relax_step = -1", "tuner_relax_step"),
+            (
+                "tuner_min_step_interval_secs = 61",
+                "tuner_min_step_interval_secs",
+            ),
+            ("tuner_relax_dwell_secs = 0", "tuner_relax_dwell_secs"),
         ] {
             let toml =
                 format!("[analytics]\nenabled = true\n[analytics.motion]\n{setting}\n{cameras}");

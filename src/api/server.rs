@@ -539,6 +539,13 @@ struct MotionSettingsResponse {
     min_contour_area: f64,
     min_contour_area_grid: Vec<f64>,
     tuner_mode: TunerMode,
+    tuner_tighten_bar: f64,
+    tuner_relax_bar: f64,
+    tuner_window_secs: u64,
+    tuner_tighten_step: f64,
+    tuner_relax_step: f64,
+    tuner_min_step_interval_secs: u64,
+    tuner_relax_dwell_secs: u64,
     mask_cols: usize,
     mask_rows: usize,
     mask: Vec<bool>,
@@ -557,6 +564,13 @@ impl From<MotionSettings> for MotionSettingsResponse {
             min_contour_area: s.min_contour_area,
             min_contour_area_grid: s.min_contour_area_grid,
             tuner_mode: s.tuner_mode,
+            tuner_tighten_bar: s.tuner_tighten_bar,
+            tuner_relax_bar: s.tuner_relax_bar,
+            tuner_window_secs: s.tuner_window_secs,
+            tuner_tighten_step: s.tuner_tighten_step,
+            tuner_relax_step: s.tuner_relax_step,
+            tuner_min_step_interval_secs: s.tuner_min_step_interval_secs,
+            tuner_relax_dwell_secs: s.tuner_relax_dwell_secs,
             mask_cols: MASK_COLS,
             mask_rows: MASK_ROWS,
             mask: s.mask,
@@ -639,7 +653,7 @@ async fn motion_settings_put_handler(
             (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
         }
         // The request is the problem; the live settings are untouched.
-        Ok(Err(e @ UpdateError::NotANumber { .. })) => {
+        Ok(Err(e @ (UpdateError::NotANumber { .. } | UpdateError::InvalidTunerSettings(_)))) => {
             (StatusCode::BAD_REQUEST, e.to_string()).into_response()
         }
         Err(e) => {

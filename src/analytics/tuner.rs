@@ -36,10 +36,10 @@ impl Default for TunerParams {
         Self {
             window_secs: 1_200,
             global_event_cell_fraction: 0.5,
-            tighten_bar: 0.60,
+            tighten_bar: 0.05,
             tighten_step: 150.0,
             cell_ceiling: CELL_CONTOUR_AREA_CEILING,
-            relax_bar: 0.10,
+            relax_bar: 0.01,
             relax_dwell_secs: 2_400,
             relax_step: 100.0,
             min_step_interval_secs: 1_200,
@@ -57,7 +57,7 @@ impl From<&MotionConfig> for TunerParams {
             relax_bar: config.tuner_relax_bar,
             relax_dwell_secs: config.tuner_relax_dwell_secs,
             relax_step: config.tuner_relax_step,
-            min_step_interval_secs: config.tuner_window_secs,
+            min_step_interval_secs: config.tuner_min_step_interval_secs,
             ..Self::default()
         }
     }

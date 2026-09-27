@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use serde::{Deserialize, Serialize};
 
+use crate::config::MotionConfig;
 use crate::durable::{create_dir_all_synced, sync_dir, tmp_path, write_synced};
 use crate::locks::{LockExt, MutexExt};
 
@@ -24,6 +25,13 @@ pub const MIN_CONTOUR_AREA_MIN: f64 = 50.0;
 pub const MIN_CONTOUR_AREA_MAX: f64 = 2000.0;
 pub const CELL_CONTOUR_AREA_CEILING: f64 = 2000.0;
 pub const DEFAULT_MIN_CONTOUR_AREA: f64 = 200.0;
+pub const DEFAULT_TUNER_WINDOW_SECS: u64 = 1_200;
+pub const DEFAULT_TUNER_TIGHTEN_BAR: f64 = 0.05;
+pub const DEFAULT_TUNER_RELAX_BAR: f64 = 0.01;
+pub const DEFAULT_TUNER_TIGHTEN_STEP: f64 = 150.0;
+pub const DEFAULT_TUNER_RELAX_STEP: f64 = 100.0;
+pub const DEFAULT_TUNER_MIN_STEP_INTERVAL_SECS: u64 = 1_200;
+pub const DEFAULT_TUNER_RELAX_DWELL_SECS: u64 = 2_400;
 
 fn default_var_threshold() -> f64 {
     DEFAULT_VAR_THRESHOLD
@@ -39,6 +47,34 @@ fn default_mask() -> Vec<bool> {
 
 fn default_min_contour_area_grid() -> Vec<f64> {
     vec![0.0; MASK_CELLS]
+}
+
+fn default_tuner_window_secs() -> u64 {
+    DEFAULT_TUNER_WINDOW_SECS
+}
+
+fn default_tuner_tighten_bar() -> f64 {
+    DEFAULT_TUNER_TIGHTEN_BAR
+}
+
+fn default_tuner_relax_bar() -> f64 {
+    DEFAULT_TUNER_RELAX_BAR
+}
+
+fn default_tuner_tighten_step() -> f64 {
+    DEFAULT_TUNER_TIGHTEN_STEP
+}
+
+fn default_tuner_relax_step() -> f64 {
+    DEFAULT_TUNER_RELAX_STEP
+}
+
+fn default_tuner_min_step_interval_secs() -> u64 {
+    DEFAULT_TUNER_MIN_STEP_INTERVAL_SECS
+}
+
+fn default_tuner_relax_dwell_secs() -> u64 {
+    DEFAULT_TUNER_RELAX_DWELL_SECS
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -66,6 +102,20 @@ pub struct MotionSettings {
     /// Per-cell automatic tuner behavior. Off is the safe default for old files.
     #[serde(default)]
     pub tuner_mode: TunerMode,
+    #[serde(default = "default_tuner_tighten_bar")]
+    pub tuner_tighten_bar: f64,
+    #[serde(default = "default_tuner_relax_bar")]
+    pub tuner_relax_bar: f64,
+    #[serde(default = "default_tuner_window_secs")]
+    pub tuner_window_secs: u64,
+    #[serde(default = "default_tuner_tighten_step")]
+    pub tuner_tighten_step: f64,
+    #[serde(default = "default_tuner_relax_step")]
+    pub tuner_relax_step: f64,
+    #[serde(default = "default_tuner_min_step_interval_secs")]
+    pub tuner_min_step_interval_secs: u64,
+    #[serde(default = "default_tuner_relax_dwell_secs")]
+    pub tuner_relax_dwell_secs: u64,
     /// One bool per 16x12 cell, row-major. `true` = ignored: the cell is
     /// excluded from motion detection deterministically. This is the
     /// "movement mask": nothing ever moves here.
@@ -83,6 +133,13 @@ impl Default for MotionSettings {
             min_contour_area: DEFAULT_MIN_CONTOUR_AREA,
             min_contour_area_grid: default_min_contour_area_grid(),
             tuner_mode: TunerMode::Off,
+            tuner_tighten_bar: DEFAULT_TUNER_TIGHTEN_BAR,
+            tuner_relax_bar: DEFAULT_TUNER_RELAX_BAR,
+            tuner_window_secs: DEFAULT_TUNER_WINDOW_SECS,
+            tuner_tighten_step: DEFAULT_TUNER_TIGHTEN_STEP,
+            tuner_relax_step: DEFAULT_TUNER_RELAX_STEP,
+            tuner_min_step_interval_secs: DEFAULT_TUNER_MIN_STEP_INTERVAL_SECS,
+            tuner_relax_dwell_secs: DEFAULT_TUNER_RELAX_DWELL_SECS,
             mask: default_mask(),
             detection_mask: default_mask(),
         }
@@ -95,6 +152,25 @@ impl MotionSettings {
         let mut s = Self {
             var_threshold,
             min_contour_area,
+            min_contour_area_grid: default_min_contour_area_grid(),
+            tuner_mode: TunerMode::Off,
+            ..Self::default()
+        };
+        s.sanitize();
+        s
+    }
+
+    fn from_motion_config(config: &MotionConfig) -> Self {
+        let mut s = Self {
+            var_threshold: config.var_threshold,
+            min_contour_area: config.min_contour_area,
+            tuner_tighten_bar: config.tuner_tighten_bar,
+            tuner_relax_bar: config.tuner_relax_bar,
+            tuner_window_secs: config.tuner_window_secs,
+            tuner_tighten_step: config.tuner_tighten_step,
+            tuner_relax_step: config.tuner_relax_step,
+            tuner_min_step_interval_secs: config.tuner_min_step_interval_secs,
+            tuner_relax_dwell_secs: config.tuner_relax_dwell_secs,
             min_contour_area_grid: default_min_contour_area_grid(),
             tuner_mode: TunerMode::Off,
             mask: default_mask(),
@@ -130,12 +206,58 @@ impl MotionSettings {
                 value.clamp(MIN_CONTOUR_AREA_MIN, CELL_CONTOUR_AREA_CEILING)
             };
         }
+        if self.validate_tuner().is_err() {
+            self.tuner_tighten_bar = DEFAULT_TUNER_TIGHTEN_BAR;
+            self.tuner_relax_bar = DEFAULT_TUNER_RELAX_BAR;
+            self.tuner_window_secs = DEFAULT_TUNER_WINDOW_SECS;
+            self.tuner_tighten_step = DEFAULT_TUNER_TIGHTEN_STEP;
+            self.tuner_relax_step = DEFAULT_TUNER_RELAX_STEP;
+            self.tuner_min_step_interval_secs = DEFAULT_TUNER_MIN_STEP_INTERVAL_SECS;
+            self.tuner_relax_dwell_secs = DEFAULT_TUNER_RELAX_DWELL_SECS;
+        }
         if self.mask.len() != MASK_CELLS {
             self.mask.resize(MASK_CELLS, false);
         }
         if self.detection_mask.len() != MASK_CELLS {
             self.detection_mask.resize(MASK_CELLS, false);
         }
+    }
+
+    fn validate_tuner(&self) -> Result<(), String> {
+        for (name, value) in [
+            ("tuner_tighten_bar", self.tuner_tighten_bar),
+            ("tuner_relax_bar", self.tuner_relax_bar),
+        ] {
+            if !value.is_finite() || value <= 0.0 || value >= 1.0 {
+                return Err(format!("{name} must be between 0 and 1"));
+            }
+        }
+        if self.tuner_relax_bar >= self.tuner_tighten_bar {
+            return Err("tuner_relax_bar must stay below tuner_tighten_bar".to_string());
+        }
+        if self.tuner_window_secs < 120 || !self.tuner_window_secs.is_multiple_of(60) {
+            return Err("tuner_window_secs must be at least 120 and a multiple of 60".to_string());
+        }
+        for (name, value) in [
+            (
+                "tuner_min_step_interval_secs",
+                self.tuner_min_step_interval_secs,
+            ),
+            ("tuner_relax_dwell_secs", self.tuner_relax_dwell_secs),
+        ] {
+            if value < 60 || !value.is_multiple_of(60) {
+                return Err(format!("{name} must be at least 60 and a multiple of 60"));
+            }
+        }
+        for (name, value) in [
+            ("tuner_tighten_step", self.tuner_tighten_step),
+            ("tuner_relax_step", self.tuner_relax_step),
+        ] {
+            if !value.is_finite() || value <= 0.0 {
+                return Err(format!("{name} must be a finite number greater than 0"));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -161,6 +283,8 @@ pub enum UpdateError {
     /// A slider was sent a value that is not a real number.
     #[error("{field} must be a real number, got {value}")]
     NotANumber { field: &'static str, value: f64 },
+    #[error("invalid tuner settings: {0}")]
+    InvalidTunerSettings(String),
 }
 
 /// Partial update accepted by the settings API. Absent fields are left
@@ -171,6 +295,13 @@ pub struct SettingsUpdate {
     pub min_contour_area: Option<f64>,
     pub min_contour_area_grid: Option<Vec<f64>>,
     pub tuner_mode: Option<TunerMode>,
+    pub tuner_tighten_bar: Option<f64>,
+    pub tuner_relax_bar: Option<f64>,
+    pub tuner_window_secs: Option<u64>,
+    pub tuner_tighten_step: Option<f64>,
+    pub tuner_relax_step: Option<f64>,
+    pub tuner_min_step_interval_secs: Option<u64>,
+    pub tuner_relax_dwell_secs: Option<u64>,
     pub mask: Option<Vec<bool>>,
     pub detection_mask: Option<Vec<bool>>,
 }
@@ -203,12 +334,30 @@ impl MotionSettingsStore {
         default_var_threshold: f64,
         default_min_contour_area: f64,
     ) -> Self {
+        Self::new_with_defaults(camera_ids, data_dir, || {
+            MotionSettings::from_defaults(default_var_threshold, default_min_contour_area)
+        })
+    }
+
+    pub fn from_motion_config(
+        camera_ids: &[String],
+        data_dir: &Path,
+        config: &MotionConfig,
+    ) -> Self {
+        Self::new_with_defaults(camera_ids, data_dir, || {
+            MotionSettings::from_motion_config(config)
+        })
+    }
+
+    fn new_with_defaults(
+        camera_ids: &[String],
+        data_dir: &Path,
+        defaults: impl Fn() -> MotionSettings,
+    ) -> Self {
         let mut cameras = HashMap::new();
         for id in camera_ids {
             remove_stale_learned_state(data_dir, id);
             let path = settings_path(data_dir, id);
-            let defaults =
-                || MotionSettings::from_defaults(default_var_threshold, default_min_contour_area);
             let settings = match load(&path) {
                 Persisted::Settings(settings) => settings,
                 Persisted::Absent => defaults(),
@@ -252,6 +401,10 @@ impl MotionSettingsStore {
         for (field, value) in [
             ("var_threshold", update.var_threshold),
             ("min_contour_area", update.min_contour_area),
+            ("tuner_tighten_bar", update.tuner_tighten_bar),
+            ("tuner_relax_bar", update.tuner_relax_bar),
+            ("tuner_tighten_step", update.tuner_tighten_step),
+            ("tuner_relax_step", update.tuner_relax_step),
         ] {
             if let Some(value) = value.filter(|v| !v.is_finite()) {
                 return Err(UpdateError::NotANumber { field, value });
@@ -262,25 +415,51 @@ impl MotionSettingsStore {
         let _persist = cam.persist.lock_recover();
         let (path, settings) = {
             let mut state = cam.state.write_recover();
+            let mut candidate = state.settings.clone();
             if let Some(v) = update.var_threshold {
-                state.settings.var_threshold = v;
+                candidate.var_threshold = v;
             }
             if let Some(v) = update.min_contour_area {
-                state.settings.min_contour_area = v;
+                candidate.min_contour_area = v;
             }
             if let Some(grid) = update.min_contour_area_grid {
-                state.settings.min_contour_area_grid = grid;
+                candidate.min_contour_area_grid = grid;
             }
             if let Some(mode) = update.tuner_mode {
-                state.settings.tuner_mode = mode;
+                candidate.tuner_mode = mode;
+            }
+            if let Some(v) = update.tuner_tighten_bar {
+                candidate.tuner_tighten_bar = v;
+            }
+            if let Some(v) = update.tuner_relax_bar {
+                candidate.tuner_relax_bar = v;
+            }
+            if let Some(v) = update.tuner_window_secs {
+                candidate.tuner_window_secs = v;
+            }
+            if let Some(v) = update.tuner_tighten_step {
+                candidate.tuner_tighten_step = v;
+            }
+            if let Some(v) = update.tuner_relax_step {
+                candidate.tuner_relax_step = v;
+            }
+            if let Some(v) = update.tuner_min_step_interval_secs {
+                candidate.tuner_min_step_interval_secs = v;
+            }
+            if let Some(v) = update.tuner_relax_dwell_secs {
+                candidate.tuner_relax_dwell_secs = v;
             }
             if let Some(m) = update.mask {
-                state.settings.mask = m;
+                candidate.mask = m;
             }
             if let Some(m) = update.detection_mask {
-                state.settings.detection_mask = m;
+                candidate.detection_mask = m;
             }
-            state.settings.sanitize();
+            candidate
+                .validate_tuner()
+                .map_err(UpdateError::InvalidTunerSettings)?;
+            candidate.sanitize();
+            state.settings = candidate;
             (state.path.clone(), state.settings.clone())
         };
         match save(&path, &settings) {
@@ -454,6 +633,13 @@ mod tests {
         assert!(s.min_contour_area_grid.iter().all(|&value| value == 0.0));
         assert_eq!(s.mask.len(), MASK_CELLS);
         assert!(s.mask.iter().all(|&m| !m));
+        assert_eq!(s.tuner_tighten_bar, 0.05);
+        assert_eq!(s.tuner_relax_bar, 0.01);
+        assert_eq!(s.tuner_window_secs, 1_200);
+        assert_eq!(s.tuner_tighten_step, 150.0);
+        assert_eq!(s.tuner_relax_step, 100.0);
+        assert_eq!(s.tuner_min_step_interval_secs, 1_200);
+        assert_eq!(s.tuner_relax_dwell_secs, 2_400);
     }
 
     #[test]
@@ -465,6 +651,7 @@ mod tests {
             tuner_mode: TunerMode::Off,
             mask: vec![true; 3],
             detection_mask: vec![true; 5],
+            ..Default::default()
         };
         s.sanitize();
         assert_eq!(s.var_threshold, VAR_THRESHOLD_MAX);
@@ -483,6 +670,7 @@ mod tests {
             tuner_mode: TunerMode::Off,
             mask: default_mask(),
             detection_mask: default_mask(),
+            ..Default::default()
         };
         low.sanitize();
         assert_eq!(low.var_threshold, VAR_THRESHOLD_MIN);
@@ -519,6 +707,7 @@ mod tests {
             tuner_mode: TunerMode::Auto,
             mask: default_mask(),
             detection_mask: default_mask(),
+            ..Default::default()
         };
         s.mask[5] = true;
         s.mask[MASK_CELLS - 1] = true;
@@ -634,10 +823,16 @@ mod tests {
                 SettingsUpdate {
                     var_threshold: Some(48.0),
                     min_contour_area: Some(500.0),
-                    min_contour_area_grid: None,
                     tuner_mode: Some(TunerMode::Shadow),
+                    tuner_tighten_bar: Some(0.07),
+                    tuner_relax_bar: Some(0.02),
+                    tuner_window_secs: Some(1_800),
+                    tuner_tighten_step: Some(175.0),
+                    tuner_relax_step: Some(75.0),
+                    tuner_min_step_interval_secs: Some(600),
+                    tuner_relax_dwell_secs: Some(3_000),
                     mask: Some(mask),
-                    detection_mask: None,
+                    ..Default::default()
                 },
             )
             .unwrap();
@@ -651,6 +846,37 @@ mod tests {
         assert_eq!(loaded.min_contour_area, 500.0);
         assert!(loaded.mask[10]);
         assert_eq!(loaded.tuner_mode, TunerMode::Shadow);
+        assert_eq!(loaded.tuner_tighten_bar, 0.07);
+        assert_eq!(loaded.tuner_relax_bar, 0.02);
+        assert_eq!(loaded.tuner_window_secs, 1_800);
+        assert_eq!(loaded.tuner_tighten_step, 175.0);
+        assert_eq!(loaded.tuner_relax_step, 75.0);
+        assert_eq!(loaded.tuner_min_step_interval_secs, 600);
+        assert_eq!(loaded.tuner_relax_dwell_secs, 3_000);
+    }
+
+    #[test]
+    fn invalid_tuner_update_is_rejected_atomically() {
+        let dir = TempDir::new().unwrap();
+        let store = MotionSettingsStore::new(&["cam1".to_string()], dir.path(), 16.0, 200.0);
+
+        let error = store
+            .update(
+                "cam1",
+                SettingsUpdate {
+                    min_contour_area: Some(500.0),
+                    tuner_tighten_bar: Some(0.01),
+                    tuner_relax_bar: Some(0.02),
+                    ..Default::default()
+                },
+            )
+            .unwrap_err();
+
+        assert!(matches!(error, UpdateError::InvalidTunerSettings(_)));
+        let settings = store.get("cam1").unwrap();
+        assert_eq!(settings.min_contour_area, 200.0);
+        assert_eq!(settings.tuner_tighten_bar, 0.05);
+        assert_eq!(settings.tuner_relax_bar, 0.01);
     }
 
     #[test]
@@ -668,6 +894,7 @@ mod tests {
                     tuner_mode: None,
                     mask: None,
                     detection_mask: None,
+                    ..Default::default()
                 },
             )
             .unwrap();
@@ -685,6 +912,7 @@ mod tests {
                 tuner_mode: TunerMode::Off,
                 mask: default_mask(),
                 detection_mask: default_mask(),
+                ..Default::default()
             };
             s.sanitize();
             assert_eq!(s.var_threshold, DEFAULT_VAR_THRESHOLD, "from {bad}");

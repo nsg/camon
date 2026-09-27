@@ -414,11 +414,10 @@ fn init_motion_settings(
         return None;
     }
     let data_dir = std::path::PathBuf::from(&config.storage.data_dir);
-    Some(analytics::MotionSettingsStore::new(
+    Some(analytics::MotionSettingsStore::from_motion_config(
         camera_ids,
         &data_dir,
-        config.analytics.motion.var_threshold,
-        config.analytics.motion.min_contour_area,
+        &config.analytics.motion,
     ))
 }
 
