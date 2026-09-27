@@ -253,6 +253,10 @@ impl MotionTuner {
     }
 
     pub fn set_mode(&mut self, mode: TunerMode) {
+        if self.mode != mode {
+            self.quiet_since = [None; MASK_CELLS];
+            self.proposed_quiet_since = [None; MASK_CELLS];
+        }
         self.mode = mode;
     }
 
@@ -1468,6 +1472,35 @@ mod tests {
             .evaluate(start + Duration::from_secs(122), SystemTime::now())
             .is_empty());
         assert_eq!(tuner.state().learned[0], 150.0);
+    }
+
+    #[test]
+    fn mode_switches_restart_continuous_quiet_dwell() {
+        let start = Instant::now();
+        let mut configured = params();
+        configured.cell_ceiling = 1_000.0;
+        let mut tuner = MotionTuner::new(configured);
+        tuner.set_mode(TunerMode::Auto);
+        let mut learned = vec![0.0; MASK_CELLS];
+        learned[0] = 350.0;
+        tuner.load_state(&TunerState {
+            version: 2,
+            learned,
+            last_change: vec![None; MASK_CELLS],
+        });
+
+        observe(&mut tuner, start, 0..=120, false, 0);
+        tuner.evaluate(start + Duration::from_secs(120), SystemTime::now());
+        assert!(tuner.quiet_since[0].is_some());
+
+        tuner.set_mode(TunerMode::Off);
+        observe(&mut tuner, start, 121..=300, false, 0);
+        tuner.set_mode(TunerMode::Auto);
+        assert!(tuner
+            .evaluate(start + Duration::from_secs(300), SystemTime::now())
+            .is_empty());
+        assert_eq!(tuner.state().learned[0], 350.0);
+        assert_eq!(tuner.quiet_since[0], Some(start + Duration::from_secs(300)));
     }
 
     #[test]
