@@ -123,8 +123,9 @@ sample_fps = 5
 # slider, and two paintable 16x12 masks: the movement mask, which excludes
 # cells from motion detection, and the detection mask, which blacks cells out
 # of every frame sent to the vision model) — takes over. The optional per-cell
-# tuner mode is also stored there and defaults to off; its control-loop
-# parameters below are global defaults. Both masks default to all-off.
+# tuner mode and its control-loop parameters are also stored there; the values
+# below seed each camera and remain editable in its web UI. The tuner defaults
+# to off, and both masks default to all-off.
 # A number outside its range is clamped into it at startup, with a warning
 # naming the field and the value being used. A value that is not a number at
 # all — TOML accepts the literals nan, inf and -inf — is refused instead: no
@@ -139,15 +140,22 @@ min_contour_area = 200
 # tuner_window_secs = 1200
 # Fraction of cells above which a triggered segment is treated as whole-frame.
 # tuner_global_event_cell_fraction = 0.5
-# Fraction of analyzed segments that must hit a cell before tightening it.
-# tuner_tighten_bar = 0.60
-# Foreground pixels added to a noisy cell per tuning step.
+# Fraction of analyzed segments whose baseline-qualified motion midpoint must
+# land in a cell before tightening it (default: 0.05). Validate this starting
+# value and tuner_relax_bar in Shadow before enabling Auto.
+# tuner_tighten_bar = 0.05
+# Foreground pixels added to a noisy cell per tuning step (default: 150).
 # tuner_tighten_step = 150
-# A cell below this fraction is quiet and starts its relaxation dwell.
-# tuner_relax_bar = 0.10
-# Continuous quiet seconds required before each relaxation step.
+# A cell below this fraction is quiet and starts its relaxation dwell (default:
+# 0.01; must stay below tuner_tighten_bar).
+# tuner_relax_bar = 0.01
+# Minimum seconds between adjustments to one cell (default: 1200; >=60,
+# multiple of 60).
+# tuner_min_step_interval_secs = 1200
+# Continuous quiet seconds required before each relaxation step (default: 2400;
+# >=60, multiple of 60).
 # tuner_relax_dwell_secs = 2400
-# Foreground pixels removed from a quiet cell per relaxation step.
+# Foreground pixels removed from a quiet cell per relaxation step (default: 100).
 # tuner_relax_step = 100
 
 # Object detection via Ollama or a tpue Edge TPU service (requires analytics enabled).
