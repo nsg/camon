@@ -66,10 +66,8 @@ pub struct MotionDetector {
     ccl: ConnectedComponents,
     components: Vec<Component>,
     retained: Vec<bool>,
-    learning_retained: Vec<bool>,
     bboxes: Vec<MotionBox>,
     learning_bboxes: Vec<MotionBox>,
-    learning_score: f32,
 }
 
 impl MotionDetector {
@@ -99,10 +97,8 @@ impl MotionDetector {
             ccl: ConnectedComponents::new(),
             components: Vec::new(),
             retained: Vec::new(),
-            learning_retained: Vec::new(),
             bboxes: Vec::new(),
             learning_bboxes: Vec::new(),
-            learning_score: 0.0,
         }
     }
 
@@ -174,7 +170,6 @@ impl MotionDetector {
             self.frames_since_stable = 0;
             self.bboxes.clear();
             self.learning_bboxes.clear();
-            self.learning_score = 0.0;
             return 0.0;
         }
 
@@ -183,7 +178,6 @@ impl MotionDetector {
         if self.frames_since_stable < WARMUP_FRAMES {
             self.bboxes.clear();
             self.learning_bboxes.clear();
-            self.learning_score = 0.0;
             return 0.0;
         }
 
@@ -204,8 +198,6 @@ impl MotionDetector {
             .label(&self.morph_mask, width, height, &mut self.components);
         self.retained.clear();
         self.retained.resize(self.components.len(), false);
-        self.learning_retained.clear();
-        self.learning_retained.resize(self.components.len(), false);
         self.bboxes.clear();
         self.learning_bboxes.clear();
         for (i, c) in self.components.iter().enumerate() {
@@ -226,7 +218,6 @@ impl MotionDetector {
                 height: (c.max_y - c.min_y + 1) as i32,
             };
             if f64::from(c.area) >= learning_effective {
-                self.learning_retained[i] = true;
                 self.learning_bboxes.push(bbox);
             }
             if f64::from(c.area) >= effective {
@@ -238,7 +229,6 @@ impl MotionDetector {
         self.final_mask.clear();
         self.final_mask.resize(total_pixels, 0);
         let mut fg_pixels = 0u32;
-        let mut learning_fg_pixels = 0u32;
         for (out, &label) in self.final_mask.iter_mut().zip(self.ccl.labels()) {
             if label != 0 {
                 let component = (label - 1) as usize;
@@ -246,14 +236,10 @@ impl MotionDetector {
                     *out = 255;
                     fg_pixels += 1;
                 }
-                if self.learning_retained[component] {
-                    learning_fg_pixels += 1;
-                }
             }
         }
 
         let foreground_ratio = fg_pixels as f32 / total_pixels as f32;
-        self.learning_score = (learning_fg_pixels as f32 / total_pixels as f32 * 10.0).min(1.0);
         (foreground_ratio * 10.0).min(1.0)
     }
 
@@ -340,10 +326,6 @@ impl MotionDetector {
     /// before automatic cell thresholds are applied.
     pub fn learning_bboxes(&self) -> &[MotionBox] {
         &self.learning_bboxes
-    }
-
-    pub fn learning_score(&self) -> f32 {
-        self.learning_score
     }
 
     /// Whether the last frame was fully processed. False during model warmup
@@ -475,7 +457,6 @@ mod tests {
         let frame = frame_with_blob(100, 80, 24);
         assert_eq!(det.process_frame(&frame, W, H), 0.0);
         assert!(det.motion_bboxes().is_empty());
-        assert!(det.learning_score() > 0.0);
         assert_eq!(det.learning_bboxes().len(), 1);
 
         det.set_min_contour_area_grid(&[0.0; MASK_CELLS]);

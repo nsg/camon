@@ -2177,7 +2177,6 @@ fn skip_reporter_totals_everything_it_held_back() {
 fn motion_verdict_needs_the_threshold() {
     let scored = |score| SegmentAnalysis {
         score,
-        tuner_score: score,
         crop: None,
         motion_rects: Vec::new(),
         motion_cells: [false; MASK_CELLS],
@@ -2186,6 +2185,21 @@ fn motion_verdict_needs_the_threshold() {
     assert!(!scored(0.0).has_motion());
     assert!(!scored(MOTION_THRESHOLD - 0.001).has_motion());
     assert!(scored(MOTION_THRESHOLD).has_motion());
+}
+
+#[test]
+fn tuner_counts_any_baseline_qualified_midpoint_without_a_score_floor() {
+    let mut analysis = SegmentAnalysis {
+        score: MOTION_THRESHOLD - 0.001,
+        crop: None,
+        motion_rects: Vec::new(),
+        motion_cells: [false; MASK_CELLS],
+        motion_coverage_cells: [false; MASK_CELLS],
+    };
+    assert!(!analysis.has_tuner_motion());
+
+    analysis.motion_cells[17] = true;
+    assert!(analysis.has_tuner_motion());
 }
 
 #[test]

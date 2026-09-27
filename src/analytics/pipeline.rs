@@ -95,7 +95,6 @@ impl FrameUse {
 /// One segment's motion verdict.
 struct SegmentAnalysis {
     score: f32,
-    tuner_score: f32,
     crop: Option<NormalizedRect>,
     motion_rects: Vec<NormalizedRect>,
     motion_cells: [bool; MASK_CELLS],
@@ -108,7 +107,7 @@ impl SegmentAnalysis {
     }
 
     fn has_tuner_motion(&self) -> bool {
-        self.tuner_score >= MOTION_THRESHOLD
+        self.motion_cells.iter().any(|&active| active)
     }
 }
 
@@ -781,7 +780,6 @@ impl MotionAnalyzer {
                 motion_rects,
                 motion_cells: _,
                 motion_coverage_cells: _,
-                tuner_score: _,
             } = analysis;
             // Whatever has accumulated belongs to the run that just closed:
             // this batch's own frames are extracted later, in
@@ -999,7 +997,6 @@ impl MotionAnalyzer {
 
         let (w, h) = (ANALYSIS_WIDTH as usize, ANALYSIS_HEIGHT as usize);
         let mut total_score = 0.0f32;
-        let mut tuner_total_score = 0.0f32;
         let mut frame_count = 0u32;
         let mut all_rects = Vec::new();
         let mut motion_cells = [false; MASK_CELLS];
@@ -1008,7 +1005,6 @@ impl MotionAnalyzer {
         for frame_data in &raw_frames {
             let score = self.detector.process_frame(frame_data, w, h);
             total_score += score;
-            tuner_total_score += self.detector.learning_score();
             frame_count += 1;
             mark_midpoint_cells(self.detector.learning_bboxes(), w, h, &mut motion_cells);
             mark_covered_cells(
@@ -1026,7 +1022,6 @@ impl MotionAnalyzer {
 
         Ok(Some(SegmentAnalysis {
             score: total_score / frame_count as f32,
-            tuner_score: tuner_total_score / frame_count as f32,
             crop,
             motion_rects: all_rects,
             motion_cells,
