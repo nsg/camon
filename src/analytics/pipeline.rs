@@ -249,6 +249,10 @@ impl MotionAnalyzer {
         let mut tuner = MotionTuner::new(TunerParams::from(&ctx.config.motion));
         if let Some(settings) = settings.as_ref() {
             tuner.set_mode(settings.tuner_mode);
+            tuner.set_params(TunerParams::from_settings(
+                settings,
+                ctx.config.motion.tuner_global_event_cell_fraction,
+            ));
         }
         let state_path = tuner_state_path(&ctx.data_dir, &ctx.camera_id);
         match load_tuner_state(&state_path) {
@@ -265,7 +269,9 @@ impl MotionAnalyzer {
         let mut detector = MotionDetector::new(var_threshold, min_contour_area);
         if let Some(s) = settings.as_ref() {
             detector.set_mask(&s.mask);
-            detector.set_min_contour_area_grid(&tuner.effective_grid(&s.min_contour_area_grid));
+            detector.set_min_contour_area_grid(
+                &tuner.effective_grid_from_baseline(s.min_contour_area, &s.min_contour_area_grid),
+            );
         }
         let detection_mask = settings
             .as_ref()
@@ -318,9 +324,11 @@ impl MotionAnalyzer {
         if let Some(settings) = settings.as_ref() {
             analyzer.tuner_store.publish(
                 &analyzer.camera_id,
-                analyzer
-                    .tuner
-                    .snapshot(&settings.min_contour_area_grid, Instant::now()),
+                analyzer.tuner.snapshot_with_baseline(
+                    settings.min_contour_area,
+                    &settings.min_contour_area_grid,
+                    Instant::now(),
+                ),
             );
         }
         analyzer
@@ -503,6 +511,10 @@ impl MotionAnalyzer {
     fn control_plane(&mut self, now: Instant) {
         if let Some(s) = self.motion_settings.get(&self.camera_id) {
             self.tuner.set_mode(s.tuner_mode);
+            self.tuner.set_params(TunerParams::from_settings(
+                &s,
+                self.config.motion.tuner_global_event_cell_fraction,
+            ));
             let reset = self.tuner_store.take_reset(&self.camera_id);
             if reset {
                 self.tuner.reset();
@@ -513,7 +525,12 @@ impl MotionAnalyzer {
             let cadence_due =
                 now.saturating_duration_since(self.last_tuner_eval) >= Duration::from_secs(60);
             if cadence_due {
-                let changes = self.tuner.evaluate(now, SystemTime::now());
+                let changes = self.tuner.evaluate_with_baseline(
+                    s.min_contour_area,
+                    &s.min_contour_area_grid,
+                    now,
+                    SystemTime::now(),
+                );
                 for change in &changes {
                     tracing::info!(
                         camera = %self.camera_id,
@@ -541,13 +558,19 @@ impl MotionAnalyzer {
 
             self.detector.set_var_threshold(s.var_threshold);
             self.detector.set_min_contour_area(s.min_contour_area);
-            let effective = self.tuner.effective_grid(&s.min_contour_area_grid);
+            let effective = self
+                .tuner
+                .effective_grid_from_baseline(s.min_contour_area, &s.min_contour_area_grid);
             self.detector.set_min_contour_area_grid(&effective);
             self.detector.set_mask(&s.mask);
             self.detection_mask = s.detection_mask;
             self.tuner_store.publish(
                 &self.camera_id,
-                self.tuner.snapshot(&s.min_contour_area_grid, now),
+                self.tuner.snapshot_with_baseline(
+                    s.min_contour_area,
+                    &s.min_contour_area_grid,
+                    now,
+                ),
             );
         }
     }
@@ -707,8 +730,12 @@ impl MotionAnalyzer {
             publish_debug_maps(&self.motion_store, &self.camera_id, &self.detector);
 
             let has_motion = analysis.has_motion();
-            self.tuner
-                .observe_segment(has_motion, &analysis.motion_cells, now);
+            self.tuner.observe_segment_with_duration(
+                has_motion,
+                &analysis.motion_cells,
+                Duration::from_nanos(seg.duration_ns),
+                now,
+            );
             let SegmentAnalysis {
                 score,
                 crop,

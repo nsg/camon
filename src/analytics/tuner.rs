@@ -8,15 +8,15 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 use crate::analytics::motion_settings::{
-    TunerMode, CELL_CONTOUR_AREA_CEILING, MASK_CELLS, MASK_COLS, MASK_ROWS,
+    MotionSettings, TunerMode, CELL_CONTOUR_AREA_CEILING, MASK_CELLS, MASK_COLS, MASK_ROWS,
 };
 use crate::config::MotionConfig;
 use crate::durable::{create_dir_all_synced, sync_dir, tmp_path, write_synced};
 use crate::locks::LockExt;
 
 const BUCKET_SECS: u64 = 60;
-/// Half a minute of the roughly one-segment-per-second analyzer stream.
-const MIN_BUCKET_SEGMENTS: u32 = 30;
+const MIN_COVERAGE_FRACTION: f64 = 0.9;
+const MAX_MISSING_CADENCES: u32 = 3;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TunerParams {
@@ -61,6 +61,33 @@ impl From<&MotionConfig> for TunerParams {
             ..Self::default()
         }
     }
+}
+
+impl TunerParams {
+    pub fn from_settings(settings: &MotionSettings, global_event_cell_fraction: f64) -> Self {
+        Self {
+            window_secs: settings.tuner_window_secs,
+            global_event_cell_fraction,
+            tighten_bar: settings.tuner_tighten_bar,
+            tighten_step: settings.tuner_tighten_step,
+            cell_ceiling: CELL_CONTOUR_AREA_CEILING,
+            relax_bar: settings.tuner_relax_bar,
+            relax_dwell_secs: settings.tuner_relax_dwell_secs,
+            relax_step: settings.tuner_relax_step,
+            min_step_interval_secs: settings.tuner_min_step_interval_secs,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CellAdaptationStatus {
+    Off,
+    InsufficientCoverage,
+    BelowThreshold,
+    Cooldown,
+    Ceiling,
+    Ready,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -109,6 +136,7 @@ pub struct TunerSnapshot {
     pub proposed: Vec<f64>,
     pub effective: Vec<f64>,
     pub trigger_fraction: Vec<f64>,
+    pub adaptation_status: Vec<CellAdaptationStatus>,
     pub last_change: Vec<Option<PersistedCellChange>>,
     pub params: TunerParams,
 }
@@ -131,9 +159,29 @@ impl TunerSnapshot {
             proposed: vec![0.0; MASK_CELLS],
             effective: vec![0.0; MASK_CELLS],
             trigger_fraction: vec![0.0; MASK_CELLS],
+            adaptation_status: vec![CellAdaptationStatus::InsufficientCoverage; MASK_CELLS],
             last_change: vec![None; MASK_CELLS],
             params,
         }
+    }
+
+    pub fn empty_for_settings(settings: &MotionSettings, global_event_cell_fraction: f64) -> Self {
+        let params = TunerParams::from_settings(settings, global_event_cell_fraction);
+        let mut snapshot = Self::empty_with_params(settings.tuner_mode, params);
+        snapshot.base = (0..MASK_CELLS)
+            .map(|cell| {
+                manual_baseline(
+                    settings.min_contour_area,
+                    &settings.min_contour_area_grid,
+                    cell,
+                )
+            })
+            .collect();
+        snapshot.effective.clone_from(&snapshot.base);
+        if settings.tuner_mode == TunerMode::Off {
+            snapshot.adaptation_status.fill(CellAdaptationStatus::Off);
+        }
+        snapshot
     }
 }
 
@@ -150,6 +198,12 @@ struct Bucket {
     segments: u32,
     global_events: u32,
     cell_hits: [u32; MASK_CELLS],
+}
+
+#[derive(Clone, Copy)]
+struct Observation {
+    at: Instant,
+    expected_duration: Duration,
 }
 
 impl Bucket {
@@ -173,6 +227,7 @@ pub struct MotionTuner {
     last_change: Vec<Option<PersistedCellChange>>,
     started: Option<Instant>,
     buckets: VecDeque<Bucket>,
+    observations: VecDeque<Observation>,
 }
 
 impl MotionTuner {
@@ -187,15 +242,31 @@ impl MotionTuner {
             last_change: vec![None; MASK_CELLS],
             started: None,
             buckets: VecDeque::new(),
+            observations: VecDeque::new(),
         }
     }
 
     pub fn set_mode(&mut self, mode: TunerMode) {
+        if self.mode != mode {
+            self.last_step = [None; MASK_CELLS];
+            self.quiet_since = [None; MASK_CELLS];
+        }
         self.mode = mode;
     }
 
     pub fn mode(&self) -> TunerMode {
         self.mode
+    }
+
+    pub fn set_params(&mut self, params: TunerParams) {
+        if self.params != params {
+            self.last_step = [None; MASK_CELLS];
+            self.quiet_since = [None; MASK_CELLS];
+            self.started = None;
+            self.buckets.clear();
+            self.observations.clear();
+        }
+        self.params = params;
     }
 
     pub fn observe_segment(
@@ -204,10 +275,21 @@ impl MotionTuner {
         motion_cells: &[bool; MASK_CELLS],
         now: Instant,
     ) {
+        self.observe_segment_with_duration(triggered, motion_cells, Duration::from_secs(1), now);
+    }
+
+    pub fn observe_segment_with_duration(
+        &mut self,
+        triggered: bool,
+        motion_cells: &[bool; MASK_CELLS],
+        expected_duration: Duration,
+        now: Instant,
+    ) {
         if self.started.is_none() {
             self.started = Some(now);
         }
         self.rotate(now);
+        self.record_observation(now, expected_duration);
         let minute = self.minute_at(now);
         let Some(oldest) = self.buckets.front().map(|bucket| bucket.minute) else {
             return;
@@ -238,14 +320,23 @@ impl MotionTuner {
     }
 
     pub fn evaluate(&mut self, now: Instant, wall: SystemTime) -> Vec<CellChange> {
+        self.evaluate_with_baseline(0.0, &[], now, wall)
+    }
+
+    pub fn evaluate_with_baseline(
+        &mut self,
+        min_contour_area: f64,
+        manual_grid: &[f64],
+        now: Instant,
+        wall: SystemTime,
+    ) -> Vec<CellChange> {
         self.rotate(now);
         if self.mode == TunerMode::Off || self.started.is_none() {
             return Vec::new();
         }
 
         let fractions = self.trigger_fractions();
-        let tighten_ready = self.tighten_ready(now);
-        let relax_ready = self.elapsed_window_ready(now);
+        let coverage_ready = self.coverage_ready(now);
         let step_interval = Duration::from_secs(self.params.min_step_interval_secs);
         let relax_dwell = Duration::from_secs(self.params.relax_dwell_secs);
         let window_minutes = self.params.window_secs / BUCKET_SECS;
@@ -253,14 +344,16 @@ impl MotionTuner {
         let mut changes = Vec::new();
 
         for (cell, &fraction) in fractions.iter().enumerate() {
-            let current = match self.mode {
+            let baseline = manual_baseline(min_contour_area, manual_grid, cell);
+            let stored = match self.mode {
                 TunerMode::Auto => self.learned[cell],
                 TunerMode::Shadow => self.proposed[cell],
                 TunerMode::Off => unreachable!(),
             };
+            let current = stored.min(self.params.cell_ceiling).max(baseline);
             let step_ready = self.last_step[cell]
                 .is_none_or(|last| now.saturating_duration_since(last) >= step_interval);
-            let change = if fraction >= self.params.tighten_bar && tighten_ready && step_ready {
+            let change = if fraction >= self.params.tighten_bar && coverage_ready && step_ready {
                 self.quiet_since[cell] = None;
                 let target = (current + self.params.tighten_step).min(self.params.cell_ceiling);
                 (target > current).then(|| {
@@ -273,10 +366,14 @@ impl MotionTuner {
                     )
                 })
             } else if fraction < self.params.relax_bar {
+                if !coverage_ready {
+                    self.quiet_since[cell] = None;
+                    continue;
+                }
                 let quiet_since = *self.quiet_since[cell].get_or_insert(now);
                 let quiet_long_enough = now.saturating_duration_since(quiet_since) >= relax_dwell;
-                if relax_ready && quiet_long_enough && current > 0.0 && step_ready {
-                    let target = (current - self.params.relax_step).max(0.0);
+                if quiet_long_enough && current > baseline && step_ready {
+                    let target = (current - self.params.relax_step).max(baseline);
                     let percent = (fraction * 100.0).round() as u64;
                     Some((
                         target,
@@ -315,16 +412,22 @@ impl MotionTuner {
         changes
     }
 
-    pub fn effective_grid(&self, base: &[f64]) -> Vec<f64> {
+    pub fn effective_grid(&self, manual_grid: &[f64]) -> Vec<f64> {
+        self.effective_grid_from_baseline(0.0, manual_grid)
+    }
+
+    pub fn effective_grid_from_baseline(
+        &self,
+        min_contour_area: f64,
+        manual_grid: &[f64],
+    ) -> Vec<f64> {
         if self.mode != TunerMode::Auto {
-            return base.to_vec();
+            return manual_grid.to_vec();
         }
         (0..MASK_CELLS)
             .map(|cell| {
-                base.get(cell)
-                    .copied()
-                    .unwrap_or(0.0)
-                    .max(self.learned[cell])
+                manual_baseline(min_contour_area, manual_grid, cell)
+                    .max(self.learned[cell].min(self.params.cell_ceiling))
             })
             .collect()
     }
@@ -337,17 +440,34 @@ impl MotionTuner {
         self.last_change.fill(None);
         self.started = None;
         self.buckets.clear();
+        self.observations.clear();
     }
 
-    pub fn snapshot(&mut self, base: &[f64], now: Instant) -> TunerSnapshot {
+    pub fn snapshot(&mut self, manual_grid: &[f64], now: Instant) -> TunerSnapshot {
+        self.snapshot_with_baseline(0.0, manual_grid, now)
+    }
+
+    pub fn snapshot_with_baseline(
+        &mut self,
+        min_contour_area: f64,
+        manual_grid: &[f64],
+        now: Instant,
+    ) -> TunerSnapshot {
         self.rotate(now);
-        let base = normalized_grid(base);
+        let base: Vec<f64> = (0..MASK_CELLS)
+            .map(|cell| manual_baseline(min_contour_area, manual_grid, cell))
+            .collect();
+        let effective = if self.mode == TunerMode::Auto {
+            self.effective_grid_from_baseline(min_contour_area, manual_grid)
+        } else {
+            base.clone()
+        };
         TunerSnapshot {
             mode: self.mode,
             cols: MASK_COLS,
             rows: MASK_ROWS,
             window_secs: self.params.window_secs,
-            window_full: self.tighten_ready(now),
+            window_full: self.coverage_ready(now),
             global_events_in_window: self
                 .buckets
                 .iter()
@@ -356,8 +476,9 @@ impl MotionTuner {
             base: base.clone(),
             learned: self.learned.to_vec(),
             proposed: self.proposed.to_vec(),
-            effective: self.effective_grid(&base),
+            effective,
             trigger_fraction: self.trigger_fractions().to_vec(),
+            adaptation_status: self.adaptation_statuses(&base, now),
             last_change: self.last_change.clone(),
             params: self.params.clone(),
         }
@@ -422,6 +543,16 @@ impl MotionTuner {
         {
             self.buckets.pop_front();
         }
+        let oldest_observation = now
+            .checked_sub(Duration::from_secs(self.params.window_secs))
+            .unwrap_or(now);
+        while self
+            .observations
+            .front()
+            .is_some_and(|sample| sample.at < oldest_observation)
+        {
+            self.observations.pop_front();
+        }
     }
 
     fn minute_at(&self, now: Instant) -> u64 {
@@ -440,33 +571,103 @@ impl MotionTuner {
         })
     }
 
-    fn tighten_ready(&self, now: Instant) -> bool {
+    fn coverage_ready(&self, now: Instant) -> bool {
         if !self.elapsed_window_ready(now) {
             return false;
         }
 
-        let current_minute = self.minute_at(now);
-        let window_minutes = self.window_minutes();
-        if current_minute < window_minutes {
-            return false;
-        }
-        let first_complete = current_minute - window_minutes;
-        let complete_buckets_observed = (first_complete..current_minute).all(|minute| {
-            self.buckets
-                .iter()
-                .find(|bucket| bucket.minute == minute)
-                .is_some_and(|bucket| bucket.segments >= MIN_BUCKET_SEGMENTS)
-        });
-        if !complete_buckets_observed {
+        let window_start = now
+            .checked_sub(Duration::from_secs(self.params.window_secs))
+            .unwrap_or(now);
+        let samples: Vec<_> = self
+            .observations
+            .iter()
+            .filter(|sample| sample.at >= window_start && sample.at < now)
+            .copied()
+            .collect();
+        let covered_secs: f64 = samples
+            .iter()
+            .map(|sample| sample.expected_duration.as_secs_f64())
+            .sum();
+        if covered_secs < self.params.window_secs as f64 * MIN_COVERAGE_FRACTION {
             return false;
         }
 
-        let segments: u64 = self
-            .buckets
+        let mut previous_at = window_start;
+        let mut previous_cadence = samples
+            .first()
+            .map_or(Duration::ZERO, |sample| sample.expected_duration);
+        for sample in &samples {
+            let cadence = previous_cadence.max(sample.expected_duration);
+            if sample.at.saturating_duration_since(previous_at)
+                > cadence.saturating_mul(MAX_MISSING_CADENCES)
+            {
+                return false;
+            }
+            previous_at = sample.at;
+            previous_cadence = sample.expected_duration;
+        }
+        now.saturating_duration_since(previous_at)
+            <= previous_cadence.saturating_mul(MAX_MISSING_CADENCES)
+    }
+
+    fn record_observation(&mut self, at: Instant, expected_duration: Duration) {
+        let expected_duration = expected_duration.max(Duration::from_millis(1));
+        let sample = Observation {
+            at,
+            expected_duration,
+        };
+        let insert_at = self
+            .observations
             .iter()
-            .map(|bucket| u64::from(bucket.segments))
-            .sum();
-        segments >= self.params.window_secs / 2
+            .position(|existing| existing.at > at)
+            .unwrap_or(self.observations.len());
+        self.observations.insert(insert_at, sample);
+    }
+
+    fn adaptation_statuses(&self, base: &[f64], now: Instant) -> Vec<CellAdaptationStatus> {
+        let coverage_ready = self.coverage_ready(now);
+        let fractions = self.trigger_fractions();
+        let step_interval = Duration::from_secs(self.params.min_step_interval_secs);
+        let relax_dwell = Duration::from_secs(self.params.relax_dwell_secs);
+        (0..MASK_CELLS)
+            .map(|cell| {
+                if self.mode == TunerMode::Off {
+                    return CellAdaptationStatus::Off;
+                }
+                if !coverage_ready {
+                    return CellAdaptationStatus::InsufficientCoverage;
+                }
+                let stored = match self.mode {
+                    TunerMode::Shadow => self.proposed[cell],
+                    TunerMode::Auto => self.learned[cell],
+                    TunerMode::Off => unreachable!(),
+                };
+                let current = stored.min(self.params.cell_ceiling).max(base[cell]);
+                let step_ready = self.last_step[cell]
+                    .is_none_or(|last| now.saturating_duration_since(last) >= step_interval);
+                if fractions[cell] >= self.params.tighten_bar {
+                    if current >= self.params.cell_ceiling {
+                        return CellAdaptationStatus::Ceiling;
+                    }
+                    if !step_ready {
+                        return CellAdaptationStatus::Cooldown;
+                    }
+                    return CellAdaptationStatus::Ready;
+                }
+                if fractions[cell] < self.params.relax_bar && current > base[cell] {
+                    let dwell_ready = self.quiet_since[cell].is_some_and(|quiet_since| {
+                        now.saturating_duration_since(quiet_since) >= relax_dwell
+                    });
+                    return if step_ready && dwell_ready {
+                        CellAdaptationStatus::Ready
+                    } else {
+                        CellAdaptationStatus::Cooldown
+                    };
+                }
+                CellAdaptationStatus::BelowThreshold
+            })
+            .collect()
     }
 
     fn trigger_fractions(&self) -> [f64; MASK_CELLS] {
@@ -489,10 +690,13 @@ impl MotionTuner {
     }
 }
 
-fn normalized_grid(base: &[f64]) -> Vec<f64> {
-    (0..MASK_CELLS)
-        .map(|cell| base.get(cell).copied().unwrap_or(0.0))
-        .collect()
+fn manual_baseline(min_contour_area: f64, manual_grid: &[f64], cell: usize) -> f64 {
+    manual_grid
+        .get(cell)
+        .copied()
+        .filter(|value| *value > 0.0)
+        .unwrap_or(min_contour_area)
+        .max(min_contour_area)
 }
 
 pub fn tuner_state_path(data_dir: &Path, camera_id: &str) -> std::path::PathBuf {
@@ -724,17 +928,125 @@ mod tests {
     }
 
     #[test]
-    fn shadow_only_changes_proposed_and_never_effective() {
+    fn first_step_starts_above_camera_and_manual_cell_baselines() {
+        let start = Instant::now();
+        let mut configured = params();
+        configured.cell_ceiling = 1_000.0;
+        let mut tuner = MotionTuner::new(configured);
+        tuner.set_mode(TunerMode::Auto);
+        observe(&mut tuner, start, 0..=120, true, 3);
+
+        let first = tuner.evaluate_with_baseline(
+            200.0,
+            &[],
+            start + Duration::from_secs(120),
+            SystemTime::now(),
+        );
+        assert_eq!((first[0].old, first[0].new), (200.0, 350.0));
+
+        tuner.reset();
+        tuner.set_mode(TunerMode::Auto);
+        let mut manual = vec![0.0; MASK_CELLS];
+        manual[3] = 500.0;
+        observe(&mut tuner, start, 0..=120, true, 3);
+        let first = tuner.evaluate_with_baseline(
+            200.0,
+            &manual,
+            start + Duration::from_secs(120),
+            SystemTime::now(),
+        );
+        assert_eq!((first[0].old, first[0].new), (500.0, 650.0));
+    }
+
+    #[test]
+    fn automatic_ceiling_never_lowers_a_manual_baseline() {
+        let mut configured = params();
+        configured.cell_ceiling = 300.0;
+        let mut tuner = MotionTuner::new(configured);
+        tuner.set_mode(TunerMode::Auto);
+        tuner.load_state(&TunerState {
+            version: 2,
+            learned: vec![300.0; MASK_CELLS],
+            last_change: vec![None; MASK_CELLS],
+        });
+        let mut manual = vec![0.0; MASK_CELLS];
+        manual[4] = 500.0;
+
+        let effective = tuner.effective_grid_from_baseline(200.0, &manual);
+        assert_eq!(effective[4], 500.0);
+        assert_eq!(effective[5], 300.0);
+    }
+
+    #[test]
+    fn cadence_coverage_accepts_missing_samples_and_non_one_second_segments() {
+        let start = Instant::now();
+        for cadence_secs in [1, 2] {
+            let mut tuner = MotionTuner::new(params());
+            tuner.set_mode(TunerMode::Auto);
+            for second in (0..120).step_by(cadence_secs as usize) {
+                if cadence_secs == 1 && second % 20 == 10 {
+                    continue;
+                }
+                let mut cells = [false; MASK_CELLS];
+                cells[6] = true;
+                tuner.observe_segment_with_duration(
+                    true,
+                    &cells,
+                    Duration::from_secs(cadence_secs),
+                    start + Duration::from_secs(second),
+                );
+            }
+            assert!(
+                tuner
+                    .snapshot(&[], start + Duration::from_secs(120))
+                    .window_full,
+                "{cadence_secs}s cadence"
+            );
+        }
+    }
+
+    #[test]
+    fn cadence_coverage_rejects_a_long_gap_even_with_enough_total_samples() {
         let start = Instant::now();
         let mut tuner = MotionTuner::new(params());
+        tuner.set_mode(TunerMode::Auto);
+        for second in 0..120 {
+            if (55..=65).contains(&second) {
+                continue;
+            }
+            tuner.observe_segment(
+                false,
+                &[false; MASK_CELLS],
+                start + Duration::from_secs(second),
+            );
+        }
+
+        let snapshot = tuner.snapshot(&[], start + Duration::from_secs(120));
+        assert!(!snapshot.window_full);
+        assert_eq!(
+            snapshot.adaptation_status[0],
+            CellAdaptationStatus::InsufficientCoverage
+        );
+    }
+
+    #[test]
+    fn shadow_only_changes_proposed_and_never_effective() {
+        let start = Instant::now();
+        let mut configured = params();
+        configured.cell_ceiling = 1_000.0;
+        let mut tuner = MotionTuner::new(configured);
         tuner.set_mode(TunerMode::Shadow);
         observe(&mut tuner, start, 0..=120, true, 2);
-        tuner.evaluate(start + Duration::from_secs(120), SystemTime::now());
-        let base = vec![500.0; MASK_CELLS];
-        let snapshot = tuner.snapshot(&base, start + Duration::from_secs(120));
-        assert_eq!(snapshot.proposed[2], 150.0);
+        tuner.evaluate_with_baseline(
+            200.0,
+            &[],
+            start + Duration::from_secs(120),
+            SystemTime::now(),
+        );
+        let snapshot = tuner.snapshot_with_baseline(200.0, &[], start + Duration::from_secs(120));
+        assert_eq!(snapshot.proposed[2], 350.0);
         assert_eq!(snapshot.learned[2], 0.0);
-        assert_eq!(snapshot.effective, base);
+        assert!(snapshot.effective.iter().all(|&value| value == 200.0));
     }
 
     #[test]
@@ -863,12 +1175,12 @@ mod tests {
     }
 
     #[test]
-    fn relax_is_gap_tolerant() {
+    fn a_gap_cannot_be_mistaken_for_quiet_relaxation() {
         let start = Instant::now();
         let mut tuner = MotionTuner::new(params());
         tuner.set_mode(TunerMode::Auto);
         let mut learned = vec![0.0; MASK_CELLS];
-        learned[9] = 100.0;
+        learned[9] = 400.0;
         tuner.load_state(&TunerState {
             version: 2,
             learned,
@@ -877,9 +1189,14 @@ mod tests {
         tuner.observe_segment(false, &[false; MASK_CELLS], start);
         tuner.evaluate(start + Duration::from_secs(120), SystemTime::now());
 
-        let changes = tuner.evaluate(start + Duration::from_secs(240), SystemTime::now());
-        assert!(changes.iter().any(|change| change.cell == 9));
-        assert_eq!(tuner.state().learned[9], 0.0);
+        let changes = tuner.evaluate_with_baseline(
+            200.0,
+            &[],
+            start + Duration::from_secs(240),
+            SystemTime::now(),
+        );
+        assert!(changes.is_empty());
+        assert_eq!(tuner.state().learned[9], 300.0);
         assert!(
             !tuner
                 .snapshot(&[], start + Duration::from_secs(240))
@@ -888,31 +1205,65 @@ mod tests {
     }
 
     #[test]
-    fn quiet_relaxes_to_zero_and_activity_resets_dwell() {
+    fn quiet_relaxes_to_the_manual_baseline_and_activity_resets_dwell() {
         let start = Instant::now();
-        let mut tuner = MotionTuner::new(params());
+        let mut configured = params();
+        configured.cell_ceiling = 600.0;
+        let mut tuner = MotionTuner::new(configured);
         tuner.set_mode(TunerMode::Auto);
         tuner.load_state(&TunerState {
             version: 2,
-            learned: vec![200.0; MASK_CELLS],
+            learned: vec![400.0; MASK_CELLS],
             last_change: vec![None; MASK_CELLS],
         });
         observe(&mut tuner, start, 0..=120, false, 0);
-        tuner.evaluate(start + Duration::from_secs(120), SystemTime::now());
+        tuner.evaluate_with_baseline(
+            200.0,
+            &[],
+            start + Duration::from_secs(120),
+            SystemTime::now(),
+        );
         assert!(tuner
-            .evaluate(start + Duration::from_secs(239), SystemTime::now())
+            .evaluate_with_baseline(
+                200.0,
+                &[],
+                start + Duration::from_secs(239),
+                SystemTime::now(),
+            )
             .is_empty());
 
         observe(&mut tuner, start, 121..=150, true, 0);
         observe(&mut tuner, start, 151..=240, false, 0);
-        tuner.evaluate(start + Duration::from_secs(240), SystemTime::now());
-        observe(&mut tuner, start, 241..=360, false, 0);
-        tuner.evaluate(start + Duration::from_secs(360), SystemTime::now());
-        let changes = tuner.evaluate(start + Duration::from_secs(480), SystemTime::now());
+        tuner.evaluate_with_baseline(
+            200.0,
+            &[],
+            start + Duration::from_secs(240),
+            SystemTime::now(),
+        );
+        observe(&mut tuner, start, 241..=359, false, 0);
+        tuner.evaluate_with_baseline(
+            200.0,
+            &[],
+            start + Duration::from_secs(360),
+            SystemTime::now(),
+        );
+        observe(&mut tuner, start, 360..=479, false, 0);
+        let changes = tuner.evaluate_with_baseline(
+            200.0,
+            &[],
+            start + Duration::from_secs(480),
+            SystemTime::now(),
+        );
         assert!(changes.iter().any(|change| change.cell == 0));
-        assert_eq!(tuner.state().learned[0], 100.0);
-        tuner.evaluate(start + Duration::from_secs(600), SystemTime::now());
-        assert_eq!(tuner.state().learned[0], 0.0);
+        assert_eq!(tuner.state().learned[0], 300.0);
+        observe(&mut tuner, start, 480..=599, false, 0);
+        tuner.evaluate_with_baseline(
+            200.0,
+            &[],
+            start + Duration::from_secs(600),
+            SystemTime::now(),
+        );
+        assert_eq!(tuner.state().learned[0], 200.0);
     }
 
     #[test]
@@ -927,6 +1278,59 @@ mod tests {
         assert!(snapshot.trigger_fraction[4] > 0.9);
         assert!(snapshot.learned.iter().all(|&value| value == 0.0));
         assert!(snapshot.proposed.iter().all(|&value| value == 0.0));
+        assert_eq!(snapshot.adaptation_status[4], CellAdaptationStatus::Off);
+    }
+
+    #[test]
+    fn snapshot_explains_below_threshold_cooldown_and_ceiling() {
+        let start = Instant::now();
+        let mut tuner = MotionTuner::new(params());
+        tuner.set_mode(TunerMode::Auto);
+        observe(&mut tuner, start, 0..=119, false, 0);
+        let quiet = tuner.snapshot(&[], start + Duration::from_secs(120));
+        assert_eq!(
+            quiet.adaptation_status[0],
+            CellAdaptationStatus::BelowThreshold
+        );
+
+        observe(&mut tuner, start, 120..=239, true, 1);
+        tuner.evaluate(start + Duration::from_secs(240), SystemTime::now());
+        let changed = tuner.snapshot(&[], start + Duration::from_secs(240));
+        assert!(changed.trigger_fraction[1] > 0.9);
+        assert_eq!(changed.adaptation_status[1], CellAdaptationStatus::Cooldown);
+
+        observe(&mut tuner, start, 240..=359, true, 1);
+        tuner.evaluate(start + Duration::from_secs(360), SystemTime::now());
+        let capped = tuner.snapshot(&[], start + Duration::from_secs(360));
+        assert_eq!(capped.adaptation_status[1], CellAdaptationStatus::Ceiling);
+    }
+
+    #[test]
+    fn changing_mode_or_parameters_discards_timing_history() {
+        let start = Instant::now();
+        let mut tuner = MotionTuner::new(params());
+        tuner.set_mode(TunerMode::Shadow);
+        observe(&mut tuner, start, 0..=119, true, 0);
+        assert!(
+            tuner
+                .snapshot(&[], start + Duration::from_secs(120))
+                .window_full
+        );
+
+        tuner.set_mode(TunerMode::Auto);
+        assert!(tuner.last_step.iter().all(Option::is_none));
+        assert!(tuner.quiet_since.iter().all(Option::is_none));
+
+        let mut changed = params();
+        changed.window_secs = 180;
+        tuner.set_params(changed);
+        assert!(tuner.buckets.is_empty());
+        assert!(tuner.observations.is_empty());
+        assert!(
+            !tuner
+                .snapshot(&[], start + Duration::from_secs(180))
+                .window_full
+        );
     }
 
     #[test]

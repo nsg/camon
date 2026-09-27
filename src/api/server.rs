@@ -20,7 +20,7 @@ use crate::analytics::motion_settings::{
     MIN_CONTOUR_AREA_MAX, MIN_CONTOUR_AREA_MIN, VAR_THRESHOLD_MAX, VAR_THRESHOLD_MIN,
 };
 use crate::analytics::{
-    MotionSettingsStore, SettingsUpdate, TunerSnapshot, TunerStore, UpdateError,
+    MotionSettingsStore, SettingsUpdate, TunerParams, TunerSnapshot, TunerStore, UpdateError,
 };
 use crate::buffer::{wall_clock_ns, HotBuffer, StreamHealth};
 use crate::locks::{LockExt, MutexExt};
@@ -597,9 +597,12 @@ async fn motion_tuner_get_handler(
     };
     let snapshot = match state.tuner_store.as_ref() {
         Some(store) => store.get(&id).unwrap_or_else(|| {
-            TunerSnapshot::empty_with_params(settings.tuner_mode, store.params())
+            TunerSnapshot::empty_for_settings(&settings, store.params().global_event_cell_fraction)
         }),
-        None => TunerSnapshot::empty(settings.tuner_mode),
+        None => TunerSnapshot::empty_for_settings(
+            &settings,
+            TunerParams::default().global_event_cell_fraction,
+        ),
     };
     Json(snapshot).into_response()
 }
@@ -2396,7 +2399,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tuner_get_before_first_publish_is_zeroed_and_uses_settings_mode() {
+    async fn tuner_get_before_first_publish_uses_per_camera_settings() {
         let dir = tempfile::tempdir().unwrap();
         let params = TunerParams {
             window_secs: 600,
@@ -2412,6 +2415,8 @@ mod tests {
                 "cam",
                 SettingsUpdate {
                     tuner_mode: Some(TunerMode::Shadow),
+                    tuner_window_secs: Some(params.window_secs),
+                    tuner_tighten_bar: Some(params.tighten_bar),
                     ..Default::default()
                 },
             )
@@ -2435,7 +2440,7 @@ mod tests {
             .as_array()
             .unwrap()
             .iter()
-            .all(|value| value == 0.0));
+            .all(|value| value == 200.0));
     }
 
     #[tokio::test]
