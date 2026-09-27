@@ -789,14 +789,16 @@ mod tests {
             r#"{"var_threshold":24,"min_contour_area":450,"mask":[],"detection_mask":[]}"#,
         )
         .unwrap();
-        let mut config = MotionConfig::default();
-        config.tuner_tighten_bar = 0.08;
-        config.tuner_relax_bar = 0.03;
-        config.tuner_window_secs = 1_800;
-        config.tuner_tighten_step = 175.0;
-        config.tuner_relax_step = 75.0;
-        config.tuner_min_step_interval_secs = 600;
-        config.tuner_relax_dwell_secs = 3_000;
+        let config = MotionConfig {
+            tuner_tighten_bar: 0.08,
+            tuner_relax_bar: 0.03,
+            tuner_window_secs: 1_800,
+            tuner_tighten_step: 175.0,
+            tuner_relax_step: 75.0,
+            tuner_min_step_interval_secs: 600,
+            tuner_relax_dwell_secs: 3_000,
+            ..Default::default()
+        };
 
         let store =
             MotionSettingsStore::from_motion_config(&["cam1".to_string()], dir.path(), &config);
@@ -829,14 +831,16 @@ mod tests {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, serde_json::to_vec(&saved).unwrap()).unwrap();
 
-        let mut config = MotionConfig::default();
-        config.tuner_tighten_bar = 0.08;
-        config.tuner_relax_bar = 0.03;
-        config.tuner_window_secs = 1_800;
-        config.tuner_tighten_step = 175.0;
-        config.tuner_relax_step = 75.0;
-        config.tuner_min_step_interval_secs = 600;
-        config.tuner_relax_dwell_secs = 3_000;
+        let config = MotionConfig {
+            tuner_tighten_bar: 0.08,
+            tuner_relax_bar: 0.03,
+            tuner_window_secs: 1_800,
+            tuner_tighten_step: 175.0,
+            tuner_relax_step: 75.0,
+            tuner_min_step_interval_secs: 600,
+            tuner_relax_dwell_secs: 3_000,
+            ..Default::default()
+        };
 
         let store =
             MotionSettingsStore::from_motion_config(&["cam1".to_string()], dir.path(), &config);
