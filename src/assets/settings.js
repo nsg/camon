@@ -222,8 +222,8 @@ function applyMotionSettings(data) {
 
 function applyTunerSettings(data) {
     if (!data) return;
-    tunerTighten.value = String(Number(data.tuner_tighten_bar) * 100);
-    tunerRelax.value = String(Number(data.tuner_relax_bar) * 100);
+    tunerTighten.value = String(Number((Number(data.tuner_tighten_bar) * 100).toFixed(6)));
+    tunerRelax.value = String(Number((Number(data.tuner_relax_bar) * 100).toFixed(6)));
     tunerWindow.value = String(Number(data.tuner_window_secs) / 60);
     tunerTightenStep.value = String(Number(data.tuner_tighten_step));
     tunerRelaxStep.value = String(Number(data.tuner_relax_step));
@@ -244,19 +244,27 @@ function clearSettingsError() {
 // A persistence failure leaves the live value visible but warns it will not survive restart.
 function putMotionSettings(partial) {
     if (!currentDetailCameraId) return;
+    const cameraId = currentDetailCameraId;
     clearSettingsError();
-    apiFetch(`api/cameras/${encodeURIComponent(currentDetailCameraId)}/motion/settings`, {
+    apiFetch(`api/cameras/${encodeURIComponent(cameraId)}/motion/settings`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(partial),
     })
         .then(r => {
-            if (r.ok) return r.json().then(applyMotionSettings);
+            if (currentDetailCameraId !== cameraId) return;
+            if (r.ok) return r.json().then(data => {
+                if (currentDetailCameraId === cameraId) applyMotionSettings(data);
+            });
             if (r.status === 401) return;
-            return r.text().then(body => showSettingsError(
-                body.trim() || `the server refused the change (HTTP ${r.status})`));
+            return r.text().then(body => {
+                if (currentDetailCameraId !== cameraId) return;
+                showSettingsError(
+                    body.trim() || `the server refused the change (HTTP ${r.status})`);
+            });
         })
         .catch(err => {
+            if (currentDetailCameraId !== cameraId) return;
             console.error('Failed to update motion settings:', err);
             showSettingsError('could not reach camon — the change may or may not have been saved, reload to see what stuck');
         });
