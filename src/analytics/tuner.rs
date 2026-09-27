@@ -388,9 +388,10 @@ impl MotionTuner {
             };
 
             if let Some((target, reason)) = change {
+                let stored_target = if target <= baseline { 0.0 } else { target };
                 match self.mode {
-                    TunerMode::Auto => self.learned[cell] = target,
-                    TunerMode::Shadow => self.proposed[cell] = target,
+                    TunerMode::Auto => self.learned[cell] = stored_target,
+                    TunerMode::Shadow => self.proposed[cell] = stored_target,
                     TunerMode::Off => unreachable!(),
                 }
                 self.last_step[cell] = Some(now);
@@ -1263,7 +1264,12 @@ mod tests {
             start + Duration::from_secs(600),
             SystemTime::now(),
         );
-        assert_eq!(tuner.state().learned[0], 200.0);
+        assert_eq!(tuner.state().learned[0], 0.0);
+        assert_eq!(
+            tuner.effective_grid_from_baseline(100.0, &[])[0],
+            100.0,
+            "a later manual decrease must not be held up by a fully relaxed value"
+        );
     }
 
     #[test]
