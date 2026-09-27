@@ -223,8 +223,11 @@ pub struct MotionTuner {
     learned: [f64; MASK_CELLS],
     proposed: [f64; MASK_CELLS],
     last_step: [Option<Instant>; MASK_CELLS],
+    proposed_last_step: [Option<Instant>; MASK_CELLS],
     quiet_since: [Option<Instant>; MASK_CELLS],
+    proposed_quiet_since: [Option<Instant>; MASK_CELLS],
     last_change: Vec<Option<PersistedCellChange>>,
+    proposed_last_change: Vec<Option<PersistedCellChange>>,
     started: Option<Instant>,
     buckets: VecDeque<Bucket>,
     observations: VecDeque<Observation>,
@@ -238,8 +241,11 @@ impl MotionTuner {
             learned: [0.0; MASK_CELLS],
             proposed: [0.0; MASK_CELLS],
             last_step: [None; MASK_CELLS],
+            proposed_last_step: [None; MASK_CELLS],
             quiet_since: [None; MASK_CELLS],
+            proposed_quiet_since: [None; MASK_CELLS],
             last_change: vec![None; MASK_CELLS],
+            proposed_last_change: vec![None; MASK_CELLS],
             started: None,
             buckets: VecDeque::new(),
             observations: VecDeque::new(),
@@ -247,10 +253,6 @@ impl MotionTuner {
     }
 
     pub fn set_mode(&mut self, mode: TunerMode) {
-        if self.mode != mode {
-            self.last_step = [None; MASK_CELLS];
-            self.quiet_since = [None; MASK_CELLS];
-        }
         self.mode = mode;
     }
 
@@ -260,8 +262,8 @@ impl MotionTuner {
 
     pub fn set_params(&mut self, params: TunerParams) {
         if self.params != params {
-            self.last_step = [None; MASK_CELLS];
             self.quiet_since = [None; MASK_CELLS];
+            self.proposed_quiet_since = [None; MASK_CELLS];
             self.started = None;
             self.buckets.clear();
             self.observations.clear();
@@ -368,10 +370,19 @@ impl MotionTuner {
                 TunerMode::Off => unreachable!(),
             };
             let current = stored.min(self.params.cell_ceiling).max(baseline);
-            let step_ready = self.last_step[cell]
-                .is_none_or(|last| now.saturating_duration_since(last) >= step_interval);
+            let last_step = match self.mode {
+                TunerMode::Auto => self.last_step[cell],
+                TunerMode::Shadow => self.proposed_last_step[cell],
+                TunerMode::Off => unreachable!(),
+            };
+            let step_ready =
+                last_step.is_none_or(|last| now.saturating_duration_since(last) >= step_interval);
             let change = if fraction >= self.params.tighten_bar && coverage_ready && step_ready {
-                self.quiet_since[cell] = None;
+                match self.mode {
+                    TunerMode::Auto => self.quiet_since[cell] = None,
+                    TunerMode::Shadow => self.proposed_quiet_since[cell] = None,
+                    TunerMode::Off => unreachable!(),
+                }
                 let target = (current + self.params.tighten_step).min(self.params.cell_ceiling);
                 (target > current).then(|| {
                     let percent = (fraction * 100.0).round() as u64;
@@ -384,10 +395,18 @@ impl MotionTuner {
                 })
             } else if fraction < self.params.relax_bar {
                 if !coverage_ready {
-                    self.quiet_since[cell] = None;
+                    match self.mode {
+                        TunerMode::Auto => self.quiet_since[cell] = None,
+                        TunerMode::Shadow => self.proposed_quiet_since[cell] = None,
+                        TunerMode::Off => unreachable!(),
+                    }
                     continue;
                 }
-                let quiet_since = *self.quiet_since[cell].get_or_insert(now);
+                let quiet_since = match self.mode {
+                    TunerMode::Auto => *self.quiet_since[cell].get_or_insert(now),
+                    TunerMode::Shadow => *self.proposed_quiet_since[cell].get_or_insert(now),
+                    TunerMode::Off => unreachable!(),
+                };
                 let quiet_long_enough = now.saturating_duration_since(quiet_since) >= relax_dwell;
                 if quiet_long_enough && current > baseline && step_ready {
                     let target = (current - self.params.relax_step).max(baseline);
@@ -400,20 +419,33 @@ impl MotionTuner {
                     None
                 }
             } else {
-                self.quiet_since[cell] = None;
+                match self.mode {
+                    TunerMode::Auto => self.quiet_since[cell] = None,
+                    TunerMode::Shadow => self.proposed_quiet_since[cell] = None,
+                    TunerMode::Off => unreachable!(),
+                }
                 None
             };
 
             if let Some((target, reason)) = change {
                 let stored_target = if target <= baseline { 0.0 } else { target };
                 match self.mode {
-                    TunerMode::Auto => self.learned[cell] = stored_target,
-                    TunerMode::Shadow => self.proposed[cell] = stored_target,
+                    TunerMode::Auto => {
+                        self.learned[cell] = stored_target;
+                        self.last_step[cell] = Some(now);
+                    }
+                    TunerMode::Shadow => {
+                        self.proposed[cell] = stored_target;
+                        self.proposed_last_step[cell] = Some(now);
+                    }
                     TunerMode::Off => unreachable!(),
                 }
-                self.last_step[cell] = Some(now);
                 if target < current {
-                    self.quiet_since[cell] = Some(now);
+                    match self.mode {
+                        TunerMode::Auto => self.quiet_since[cell] = Some(now),
+                        TunerMode::Shadow => self.proposed_quiet_since[cell] = Some(now),
+                        TunerMode::Off => unreachable!(),
+                    }
                 }
                 let change = CellChange {
                     cell,
@@ -423,7 +455,11 @@ impl MotionTuner {
                     delta: target - current,
                     reason,
                 };
-                self.last_change[cell] = Some(change.persisted());
+                match self.mode {
+                    TunerMode::Auto => self.last_change[cell] = Some(change.persisted()),
+                    TunerMode::Shadow => self.proposed_last_change[cell] = Some(change.persisted()),
+                    TunerMode::Off => unreachable!(),
+                }
                 changes.push(change);
             }
         }
@@ -454,8 +490,11 @@ impl MotionTuner {
         self.learned = [0.0; MASK_CELLS];
         self.proposed = [0.0; MASK_CELLS];
         self.last_step = [None; MASK_CELLS];
+        self.proposed_last_step = [None; MASK_CELLS];
         self.quiet_since = [None; MASK_CELLS];
+        self.proposed_quiet_since = [None; MASK_CELLS];
         self.last_change.fill(None);
+        self.proposed_last_change.fill(None);
         self.started = None;
         self.buckets.clear();
         self.observations.clear();
@@ -497,7 +536,11 @@ impl MotionTuner {
             effective,
             trigger_fraction: self.trigger_fractions().to_vec(),
             adaptation_status: self.adaptation_statuses(&base, now),
-            last_change: self.last_change.clone(),
+            last_change: if self.mode == TunerMode::Shadow {
+                self.proposed_last_change.clone()
+            } else {
+                self.last_change.clone()
+            },
             params: self.params.clone(),
         }
     }
@@ -662,7 +705,15 @@ impl MotionTuner {
                     TunerMode::Off => unreachable!(),
                 };
                 let current = stored.min(self.params.cell_ceiling).max(base[cell]);
-                let step_ready = self.last_step[cell]
+                let (last_step, quiet_since) = match self.mode {
+                    TunerMode::Auto => (self.last_step[cell], self.quiet_since[cell]),
+                    TunerMode::Shadow => (
+                        self.proposed_last_step[cell],
+                        self.proposed_quiet_since[cell],
+                    ),
+                    TunerMode::Off => unreachable!(),
+                };
+                let step_ready = last_step
                     .is_none_or(|last| now.saturating_duration_since(last) >= step_interval);
                 if fractions[cell] >= self.params.tighten_bar {
                     if current >= self.params.cell_ceiling {
@@ -674,7 +725,7 @@ impl MotionTuner {
                     return CellAdaptationStatus::Ready;
                 }
                 if fractions[cell] < self.params.relax_bar && current > base[cell] {
-                    let dwell_ready = self.quiet_since[cell].is_some_and(|quiet_since| {
+                    let dwell_ready = quiet_since.is_some_and(|quiet_since| {
                         now.saturating_duration_since(quiet_since) >= relax_dwell
                     });
                     return if step_ready && dwell_ready {
@@ -1354,31 +1405,58 @@ mod tests {
     }
 
     #[test]
-    fn changing_mode_or_parameters_discards_timing_history() {
+    fn shadow_history_is_separate_and_mode_switches_preserve_auto_cooldown() {
         let start = Instant::now();
-        let mut tuner = MotionTuner::new(params());
-        tuner.set_mode(TunerMode::Shadow);
+        let mut configured = params();
+        configured.cell_ceiling = 1_000.0;
+        configured.min_step_interval_secs = 600;
+        let mut tuner = MotionTuner::new(configured);
+        tuner.set_mode(TunerMode::Auto);
         observe(&mut tuner, start, 0..=119, true, 0);
-        assert!(
-            tuner
-                .snapshot(&[], start + Duration::from_secs(120))
-                .window_full
-        );
+        tuner.evaluate(start + Duration::from_secs(120), SystemTime::now());
+        let persisted_auto_change = tuner.state().last_change[0].clone();
+        assert_eq!(tuner.state().learned[0], 150.0);
+
+        tuner.set_mode(TunerMode::Shadow);
+        tuner.evaluate(start + Duration::from_secs(121), SystemTime::now());
+        assert_eq!(tuner.state().last_change[0], persisted_auto_change);
+        assert!(tuner
+            .snapshot(&[], start + Duration::from_secs(121))
+            .last_change[0]
+            .is_some());
 
         tuner.set_mode(TunerMode::Auto);
-        assert!(tuner.last_step.iter().all(Option::is_none));
-        assert!(tuner.quiet_since.iter().all(Option::is_none));
+        assert!(tuner
+            .evaluate(start + Duration::from_secs(122), SystemTime::now())
+            .is_empty());
+        assert_eq!(tuner.state().learned[0], 150.0);
+    }
 
-        let mut changed = params();
-        changed.window_secs = 180;
+    #[test]
+    fn parameter_changes_reset_measurements_but_preserve_real_cooldowns() {
+        let start = Instant::now();
+        let mut configured = params();
+        configured.cell_ceiling = 1_000.0;
+        configured.min_step_interval_secs = 600;
+        let mut tuner = MotionTuner::new(configured.clone());
+        tuner.set_mode(TunerMode::Auto);
+        observe(&mut tuner, start, 0..=119, true, 0);
+        tuner.evaluate(start + Duration::from_secs(120), SystemTime::now());
+        let real_last_step = tuner.last_step[0];
+
+        let mut changed = configured;
+        changed.tighten_step = 175.0;
         tuner.set_params(changed);
         assert!(tuner.buckets.is_empty());
         assert!(tuner.observations.is_empty());
-        assert!(
-            !tuner
-                .snapshot(&[], start + Duration::from_secs(180))
-                .window_full
-        );
+        assert_eq!(tuner.last_step[0], real_last_step);
+        assert!(tuner.quiet_since.iter().all(Option::is_none));
+
+        observe(&mut tuner, start, 121..=240, true, 0);
+        assert!(tuner
+            .evaluate(start + Duration::from_secs(241), SystemTime::now())
+            .is_empty());
+        assert_eq!(tuner.state().learned[0], 150.0);
     }
 
     #[test]
