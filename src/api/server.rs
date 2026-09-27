@@ -2379,6 +2379,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tuner_settings_round_trip_through_the_camera_api() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = serve_with_motion_settings(dir.path()).await;
+        let url = format!("{base}/api/cameras/cam/motion/settings");
+        let client = reqwest::Client::new();
+        let expected = serde_json::json!({
+            "tuner_mode": "shadow",
+            "tuner_tighten_bar": 0.08,
+            "tuner_relax_bar": 0.02,
+            "tuner_window_secs": 1800,
+            "tuner_tighten_step": 175.0,
+            "tuner_relax_step": 75.0,
+            "tuner_min_step_interval_secs": 600,
+            "tuner_relax_dwell_secs": 3000,
+        });
+
+        let put = client.put(&url).json(&expected).send().await.unwrap();
+        assert_eq!(put.status(), reqwest::StatusCode::OK);
+        let put_json: serde_json::Value = put.json().await.unwrap();
+        for (field, value) in expected.as_object().unwrap() {
+            assert_eq!(&put_json[field], value, "PUT omitted or changed {field}");
+        }
+
+        let get_json: serde_json::Value =
+            client.get(&url).send().await.unwrap().json().await.unwrap();
+        for (field, value) in expected.as_object().unwrap() {
+            assert_eq!(&get_json[field], value, "GET omitted or changed {field}");
+        }
+    }
+
+    #[tokio::test]
     async fn a_slider_value_the_store_refuses_is_a_400_not_a_500() {
         let dir = tempfile::tempdir().unwrap();
         let state = motion_settings_state(dir.path());
