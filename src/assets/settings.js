@@ -17,6 +17,13 @@ const layerSizeBtn = document.getElementById('layer-size-btn');
 const sizeBrush = document.getElementById('size-brush');
 const tunerMode = document.getElementById('tuner-mode');
 const tunerResetBtn = document.getElementById('tuner-reset-btn');
+const tunerTighten = document.getElementById('tuner-tighten');
+const tunerRelax = document.getElementById('tuner-relax');
+const tunerWindow = document.getElementById('tuner-window');
+const tunerTightenStep = document.getElementById('tuner-tighten-step');
+const tunerRelaxStep = document.getElementById('tuner-relax-step');
+const tunerStepInterval = document.getElementById('tuner-step-interval');
+const tunerRelaxDwell = document.getElementById('tuner-relax-dwell');
 const settingsError = document.getElementById('settings-error');
 const settingsErrorText = document.getElementById('settings-error-text');
 const settingsErrorDismiss = document.getElementById('settings-error-dismiss');
@@ -85,6 +92,14 @@ function wireSettingsPanel() {
         putMotionSettings({ tuner_mode: tunerMode.value });
     });
 
+    tunerTighten.addEventListener('change', updateTunerThresholds);
+    tunerRelax.addEventListener('change', updateTunerThresholds);
+    wireTunerNumber(tunerWindow, 'tuner_window_secs', 60);
+    wireTunerNumber(tunerTightenStep, 'tuner_tighten_step');
+    wireTunerNumber(tunerRelaxStep, 'tuner_relax_step');
+    wireTunerNumber(tunerStepInterval, 'tuner_min_step_interval_secs', 60);
+    wireTunerNumber(tunerRelaxDwell, 'tuner_relax_dwell_secs', 60);
+
     tunerResetBtn.addEventListener('click', async () => {
         if (!currentDetailCameraId) return;
         const cameraId = currentDetailCameraId;
@@ -143,6 +158,26 @@ function wireSettingsPanel() {
     maskOverlay.addEventListener('pointercancel', endMaskPaint);
 }
 
+function wireTunerNumber(input, field, scale = 1) {
+    input.addEventListener('change', () => {
+        if (!input.reportValidity()) return;
+        putMotionSettings({ [field]: Number(input.value) * scale });
+    });
+}
+
+function updateTunerThresholds(event) {
+    if (!event.target.reportValidity()) return;
+    const tighten = Number(tunerTighten.value) / 100;
+    const relax = Number(tunerRelax.value) / 100;
+    if (relax >= tighten) {
+        showSettingsError('Relax below must stay below Tighten above.');
+        applyTunerSettings(motionSettings);
+        return;
+    }
+    const field = event.target === tunerTighten ? 'tuner_tighten_bar' : 'tuner_relax_bar';
+    putMotionSettings({ [field]: event.target === tunerTighten ? tighten : relax });
+}
+
 function fetchMotionSettings(cameraId) {
     apiFetch(`api/cameras/${encodeURIComponent(cameraId)}/motion/settings`)
         .then(r => r.ok ? r.json() : null)
@@ -179,9 +214,21 @@ function applyMotionSettings(data) {
     minsizeSlider.value = data.min_contour_area;
     minsizeValue.textContent = String(Math.round(data.min_contour_area));
     tunerMode.value = data.tuner_mode || 'off';
+    applyTunerSettings(data);
 
     if (maskEditEnabled) drawMask();
     if (tunerEnabled) fetchTunerSnapshot();
+}
+
+function applyTunerSettings(data) {
+    if (!data) return;
+    tunerTighten.value = String(Number(data.tuner_tighten_bar) * 100);
+    tunerRelax.value = String(Number(data.tuner_relax_bar) * 100);
+    tunerWindow.value = String(Number(data.tuner_window_secs) / 60);
+    tunerTightenStep.value = String(Number(data.tuner_tighten_step));
+    tunerRelaxStep.value = String(Number(data.tuner_relax_step));
+    tunerStepInterval.value = String(Number(data.tuner_min_step_interval_secs) / 60);
+    tunerRelaxDwell.value = String(Number(data.tuner_relax_dwell_secs) / 60);
 }
 
 function showSettingsError(message) {

@@ -882,6 +882,18 @@ function formatTunerNumber(value) {
     return String(Math.round(number));
 }
 
+function tunerAdaptationReason(status) {
+    const reasons = {
+        off: 'not adapting: tuner is off',
+        insufficient_coverage: 'not adapting: insufficient coverage',
+        below_threshold: 'not adapting: below threshold',
+        cooldown: 'not adapting: cooldown or quiet dwell',
+        ceiling: 'not adapting: cell ceiling reached',
+        ready: 'ready to adapt',
+    };
+    return reasons[status] || 'adaptation status unavailable';
+}
+
 function updateTunerReadout(idx) {
     if (!tunerSnapshot || idx < 0) {
         tunerReadout.hidden = true;
@@ -898,6 +910,7 @@ function updateTunerReadout(idx) {
     const effectiveLabel = `${formatTunerNumber(effective)}${rawEffective === 0 ? ' (global)' : ''}`;
     const triggerFraction = Number(tunerSnapshot.trigger_fraction && tunerSnapshot.trigger_fraction[idx]) || 0;
     const percent = (triggerFraction * 100).toFixed(1).replace(/\.0$/, '');
+    const adaptationStatus = tunerSnapshot.adaptation_status && tunerSnapshot.adaptation_status[idx];
     const windowMinutes = (Number(tunerSnapshot.window_secs) / 60).toFixed(1).replace(/\.0$/, '');
     const change = tunerSnapshot.last_change && tunerSnapshot.last_change[idx];
     const last = change
@@ -905,7 +918,8 @@ function updateTunerReadout(idx) {
         : 'no changes';
     tunerReadout.textContent = [
         `cell ${row + 1},${col + 1} · base ${formatTunerNumber(base)} · learned ${formatTunerNumber(learned)} · proposed ${formatTunerNumber(proposed)} · effective ${effectiveLabel}`,
-        `motion ${percent}% of last ${windowMinutes} min`,
+        `activity: ${percent}% of analyzed segments in the last ${windowMinutes} min`,
+        tunerAdaptationReason(adaptationStatus),
         `last: ${last}`,
         `mode: ${tunerSnapshot.mode} · window ${tunerSnapshot.window_full ? 'full' : 'filling'}`,
         `whole-frame events: ${Number(tunerSnapshot.global_events_in_window) || 0} in window`,

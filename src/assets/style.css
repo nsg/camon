@@ -374,6 +374,23 @@ main {
     color: #ddd;
 }
 
+.setting-row input[type="number"] {
+    width: 6rem;
+    padding: 0.35rem 0.5rem;
+    border: 1px solid rgba(255, 255, 255, 0.2);
+    border-radius: 4px;
+    background: #242424;
+    color: #ddd;
+}
+
+.setting-unit,
+.setting-sign {
+    font-size: 0.8rem;
+    color: #aaa;
+}
+
+.setting-sign { margin-right: -0.5rem; }
+
 .setting-value {
     font-family: monospace;
     font-size: 0.85rem;
@@ -477,6 +494,24 @@ main {
 }
 
 .tuner-mode-hint { flex-basis: 100%; margin-left: 10.25rem; }
+
+.tuner-shadow-hint { margin-left: 10.25rem; }
+
+.tuner-advanced {
+    border-top: 1px solid rgba(255, 255, 255, 0.08);
+    padding-top: 0.4rem;
+}
+
+.tuner-advanced summary {
+    width: fit-content;
+    cursor: pointer;
+    color: #bbb;
+    font-size: 0.85rem;
+}
+
+.tuner-advanced[open] summary { margin-bottom: 0.6rem; }
+.tuner-advanced .setting-row + .setting-row { margin-top: 0.6rem; }
+.tuner-advanced .setting-row label { min-width: 13rem; }
 
 /* === Hot Timeline === */
 .hot-timeline {

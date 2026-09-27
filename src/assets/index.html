@@ -144,6 +144,49 @@
                     <span class="setting-hint tuner-mode-hint">off: manual grid only &middot; shadow: shows what auto would do, applies nothing &middot; auto: applies within the cell ceiling</span>
                 </div>
                 <div class="setting-row">
+                    <label for="tuner-tighten">Tighten above</label>
+                    <input type="number" id="tuner-tighten" min="0.1" max="99.9" step="0.1" value="5" required>
+                    <span class="setting-unit">%</span>
+                    <span class="setting-hint">local motion in this share of analyzed segments</span>
+                </div>
+                <div class="setting-row">
+                    <label for="tuner-relax">Relax below</label>
+                    <input type="number" id="tuner-relax" min="0.1" max="99.8" step="0.1" value="1" required>
+                    <span class="setting-unit">%</span>
+                    <span class="setting-hint">must stay below Tighten above</span>
+                </div>
+                <div class="setting-row">
+                    <label for="tuner-window">Observation window</label>
+                    <input type="number" id="tuner-window" min="2" step="1" value="20" required>
+                    <span class="setting-unit">minutes</span>
+                </div>
+                <div class="setting-hint tuner-shadow-hint">The 5% and 1% defaults are starting points. Validate them in Shadow before enabling Auto.</div>
+                <details class="tuner-advanced">
+                    <summary>Advanced</summary>
+                    <div class="setting-row">
+                        <label for="tuner-tighten-step">Tightening step</label>
+                        <span class="setting-sign">+</span>
+                        <input type="number" id="tuner-tighten-step" min="0.1" step="0.1" value="150" required>
+                        <span class="setting-unit">pixels</span>
+                    </div>
+                    <div class="setting-row">
+                        <label for="tuner-relax-step">Relaxation step</label>
+                        <span class="setting-sign">&minus;</span>
+                        <input type="number" id="tuner-relax-step" min="0.1" step="0.1" value="100" required>
+                        <span class="setting-unit">pixels</span>
+                    </div>
+                    <div class="setting-row">
+                        <label for="tuner-step-interval">Minimum adjustment interval</label>
+                        <input type="number" id="tuner-step-interval" min="1" step="1" value="20" required>
+                        <span class="setting-unit">minutes</span>
+                    </div>
+                    <div class="setting-row">
+                        <label for="tuner-relax-dwell">Quiet dwell before relaxation</label>
+                        <input type="number" id="tuner-relax-dwell" min="1" step="1" value="40" required>
+                        <span class="setting-unit">minutes</span>
+                    </div>
+                </details>
+                <div class="setting-row">
                     <button id="mask-edit-btn" class="settings-action-btn">Edit masks</button>
                     <span class="setting-hint">Paint cells on the video for the active mask below.</span>
                 </div>
