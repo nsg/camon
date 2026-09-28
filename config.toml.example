@@ -185,6 +185,38 @@ confidence_threshold = 0.5
 # Assistant entities and the selected backend always agree on the spelling.
 classes = ["person", "car", "truck", "dog", "cat"]
 
+# What the detector is shown of each sampled frame, and what is drawn on the
+# frames camon keeps. Applies to both backends. Checked whenever analytics is
+# enabled, even with object detection off, so turning it on later cannot
+# surface a bad value.
+[analytics.object_detection.framing]
+# "motion" (default) crops each frame to its motion boxes to zoom in on the
+# action; "full" sends the whole frame. A full frame keeps the scene's scale and
+# context, but a distant person or car is shrunk to a few pixels at the model's
+# input resolution and is easier to miss. Any other value is refused at load.
+crop = "motion"
+# Motion crops only: fraction of the motion box's size added on each side
+# before cropping, so a box drawn around a moving arm still shows the person
+# (default: 0.2). Range 0.0-1.0; outside that it is clamped with a warning.
+# Not a number (nan, inf) is refused at startup.
+padding = 0.2
+# Motion crops only: smallest width and height of the motion box, as fractions
+# of the frame's, before padding is added, so a tiny box is not blown up into a
+# blur (default: 0.15). Range 0.05-1.0; clamped and refused the same way as
+# padding.
+min_fraction = 0.15
+# Motion crops only: widen the crop to the frame's aspect ratio instead of
+# the motion box's own shape (default: false).
+preserve_aspect = false
+# Draw the motion boxes onto the image sent to the model (default: false).
+# Shows the model where to look, but a highlighted box may also bias it toward
+# reporting something there that is not.
+motion_boxes = false
+# Draw the model's detection boxes onto the frames camon keeps (default:
+# false). Changes what you see, not what is detected: stored event thumbnails
+# and the MQTT per-class snapshots carry the boxes too.
+detection_boxes = false
+
 [analytics.object_detection.ollama]
 # Ollama server URL (default: http://localhost:11434)
 url = "http://localhost:11434"

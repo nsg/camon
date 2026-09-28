@@ -14,6 +14,7 @@ use crate::storage::{
 };
 
 use super::detector::{Detection, Detector};
+use super::pipeline::JPEG_QUALITY;
 #[cfg(test)]
 use super::{OllamaClient, TpueClient};
 
@@ -29,10 +30,14 @@ pub struct DetectionJob {
     pub camera_id: String,
     /// Segment sequences of the motion run this job covers (ascending).
     pub seqs: Vec<u64>,
-    /// Cropped frames, JPEG-encoded, at most 4 are used. Held by handle
+    /// Clean cropped frames, JPEG-encoded, for display. Held by handle
     /// because the debug store outlives the job: it takes a share of these
     /// bytes rather than a second copy of them.
     pub crop_jpegs: Vec<Arc<Vec<u8>>>,
+    /// The frames as the detector sees them, parallel to `crop_jpegs`; at most 4 are sent.
+    pub model_jpegs: Vec<Arc<Vec<u8>>>,
+    /// The normalized full-frame region each frame shows, parallel to `crop_jpegs`.
+    pub frame_crops: Vec<(f32, f32, f32, f32)>,
     /// A full (uncropped) frame for the debug overlay, which is what reads it — so the
     /// analyzer encodes one only while somebody is watching that view, and this is `None` the
     /// rest of the time.
@@ -41,6 +46,8 @@ pub struct DetectionJob {
     pub motion_rects: Vec<(f32, f32, f32, f32)>,
     /// The union crop region the frames were cropped to, normalized.
     pub run_crop: Option<(f32, f32, f32, f32)>,
+    /// Outline the verdict's detections on the stored thumbnail and the MQTT sightings.
+    pub detection_boxes: bool,
     /// The registry's handle on this job, stamped by [`DetectQueueSender::send`] as the job is
     /// accepted and handed back when the job leaves the system — answered here, or dropped at
     /// the queue cap.
@@ -106,13 +113,13 @@ impl DetectionWorker {
     async fn classify_job(&self, job: DetectionJob) {
         // Kept per frame rather than flattened so each detection stays
         // attributable to the crop it came from: entry `i` holds the verdict
-        // for `job.crop_jpegs[i]`, including for frames the model failed on.
+        // for `job.model_jpegs[i]`, including for frames the model failed on.
         let mut per_frame: Vec<Vec<Detection>> = Vec::new();
         let mut raw_responses = Vec::new();
         let mut model = self.client.model().to_string();
 
         // Strictly sequential: each frame waits for the previous response.
-        for jpeg in job.crop_jpegs.iter().take(MAX_FRAMES_PER_RUN) {
+        for jpeg in job.model_jpegs.iter().take(MAX_FRAMES_PER_RUN) {
             match self.client.detect_jpeg(jpeg).await {
                 Ok(result) => {
                     per_frame.push(result.detections);
@@ -127,9 +134,8 @@ impl DetectionWorker {
                 }
             }
         }
+        self.store_debug_entry(&job, &per_frame, raw_responses, &model);
         let detections: Vec<Detection> = per_frame.concat();
-
-        self.store_debug_entry(&job, &detections, raw_responses, &model);
 
         if detections.is_empty() {
             return;
@@ -143,6 +149,7 @@ impl DetectionWorker {
         );
 
         let (classes, confidences) = deduplicate_by_class(&detections);
+        let frames = presentation_frames(&job, &per_frame).await;
         // Parsing already applied class and confidence filters, so this deduped set is the
         // complete verdict used by every consumer.
         if let Some(ref tx) = self.mqtt_tx {
@@ -153,13 +160,13 @@ impl DetectionWorker {
                     sightings: build_sightings(
                         &classes,
                         &per_frame,
-                        &job.crop_jpegs,
+                        &frames,
                         job.full_frame_jpeg.as_ref().map(|f| f.as_slice()),
                     ),
                 },
             );
         }
-        self.store_detections(&job, &classes, &confidences, &model);
+        self.store_detections(&job, &frames, &classes, &confidences, &model);
         self.upgrade_covering_events(&job, &detections, &classes, &model);
     }
 
@@ -167,17 +174,17 @@ impl DetectionWorker {
     fn store_detections(
         &self,
         job: &DetectionJob,
+        frames: &[Arc<Vec<u8>>],
         classes: &[String],
         confidences: &[f32],
         model: &str,
     ) {
         // Thumbnail: the second frame when there is one (an inner frame of
         // the run reads better than the leading edge).
-        let best_idx = if job.crop_jpegs.len() > 1 { 1 } else { 0 };
-        let frame_jpeg = job
-            .crop_jpegs
+        let best_idx = if frames.len() > 1 { 1 } else { 0 };
+        let frame_jpeg = frames
             .get(best_idx)
-            .or_else(|| job.crop_jpegs.first())
+            .or_else(|| frames.first())
             .map(Arc::clone)
             .unwrap_or_default();
 
@@ -255,7 +262,7 @@ impl DetectionWorker {
     fn store_debug_entry(
         &self,
         job: &DetectionJob,
-        detections: &[Detection],
+        per_frame: &[Vec<Detection>],
         raw_responses: Vec<String>,
         model: &str,
     ) {
@@ -268,33 +275,133 @@ impl DetectionWorker {
         if job.crop_jpegs.is_empty() {
             return;
         }
-        // Map detector bboxes from crop space back to full-frame space.
-        let ollama_rects: Vec<(String, f32, f32, f32, f32)> = detections
-            .iter()
-            .filter_map(|d| {
-                let (x, y, w, h) = match (d.bbox, job.run_crop) {
-                    (Some((bx, by, bw, bh)), Some((cx, cy, cw, ch))) => {
-                        (cx + bx * cw, cy + by * ch, bw * cw, bh * ch)
-                    }
-                    (Some(b), None) => b,
-                    (None, Some(c)) => c,
-                    (None, None) => return None,
-                };
-                Some((d.class_name.clone(), x, y, w, h))
-            })
-            .collect();
         debug_store.insert(
             &job.camera_id,
             // Both of these clone `Arc` handles, not JPEGs.
             job.crop_jpegs.clone(),
             raw_responses,
             model.to_string(),
-            detections.len(),
+            per_frame.iter().map(Vec::len).sum(),
             job.full_frame_jpeg.clone(),
             job.motion_rects.clone(),
             job.run_crop,
-            ollama_rects,
+            full_frame_rects(per_frame, &job.frame_crops),
         );
+    }
+}
+
+/// Map each detection's box from its own frame's crop region back to full-frame space.
+/// Detections without a box have nothing to draw.
+fn full_frame_rects(
+    per_frame: &[Vec<Detection>],
+    frame_crops: &[(f32, f32, f32, f32)],
+) -> Vec<(String, f32, f32, f32, f32)> {
+    per_frame
+        .iter()
+        .zip(frame_crops)
+        .flat_map(|(detections, &(cx, cy, cw, ch))| {
+            detections.iter().filter_map(move |d| {
+                let (bx, by, bw, bh) = d.bbox?;
+                Some((
+                    d.class_name.clone(),
+                    cx + bx * cw,
+                    cy + by * ch,
+                    bw * cw,
+                    bh * ch,
+                ))
+            })
+        })
+        .collect()
+}
+
+/// The frames the verdict is presented with: the clean crops themselves, or — when the job
+/// asks for detection boxes — copies with each frame's detections outlined.
+async fn presentation_frames(
+    job: &DetectionJob,
+    per_frame: &[Vec<Detection>],
+) -> Vec<Arc<Vec<u8>>> {
+    if !job.detection_boxes {
+        return job.crop_jpegs.clone();
+    }
+    let boxes: Vec<Vec<(f32, f32, f32, f32)>> = per_frame
+        .iter()
+        .map(|frame| frame.iter().filter_map(|d| d.bbox).collect())
+        .collect();
+    if boxes.iter().all(Vec::is_empty) {
+        return job.crop_jpegs.clone();
+    }
+    let camera_id = job.camera_id.clone();
+    let clean = job.crop_jpegs.clone();
+    match tokio::task::spawn_blocking(move || outline_frames(&camera_id, &clean, &boxes)).await {
+        Ok(frames) => frames,
+        Err(e) => {
+            tracing::warn!(camera = %job.camera_id, error = %e, "detection box drawing failed, using clean frames");
+            job.crop_jpegs.clone()
+        }
+    }
+}
+
+/// Outline `boxes[i]` on frame `i`; a frame with no boxes, or one that fails to decode or
+/// encode, is passed through clean.
+fn outline_frames(
+    camera_id: &str,
+    clean: &[Arc<Vec<u8>>],
+    boxes: &[Vec<(f32, f32, f32, f32)>],
+) -> Vec<Arc<Vec<u8>>> {
+    clean
+        .iter()
+        .enumerate()
+        .map(|(idx, jpeg)| match boxes.get(idx) {
+            Some(frame_boxes) if !frame_boxes.is_empty() => outlined_jpeg(jpeg, frame_boxes)
+                .map(Arc::new)
+                .unwrap_or_else(|e| {
+                    tracing::warn!(camera = %camera_id, frame = idx, error = %e,
+                        "could not draw detection boxes, using the clean frame");
+                    Arc::clone(jpeg)
+                }),
+            _ => Arc::clone(jpeg),
+        })
+        .collect()
+}
+
+fn outlined_jpeg(jpeg: &[u8], boxes: &[(f32, f32, f32, f32)]) -> image::ImageResult<Vec<u8>> {
+    let mut frame = image::load_from_memory_with_format(jpeg, image::ImageFormat::Jpeg)?.to_rgb8();
+    draw_outlines(&mut frame, boxes);
+    let mut out = Vec::new();
+    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, JPEG_QUALITY).encode(
+        frame.as_raw(),
+        frame.width(),
+        frame.height(),
+        image::ExtendedColorType::Rgb8,
+    )?;
+    Ok(out)
+}
+
+const DETECTION_BOX_COLOR: image::Rgb<u8> = image::Rgb([0, 255, 0]);
+
+/// Draw unfilled outlines of normalized boxes, clipped to the frame, with the stroke inside
+/// each box.
+fn draw_outlines(frame: &mut image::RgbImage, boxes: &[(f32, f32, f32, f32)]) {
+    let (width, height) = frame.dimensions();
+    let stroke = ((width.min(height) as f32 * 0.004).round() as u32).max(2);
+    let to_px = |v: f32, size: u32| ((v * size as f32).round().max(0.0) as u32).min(size);
+    for &(x, y, w, h) in boxes {
+        let (left, right) = (to_px(x, width), to_px(x + w, width));
+        let (top, bottom) = (to_px(y, height), to_px(y + h, height));
+        if left >= right || top >= bottom {
+            continue;
+        }
+        let mut fill = |x0: u32, y0: u32, x1: u32, y1: u32| {
+            for py in y0..y1 {
+                for px in x0..x1 {
+                    frame.put_pixel(px, py, DETECTION_BOX_COLOR);
+                }
+            }
+        };
+        fill(left, top, right, (top + stroke).min(bottom));
+        fill(left, bottom.saturating_sub(stroke).max(top), right, bottom);
+        fill(left, top, (left + stroke).min(right), bottom);
+        fill(right.saturating_sub(stroke).max(left), top, right, bottom);
     }
 }
 
@@ -317,7 +424,7 @@ fn deduplicate_by_class(detections: &[Detection]) -> (Vec<String>, Vec<f32>) {
 
 /// The frame that best evidences each class: the index of the frame holding
 /// that class's highest-confidence detection. `per_frame[i]` is the verdict for
-/// crop `i`, so the returned index addresses `crop_jpegs` directly.
+/// frame `i`, so the returned index addresses the job's frames directly.
 fn best_frame_per_class(per_frame: &[Vec<Detection>]) -> HashMap<&str, usize> {
     let mut best: HashMap<&str, (usize, f32)> = HashMap::new();
     for (idx, frame) in per_frame.iter().enumerate() {
@@ -336,12 +443,12 @@ fn best_frame_per_class(per_frame: &[Vec<Detection>]) -> HashMap<&str, usize> {
 }
 
 /// Pair every class of the verdict with the picture behind it, for the Home Assistant bridge to
-/// publish retained: the crop the model classified when picking that class, the run's full
+/// publish retained: the crop that evidences that class, the run's full
 /// frame when the crops are gone, and nothing at all when the job carried no frame.
 fn build_sightings(
     classes: &[String],
     per_frame: &[Vec<Detection>],
-    crop_jpegs: &[Arc<Vec<u8>>],
+    frames: &[Arc<Vec<u8>>],
     full_frame_jpeg: Option<&[u8]>,
 ) -> Vec<Sighting> {
     let best = best_frame_per_class(per_frame);
@@ -351,7 +458,7 @@ fn build_sightings(
             class: class.clone(),
             frame_jpeg: best
                 .get(class.as_str())
-                .and_then(|&idx| crop_jpegs.get(idx))
+                .and_then(|&idx| frames.get(idx))
                 .map(|jpeg| jpeg.as_slice())
                 .or(full_frame_jpeg)
                 .map(<[u8]>::to_vec),
@@ -505,9 +612,12 @@ mod tests {
             camera_id: camera_id.to_string(),
             seqs,
             crop_jpegs: vec![Arc::new(vec![0xff])],
+            model_jpegs: vec![Arc::new(vec![0xff])],
+            frame_crops: vec![(0.0, 0.0, 1.0, 1.0)],
             full_frame_jpeg: None,
             motion_rects: Vec::new(),
             run_crop: None,
+            detection_boxes: false,
             verdict_id: None,
         }
     }
@@ -600,6 +710,7 @@ mod tests {
                 0.5,
                 vec!["person".to_string()],
                 None,
+                false,
             )
             .expect("client"),
         );
@@ -714,8 +825,16 @@ mod tests {
     ) -> DetectionWorker {
         let ids: Vec<String> = cameras.iter().map(|c| (*c).to_string()).collect();
         let client = Detector::Ollama(
-            OllamaClient::new(url, "test-model", 5, 0.5, vec!["person".to_string()], None)
-                .expect("client"),
+            OllamaClient::new(
+                url,
+                "test-model",
+                5,
+                0.5,
+                vec!["person".to_string()],
+                None,
+                false,
+            )
+            .expect("client"),
         );
         DetectionWorker::new(
             client,
@@ -980,6 +1099,7 @@ mod tests {
                 0.5,
                 vec!["person".to_string()],
                 None,
+                false,
             )
             .expect("client"),
         );
@@ -996,8 +1116,178 @@ mod tests {
     fn job_with_pictures(crop: &Arc<Vec<u8>>, full: &Arc<Vec<u8>>) -> DetectionJob {
         let mut job = job("cam", vec![0]);
         job.crop_jpegs = vec![Arc::clone(crop)];
+        job.model_jpegs = vec![Arc::clone(crop)];
         job.full_frame_jpeg = Some(Arc::clone(full));
         job
+    }
+
+    fn gray_jpeg() -> Arc<Vec<u8>> {
+        let frame = image::RgbImage::from_pixel(64, 48, image::Rgb([128, 128, 128]));
+        let mut out = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, JPEG_QUALITY)
+            .encode(frame.as_raw(), 64, 48, image::ExtendedColorType::Rgb8)
+            .expect("encode");
+        Arc::new(out)
+    }
+
+    struct Presented {
+        clean: Arc<Vec<u8>>,
+        stored: Arc<Vec<u8>>,
+        sighting: Option<Vec<u8>>,
+        debug: Arc<Vec<u8>>,
+    }
+
+    /// Run one job through a worker whose model always sees a boxed person, and collect every
+    /// picture the verdict was presented with.
+    async fn present(detection_boxes: bool) -> Presented {
+        let url = ollama_that_always_sees_a_person().await;
+        let store = DetectionStore::new(&["cam".to_string()]);
+        let debug_store = DetectionDebugStore::new(&["cam".to_string()]);
+        debug_store.list("cam");
+        let (mqtt_tx, mut mqtt_rx) = mpsc::channel(4);
+        let client = Detector::Ollama(
+            OllamaClient::new(
+                &url,
+                "test-model",
+                5,
+                0.5,
+                vec!["person".to_string()],
+                None,
+                false,
+            )
+            .expect("client"),
+        );
+        let worker = DetectionWorker::new(
+            client,
+            store.clone(),
+            Some(debug_store.clone()),
+            None,
+            HashMap::new(),
+            Some(mqtt_tx),
+        );
+
+        let clean = gray_jpeg();
+        let mut job = job("cam", vec![0]);
+        job.crop_jpegs = vec![Arc::clone(&clean)];
+        job.model_jpegs = vec![Arc::new(clean.to_vec())];
+        job.detection_boxes = detection_boxes;
+        worker.process_job(job).await;
+
+        let id = store.get_detections("cam")[0].id;
+        let stored = store.get_frame("cam", id).expect("stored thumbnail");
+        let sighting = match mqtt_rx.try_recv() {
+            Ok(MqttEvent::Detections { mut sightings, .. }) => sightings.remove(0).frame_jpeg,
+            other => panic!("expected a detections event, got {other:?}"),
+        };
+        let debug_id = debug_store.list("cam")[0].id;
+        let debug = debug_store
+            .get_frame_jpeg("cam", debug_id, 0)
+            .expect("debug frame");
+        Presented {
+            clean,
+            stored,
+            sighting,
+            debug,
+        }
+    }
+
+    #[tokio::test]
+    async fn without_detection_boxes_the_verdict_shares_the_clean_frame() {
+        let presented = present(false).await;
+        assert!(
+            Arc::ptr_eq(&presented.stored, &presented.clean),
+            "the thumbnail was re-encoded although no boxes were asked for"
+        );
+        assert_eq!(
+            presented.sighting.as_deref(),
+            Some(presented.clean.as_slice())
+        );
+        assert!(Arc::ptr_eq(&presented.debug, &presented.clean));
+    }
+
+    #[tokio::test]
+    async fn detection_boxes_decorate_the_thumbnail_and_sighting_but_not_the_debug_view() {
+        let presented = present(true).await;
+        assert_ne!(
+            presented.stored.as_slice(),
+            presented.clean.as_slice(),
+            "the thumbnail carries no detection boxes"
+        );
+        assert_eq!(
+            presented.sighting.as_deref(),
+            Some(presented.stored.as_slice()),
+            "the sighting and the thumbnail show different pictures"
+        );
+        assert!(
+            Arc::ptr_eq(&presented.debug, &presented.clean),
+            "the debug view lost its clean frame"
+        );
+    }
+
+    #[test]
+    fn a_frame_that_does_not_decode_is_presented_clean() {
+        let clean = vec![Arc::new(vec![0xde, 0xad])];
+        let frames = outline_frames("cam", &clean, &[vec![(0.1, 0.1, 0.2, 0.2)]]);
+        assert!(Arc::ptr_eq(&frames[0], &clean[0]));
+    }
+
+    #[test]
+    fn outlines_cover_the_box_edge_and_nothing_else() {
+        let background = image::Rgb([0, 0, 0]);
+        let mut frame = image::RgbImage::from_pixel(100, 100, background);
+        draw_outlines(&mut frame, &[(0.2, 0.2, 0.5, 0.5), (0.9, 0.9, 0.5, 0.5)]);
+
+        for (x, y) in [
+            (20, 20),
+            (21, 45),
+            (69, 45),
+            (68, 69),
+            (45, 69),
+            (99, 99),
+            (90, 95),
+        ] {
+            assert_eq!(
+                *frame.get_pixel(x, y),
+                DETECTION_BOX_COLOR,
+                "edge pixel ({x}, {y})"
+            );
+        }
+        for (x, y) in [
+            (22, 22),
+            (45, 45),
+            (67, 67),
+            (19, 45),
+            (70, 45),
+            (45, 70),
+            (10, 10),
+        ] {
+            assert_eq!(
+                *frame.get_pixel(x, y),
+                background,
+                "pixel ({x}, {y}) off the edge"
+            );
+        }
+    }
+
+    #[test]
+    fn debug_boxes_map_through_their_own_frames_crop() {
+        let boxed = |bbox| Detection {
+            class_name: "person".to_string(),
+            confidence: 0.9,
+            bbox,
+        };
+        let per_frame = vec![
+            vec![boxed(Some((0.5, 0.5, 0.5, 0.5)))],
+            vec![boxed(Some((0.25, 0.25, 0.5, 0.5))), boxed(None)],
+        ];
+        let rects = full_frame_rects(&per_frame, &[(0.0, 0.0, 1.0, 1.0), (0.5, 0.0, 0.5, 0.5)]);
+        assert_eq!(
+            rects,
+            vec![
+                ("person".to_string(), 0.5, 0.5, 0.5, 0.5),
+                ("person".to_string(), 0.625, 0.125, 0.25, 0.25),
+            ]
+        );
     }
 
     #[test]

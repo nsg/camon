@@ -1,7 +1,7 @@
 use super::*;
 
 use super::decoder_slot::{DECODER_RESTART_BACKOFF, DECODER_SPAWN_BACKOFF_MAX};
-use super::framing::MIN_CROP_FRACTION;
+use super::framing::{square_up, union_rects_padded, RgbFrame};
 use super::sampling::{
     frames_per_segment, halve_past, pick_four, sample_indices, thin_evenly,
     FILMSTRIP_ACCUMULATOR_CAP, RUN_FRAME_ACCUMULATOR_CAP,
@@ -9,6 +9,7 @@ use super::sampling::{
 use super::skips::SKIP_REPORT_INTERVAL;
 use crate::analytics::motion::MotionBox;
 use crate::analytics::motion_settings::{SettingsUpdate, TunerMode, MASK_COLS};
+use crate::config::{DetectionCrop, DetectionFramingConfig};
 use std::sync::atomic::AtomicU32;
 
 fn detector_with_masks() -> MotionDetector {
@@ -581,14 +582,15 @@ async fn the_debug_overlay_frame_is_encoded_only_while_the_view_is_open() {
     let mut analyzer = MotionAnalyzer::with_decoder(ctx, FrameDecoder::dead());
 
     let frames = || {
-        vec![(
-            RgbFrame {
+        vec![SampledFrame {
+            frame: RgbFrame {
                 data: vec![0u8; 4 * 4 * 3],
                 width: 4,
                 height: 4,
             },
-            Some(FULL_FRAME),
-        )]
+            seq: 0,
+            crop: Some(FULL_FRAME),
+        }]
     };
     let segment = |seq| MotionSegment {
         seq,
@@ -1546,7 +1548,7 @@ fn normalize_rect_maps_to_unit_coords() {
 
 #[test]
 fn union_rects_empty_returns_none() {
-    assert!(union_rects_padded(&[], 0.2).is_none());
+    assert!(union_rects_padded(&[], 0.2, 0.15).is_none());
 }
 
 #[test]
@@ -1557,7 +1559,7 @@ fn union_rects_single_rect_with_padding() {
         w: 0.2,
         h: 0.2,
     };
-    let u = union_rects_padded(&[r], 0.2).unwrap();
+    let u = union_rects_padded(&[r], 0.2, 0.15).unwrap();
     assert!((u.x - 0.36).abs() < 0.01);
     assert!((u.w - 0.28).abs() < 0.01);
 }
@@ -1570,7 +1572,7 @@ fn union_rects_clamps_to_bounds() {
         w: 0.1,
         h: 0.1,
     };
-    let u = union_rects_padded(&[r], 0.5).unwrap();
+    let u = union_rects_padded(&[r], 0.5, 0.15).unwrap();
     assert!(u.x >= 0.0);
     assert!(u.y >= 0.0);
     assert!(u.x + u.w <= 1.0);
@@ -1593,7 +1595,7 @@ fn union_rects_merges_two_rects() {
             h: 0.2,
         },
     ];
-    let u = union_rects_padded(&rects, 0.0).unwrap();
+    let u = union_rects_padded(&rects, 0.0, 0.15).unwrap();
     assert!((u.x - 0.1).abs() < 0.01);
     assert!((u.y - 0.1).abs() < 0.01);
     assert!((u.w - 0.7).abs() < 0.01);
@@ -1608,9 +1610,139 @@ fn union_rects_enforces_minimum_size() {
         w: 0.01,
         h: 0.01,
     };
-    let u = union_rects_padded(&[r], 0.0).unwrap();
-    assert!(u.w >= MIN_CROP_FRACTION);
-    assert!(u.h >= MIN_CROP_FRACTION);
+    let u = union_rects_padded(&[r], 0.0, 0.15).unwrap();
+    assert!(u.w >= 0.15);
+    assert!(u.h >= 0.15);
+}
+
+fn framing(adjust: impl FnOnce(&mut DetectionFramingConfig)) -> DetectionFramingConfig {
+    let mut framing = DetectionFramingConfig::default();
+    adjust(&mut framing);
+    framing
+}
+
+fn bits(r: NormalizedRect) -> [u32; 4] {
+    [r.x.to_bits(), r.y.to_bits(), r.w.to_bits(), r.h.to_bits()]
+}
+
+#[test]
+fn default_framing_crops_exactly_as_the_fixed_padding_did() {
+    let rects = [
+        NormalizedRect {
+            x: 0.4,
+            y: 0.4,
+            w: 0.2,
+            h: 0.2,
+        },
+        NormalizedRect {
+            x: 0.52,
+            y: 0.45,
+            w: 0.01,
+            h: 0.3,
+        },
+    ];
+    let default = DetectionFramingConfig::default();
+    for rects in [&rects[..1], &rects[1..], &rects[..]] {
+        let region = detection_region(rects, &default).unwrap();
+        assert_eq!(
+            bits(region),
+            bits(union_rects_padded(rects, 0.2, 0.15).unwrap())
+        );
+    }
+    assert!(detection_region(&[], &default).is_none());
+}
+
+#[test]
+fn framing_padding_and_min_fraction_reshape_the_crop() {
+    let r = NormalizedRect {
+        x: 0.4,
+        y: 0.4,
+        w: 0.2,
+        h: 0.2,
+    };
+    let padded = detection_region(&[r], &framing(|f| f.padding = 0.5)).unwrap();
+    assert!((padded.x - 0.3).abs() < 1e-6 && (padded.w - 0.4).abs() < 1e-6);
+
+    let floored = detection_region(&[r], &framing(|f| f.min_fraction = 0.5)).unwrap();
+    assert!(
+        (floored.w - 0.7).abs() < 1e-6,
+        "0.5 floor plus 0.2 padding each side"
+    );
+
+    let bare = detection_region(
+        &[r],
+        &framing(|f| {
+            f.padding = 0.0;
+            f.min_fraction = 0.05;
+        }),
+    )
+    .unwrap();
+    for (got, want) in [(bare.x, r.x), (bare.y, r.y), (bare.w, r.w), (bare.h, r.h)] {
+        assert!((got - want).abs() < 1e-6, "{got} != {want}");
+    }
+}
+
+#[test]
+fn preserve_aspect_squares_the_crop_and_keeps_it_in_the_frame() {
+    let tight = |f: &mut DetectionFramingConfig| {
+        f.padding = 0.0;
+        f.min_fraction = 0.05;
+        f.preserve_aspect = true;
+    };
+    let centred = NormalizedRect {
+        x: 0.4,
+        y: 0.2,
+        w: 0.2,
+        h: 0.6,
+    };
+    let sq = detection_region(&[centred], &framing(tight)).unwrap();
+    assert_eq!(sq.w, sq.h);
+    assert!(
+        (sq.w - 0.6).abs() < 1e-6 && (sq.x - 0.2).abs() < 1e-6,
+        "grown about its centre"
+    );
+
+    let edge = NormalizedRect {
+        x: 0.9,
+        y: 0.1,
+        w: 0.1,
+        h: 0.5,
+    };
+    let sq = detection_region(&[edge], &framing(tight)).unwrap();
+    assert_eq!(sq.w, sq.h);
+    assert!(sq.x >= 0.0 && sq.y >= 0.0);
+    assert!(sq.x + sq.w <= 1.0 + 1e-6 && sq.y + sq.h <= 1.0 + 1e-6);
+    assert!(
+        sq.x <= edge.x && sq.x + sq.w >= edge.x + edge.w - 1e-6,
+        "still covers the motion"
+    );
+
+    let whole = square_up(NormalizedRect {
+        x: 0.0,
+        y: 0.3,
+        w: 1.0,
+        h: 0.4,
+    });
+    assert_eq!(bits(whole), bits(FULL_FRAME));
+}
+
+#[test]
+fn full_crop_uses_the_whole_frame_where_there_was_motion() {
+    let r = NormalizedRect {
+        x: 0.7,
+        y: 0.1,
+        w: 0.1,
+        h: 0.1,
+    };
+    let full = framing(|f| {
+        f.crop = DetectionCrop::Full;
+        f.preserve_aspect = true;
+    });
+    assert_eq!(
+        bits(detection_region(&[r], &full).unwrap()),
+        bits(FULL_FRAME)
+    );
+    assert!(detection_region(&[], &full).is_none());
 }
 
 fn coordinate_frame() -> RgbFrame {
@@ -1808,6 +1940,162 @@ fn detection_mask_full_frame_crop_matches_uncropped() {
     assert!(!is_black(&frame, 20, 20));
 }
 
+fn is_red(frame: &RgbFrame, col: usize, row: usize) -> bool {
+    let i = (row * frame.width + col) * 3;
+    frame.data[i..i + 3] == [255, 0, 0]
+}
+
+#[test]
+fn motion_outline_is_a_red_border_around_an_untouched_interior() {
+    let mut frame = white_frame(64, 64);
+    let rect = NormalizedRect {
+        x: 0.25,
+        y: 0.25,
+        w: 0.5,
+        h: 0.5,
+    };
+    draw_outline(&mut frame, FULL_FRAME, rect);
+
+    for (col, row) in [(16, 16), (17, 30), (47, 30), (46, 30), (30, 47), (30, 16)] {
+        assert!(is_red(&frame, col, row), "border pixel ({col}, {row})");
+    }
+    for (col, row) in [(18, 30), (45, 30), (30, 18), (30, 45), (32, 32)] {
+        assert!(!is_red(&frame, col, row), "interior pixel ({col}, {row})");
+    }
+    for (col, row) in [(15, 30), (48, 30), (30, 15), (30, 48), (0, 0)] {
+        assert!(!is_red(&frame, col, row), "outside pixel ({col}, {row})");
+    }
+}
+
+#[test]
+fn motion_outline_is_placed_in_crop_coordinates_and_clipped_to_the_crop() {
+    // The crop is the right half; the box straddles its left edge.
+    let crop = NormalizedRect {
+        x: 0.5,
+        y: 0.0,
+        w: 0.5,
+        h: 1.0,
+    };
+    let mut frame = white_frame(64, 64);
+    let straddling = NormalizedRect {
+        x: 0.375,
+        y: 0.25,
+        w: 0.25,
+        h: 0.25,
+    };
+    draw_outline(&mut frame, crop, straddling);
+    assert!(is_red(&frame, 0, 16), "top edge runs to the crop boundary");
+    assert!(is_red(&frame, 15, 24), "right edge lands at local x 14..16");
+    assert!(is_red(&frame, 14, 24));
+    assert!(!is_red(&frame, 13, 24));
+    assert!(
+        !is_red(&frame, 0, 24),
+        "the left edge lies outside the crop"
+    );
+
+    let untouched = white_frame(64, 64);
+    let mut frame = untouched.clone();
+    let outside = NormalizedRect {
+        x: 0.1,
+        y: 0.1,
+        w: 0.2,
+        h: 0.2,
+    };
+    draw_outline(&mut frame, crop, outside);
+    let past_the_corner = NormalizedRect {
+        x: 1.2,
+        y: 1.2,
+        w: 0.5,
+        h: 0.5,
+    };
+    draw_outline(&mut frame, crop, past_the_corner);
+    assert!(
+        frame.data == untouched.data,
+        "a box outside the crop drew nothing"
+    );
+}
+
+async fn framed_job(framing: DetectionFramingConfig) -> (DetectionJob, Vec<Vec<u8>>) {
+    let dir = tempfile::tempdir().unwrap();
+    let (detect_tx, queue) = crate::analytics::detect_worker::detect_queue(None);
+    let mut ctx = test_context("cam", dir.path());
+    ctx.detect_tx = Some(detect_tx);
+    ctx.config.object_detection.framing = framing;
+    let mut analyzer = MotionAnalyzer::with_decoder(ctx, FrameDecoder::dead());
+
+    let crop = NormalizedRect {
+        x: 0.0,
+        y: 0.0,
+        w: 0.5,
+        h: 0.5,
+    };
+    let motion = NormalizedRect {
+        x: 0.125,
+        y: 0.125,
+        w: 0.25,
+        h: 0.25,
+    };
+    analyzer.segment_crops.insert(7, crop);
+    analyzer.segment_motion_rects.insert(7, vec![motion]);
+    let frames = vec![SampledFrame {
+        frame: white_frame(64, 64),
+        seq: 7,
+        crop: Some(crop),
+    }];
+    let segment = MotionSegment {
+        seq: 7,
+        data: Arc::new(Vec::new()),
+        duration_ns: 1,
+    };
+    analyzer.process_run_frames(vec![segment], frames);
+    let job = queue.recv().await.expect("a crop job per run");
+    (job, analyzer.run_filmstrip.frames.clone())
+}
+
+#[tokio::test]
+async fn without_motion_boxes_the_model_is_handed_the_display_jpegs_themselves() {
+    let (job, strip) = framed_job(DetectionFramingConfig::default()).await;
+    assert_eq!(job.model_jpegs.len(), 1);
+    assert!(Arc::ptr_eq(&job.model_jpegs[0], &job.crop_jpegs[0]));
+    assert_eq!(job.frame_crops, vec![(0.0, 0.0, 0.5, 0.5)]);
+    assert_eq!(strip, vec![job.crop_jpegs[0].to_vec()]);
+    assert!(!job.detection_boxes);
+}
+
+#[tokio::test]
+async fn motion_boxes_are_drawn_on_the_model_frames_alone() {
+    let (clean, _) = framed_job(DetectionFramingConfig::default()).await;
+    let (job, strip) = framed_job(framing(|f| {
+        f.motion_boxes = true;
+        f.detection_boxes = true;
+    }))
+    .await;
+
+    assert_eq!(job.model_jpegs.len(), job.crop_jpegs.len());
+    assert_ne!(job.model_jpegs[0], job.crop_jpegs[0]);
+    assert_eq!(
+        job.crop_jpegs[0], clean.crop_jpegs[0],
+        "the display frame got the box"
+    );
+    assert_eq!(
+        strip,
+        vec![clean.crop_jpegs[0].to_vec()],
+        "the filmstrip got the box"
+    );
+    assert_eq!(job.frame_crops, clean.frame_crops);
+    assert!(job.detection_boxes);
+
+    // The box spans local 8..24 of the 32-pixel crop; (8, 16) is on its left edge.
+    let model = image::load_from_memory(&job.model_jpegs[0])
+        .unwrap()
+        .to_rgb8();
+    let [r, g, b] = model.get_pixel(8, 16).0;
+    assert!(
+        r > 180 && g < 110 && b < 110,
+        "no red edge in the model frame: {r},{g},{b}"
+    );
+}
+
 fn frames(tags: &[u8]) -> Vec<Vec<u8>> {
     tags.iter().map(|&t| vec![t]).collect()
 }
@@ -1993,13 +2281,20 @@ fn run_selection(run_len: usize, frames: impl Fn(u64) -> usize) -> Vec<(u8, u8)>
         }
     })
     .iter()
-    .map(|(frame, crop)| {
+    .map(|sampled| {
         assert_eq!(
-            crop.expect("a sampled segment always carries its crop").x,
-            frame.data[0] as f32,
+            sampled
+                .crop
+                .expect("a sampled segment always carries its crop")
+                .x,
+            sampled.frame.data[0] as f32,
             "crop tag followed the wrong segment"
         );
-        (frame.data[0], frame.data[1])
+        assert_eq!(
+            sampled.seq, sampled.frame.data[0] as u64,
+            "segment tag followed the wrong segment"
+        );
+        (sampled.frame.data[0], sampled.frame.data[1])
     })
     .collect()
 }

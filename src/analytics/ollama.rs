@@ -17,6 +17,10 @@ const NUM_PREDICT: u32 = 768;
 /// "everything is a person" response bounded in both tokens and latency.
 const MAX_DETECTIONS: usize = 15;
 
+/// Appended to the prompt when the frames carry the pipeline's motion rectangles.
+const MOTION_BOXES_NOTE: &str =
+    "Red rectangles drawn on the image mark detected motion; they are annotations, not objects.";
+
 #[derive(Serialize)]
 struct ChatRequest {
     model: String,
@@ -79,6 +83,8 @@ pub struct OllamaClient {
     confidence_threshold: f32,
     /// The configured allowlist, lowercased.
     allowed_classes: Vec<String>,
+    /// Frames arrive with motion rectangles drawn on them.
+    motion_boxes: bool,
 }
 
 impl OllamaClient {
@@ -89,6 +95,7 @@ impl OllamaClient {
         confidence_threshold: f32,
         allowed_classes: Vec<String>,
         fallback: Option<(&str, &str)>,
+        motion_boxes: bool,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(timeout_secs))
@@ -115,6 +122,7 @@ impl OllamaClient {
             fallback,
             confidence_threshold,
             allowed_classes,
+            motion_boxes,
         })
     }
 
@@ -240,14 +248,19 @@ impl OllamaClient {
 
     fn build_prompt(&self) -> String {
         let classes = self.allowed_classes.join(", ");
-        format!(
+        let mut prompt = format!(
             "Security camera frame. List objects: {classes}.\n\
              Return JSON matching the schema: a \"detections\" array. Each detection has \
              \"class\" (one of the listed objects), \"confidence\" (0.0-1.0), and bounding box \
              \"x\",\"y\",\"w\",\"h\" as fractions of image size (0.0-1.0), where x,y is the \
              top-left corner and w,h are the width and height.\n\
              If nothing noteworthy, return an empty detections array. No other text."
-        )
+        );
+        if self.motion_boxes {
+            prompt.push('\n');
+            prompt.push_str(MOTION_BOXES_NOTE);
+        }
+        prompt
     }
 }
 
@@ -365,7 +378,16 @@ mod tests {
     }
 
     fn make_client() -> OllamaClient {
-        OllamaClient::new("http://localhost:11434", "test", 90, 0.5, classes(), None).unwrap()
+        OllamaClient::new(
+            "http://localhost:11434",
+            "test",
+            90,
+            0.5,
+            classes(),
+            None,
+            false,
+        )
+        .unwrap()
     }
 
     #[test]
@@ -554,9 +576,51 @@ mod tests {
     }
 
     #[test]
+    fn prompt_without_motion_boxes_is_unchanged() {
+        assert_eq!(
+            make_client().build_prompt(),
+            "Security camera frame. List objects: person, car, dog.\n\
+             Return JSON matching the schema: a \"detections\" array. Each detection has \
+             \"class\" (one of the listed objects), \"confidence\" (0.0-1.0), and bounding box \
+             \"x\",\"y\",\"w\",\"h\" as fractions of image size (0.0-1.0), where x,y is the \
+             top-left corner and w,h are the width and height.\n\
+             If nothing noteworthy, return an empty detections array. No other text."
+        );
+    }
+
+    #[test]
+    fn prompt_with_motion_boxes_explains_the_red_rectangles() {
+        let client = OllamaClient::new(
+            "http://localhost:11434",
+            "test",
+            90,
+            0.5,
+            classes(),
+            None,
+            true,
+        )
+        .unwrap();
+        let prompt = client.build_prompt();
+        assert_eq!(
+            prompt,
+            format!("{}\n{MOTION_BOXES_NOTE}", make_client().build_prompt())
+        );
+        assert!(prompt.contains("Red rectangles"));
+        assert!(prompt.contains("not objects"));
+    }
+
+    #[test]
     fn empty_class_list_is_not_substituted() {
-        let client =
-            OllamaClient::new("http://localhost:11434", "test", 90, 0.5, vec![], None).unwrap();
+        let client = OllamaClient::new(
+            "http://localhost:11434",
+            "test",
+            90,
+            0.5,
+            vec![],
+            None,
+            false,
+        )
+        .unwrap();
         assert!(client.allowed_classes.is_empty());
     }
 
@@ -569,6 +633,7 @@ mod tests {
             0.5,
             vec!["Person".to_string(), "CAR".to_string()],
             None,
+            false,
         )
         .unwrap();
         assert_eq!(client.allowed_classes, vec!["person", "car"]);

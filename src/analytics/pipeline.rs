@@ -52,11 +52,11 @@ use decoder_slot::{
     LongLived, ZeroFrameTripwire, BLIND_DECODER_STREAK, DECODER_SPAWN_SCHEDULE, PRIMING_SEGMENTS,
 };
 use framing::{
-    apply_detection_mask, crop_frame, normalize_rect, union_rects_padded, union_two_rects,
-    NormalizedRect, RgbFrame, CROP_PADDING, FULL_FRAME,
+    apply_detection_mask, crop_frame, detection_region, draw_outline, normalize_rect,
+    union_two_rects, NormalizedRect, FULL_FRAME,
 };
-pub(crate) use sampling::FILMSTRIP_FRAMES;
-use sampling::{gray_jpeg, rgb_jpeg, sample_run_frames, Filmstrip, RunFilmstrip};
+use sampling::{gray_jpeg, rgb_jpeg, sample_run_frames, Filmstrip, RunFilmstrip, SampledFrame};
+pub(crate) use sampling::{FILMSTRIP_FRAMES, JPEG_QUALITY};
 use skips::{merge_skips, SkipReporter, SkippedSegments};
 
 struct MotionSegment {
@@ -1018,7 +1018,7 @@ impl MotionAnalyzer {
             }
         }
 
-        let crop = union_rects_padded(&all_rects, CROP_PADDING);
+        let crop = detection_region(&all_rects, &self.config.object_detection.framing);
 
         Ok(Some(SegmentAnalysis {
             score: total_score / frame_count as f32,
@@ -1106,7 +1106,7 @@ impl MotionAnalyzer {
         &self,
         run: &[MotionSegment],
         crop: &mut LongLived<CropDecoder>,
-    ) -> Vec<(RgbFrame, Option<NormalizedRect>)> {
+    ) -> Vec<SampledFrame> {
         self.prime_with(crop, run[0].seq, |decoder, data, duration_ns| {
             decoder.decode_segment(data, duration_ns, |_| {});
         });
@@ -1135,18 +1135,15 @@ impl MotionAnalyzer {
     /// The full (uncropped) frame the detection debug view draws its overlay on: the first
     /// frame of the run that has a crop, i.e. that had motion, with the detection mask blacked
     /// out so the view shows exactly what the model could not see.
-    fn debug_overlay_frame(
-        &self,
-        tagged_frames: &[(RgbFrame, Option<NormalizedRect>)],
-    ) -> Option<Arc<Vec<u8>>> {
+    fn debug_overlay_frame(&self, tagged_frames: &[SampledFrame]) -> Option<Arc<Vec<u8>>> {
         if self.detect_tx.is_none() || !self.debug_view_wanted() {
             return None;
         }
         tagged_frames
             .iter()
-            .find(|(_, crop)| crop.is_some())
-            .and_then(|(frame, _)| {
-                let mut f = frame.clone();
+            .find(|sampled| sampled.crop.is_some())
+            .and_then(|sampled| {
+                let mut f = sampled.frame.clone();
                 apply_detection_mask(&mut f, FULL_FRAME, &self.detection_mask);
                 rgb_jpeg(&f)
             })
@@ -1170,11 +1167,7 @@ impl MotionAnalyzer {
     /// Everything the run's frames are turned into, once they have been extracted. Split from
     /// the extraction above so what the strip, the job and the debug overlay are built out of
     /// can be driven from a test without an ffmpeg to decode with.
-    fn process_run_frames(
-        &mut self,
-        run: Vec<MotionSegment>,
-        tagged_frames: Vec<(RgbFrame, Option<NormalizedRect>)>,
-    ) {
+    fn process_run_frames(&mut self, run: Vec<MotionSegment>, tagged_frames: Vec<SampledFrame>) {
         let mut all_motion_rects: Vec<(f32, f32, f32, f32)> = Vec::new();
         let mut run_crop: Option<NormalizedRect> = None;
         for seg in &run {
@@ -1193,22 +1186,42 @@ impl MotionAnalyzer {
 
         let full_frame_jpeg = self.debug_overlay_frame(&tagged_frames);
 
-        // Crop, then black out painted detection-mask cells so masked pixels reach neither the
-        // model nor a stored thumbnail.
-        let cropped: Vec<RgbFrame> = tagged_frames
-            .iter()
-            .map(|(frame, crop)| {
-                let region = crop.unwrap_or(FULL_FRAME);
-                let (mut out, region) = match crop_frame(frame, &region) {
-                    Some(cropped) => (cropped, region),
-                    None => (frame.clone(), FULL_FRAME),
-                };
-                apply_detection_mask(&mut out, region, &self.detection_mask);
-                out
-            })
-            .collect();
+        let framing = &self.config.object_detection.framing;
+        let draw_motion_boxes = framing.motion_boxes && self.detect_tx.is_some();
+        let detection_boxes = framing.detection_boxes;
 
-        let filmstrip_jpegs: Vec<Vec<u8>> = cropped.iter().filter_map(rgb_jpeg).collect();
+        // Crop, then black out painted detection-mask cells so masked pixels reach neither the
+        // model nor a stored thumbnail. Motion boxes go on a copy only the model sees. A frame
+        // either encoder refuses is dropped whole, so display, model and region stay parallel.
+        let mut filmstrip_jpegs: Vec<Vec<u8>> = Vec::with_capacity(tagged_frames.len());
+        let mut boxed_jpegs: Vec<Option<Vec<u8>>> = Vec::with_capacity(tagged_frames.len());
+        let mut frame_crops: Vec<(f32, f32, f32, f32)> = Vec::with_capacity(tagged_frames.len());
+        for sampled in &tagged_frames {
+            let region = sampled.crop.unwrap_or(FULL_FRAME);
+            let (mut out, region) = match crop_frame(&sampled.frame, &region) {
+                Some(cropped) => (cropped, region),
+                None => (sampled.frame.clone(), FULL_FRAME),
+            };
+            apply_detection_mask(&mut out, region, &self.detection_mask);
+            let Some(display) = rgb_jpeg(&out) else {
+                continue;
+            };
+            let boxed = match self.segment_motion_rects.get(&sampled.seq) {
+                Some(rects) if draw_motion_boxes && !rects.is_empty() => {
+                    for &rect in rects {
+                        draw_outline(&mut out, region, rect);
+                    }
+                    let Some(jpeg) = rgb_jpeg(&out) else {
+                        continue;
+                    };
+                    Some(jpeg)
+                }
+                _ => None,
+            };
+            filmstrip_jpegs.push(display);
+            boxed_jpegs.push(boxed);
+            frame_crops.push((region.x, region.y, region.w, region.h));
+        }
 
         for seg in &run {
             self.segment_crops.remove(&seg.seq);
@@ -1216,13 +1229,23 @@ impl MotionAnalyzer {
         }
 
         if let Some(ref tx) = self.detect_tx {
+            // Copied once for the job's independent ownership; past this
+            // point the model, thumbnail and debug store all share these
+            // bytes by handle.
+            let crop_jpegs: Vec<Arc<Vec<u8>>> =
+                filmstrip_jpegs.iter().cloned().map(Arc::new).collect();
+            let model_jpegs = crop_jpegs
+                .iter()
+                .zip(boxed_jpegs)
+                .map(|(display, boxed)| boxed.map_or_else(|| Arc::clone(display), Arc::new))
+                .collect();
             tx.send(DetectionJob {
                 camera_id: self.camera_id.clone(),
                 seqs: run.iter().map(|seg| seg.seq).collect(),
-                // Copied once for the job's independent ownership; past this
-                // point the model, thumbnail and debug store all share these
-                // bytes by handle.
-                crop_jpegs: filmstrip_jpegs.iter().cloned().map(Arc::new).collect(),
+                crop_jpegs,
+                model_jpegs,
+                frame_crops,
+                detection_boxes,
                 full_frame_jpeg,
                 motion_rects: all_motion_rects,
                 run_crop: run_crop.map(|c| (c.x, c.y, c.w, c.h)),

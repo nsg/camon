@@ -128,6 +128,13 @@ pub enum ConfigError {
     )]
     ConfidenceThresholdNotANumber { value: f32 },
     #[error(
+        "[analytics.object_detection.framing] {key} is {value}, which is not a real number. A \
+         value merely out of range is clamped into it, but this one cannot be: every crop \
+         measured with it comes out with no size, so the model would be shown nothing. Write \
+         a number"
+    )]
+    NonFiniteFramingValue { key: &'static str, value: f32 },
+    #[error(
         "[analytics.object_detection.tpue] threshold must be a finite number strictly between \
          0 and 1, got {value}. Omit it to use tpue's tuned per-class thresholds"
     )]
@@ -520,6 +527,62 @@ impl Default for TpueConfig {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum DetectionCrop {
+    #[default]
+    Motion,
+    Full,
+}
+
+/// What the detector is shown of a frame, and what is drawn on the frames it keeps.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DetectionFramingConfig {
+    #[serde(default)]
+    pub crop: DetectionCrop,
+    /// Fraction of the motion box's size added on each side of it.
+    #[serde(default = "default_framing_padding")]
+    pub padding: f32,
+    /// Smallest motion-box side before padding, as a fraction of the frame's side.
+    #[serde(default = "default_framing_min_fraction")]
+    pub min_fraction: f32,
+    #[serde(default)]
+    pub preserve_aspect: bool,
+    #[serde(default)]
+    pub motion_boxes: bool,
+    #[serde(default)]
+    pub detection_boxes: bool,
+}
+
+impl DetectionFramingConfig {
+    pub const PADDING_MIN: f32 = 0.0;
+    pub const PADDING_MAX: f32 = 1.0;
+    pub const MIN_FRACTION_MIN: f32 = 0.05;
+    pub const MIN_FRACTION_MAX: f32 = 1.0;
+}
+
+impl Default for DetectionFramingConfig {
+    fn default() -> Self {
+        Self {
+            crop: DetectionCrop::default(),
+            padding: default_framing_padding(),
+            min_fraction: default_framing_min_fraction(),
+            preserve_aspect: false,
+            motion_boxes: false,
+            detection_boxes: false,
+        }
+    }
+}
+
+fn default_framing_padding() -> f32 {
+    0.2
+}
+
+fn default_framing_min_fraction() -> f32 {
+    0.15
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ObjectDetectionConfig {
@@ -531,6 +594,8 @@ pub struct ObjectDetectionConfig {
     pub confidence_threshold: f32,
     #[serde(default = "default_classes")]
     pub classes: Vec<String>,
+    #[serde(default)]
+    pub framing: DetectionFramingConfig,
     #[serde(default)]
     pub ollama: OllamaConfig,
     #[serde(default)]
@@ -544,6 +609,7 @@ impl Default for ObjectDetectionConfig {
             backend: DetectionBackend::default(),
             confidence_threshold: default_confidence_threshold(),
             classes: default_classes(),
+            framing: DetectionFramingConfig::default(),
             ollama: OllamaConfig::default(),
             tpue: TpueConfig::default(),
         }
@@ -1301,6 +1367,17 @@ impl Config {
             }
         }
 
+        // Checked with detection off too, so switching it on later cannot surface a bad value.
+        let framing = &self.analytics.object_detection.framing;
+        for (key, value) in [
+            ("padding", framing.padding),
+            ("min_fraction", framing.min_fraction),
+        ] {
+            if !value.is_finite() {
+                return Err(ConfigError::NonFiniteFramingValue { key, value });
+            }
+        }
+
         if !self.analytics.object_detection.enabled {
             return Ok(());
         }
@@ -1347,6 +1424,34 @@ impl Config {
                     configured = *value,
                     using = clamped,
                     "[analytics.motion] {key} ({value}) is outside {min}-{max}; using {clamped}"
+                );
+                *value = clamped;
+            }
+        }
+
+        let framing = &mut self.analytics.object_detection.framing;
+        for (key, value, min, max) in [
+            (
+                "padding",
+                &mut framing.padding,
+                DetectionFramingConfig::PADDING_MIN,
+                DetectionFramingConfig::PADDING_MAX,
+            ),
+            (
+                "min_fraction",
+                &mut framing.min_fraction,
+                DetectionFramingConfig::MIN_FRACTION_MIN,
+                DetectionFramingConfig::MIN_FRACTION_MAX,
+            ),
+        ] {
+            if value.is_finite() && !(min..=max).contains(value) {
+                let clamped = value.clamp(min, max);
+                tracing::warn!(
+                    key,
+                    configured = *value,
+                    using = clamped,
+                    "[analytics.object_detection.framing] {key} ({value}) is outside \
+                     {min}-{max}; using {clamped}"
                 );
                 *value = clamped;
             }
@@ -2616,6 +2721,93 @@ url = "rtsp://10.0.0.5:554/stream1"
             assert_eq!(
                 config.analytics.object_detection.confidence_threshold, expected,
                 "{literal}"
+            );
+        }
+    }
+
+    #[test]
+    fn framing_defaults_to_padded_motion_crops_and_takes_overrides() {
+        let toml = format!("[analytics]\nenabled = true\n{}", one_camera("yard"));
+        let framing = load_with_overrides(&toml, &[])
+            .unwrap()
+            .analytics
+            .object_detection
+            .framing;
+        assert_eq!(framing.crop, DetectionCrop::Motion);
+        assert_eq!(framing.padding, 0.2);
+        assert_eq!(framing.min_fraction, 0.15);
+        assert!(!framing.preserve_aspect && !framing.motion_boxes && !framing.detection_boxes);
+
+        let framing = load_with_overrides(
+            &toml,
+            &[
+                "analytics.object_detection.framing.crop=full",
+                "analytics.object_detection.framing.padding=0.5",
+                "analytics.object_detection.framing.detection_boxes=true",
+            ],
+        )
+        .unwrap()
+        .analytics
+        .object_detection
+        .framing;
+        assert_eq!(framing.crop, DetectionCrop::Full);
+        assert_eq!(framing.padding, 0.5);
+        assert!(framing.detection_boxes);
+    }
+
+    #[test]
+    fn out_of_range_framing_is_clamped_with_detection_off() {
+        let (result, written) = load_cameras_with_warnings(&format!(
+            "[analytics]\nenabled = true\n[analytics.object_detection.framing]\n\
+             padding = 3.0\nmin_fraction = 0.01\n{}",
+            one_camera("yard")
+        ));
+        let framing = result.unwrap().analytics.object_detection.framing;
+        assert_eq!(framing.padding, DetectionFramingConfig::PADDING_MAX);
+        assert_eq!(
+            framing.min_fraction,
+            DetectionFramingConfig::MIN_FRACTION_MIN
+        );
+        for expected in [
+            "[analytics.object_detection.framing] padding (3)",
+            "using 1",
+            "[analytics.object_detection.framing] min_fraction (0.01)",
+            "using 0.05",
+        ] {
+            assert!(written.contains(expected), "no {expected:?} in: {written}");
+        }
+        assert_eq!(written.matches("WARN").count(), 2, "got: {written}");
+    }
+
+    #[test]
+    fn non_finite_framing_is_refused_with_detection_off() {
+        for key in ["padding", "min_fraction"] {
+            for literal in ["nan", "inf"] {
+                let toml = format!(
+                    "[analytics]\nenabled = true\n[analytics.object_detection.framing]\n\
+                     {key} = {literal}\n{}",
+                    one_camera("yard")
+                );
+                let err = load_cameras(&toml).unwrap_err();
+                assert!(
+                    matches!(err, ConfigError::NonFiniteFramingValue { key: k, .. } if k == key),
+                    "{key} = {literal} got {err:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unknown_framing_crop_or_key_is_a_parse_error() {
+        for setting in ["crop = \"motion-box\"", "crop_mode = \"full\""] {
+            let toml = format!(
+                "[analytics.object_detection.framing]\n{setting}\n{}",
+                one_camera("yard")
+            );
+            let err = load_cameras(&toml).unwrap_err();
+            assert!(
+                matches!(err, ConfigError::Parse(_)),
+                "{setting} got {err:?}"
             );
         }
     }

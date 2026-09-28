@@ -110,19 +110,26 @@ pub(super) fn thin_evenly<T>(frames: Vec<T>, keep: usize) -> Vec<T> {
         .collect()
 }
 
+/// One frame kept out of a run, tagged with the segment it was decoded from and that segment's
+/// crop.
+pub(super) struct SampledFrame {
+    pub(super) frame: RgbFrame,
+    pub(super) seq: u64,
+    pub(super) crop: Option<NormalizedRect>,
+}
+
 /// Decode the sampled segments of `run` and reduce them to the frames the event filmstrip and
-/// the vision model get, each tagged with its own segment's crop.
+/// the vision model get, each tagged with its own segment and crop.
 pub(super) fn sample_run_frames(
     run: &[MotionSegment],
     crops: &HashMap<u64, NormalizedRect>,
     width: usize,
     height: usize,
     mut decode: impl FnMut(&Arc<Vec<u8>>, u64, &mut dyn FnMut(Vec<u8>)),
-) -> Vec<(RgbFrame, Option<NormalizedRect>)> {
+) -> Vec<SampledFrame> {
     let indices = sample_indices(run.len());
     let keep = frames_per_segment(indices.len());
-    let mut all_frames: Vec<(RgbFrame, Option<NormalizedRect>)> =
-        Vec::with_capacity(RUN_FRAME_ACCUMULATOR_CAP);
+    let mut all_frames: Vec<SampledFrame> = Vec::with_capacity(RUN_FRAME_ACCUMULATOR_CAP);
 
     for &idx in &indices {
         let seg = &run[idx];
@@ -139,16 +146,19 @@ pub(super) fn sample_run_frames(
                 halve_past(&mut held, reservoir);
             }
         });
-        all_frames.extend(thin_evenly(held, keep).into_iter().map(|data| {
-            (
-                RgbFrame {
-                    data,
-                    width,
-                    height,
-                },
-                crop,
-            )
-        }));
+        all_frames.extend(
+            thin_evenly(held, keep)
+                .into_iter()
+                .map(|data| SampledFrame {
+                    frame: RgbFrame {
+                        data,
+                        width,
+                        height,
+                    },
+                    seq: seg.seq,
+                    crop,
+                }),
+        );
     }
 
     pick_four(all_frames)
@@ -156,7 +166,7 @@ pub(super) fn sample_run_frames(
 
 /// JPEG quality for frames sent to the vision model and served to the UI.
 /// High enough that compression artifacts don't cost the model detections.
-const JPEG_QUALITY: u8 = 90;
+pub(crate) const JPEG_QUALITY: u8 = 90;
 
 fn encode_jpeg_raw(
     data: &[u8],

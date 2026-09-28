@@ -452,6 +452,7 @@ fn create_detector(config: &Config) -> Option<Detector> {
                 od.confidence_threshold,
                 od.classes.clone(),
                 fallback,
+                od.framing.motion_boxes,
             )
             .map(Detector::Ollama)
         }

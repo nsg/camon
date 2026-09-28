@@ -58,7 +58,7 @@ A fourth per-camera control, the **detection mask**, is painted on the same 16×
   <img alt="A motion event is subsampled to four frames, cropped using motion bounding boxes, JPEG-encoded, and queued to the single global serial detection worker, which talks to the detection backend (Ollama or tpue) one request at a time, records verdicts in the detection store, and upgrades events via the warm writer" src="docs/diagrams/04-detection-light.svg">
 </picture>
 
-The Motion Store keeps track of motion events. If there are several segments in sequence that have movements, they are considered a single motion event. We sample four frames from each event at 0/3, 1/3, 2/3 and 3/3 — one from each of four segments spread across the run, each carrying the motion bounding boxes measured on that segment. Only four ever reach the model, and only a handful are ever held: frames are thinned as they are decoded rather than collected and then reduced, so what a run costs in memory follows the four it keeps rather than the length of the run or the `sample_fps` it was decoded at. At the model's input resolution one raw frame is 6 MB, and collecting a run's worth first put hundreds of megabytes live at once. The few segments preceding the run are still fed to the decoder — ffmpeg emits nothing until it has probed that much input — but their footage predates the motion, so it is decoded and dropped, and the pipe is drained before the run's own segments are read so that late-arriving probe frames are not taken for the run's. That drain reaches what has arrived, not what is still inside ffmpeg, so each segment also keeps a spare frame: a decoder running a beat behind its segments costs the strip a frame rather than the whole strip. Using bounding boxes from the motion event, we crop the image to "zoom in" to the action, JPEG-encode the crops, and enqueue them as a job for a single global detection worker shared by all cameras. The worker is strictly serial — at most one in-flight detector request at any time — so a modest GPU or Edge TPU is never hit with parallel load, and the analyzer never waits for the model: if the small queue is full the job is simply dropped with a warning (the motion event still records; only the object classification is lost).
+The Motion Store keeps track of motion events. If there are several segments in sequence that have movements, they are considered a single motion event. We sample four frames from each event at 0/3, 1/3, 2/3 and 3/3 — one from each of four segments spread across the run, each carrying the motion bounding boxes measured on that segment. Only four ever reach the model, and only a handful are ever held: frames are thinned as they are decoded rather than collected and then reduced, so what a run costs in memory follows the four it keeps rather than the length of the run or the `sample_fps` it was decoded at. At the model's input resolution one raw frame is 6 MB, and collecting a run's worth first put hundreds of megabytes live at once. The few segments preceding the run are still fed to the decoder — ffmpeg emits nothing until it has probed that much input — but their footage predates the motion, so it is decoded and dropped, and the pipe is drained before the run's own segments are read so that late-arriving probe frames are not taken for the run's. That drain reaches what has arrived, not what is still inside ffmpeg, so each segment also keeps a spare frame: a decoder running a beat behind its segments costs the strip a frame rather than the whole strip. Using bounding boxes from the motion event, we crop the image to "zoom in" to the action — padded and held to a minimum size, or skipped in favour of the full frame, as `[analytics.object_detection.framing]` says — JPEG-encode the crops, and enqueue them as a job for a single global detection worker shared by all cameras. The worker is strictly serial — at most one in-flight detector request at any time — so a modest GPU or Edge TPU is never hit with parallel load, and the analyzer never waits for the model: if the small queue is full the job is simply dropped with a warning (the motion event still records; only the object classification is lost).
 
 With `backend = "tpue"`, the crops go to a [tpue](https://github.com/nsg/tpue) Coral Edge TPU service as raw JPEG bodies instead, and the configured class list is passed as the request allowlist. tpue answers in tens of milliseconds rather than tens of seconds and applies its own per-class confidence thresholds, tuned for its quantized models, so camon's `confidence_threshold` is not applied to its results; the same validation of classes and boxes is.
 
@@ -284,6 +284,25 @@ confidence_threshold = 0.5
 # enabled a class may not contain "+" or "#" — it reaches the occupancy topic
 # verbatim.
 classes = ["person", "car", "truck", "dog", "cat"]
+
+# What the detector is shown, and what is drawn on the frames camon keeps.
+[analytics.object_detection.framing]
+# "motion" (default) crops to the motion boxes; "full" sends the whole frame —
+# more context, but distant objects shrink to a few pixels.
+crop = "motion"
+# Motion crops only. padding: fraction of the box added on each side, 0.0-1.0
+# (default: 0.2). min_fraction: smallest box side before padding, as a fraction
+# of the frame's, 0.05-1.0 (default: 0.15). Out of range is clamped with a
+# warning; nan or inf is refused at startup.
+padding = 0.2
+min_fraction = 0.15
+# Motion crops only: widen the crop to the frame's aspect ratio (default: false).
+preserve_aspect = false
+# Draw motion boxes on the model's input (default: false); may bias it toward
+# finding something there.
+motion_boxes = false
+# Draw detection boxes on stored thumbnails and MQTT snapshots (default: false).
+detection_boxes = false
 
 [analytics.object_detection.ollama]
 # Ollama server URL (default: http://localhost:11434)
