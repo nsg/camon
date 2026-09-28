@@ -173,6 +173,13 @@ main {
     color: #666;
 }
 
+/* Whatever shows behind the label is not live: a snapshot poster or a stalled
+   frame. Blurring it makes that obvious at a glance. */
+.camera-cell .loading,
+.detail-video-wrapper .loading {
+    backdrop-filter: blur(6px);
+}
+
 /* The labels overlay video or a snapshot poster, so they need their own contrast. */
 .camera-cell .loading p,
 .detail-video-wrapper .loading p {
