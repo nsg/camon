@@ -1871,9 +1871,21 @@ fn empty_mask() -> Vec<bool> {
     vec![false; MASK_CELLS]
 }
 
-fn is_black(frame: &RgbFrame, col: usize, row: usize) -> bool {
+fn pixel(frame: &RgbFrame, col: usize, row: usize) -> [u8; 3] {
     let i = (row * frame.width + col) * 3;
-    frame.data[i] == 0 && frame.data[i + 1] == 0 && frame.data[i + 2] == 0
+    [frame.data[i], frame.data[i + 1], frame.data[i + 2]]
+}
+
+/// A frame with a different colour in every pixel, to tell a hidden pixel from a dimmed one.
+fn busy_frame(width: usize, height: usize) -> RgbFrame {
+    let data = (0..width * height)
+        .flat_map(|i| [(i * 7 % 200 + 56) as u8, (i * 13 % 200 + 56) as u8, 200])
+        .collect();
+    RgbFrame {
+        data,
+        width,
+        height,
+    }
 }
 
 #[test]
@@ -1884,23 +1896,55 @@ fn detection_mask_noop_when_empty() {
 }
 
 #[test]
-fn detection_mask_full_frame_blacks_exact_cell() {
-    let mut frame = white_frame(160, 120);
+fn detection_mask_hides_painted_cells_whatever_they_show() {
+    // Cell edges fall between pixels at this size: a cell is 6.25 by 5.83 pixels.
+    let (width, height) = (100, 70);
     let mut mask = empty_mask();
     mask[0] = true;
     mask[2 * MASK_COLS + 3] = true;
+    let mut white = white_frame(width, height);
+    let mut busy = busy_frame(width, height);
+    apply_detection_mask(&mut white, FULL_FRAME, &mask);
+    apply_detection_mask(&mut busy, FULL_FRAME, &mask);
+
+    // Every pixel a painted cell touches: (0, 0) and (3, 2), rounded outward.
+    for (cols, rows) in [(0..7, 0..6), (18..25, 11..18)] {
+        for row in rows {
+            for col in cols.clone() {
+                let [r, g, b] = pixel(&busy, col, row);
+                assert!(
+                    r == g && g == b && r <= 55,
+                    "({col}, {row}) shows {r} {g} {b}"
+                );
+                assert_eq!(pixel(&white, col, row), [r, g, b], "({col}, {row})");
+            }
+        }
+    }
+    // The frame's border is not an edge of the mask.
+    assert_eq!(pixel(&busy, 0, 0), [0; 3]);
+}
+
+#[test]
+fn detection_mask_only_dims_the_picture_close_to_its_edge() {
+    let mut frame = white_frame(640, 360);
+    let mut mask = empty_mask();
+    mask[5 * MASK_COLS + 7] = true; // x 280..320, y 150..180
     apply_detection_mask(&mut frame, FULL_FRAME, &mask);
 
-    assert!(is_black(&frame, 0, 0));
-    assert!(is_black(&frame, 9, 9));
-    assert!(!is_black(&frame, 10, 0));
-    assert!(!is_black(&frame, 0, 10));
-
-    assert!(is_black(&frame, 30, 20));
-    assert!(is_black(&frame, 39, 29));
-    assert!(!is_black(&frame, 29, 20));
-    assert!(!is_black(&frame, 40, 20));
-    assert!(!is_black(&frame, 30, 19));
+    // The edge reaches three boxes of 3.33 pixels out of the cell.
+    let near = |col: usize, row: usize| (269..331).contains(&col) && (139..191).contains(&row);
+    let mut dimmed = 0;
+    for row in 0..360 {
+        for col in 0..640 {
+            let [r, g, b] = pixel(&frame, col, row);
+            if !near(col, row) {
+                assert_eq!([r, g, b], [255; 3], "({col}, {row}) is beyond the edge");
+            } else if !((280..320).contains(&col) && (150..180).contains(&row)) && r < 255 {
+                dimmed += 1;
+            }
+        }
+    }
+    assert!(dimmed > 0, "the picture is dimmed around the cell");
 }
 
 #[test]
@@ -1911,34 +1955,22 @@ fn detection_mask_intersects_partial_crop() {
         w: 0.5,
         h: 1.0,
     };
-    let mut frame = white_frame(80, 120);
+    let mut frame = busy_frame(80, 120);
+    let shown = frame.clone();
     let mut mask = empty_mask();
     mask[0] = true;
     mask[8] = true;
     apply_detection_mask(&mut frame, crop, &mask);
 
-    assert!(is_black(&frame, 0, 0));
-    assert!(is_black(&frame, 9, 0));
-    assert!(!is_black(&frame, 10, 0));
-    assert!(!is_black(&frame, 79, 0));
-}
-
-#[test]
-fn detection_mask_full_frame_crop_matches_uncropped() {
-    let mut frame = white_frame(160, 120);
-    let mut mask = empty_mask();
-    mask[MASK_COLS + 1] = true; // col 1, row 1 => x=10..20, y=10..20
-    let spanning = NormalizedRect {
-        x: 0.0,
-        y: 0.0,
-        w: 1.0,
-        h: 1.0,
-    };
-    apply_detection_mask(&mut frame, spanning, &mask);
-    assert!(is_black(&frame, 10, 10));
-    assert!(is_black(&frame, 19, 19));
-    assert!(!is_black(&frame, 9, 10));
-    assert!(!is_black(&frame, 20, 20));
+    // Cell 8 is the crop's first ten columns; cell 0 lies outside the crop.
+    for col in [0, 9] {
+        let [r, g, b] = pixel(&frame, col, 0);
+        assert!(
+            r == g && g == b && r <= 55,
+            "column {col} shows {r} {g} {b}"
+        );
+    }
+    assert_eq!(pixel(&frame, 79, 0), pixel(&shown, 79, 0));
 }
 
 fn is_red(frame: &RgbFrame, col: usize, row: usize) -> bool {

@@ -1,5 +1,5 @@
 //! Rect and crop geometry: normalized regions, crop math and the detection
-//! mask blackout applied to every frame the vision model sees.
+//! mask applied to every frame the vision model sees.
 
 use crate::analytics::motion::MotionBox;
 use crate::analytics::motion_settings::{MASK_CELLS, MASK_COLS, MASK_ROWS};
@@ -147,8 +147,138 @@ pub(super) fn crop_frame(frame: &RgbFrame, region: &NormalizedRect) -> Option<Rg
     })
 }
 
-/// Black out (set to RGB black) every pixel of `frame` that belongs to a painted detection-mask
-/// cell.
+/// Each mask cell is split into this many boxes to draw the mask's edge with. On a 16:9 frame
+/// they come out square.
+const EDGE_BOXES_X: usize = 12;
+const EDGE_BOXES_Y: usize = 9;
+const BOX_COLS: usize = MASK_COLS * EDGE_BOXES_X;
+const BOX_ROWS: usize = MASK_ROWS * EDGE_BOXES_Y;
+/// How many boxes the edge reaches out of the painted cells, and into them: a third of a
+/// cell's height, a quarter of its width.
+const EDGE_REACH: i32 = 3;
+/// The lightest grey a box inside the painted cells can take.
+const EDGE_MAX_GREY: f32 = 55.0;
+
+/// A box close enough to the mask's edge to be drawn as part of it.
+struct EdgeBox {
+    col: usize,
+    row: usize,
+    painted: bool,
+    /// Distance, in boxes, to the nearest box on the other side of the edge.
+    distance: f32,
+}
+
+fn cell_painted(mask: &[bool], col: i32, row: i32) -> Option<bool> {
+    let inside = (0..MASK_COLS as i32).contains(&col) && (0..MASK_ROWS as i32).contains(&row);
+    inside.then(|| mask[row as usize * MASK_COLS + col as usize])
+}
+
+fn box_painted(mask: &[bool], col: i32, row: i32) -> Option<bool> {
+    let inside = (0..BOX_COLS as i32).contains(&col) && (0..BOX_ROWS as i32).contains(&row);
+    inside.then(|| mask[row as usize / EDGE_BOXES_Y * MASK_COLS + col as usize / EDGE_BOXES_X])
+}
+
+/// The boxes within `EDGE_REACH` of the boundary between painted and unpainted cells. The
+/// frame's border is not such a boundary, so a mask running off the frame stays solid there.
+fn edge_boxes(mask: &[bool]) -> Vec<EdgeBox> {
+    let reach = EDGE_REACH;
+    let mut boxes = Vec::new();
+    for cell_row in 0..MASK_ROWS as i32 {
+        for cell_col in 0..MASK_COLS as i32 {
+            let painted = mask[cell_row as usize * MASK_COLS + cell_col as usize];
+            // The edge is narrower than a cell, so only a cell beside the boundary holds any.
+            let beside_boundary = (-1..=1).any(|dy| {
+                (-1..=1)
+                    .any(|dx| cell_painted(mask, cell_col + dx, cell_row + dy) == Some(!painted))
+            });
+            if !beside_boundary {
+                continue;
+            }
+            for row in cell_row * EDGE_BOXES_Y as i32..(cell_row + 1) * EDGE_BOXES_Y as i32 {
+                for col in cell_col * EDGE_BOXES_X as i32..(cell_col + 1) * EDGE_BOXES_X as i32 {
+                    let nearest = (-reach..=reach)
+                        .flat_map(|dy| (-reach..=reach).map(move |dx| (dx, dy)))
+                        .filter(|&(dx, dy)| box_painted(mask, col + dx, row + dy) == Some(!painted))
+                        .map(|(dx, dy)| dx * dx + dy * dy)
+                        .min();
+                    if let Some(distance_sq) = nearest {
+                        boxes.push(EdgeBox {
+                            col: col as usize,
+                            row: row as usize,
+                            painted,
+                            distance: (distance_sq as f32).sqrt(),
+                        });
+                    }
+                }
+            }
+        }
+    }
+    boxes
+}
+
+/// Two fixed pseudo-random values in `0.0..=1.0` for a box. They depend only on where the box
+/// is in the scene, so the edge looks the same in every frame and every crop.
+fn box_noise(col: usize, row: usize) -> (f32, f32) {
+    let mut h = ((row * BOX_COLS + col) as u32).wrapping_add(0x9e37_79b9);
+    h ^= h >> 16;
+    h = h.wrapping_mul(0x85eb_ca6b);
+    h ^= h >> 13;
+    h = h.wrapping_mul(0xc2b2_ae35);
+    h ^= h >> 16;
+    ((h & 0xffff) as f32 / 65535.0, (h >> 16) as f32 / 65535.0)
+}
+
+/// The pixel rows and columns of `frame`, which shows `crop`, covered by the rect
+/// `x0..x1` by `y0..y1` given in full-frame normalized coordinates. With `outward` every pixel
+/// the rect touches is included; without it the edges round to the nearest pixel, so rects
+/// that share an edge never share a pixel.
+fn pixel_rect(
+    frame: &RgbFrame,
+    crop: NormalizedRect,
+    (x0, x1, y0, y1): (f32, f32, f32, f32),
+    outward: bool,
+) -> Option<(usize, usize, usize, usize)> {
+    let ix0 = x0.max(crop.x);
+    let ix1 = x1.min(crop.x + crop.w);
+    let iy0 = y0.max(crop.y);
+    let iy1 = y1.min(crop.y + crop.h);
+    if ix1 <= ix0 || iy1 <= iy0 {
+        return None;
+    }
+    let to_px = |v: f32, origin: f32, extent: f32, pixels: usize, up: bool| {
+        let px = (v - origin) / extent * pixels as f32;
+        let px = match (outward, up) {
+            (true, false) => px.floor(),
+            (true, true) => px.ceil(),
+            (false, _) => px.round(),
+        };
+        (px as i64).clamp(0, pixels as i64) as usize
+    };
+    let px0 = to_px(ix0, crop.x, crop.w, frame.width, false);
+    let px1 = to_px(ix1, crop.x, crop.w, frame.width, true);
+    let py0 = to_px(iy0, crop.y, crop.h, frame.height, false);
+    let py1 = to_px(iy1, crop.y, crop.h, frame.height, true);
+    (px1 > px0 && py1 > py0).then_some((px0, px1, py0, py1))
+}
+
+fn for_each_byte(
+    frame: &mut RgbFrame,
+    (px0, px1, py0, py1): (usize, usize, usize, usize),
+    mut f: impl FnMut(&mut u8),
+) {
+    for py in py0..py1 {
+        let start = (py * frame.width + px0) * 3;
+        let end = (py * frame.width + px1) * 3;
+        frame.data[start..end].iter_mut().for_each(&mut f);
+    }
+}
+
+/// Hide every pixel of `frame` that belongs to a painted detection-mask cell, and soften the
+/// mask's edge with small boxes.
+///
+/// A painted cell is filled black, shading to dark grey boxes over the last `EDGE_REACH` boxes
+/// before its edge; none of the picture survives anywhere inside it. Outside, the picture is
+/// dimmed box by box over the same distance, fading out.
 pub(super) fn apply_detection_mask(frame: &mut RgbFrame, crop: NormalizedRect, mask: &[bool]) {
     if mask.len() != MASK_CELLS
         || mask.iter().all(|&m| !m)
@@ -159,42 +289,56 @@ pub(super) fn apply_detection_mask(frame: &mut RgbFrame, crop: NormalizedRect, m
     {
         return;
     }
-    let fw = frame.width as f32;
-    let fh = frame.height as f32;
+    let edge = edge_boxes(mask);
+    let box_rect = |b: &EdgeBox| {
+        (
+            b.col as f32 / BOX_COLS as f32,
+            (b.col + 1) as f32 / BOX_COLS as f32,
+            b.row as f32 / BOX_ROWS as f32,
+            (b.row + 1) as f32 / BOX_ROWS as f32,
+        )
+    };
+    let reach = EDGE_REACH as f32;
+
+    // Dim the picture outside the mask first. Everything after this rounds outward and
+    // overwrites, so a pixel straddling a painted cell's edge ends up hidden.
+    for b in edge.iter().filter(|b| !b.painted) {
+        let fade = 1.0 - (b.distance - 0.5) / reach;
+        if fade <= 0.0 {
+            continue;
+        }
+        let dim = (fade + (box_noise(b.col, b.row).0 - 0.5) * 0.7).clamp(0.0, 1.0);
+        let keep = ((1.0 - dim) * 256.0) as u32;
+        if let Some(rect) = pixel_rect(frame, crop, box_rect(b), false) {
+            for_each_byte(frame, rect, |v| *v = ((*v as u32 * keep) >> 8) as u8);
+        }
+    }
+
     for row in 0..MASK_ROWS {
         for col in 0..MASK_COLS {
             if !mask[row * MASK_COLS + col] {
                 continue;
             }
-            // Cell rectangle in full-frame normalized coordinates.
-            let cx0 = col as f32 / MASK_COLS as f32;
-            let cx1 = (col + 1) as f32 / MASK_COLS as f32;
-            let cy0 = row as f32 / MASK_ROWS as f32;
-            let cy1 = (row + 1) as f32 / MASK_ROWS as f32;
-            // Intersect with the crop region.
-            let ix0 = cx0.max(crop.x);
-            let ix1 = cx1.min(crop.x + crop.w);
-            let iy0 = cy0.max(crop.y);
-            let iy1 = cy1.min(crop.y + crop.h);
-            if ix1 <= ix0 || iy1 <= iy0 {
-                continue;
+            let cell = (
+                col as f32 / MASK_COLS as f32,
+                (col + 1) as f32 / MASK_COLS as f32,
+                row as f32 / MASK_ROWS as f32,
+                (row + 1) as f32 / MASK_ROWS as f32,
+            );
+            if let Some(rect) = pixel_rect(frame, crop, cell, true) {
+                for_each_byte(frame, rect, |v| *v = 0);
             }
-            // Translate into crop-local pixel coordinates, rounding outward.
-            let px0 = ((((ix0 - crop.x) / crop.w) * fw).floor() as i64).clamp(0, frame.width as i64)
-                as usize;
-            let px1 = ((((ix1 - crop.x) / crop.w) * fw).ceil() as i64).clamp(0, frame.width as i64)
-                as usize;
-            let py0 = ((((iy0 - crop.y) / crop.h) * fh).floor() as i64)
-                .clamp(0, frame.height as i64) as usize;
-            let py1 = ((((iy1 - crop.y) / crop.h) * fh).ceil() as i64).clamp(0, frame.height as i64)
-                as usize;
-            for py in py0..py1 {
-                let start = (py * frame.width + px0) * 3;
-                let end = (py * frame.width + px1) * 3;
-                for b in &mut frame.data[start..end] {
-                    *b = 0;
-                }
-            }
+        }
+    }
+
+    for b in edge.iter().filter(|b| b.painted) {
+        let lightness = ((reach + 0.5 - b.distance) / (2.0 * reach)).clamp(0.0, 1.0);
+        let grey = (EDGE_MAX_GREY * lightness * (0.3 + 0.7 * box_noise(b.col, b.row).1)) as u8;
+        if grey == 0 {
+            continue;
+        }
+        if let Some(rect) = pixel_rect(frame, crop, box_rect(b), true) {
+            for_each_byte(frame, rect, |v| *v = grey);
         }
     }
 }
