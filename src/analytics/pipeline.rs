@@ -53,7 +53,7 @@ use decoder_slot::{
 };
 use framing::{
     apply_detection_mask, crop_frame, detection_region, draw_outline, normalize_rect,
-    union_two_rects, NormalizedRect, FULL_FRAME,
+    union_two_rects, NormalizedRect, Placement, FULL_FRAME,
 };
 use sampling::{gray_jpeg, rgb_jpeg, sample_run_frames, Filmstrip, RunFilmstrip, SampledFrame};
 pub(crate) use sampling::{FILMSTRIP_FRAMES, JPEG_QUALITY};
@@ -1144,7 +1144,8 @@ impl MotionAnalyzer {
             .find(|sampled| sampled.crop.is_some())
             .and_then(|sampled| {
                 let mut f = sampled.frame.clone();
-                apply_detection_mask(&mut f, FULL_FRAME, &self.detection_mask);
+                let whole = Placement::whole(&f);
+                apply_detection_mask(&mut f, whole, &self.detection_mask);
                 rgb_jpeg(&f)
             })
             .map(Arc::new)
@@ -1199,11 +1200,15 @@ impl MotionAnalyzer {
         let mut frame_crops: Vec<(f32, f32, f32, f32)> = Vec::with_capacity(tagged_frames.len());
         for sampled in &tagged_frames {
             let region = sampled.crop.unwrap_or(FULL_FRAME);
-            let (mut out, region) = match crop_frame(&sampled.frame, &region) {
-                Some(cropped) => (cropped, region),
-                None => (sampled.frame.clone(), FULL_FRAME),
+            let (mut out, region, placement) = match crop_frame(&sampled.frame, &region) {
+                Some((cropped, placement)) => (cropped, region, placement),
+                None => (
+                    sampled.frame.clone(),
+                    FULL_FRAME,
+                    Placement::whole(&sampled.frame),
+                ),
             };
-            apply_detection_mask(&mut out, region, &self.detection_mask);
+            apply_detection_mask(&mut out, placement, &self.detection_mask);
             let Some(display) = rgb_jpeg(&out) else {
                 continue;
             };

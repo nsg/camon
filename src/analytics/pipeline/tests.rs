@@ -1,7 +1,7 @@
 use super::*;
 
 use super::decoder_slot::{DECODER_RESTART_BACKOFF, DECODER_SPAWN_BACKOFF_MAX};
-use super::framing::{square_up, union_rects_padded, RgbFrame};
+use super::framing::{square_up, union_rects_padded, Placement, RgbFrame};
 use super::sampling::{
     frames_per_segment, halve_past, pick_four, sample_indices, thin_evenly,
     FILMSTRIP_ACCUMULATOR_CAP, RUN_FRAME_ACCUMULATOR_CAP,
@@ -1770,7 +1770,7 @@ fn crop_frame_extracts_region() {
         w: 0.5,
         h: 0.5,
     };
-    let cropped = crop_frame(&frame, &region).unwrap();
+    let (cropped, _) = crop_frame(&frame, &region).unwrap();
     assert_eq!(cropped.width, 100);
     assert_eq!(cropped.height, 50);
     assert_eq!(cropped.data.len(), 100 * 50 * 3);
@@ -1788,7 +1788,7 @@ fn crop_frame_clamps_at_edge() {
         w: 0.5,
         h: 0.5,
     };
-    let cropped = crop_frame(&frame, &region).unwrap();
+    let (cropped, _) = crop_frame(&frame, &region).unwrap();
     assert_eq!(cropped.width, 40);
     assert_eq!(cropped.height, 20);
     assert_eq!(&cropped.data[0..3], &[160, 80, 0]);
@@ -1888,10 +1888,15 @@ fn busy_frame(width: usize, height: usize) -> RgbFrame {
     }
 }
 
+fn mask_whole(frame: &mut RgbFrame, mask: &[bool]) {
+    let whole = Placement::whole(frame);
+    apply_detection_mask(frame, whole, mask);
+}
+
 #[test]
 fn detection_mask_noop_when_empty() {
     let mut frame = white_frame(160, 120);
-    apply_detection_mask(&mut frame, FULL_FRAME, &empty_mask());
+    mask_whole(&mut frame, &empty_mask());
     assert!(frame.data.iter().all(|&b| b == 255), "frame untouched");
 }
 
@@ -1904,8 +1909,8 @@ fn detection_mask_hides_painted_cells_whatever_they_show() {
     mask[2 * MASK_COLS + 3] = true;
     let mut white = white_frame(width, height);
     let mut busy = busy_frame(width, height);
-    apply_detection_mask(&mut white, FULL_FRAME, &mask);
-    apply_detection_mask(&mut busy, FULL_FRAME, &mask);
+    mask_whole(&mut white, &mask);
+    mask_whole(&mut busy, &mask);
 
     // Every pixel a painted cell touches: (0, 0) and (3, 2), rounded outward.
     for (cols, rows) in [(0..7, 0..6), (18..25, 11..18)] {
@@ -1929,7 +1934,7 @@ fn detection_mask_only_dims_the_picture_close_to_its_edge() {
     let mut frame = white_frame(640, 360);
     let mut mask = empty_mask();
     mask[5 * MASK_COLS + 7] = true; // x 280..320, y 150..180
-    apply_detection_mask(&mut frame, FULL_FRAME, &mask);
+    mask_whole(&mut frame, &mask);
 
     // The edge reaches three boxes of 3.33 pixels out of the cell.
     let near = |col: usize, row: usize| (269..331).contains(&col) && (139..191).contains(&row);
@@ -1948,29 +1953,44 @@ fn detection_mask_only_dims_the_picture_close_to_its_edge() {
 }
 
 #[test]
-fn detection_mask_intersects_partial_crop() {
-    let crop = NormalizedRect {
-        x: 0.5,
-        y: 0.0,
+fn detection_mask_hides_the_same_pixels_in_a_crop() {
+    // Neither the crop nor the cells fall on whole pixels of this 100 by 70 picture.
+    let region = NormalizedRect {
+        x: 0.033,
+        y: 0.04,
         w: 0.5,
-        h: 1.0,
+        h: 0.8,
     };
-    let mut frame = busy_frame(80, 120);
-    let shown = frame.clone();
     let mut mask = empty_mask();
     mask[0] = true;
-    mask[8] = true;
-    apply_detection_mask(&mut frame, crop, &mask);
+    mask[2 * MASK_COLS + 3] = true;
+    let (mut white, placement) = crop_frame(&white_frame(100, 70), &region).unwrap();
+    let (mut busy, _) = crop_frame(&busy_frame(100, 70), &region).unwrap();
+    apply_detection_mask(&mut white, placement, &mask);
+    apply_detection_mask(&mut busy, placement, &mask);
 
-    // Cell 8 is the crop's first ten columns; cell 0 lies outside the crop.
-    for col in [0, 9] {
-        let [r, g, b] = pixel(&frame, col, 0);
-        assert!(
-            r == g && g == b && r <= 55,
-            "column {col} shows {r} {g} {b}"
-        );
+    // The picture's pixels the painted cells touch, as in the uncropped test above.
+    let painted = |x: usize, y: usize| {
+        ((0..7).contains(&x) && (0..6).contains(&y))
+            || ((18..25).contains(&x) && (11..18).contains(&y))
+    };
+    let mut hidden = 0;
+    for row in 0..busy.height {
+        for col in 0..busy.width {
+            if !painted(placement.x + col, placement.y + row) {
+                continue;
+            }
+            let [r, g, b] = pixel(&busy, col, row);
+            assert!(
+                r == g && g == b && r <= 55,
+                "({col}, {row}) shows {r} {g} {b}"
+            );
+            assert_eq!(pixel(&white, col, row), [r, g, b], "({col}, {row})");
+            hidden += 1;
+        }
     }
-    assert_eq!(pixel(&frame, 79, 0), pixel(&shown, 79, 0));
+    // The crop starts at pixel (3, 2): it cuts through the first cell and holds the second.
+    assert_eq!(hidden, 4 * 4 + 7 * 7);
 }
 
 fn is_red(frame: &RgbFrame, col: usize, row: usize) -> bool {
@@ -2663,6 +2683,6 @@ fn post_padding_elapses_inside_a_backlogged_batch() {
 #[test]
 fn detection_mask_ignores_wrong_length() {
     let mut frame = white_frame(160, 120);
-    apply_detection_mask(&mut frame, FULL_FRAME, &[true, false, true]);
+    mask_whole(&mut frame, &[true, false, true]);
     assert!(frame.data.iter().all(|&b| b == 255));
 }

@@ -116,10 +116,35 @@ pub(super) struct RgbFrame {
     pub(super) height: usize,
 }
 
+/// Where a frame sits in the picture it was cut from, in whole pixels of that picture.
+#[derive(Clone, Copy)]
+pub(super) struct Placement {
+    pub(super) x: usize,
+    pub(super) y: usize,
+    pub(super) source_width: usize,
+    pub(super) source_height: usize,
+}
+
+impl Placement {
+    /// A frame that is the whole picture.
+    pub(super) fn whole(frame: &RgbFrame) -> Self {
+        Self {
+            x: 0,
+            y: 0,
+            source_width: frame.width,
+            source_height: frame.height,
+        }
+    }
+}
+
 /// Cut a normalized region out of a frame with pure row copying. The region
 /// is clamped to the frame bounds; a region that leaves no visible area
-/// yields `None`.
-pub(super) fn crop_frame(frame: &RgbFrame, region: &NormalizedRect) -> Option<RgbFrame> {
+/// yields `None`. The cut falls on whole pixels, so it is returned with where
+/// it really sits, which is not quite the region asked for.
+pub(super) fn crop_frame(
+    frame: &RgbFrame,
+    region: &NormalizedRect,
+) -> Option<(RgbFrame, Placement)> {
     let cols = frame.width as i32;
     let rows = frame.height as i32;
     if cols == 0 || rows == 0 {
@@ -140,11 +165,18 @@ pub(super) fn crop_frame(frame: &RgbFrame, region: &NormalizedRect) -> Option<Rg
         let start = (row * frame.width + x) * 3;
         data.extend_from_slice(&frame.data[start..start + w * 3]);
     }
-    Some(RgbFrame {
+    let placement = Placement {
+        x,
+        y,
+        source_width: frame.width,
+        source_height: frame.height,
+    };
+    let cropped = RgbFrame {
         data,
         width: w,
         height: h,
-    })
+    };
+    Some((cropped, placement))
 }
 
 /// Each mask cell is split into this many boxes to draw the mask's edge with. On a 16:9 frame
@@ -228,36 +260,44 @@ fn box_noise(col: usize, row: usize) -> (f32, f32) {
     ((h & 0xffff) as f32 / 65535.0, (h >> 16) as f32 / 65535.0)
 }
 
-/// The pixel rows and columns of `frame`, which shows `crop`, covered by the rect
-/// `x0..x1` by `y0..y1` given in full-frame normalized coordinates. With `outward` every pixel
-/// the rect touches is included; without it the edges round to the nearest pixel, so rects
-/// that share an edge never share a pixel.
+/// The pixels along one axis of a frame that grid division `index` of `count` covers, where
+/// the grid spans `source` pixels and the frame shows `len` of them starting at `origin`. With
+/// `outward` every pixel the division touches is included; without it the edges round to the
+/// nearest pixel, so neighbouring divisions never share one.
+fn pixel_span(
+    index: usize,
+    count: usize,
+    (source, origin, len): (usize, usize, usize),
+    outward: bool,
+) -> (usize, usize) {
+    let (lo, hi) = if outward {
+        (
+            index * source / count,
+            ((index + 1) * source).div_ceil(count),
+        )
+    } else {
+        let nearest = |edge: usize| (2 * edge * source + count) / (2 * count);
+        (nearest(index), nearest(index + 1))
+    };
+    (
+        lo.saturating_sub(origin).min(len),
+        hi.saturating_sub(origin).min(len),
+    )
+}
+
+/// The pixels of `frame` covered by the division at (`col`, `row`) of a `cols` by `rows` grid
+/// laid over the whole picture.
 fn pixel_rect(
     frame: &RgbFrame,
-    crop: NormalizedRect,
-    (x0, x1, y0, y1): (f32, f32, f32, f32),
+    placement: Placement,
+    (col, row): (usize, usize),
+    (cols, rows): (usize, usize),
     outward: bool,
 ) -> Option<(usize, usize, usize, usize)> {
-    let ix0 = x0.max(crop.x);
-    let ix1 = x1.min(crop.x + crop.w);
-    let iy0 = y0.max(crop.y);
-    let iy1 = y1.min(crop.y + crop.h);
-    if ix1 <= ix0 || iy1 <= iy0 {
-        return None;
-    }
-    let to_px = |v: f32, origin: f32, extent: f32, pixels: usize, up: bool| {
-        let px = (v - origin) / extent * pixels as f32;
-        let px = match (outward, up) {
-            (true, false) => px.floor(),
-            (true, true) => px.ceil(),
-            (false, _) => px.round(),
-        };
-        (px as i64).clamp(0, pixels as i64) as usize
-    };
-    let px0 = to_px(ix0, crop.x, crop.w, frame.width, false);
-    let px1 = to_px(ix1, crop.x, crop.w, frame.width, true);
-    let py0 = to_px(iy0, crop.y, crop.h, frame.height, false);
-    let py1 = to_px(iy1, crop.y, crop.h, frame.height, true);
+    let across = (placement.source_width, placement.x, frame.width);
+    let down = (placement.source_height, placement.y, frame.height);
+    let (px0, px1) = pixel_span(col, cols, across, outward);
+    let (py0, py1) = pixel_span(row, rows, down, outward);
     (px1 > px0 && py1 > py0).then_some((px0, px1, py0, py1))
 }
 
@@ -279,25 +319,16 @@ fn for_each_byte(
 /// A painted cell is filled black, shading to dark grey boxes over the last `EDGE_REACH` boxes
 /// before its edge; none of the picture survives anywhere inside it. Outside, the picture is
 /// dimmed box by box over the same distance, fading out.
-pub(super) fn apply_detection_mask(frame: &mut RgbFrame, crop: NormalizedRect, mask: &[bool]) {
-    if mask.len() != MASK_CELLS
-        || mask.iter().all(|&m| !m)
-        || crop.w <= 0.0
-        || crop.h <= 0.0
-        || frame.width == 0
-        || frame.height == 0
-    {
+///
+/// `placement` says where `frame` sits in the picture the mask was painted on. The mask is
+/// laid out in that picture's whole pixels, so a crop hides exactly the pixels the full
+/// frame would.
+pub(super) fn apply_detection_mask(frame: &mut RgbFrame, placement: Placement, mask: &[bool]) {
+    if mask.len() != MASK_CELLS || mask.iter().all(|&m| !m) {
         return;
     }
     let edge = edge_boxes(mask);
-    let box_rect = |b: &EdgeBox| {
-        (
-            b.col as f32 / BOX_COLS as f32,
-            (b.col + 1) as f32 / BOX_COLS as f32,
-            b.row as f32 / BOX_ROWS as f32,
-            (b.row + 1) as f32 / BOX_ROWS as f32,
-        )
-    };
+    let boxes = (BOX_COLS, BOX_ROWS);
     let reach = EDGE_REACH as f32;
 
     // Dim the picture outside the mask first. Everything after this rounds outward and
@@ -309,7 +340,7 @@ pub(super) fn apply_detection_mask(frame: &mut RgbFrame, crop: NormalizedRect, m
         }
         let dim = (fade + (box_noise(b.col, b.row).0 - 0.5) * 0.7).clamp(0.0, 1.0);
         let keep = ((1.0 - dim) * 256.0) as u32;
-        if let Some(rect) = pixel_rect(frame, crop, box_rect(b), false) {
+        if let Some(rect) = pixel_rect(frame, placement, (b.col, b.row), boxes, false) {
             for_each_byte(frame, rect, |v| *v = ((*v as u32 * keep) >> 8) as u8);
         }
     }
@@ -319,13 +350,8 @@ pub(super) fn apply_detection_mask(frame: &mut RgbFrame, crop: NormalizedRect, m
             if !mask[row * MASK_COLS + col] {
                 continue;
             }
-            let cell = (
-                col as f32 / MASK_COLS as f32,
-                (col + 1) as f32 / MASK_COLS as f32,
-                row as f32 / MASK_ROWS as f32,
-                (row + 1) as f32 / MASK_ROWS as f32,
-            );
-            if let Some(rect) = pixel_rect(frame, crop, cell, true) {
+            let cells = (MASK_COLS, MASK_ROWS);
+            if let Some(rect) = pixel_rect(frame, placement, (col, row), cells, true) {
                 for_each_byte(frame, rect, |v| *v = 0);
             }
         }
@@ -337,7 +363,7 @@ pub(super) fn apply_detection_mask(frame: &mut RgbFrame, crop: NormalizedRect, m
         if grey == 0 {
             continue;
         }
-        if let Some(rect) = pixel_rect(frame, crop, box_rect(b), true) {
+        if let Some(rect) = pixel_rect(frame, placement, (b.col, b.row), boxes, true) {
             for_each_byte(frame, rect, |v| *v = grey);
         }
     }
