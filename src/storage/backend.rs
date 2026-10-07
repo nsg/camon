@@ -552,6 +552,7 @@ async fn write_filmstrip(camera_dir: &Path, stem: &str, frames: &[Vec<u8>]) -> u
         let thumb_path = camera_dir.join(format!("{}_thumb_{}.jpg", stem, i));
         if let Err(e) = write_metadata_atomic(&thumb_path, jpeg).await {
             tracing::warn!(error = %e, "failed to write filmstrip thumbnail");
+            break;
         } else {
             wrote += 1;
         }
