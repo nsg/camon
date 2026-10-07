@@ -594,10 +594,20 @@ impl StathostBackend {
             camera = %camera_id,
             stem = %stem,
             "the video of an event being upgraded is no longer on stathost — retention deleted \
-             it while the upgrade was in flight. Dropping the index entry and the sidecar the \
+             it while the upgrade was in flight. Dropping the index entry and the metadata the \
              upgrade wrote (detections remain available in the detection store)"
         );
-        self.events.remove(camera_id, key);
+        let removed = self.events.remove(camera_id, key);
+        if !self.stop.stopped() {
+            if let Some(entry) = removed {
+                for i in (0..entry.filmstrip_frames).rev() {
+                    if self.stop.stopped() {
+                        break;
+                    }
+                    let _ = self.http.delete(&thumb_key(camera_id, stem, i)).await;
+                }
+            }
+        }
         if !self.stop.stopped() {
             let _ = self.http.delete(&sidecar_key(camera_id, stem)).await;
         }
@@ -1353,9 +1363,9 @@ impl WarmStorageBackend for StathostBackend {
     }
 
     async fn upgrade_event(&self, camera_id: &str, upgrade: &EventUpgrade) {
-        // The upgrade rewrites the sidecar in place — no video is moved. If the
-        // event was never indexed (write failed, or already pruned) there is
-        // nothing to rewrite; the detections remain in the detection store.
+        // The upgrade rewrites metadata in place — no video is moved. If the event was never
+        // indexed (write failed, or already pruned) there is nothing to rewrite; the detections
+        // remain in the detection store.
         let key = (upgrade.start_pts_ns, upgrade.duration_ms);
         if !self.events.contains(camera_id, key) {
             tracing::warn!(
@@ -1376,13 +1386,25 @@ impl WarmStorageBackend for StathostBackend {
             upgrade.continues,
         );
         let sidecar_bytes = sidecar.len() as u64;
-        // An upgraded sidecar carries the detections the movement event had none of, so it is
-        // bigger than the one it replaces — and it is stored before anything accounts for it.
-        let growth = self
-            .events
-            .find(camera_id, key)
-            .map_or(0, |entry| sidecar_bytes.saturating_sub(entry.sidecar_bytes));
-        let room = self.budget.reserve(growth);
+        let Some(previous) = self.events.find(camera_id, key) else {
+            return;
+        };
+        let planned_thumbnail_bytes = upgrade
+            .filmstrip_frames
+            .as_ref()
+            .map_or(previous.thumbnail_bytes, |frames| {
+                frames.iter().map(|frame| frame.len() as u64).sum()
+            });
+        // The reservation covers the net metadata growth until the reidentified index entry
+        // takes over the accounting.
+        let planned_growth = sidecar_bytes
+            .saturating_add(planned_thumbnail_bytes)
+            .saturating_sub(
+                previous
+                    .sidecar_bytes
+                    .saturating_add(previous.thumbnail_bytes),
+            );
+        let room = self.budget.reserve(planned_growth);
         if !self
             .upload(&sidecar_key, Bytes::from(sidecar.into_bytes()))
             .await
@@ -1390,6 +1412,25 @@ impl WarmStorageBackend for StathostBackend {
             tracing::error!(camera = %camera_id, stem = %stem,
                 "failed to upload upgraded sidecar to stathost, aborting upgrade");
             return;
+        }
+
+        let mut replacement = None;
+        if let Some(frames) = &upgrade.filmstrip_frames {
+            let mut stored_frames = 0usize;
+            let mut stored_bytes = 0u64;
+            for (i, jpeg) in frames.iter().enumerate() {
+                if !self
+                    .upload(&thumb_key(camera_id, &stem, i), Bytes::from(jpeg.clone()))
+                    .await
+                {
+                    tracing::warn!(camera = %camera_id, stem = %stem, frame = i,
+                        "failed to upload replacement filmstrip frame during object upgrade");
+                    break;
+                }
+                stored_frames += 1;
+                stored_bytes += jpeg.len() as u64;
+            }
+            replacement = Some((stored_frames, stored_bytes));
         }
 
         // The retention sweep runs on its own task and deletes an event's objects one request
@@ -1406,6 +1447,10 @@ impl WarmStorageBackend for StathostBackend {
             // whole entry here, which is where this was being lost).
             entry.continues = upgrade.continues;
             entry.sidecar_bytes = sidecar_bytes;
+            if let Some((frames, bytes)) = replacement {
+                entry.filmstrip_frames = frames;
+                entry.thumbnail_bytes = bytes;
+            }
         });
         drop(room);
         if !reclassified {
@@ -1413,11 +1458,21 @@ impl WarmStorageBackend for StathostBackend {
                 camera = %camera_id,
                 stem = %stem,
                 "retention deleted this event while its object upgrade was in flight; \
-                 removing the sidecar the upgrade wrote back \
+                 removing the metadata the upgrade wrote back \
                  (detections remain available in the detection store)"
             );
             // Not once shutdown is up: the next startup's orphan sweep collects
             // it, and issuing a request here is the drain waiting for one.
+            if !self.stop.stopped() {
+                if let Some((frames, _)) = replacement {
+                    for i in (0..frames).rev() {
+                        if self.stop.stopped() {
+                            break;
+                        }
+                        let _ = self.http.delete(&thumb_key(camera_id, &stem, i)).await;
+                    }
+                }
+            }
             if !self.stop.stopped() {
                 let _ = self.http.delete(&sidecar_key).await;
             }
@@ -1432,6 +1487,17 @@ impl WarmStorageBackend for StathostBackend {
         {
             return;
         }
+        if let Some((frames, _)) = replacement {
+            self.trim_thumbnails(camera_id, key, frames, previous.filmstrip_frames)
+                .await;
+        }
+        let growth = sidecar_bytes
+            .saturating_add(replacement.map_or(previous.thumbnail_bytes, |(_, bytes)| bytes))
+            .saturating_sub(
+                previous
+                    .sidecar_bytes
+                    .saturating_add(previous.thumbnail_bytes),
+            );
         // The growth is in the index now, and nothing evicted for it. Say so if
         // it took the store over: this upgrade may be the last thing this
         // camera does for a while, and there is no write behind it to notice.

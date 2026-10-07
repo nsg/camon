@@ -19,6 +19,7 @@ const RECORD_ALARM: usize = 256;
 pub struct Verdict {
     pub object_classes: Vec<String>,
     pub detections: Vec<DetectionDetail>,
+    pub filmstrip_frames: Option<Arc<Vec<Vec<u8>>>>,
     pub backend: String,
     pub model: String,
 }
@@ -174,9 +175,9 @@ impl EventRegistry {
                 continue;
             }
             match record.state {
-                // First verdict wins, as it does for a written event: the
-                // upgrade rewrites the whole sidecar, so a second one would be
-                // the same rewrite with a different opinion.
+                // First verdict wins, as it does for a written event: an upgrade replaces the
+                // event's classification and optional presentation strip, so a second one would
+                // be the same rewrite with a different opinion.
                 State::Pending(ref mut parked) => {
                     parked.get_or_insert_with(|| verdict.clone());
                 }
@@ -328,6 +329,7 @@ mod tests {
                 class: class.to_string(),
                 confidence: 0.9,
             }],
+            filmstrip_frames: None,
             backend: "ollama".to_string(),
             model: "test-model".to_string(),
         }

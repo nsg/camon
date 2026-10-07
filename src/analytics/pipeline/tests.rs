@@ -1164,6 +1164,7 @@ fn person() -> crate::storage::Verdict {
             class: "person".to_string(),
             confidence: 0.9,
         }],
+        filmstrip_frames: None,
         backend: "ollama".to_string(),
         model: "test-model".to_string(),
     }
@@ -2063,7 +2064,7 @@ async fn without_motion_boxes_the_model_is_handed_the_display_jpegs_themselves()
 }
 
 #[tokio::test]
-async fn motion_boxes_are_drawn_on_the_model_frames_alone() {
+async fn motion_boxes_leave_the_analyzers_run_filmstrip_clean() {
     let (clean, _) = framed_job(DetectionFramingConfig::default()).await;
     let (job, strip) = framed_job(framing(|f| {
         f.motion_boxes = true;
@@ -2075,12 +2076,12 @@ async fn motion_boxes_are_drawn_on_the_model_frames_alone() {
     assert_ne!(job.model_jpegs[0], job.crop_jpegs[0]);
     assert_eq!(
         job.crop_jpegs[0], clean.crop_jpegs[0],
-        "the display frame got the box"
+        "the clean crop got the box"
     );
     assert_eq!(
         strip,
         vec![clean.crop_jpegs[0].to_vec()],
-        "the filmstrip got the box"
+        "the run-wide filmstrip got the box"
     );
     assert_eq!(job.frame_crops, clean.frame_crops);
     assert!(job.detection_boxes);

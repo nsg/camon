@@ -210,11 +210,14 @@ min_fraction = 0.15
 preserve_aspect = false
 # Draw the motion boxes onto the image sent to the model (default: false).
 # Shows the model where to look, but a highlighted box may also bias it toward
-# reporting something there that is not.
+# reporting something there that is not. On its own this changes only the
+# model's input.
 motion_boxes = false
 # Draw the model's detection boxes onto the frames camon keeps (default:
-# false). Changes what you see, not what is detected: stored event thumbnails
-# and the MQTT per-class snapshots carry the boxes too.
+# false). An object event's filmstrip becomes the model-input frames it matched,
+# with green detection boxes; the live timeline thumbnail and MQTT per-class
+# snapshots use the same frames. With motion_boxes enabled they therefore carry
+# the red motion boxes too. This changes what you see, not what is detected.
 detection_boxes = false
 
 [analytics.object_detection.ollama]

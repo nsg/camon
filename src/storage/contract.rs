@@ -241,6 +241,7 @@ pub(crate) mod contract_tests {
                 class: "person".to_string(),
                 confidence: 0.9,
             }],
+            filmstrip_frames: None,
             backend: "ollama".to_string(),
             model: "m".to_string(),
             continues: false,
@@ -364,6 +365,44 @@ pub(crate) mod contract_tests {
                 .unwrap_or(0),
             40,
             "the upgraded event's video is no longer where the index says it is"
+        );
+    }
+
+    /// A strip carried by an upgrade replaces every old frame, including a longer old tail.
+    pub(crate) async fn an_upgrade_replaces_the_event_filmstrip(backend: &dyn WarmStorageBackend) {
+        backend.write_event("cam", &event(1_000, 40)).await;
+        let mut replacement = upgrade(1_000);
+        replacement.filmstrip_frames = Some(Arc::new(vec![vec![0x09]]));
+        backend.upgrade_event("cam", &replacement).await;
+
+        let entries = backend.query("cam", EventPage::unbounded(0, u64::MAX));
+        assert_eq!(entries[0].filmstrip_frames, 1);
+        assert_eq!(
+            backend.read_filmstrip("cam", &entries[0], 0).await.unwrap(),
+            vec![0x09]
+        );
+        assert!(
+            backend.read_filmstrip("cam", &entries[0], 1).await.is_err(),
+            "the old filmstrip tail survived its replacement"
+        );
+    }
+
+    /// An ordinary reclassification leaves the event's existing filmstrip untouched.
+    pub(crate) async fn an_upgrade_without_a_strip_keeps_the_event_filmstrip(
+        backend: &dyn WarmStorageBackend,
+    ) {
+        backend.write_event("cam", &event(1_000, 40)).await;
+        backend.upgrade_event("cam", &upgrade(1_000)).await;
+
+        let entries = backend.query("cam", EventPage::unbounded(0, u64::MAX));
+        assert_eq!(entries[0].filmstrip_frames, 2);
+        assert_eq!(
+            backend.read_filmstrip("cam", &entries[0], 0).await.unwrap(),
+            vec![0x01, 0x02]
+        );
+        assert_eq!(
+            backend.read_filmstrip("cam", &entries[0], 1).await.unwrap(),
+            vec![0x03, 0x04]
         );
     }
 

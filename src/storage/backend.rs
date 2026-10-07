@@ -165,8 +165,9 @@ pub trait WarmStorageBackend: Send + Sync {
     async fn write_event(&self, camera_id: &str, event: &FinishedEvent) -> WriteOutcome;
 
     /// Apply a movement→object upgrade as an intent: attach the new detections
-    /// and reclassify the event. LocalDisk renames the files into `objects/`
-    /// and rewrites the sidecar; a remote backend rewrites a sidecar in place.
+    /// and reclassify the event, replacing its filmstrip when one is supplied.
+    /// LocalDisk renames the files into `objects/`; a remote backend updates
+    /// the same object keys in place.
     async fn upgrade_event(&self, camera_id: &str, upgrade: &EventUpgrade);
 
     /// Delete events older than their per-class retention, bounded by the per-camera share one
@@ -560,6 +561,27 @@ async fn write_filmstrip(camera_dir: &Path, stem: &str, frames: &[Vec<u8>]) -> u
     wrote
 }
 
+async fn replace_filmstrip(
+    movements: &Path,
+    objects: &Path,
+    stem: &str,
+    frames: &[Vec<u8>],
+) -> usize {
+    for i in 0..MAX_FILMSTRIP_FRAMES {
+        let name = format!("{stem}_thumb_{i}.jpg");
+        for path in [movements.join(&name), objects.join(&name)] {
+            if let Err(e) = tokio::fs::remove_file(&path).await {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    tracing::warn!(path = %path.display(), error = %e,
+                        "failed to remove an old filmstrip frame during object upgrade");
+                }
+            }
+        }
+    }
+    write_filmstrip(objects, stem, frames).await;
+    filmstrip_frame_count(|i| objects.join(format!("{stem}_thumb_{i}.jpg")).exists())
+}
+
 fn build_index_entry(
     event: &FinishedEvent,
     duration_ms: u64,
@@ -755,10 +777,15 @@ async fn upgrade_event(
     }
 
     // Steps 3 + 4: thumbnails follow, the stale movement sidecar goes.
-    for i in 0..MAX_FILMSTRIP_FRAMES {
-        let name = format!("{stem}_thumb_{i}.jpg");
-        let _ = tokio::fs::rename(movements.join(&name), objects.join(&name)).await;
-    }
+    let replacement_frames = if let Some(frames) = &upgrade.filmstrip_frames {
+        Some(replace_filmstrip(&movements, &objects, &stem, frames).await)
+    } else {
+        for i in 0..MAX_FILMSTRIP_FRAMES {
+            let name = format!("{stem}_thumb_{i}.jpg");
+            let _ = tokio::fs::rename(movements.join(&name), objects.join(&name)).await;
+        }
+        None
+    };
     let _ = tokio::fs::remove_file(movements.join(format!("{stem}.json"))).await;
 
     // Step 5: both sides of the move, destination first and *only* then the
@@ -779,6 +806,9 @@ async fn upgrade_event(
             entry.detections = upgrade.detections.clone();
             entry.backend = Some(upgrade.backend.clone());
             entry.model = Some(upgrade.model.clone());
+            if let Some(frames) = replacement_frames {
+                entry.filmstrip_frames = frames;
+            }
         },
     );
     if !updated {
@@ -1020,6 +1050,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn contract_an_upgrade_replaces_the_event_filmstrip() {
+        let (_dir, backend) = contract_backend();
+        crate::storage::contract::contract_tests::an_upgrade_replaces_the_event_filmstrip(&backend)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn contract_an_upgrade_without_a_strip_keeps_the_event_filmstrip() {
+        let (_dir, backend) = contract_backend();
+        crate::storage::contract::contract_tests::an_upgrade_without_a_strip_keeps_the_event_filmstrip(
+            &backend,
+        )
+        .await;
+    }
+
+    #[tokio::test]
     async fn contract_an_upgrade_of_a_deleted_event_indexes_nothing() {
         let (_dir, backend) = contract_backend();
         crate::storage::contract::contract_tests::an_upgrade_of_a_deleted_event_indexes_nothing(
@@ -1075,6 +1121,7 @@ mod tests {
                     confidence: 0.9,
                 },
             ],
+            filmstrip_frames: None,
             backend: "ollama".to_string(),
             model: "test-model".to_string(),
             continues: false,
@@ -1522,7 +1569,9 @@ mod tests {
             .find_event("cam", EventRef::new(first_pts, 4000, EventType::Movement))
             .is_none());
 
-        upgrade_event(dir.path(), "cam", &upgrade_for(&event), &index).await;
+        let mut upgrade = upgrade_for(&event);
+        upgrade.filmstrip_frames = Some(std::sync::Arc::new(vec![vec![0x09]]));
+        upgrade_event(dir.path(), "cam", &upgrade, &index).await;
 
         let entry = index
             .find_event("cam", EventRef::new(first_pts, 4000, EventType::Object))
@@ -1531,7 +1580,14 @@ mod tests {
         assert_eq!(entry.object_classes, vec!["person".to_string()]);
         assert_eq!(entry.detections.len(), 2);
         assert_eq!(entry.file_size, 16);
-        assert_eq!(entry.filmstrip_frames, 2);
+        assert_eq!(entry.filmstrip_frames, 1);
+        let stem = format!("{first_pts}_4000");
+        let objects = dir.path().join("cam").join("objects");
+        assert_eq!(
+            std::fs::read(objects.join(format!("{stem}_thumb_0.jpg"))).unwrap(),
+            vec![0x09]
+        );
+        assert!(!objects.join(format!("{stem}_thumb_1.jpg")).exists());
         assert_eq!(
             index.resolve_file_path("cam", &entry),
             dir.path()
@@ -1593,6 +1649,7 @@ mod tests {
             duration_ms: 4000,
             object_classes: vec!["person".to_string()],
             detections: vec![],
+            filmstrip_frames: None,
             backend: "ollama".to_string(),
             model: "m".to_string(),
             continues: false,

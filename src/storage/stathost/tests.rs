@@ -537,6 +537,7 @@ fn upgrade_for(first_pts: u64) -> EventUpgrade {
             class: "person".to_string(),
             confidence: 0.9,
         }],
+        filmstrip_frames: None,
         backend: "ollama".to_string(),
         model: "m".to_string(),
         continues: false,
@@ -2340,6 +2341,24 @@ async fn contract_an_upgrade_reclassifies_the_one_indexed_event() {
     let (url, _stub) = spawn_stub("secret").await;
     let backend = scanned_backend_for(&url, "secret", 0).await;
     crate::storage::contract::contract_tests::an_upgrade_reclassifies_the_one_indexed_event(
+        &backend,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn contract_an_upgrade_replaces_the_event_filmstrip() {
+    let (url, _stub) = spawn_stub("secret").await;
+    let backend = scanned_backend_for(&url, "secret", 0).await;
+    crate::storage::contract::contract_tests::an_upgrade_replaces_the_event_filmstrip(&backend)
+        .await;
+}
+
+#[tokio::test]
+async fn contract_an_upgrade_without_a_strip_keeps_the_event_filmstrip() {
+    let (url, _stub) = spawn_stub("secret").await;
+    let backend = scanned_backend_for(&url, "secret", 0).await;
+    crate::storage::contract::contract_tests::an_upgrade_without_a_strip_keeps_the_event_filmstrip(
         &backend,
     )
     .await;

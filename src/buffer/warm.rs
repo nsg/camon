@@ -79,6 +79,7 @@ pub struct EventUpgrade {
     pub duration_ms: u32,
     pub object_classes: Vec<String>,
     pub detections: Vec<DetectionDetail>,
+    pub filmstrip_frames: Option<Arc<Vec<Vec<u8>>>>,
     pub backend: String,
     pub model: String,
     /// Preserved from the original event so the chain-stitching flag
@@ -94,6 +95,7 @@ impl EventUpgrade {
             duration_ms: target.duration_ms,
             object_classes: verdict.object_classes,
             detections: verdict.detections,
+            filmstrip_frames: verdict.filmstrip_frames,
             backend: verdict.backend,
             model: verdict.model,
             continues: target.continues,
@@ -165,11 +167,15 @@ pub fn assemble_event(
     // pruned these sequences yet (they are still in the hot buffer).
     let mut object_classes: Vec<String> = Vec::new();
     let mut detection_details = Vec::new();
+    let mut detection_filmstrip = None;
     let mut backend = None;
     let mut model = None;
     if let Some(store) = detection_store {
         for seq in first_motion_seq..=last_seq {
             for info in store.get_detection_info(camera_id, seq) {
+                if detection_filmstrip.is_none() {
+                    detection_filmstrip = info.filmstrip_frames.clone();
+                }
                 if !object_classes.contains(&info.object_class) {
                     object_classes.push(info.object_class.clone());
                 }
@@ -191,7 +197,7 @@ pub fn assemble_event(
         total_bytes,
         has_objects: !detection_details.is_empty(),
         object_classes,
-        filmstrip_frames,
+        filmstrip_frames: detection_filmstrip.or(filmstrip_frames),
         backend,
         model,
         detection_details,
@@ -705,6 +711,7 @@ mod tests {
                 object_class: "person".to_string(),
                 confidence: 0.9,
                 frame_jpeg: Arc::new(vec![1]),
+                filmstrip_frames: None,
                 backend: "ollama".to_string(),
                 model: "test-model".to_string(),
             },
@@ -717,6 +724,7 @@ mod tests {
                 object_class: "person".to_string(),
                 confidence: 0.7,
                 frame_jpeg: Arc::new(vec![1]),
+                filmstrip_frames: None,
                 backend: "ollama".to_string(),
                 model: "test-model".to_string(),
             },
@@ -743,6 +751,50 @@ mod tests {
         assert!(event.filmstrip_frames.is_some());
         let deduped = deduplicate_detections(&event.detection_details);
         assert_eq!(deduped, vec![("person".to_string(), 0.9)]);
+    }
+
+    #[test]
+    fn assembly_prefers_the_first_detection_strip_over_the_run_strip() {
+        use crate::locks::LockExt;
+        let buffer = populated_buffer(10);
+        let store = DetectionStore::new(&["cam".to_string()]);
+        let first = Arc::new(vec![vec![0x11], vec![0x12]]);
+        let later = Arc::new(vec![vec![0x21]]);
+        for (sequence, filmstrip_frames) in
+            [(6, Some(Arc::clone(&first))), (7, Some(Arc::clone(&later)))]
+        {
+            store.insert(
+                "cam",
+                DetectionEntry {
+                    id: store.next_id(),
+                    segment_sequence: sequence,
+                    object_class: "person".to_string(),
+                    confidence: 0.9,
+                    frame_jpeg: Arc::new(vec![1]),
+                    filmstrip_frames,
+                    backend: "ollama".to_string(),
+                    model: "test-model".to_string(),
+                },
+            );
+        }
+
+        let event = assemble_event(
+            &buffer.read_recover(),
+            Some(&store),
+            "cam",
+            5,
+            7,
+            0,
+            0,
+            false,
+            Some(Arc::new(vec![vec![0xff]])),
+        )
+        .unwrap();
+
+        assert!(Arc::ptr_eq(
+            event.filmstrip_frames.as_ref().unwrap(),
+            &first
+        ));
     }
 
     #[test]

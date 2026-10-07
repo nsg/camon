@@ -1191,8 +1191,9 @@ impl MotionAnalyzer {
         let detection_boxes = framing.detection_boxes;
 
         // Crop, then black out painted detection-mask cells so masked pixels reach neither the
-        // model nor a stored thumbnail. Motion boxes go on a copy only the model sees. A frame
-        // either encoder refuses is dropped whole, so display, model and region stay parallel.
+        // model nor a stored thumbnail. Motion boxes go on the model copy, which is also used
+        // for object-event presentation when detection boxes are enabled. A frame either
+        // encoder refuses is dropped whole, so display, model and region stay parallel.
         let mut filmstrip_jpegs: Vec<Vec<u8>> = Vec::with_capacity(tagged_frames.len());
         let mut boxed_jpegs: Vec<Option<Vec<u8>>> = Vec::with_capacity(tagged_frames.len());
         let mut frame_crops: Vec<(f32, f32, f32, f32)> = Vec::with_capacity(tagged_frames.len());

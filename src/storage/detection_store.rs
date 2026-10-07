@@ -10,6 +10,7 @@ pub struct DetectionEntry {
     pub object_class: String,
     pub confidence: f32,
     pub frame_jpeg: Arc<Vec<u8>>,
+    pub filmstrip_frames: Option<Arc<Vec<Vec<u8>>>>,
     pub backend: String,
     pub model: String,
 }
@@ -24,6 +25,7 @@ pub struct DetectionSnapshot {
 pub struct DetectionInfo {
     pub object_class: String,
     pub confidence: f32,
+    pub filmstrip_frames: Option<Arc<Vec<Vec<u8>>>>,
     pub backend: String,
     pub model: String,
 }
@@ -95,6 +97,7 @@ impl DetectionStore {
                     .map(|e| DetectionInfo {
                         object_class: e.object_class.clone(),
                         confidence: e.confidence,
+                        filmstrip_frames: e.filmstrip_frames.clone(),
                         backend: e.backend.clone(),
                         model: e.model.clone(),
                     })
@@ -137,6 +140,7 @@ mod tests {
             object_class: "person".to_string(),
             confidence: 0.9,
             frame_jpeg: Arc::new(Vec::new()),
+            filmstrip_frames: None,
             backend: "ollama".to_string(),
             model: "test".to_string(),
         }
