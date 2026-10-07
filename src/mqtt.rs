@@ -61,7 +61,7 @@ impl ImageBudget {
     fn take(&self, bytes: usize) -> bool {
         let taken = self
             .spent
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |spent| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |spent| {
                 spent
                     .checked_add(bytes)
                     .filter(|&total| total <= MAX_IMAGE_BYTES_PER_TICK)
