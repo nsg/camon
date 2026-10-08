@@ -15,6 +15,9 @@ const nextEventThumb = document.getElementById('next-event-thumb');
 const prevEventText = document.getElementById('prev-event-text');
 const nextEventText = document.getElementById('next-event-text');
 
+// The widest the prev/next buttons ever show their event's thumbnail, in CSS pixels.
+const NAV_THUMB_WIDTH = 64;
+
 let playbackHls = null;
 let currentPlaybackKey = null;
 let playbackAnimationId = null;
@@ -172,7 +175,7 @@ function updatePlaybackNav() {
         prevEventBtn.hidden = false;
         const prevDate = new Date(nav.prev.start_ms);
         prevEventText.textContent = prevDate.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-        prevEventThumb.src = authUrl(`api/cameras/${encodeURIComponent(currentDetailCameraId)}/events/${nav.prev.key}/thumbnail`);
+        prevEventThumb.src = authUrl(`api/cameras/${encodeURIComponent(currentDetailCameraId)}/events/${nav.prev.key}/thumbnail?${frameSizeQuery(NAV_THUMB_WIDTH)}`);
     } else {
         prevEventBtn.hidden = true;
     }
@@ -181,7 +184,7 @@ function updatePlaybackNav() {
         nextEventBtn.hidden = false;
         const nextDate = new Date(nav.next.start_ms);
         nextEventText.textContent = nextDate.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-        nextEventThumb.src = authUrl(`api/cameras/${encodeURIComponent(currentDetailCameraId)}/events/${nav.next.key}/thumbnail`);
+        nextEventThumb.src = authUrl(`api/cameras/${encodeURIComponent(currentDetailCameraId)}/events/${nav.next.key}/thumbnail?${frameSizeQuery(NAV_THUMB_WIDTH)}`);
     } else {
         nextEventBtn.hidden = true;
     }

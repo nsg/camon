@@ -55,6 +55,8 @@ pub struct AppState {
     /// Shared process limit for snapshot ffmpeg decodes across every camera.
     snapshot_decodes: Arc<tokio::sync::Semaphore>,
     snapshot_flights: SnapshotFlights,
+    /// Shared process limit for scaling stored event frames down to the size a page shows.
+    frame_scales: Arc<tokio::sync::Semaphore>,
 }
 
 impl AppState {
@@ -81,6 +83,7 @@ impl AppState {
             tuner_store: None,
             snapshot_decodes: Arc::new(tokio::sync::Semaphore::new(SNAPSHOT_DECODE_PERMITS)),
             snapshot_flights: Arc::new(Mutex::new(HashMap::new())),
+            frame_scales: Arc::new(tokio::sync::Semaphore::new(FRAME_SCALE_PERMITS)),
         }
     }
 
@@ -1269,6 +1272,86 @@ fn video_stream_response(video: VideoStream) -> Response {
     }
 }
 
+#[derive(Deserialize)]
+struct FrameSizeQuery {
+    /// The box the frame is shown in, in device pixels. The frame is scaled down to the
+    /// smallest size that still covers it, never up; with neither it is served as stored.
+    w: Option<u32>,
+    h: Option<u32>,
+}
+
+/// Each scale is a JPEG decode and encode on a blocking thread. Two at once serve a page of
+/// event cards quickly without taking every core from the analyzers.
+const FRAME_SCALE_PERMITS: usize = 2;
+
+/// JPEG quality of a scaled frame. Below the stored frames' own, which the vision model also
+/// reads: these are only ever looked at small.
+const SCALED_FRAME_QUALITY: u8 = 80;
+
+/// The size a `width`×`height` frame is served at to cover the box `query` names, or `None`
+/// when that is the size it already has.
+fn scaled_size(width: u32, height: u32, query: &FrameSizeQuery) -> Option<(u32, u32)> {
+    let share = |wanted: Option<u32>, stored: u32| {
+        wanted.map(|wanted| f64::from(wanted.clamp(16, 7680)) / f64::from(stored.max(1)))
+    };
+    let factor = match (share(query.w, width), share(query.h, height)) {
+        (Some(w), Some(h)) => w.max(h),
+        (Some(one), None) | (None, Some(one)) => one,
+        (None, None) => return None,
+    };
+    if factor >= 1.0 {
+        return None;
+    }
+    let scale = |side: u32| ((f64::from(side) * factor).round() as u32).max(1);
+    Some((scale(width), scale(height)))
+}
+
+/// `jpeg` re-encoded at the size `query` asks for; `None` when it is served as stored.
+fn scale_jpeg(jpeg: &[u8], query: &FrameSizeQuery) -> image::ImageResult<Option<Vec<u8>>> {
+    let reader =
+        || image::ImageReader::with_format(std::io::Cursor::new(jpeg), image::ImageFormat::Jpeg);
+    // Only the header is read for this, so a frame that is small enough costs no decode.
+    let (width, height) = reader().into_dimensions()?;
+    let Some((width, height)) = scaled_size(width, height, query) else {
+        return Ok(None);
+    };
+    let small = image::imageops::thumbnail(&reader().decode()?.into_rgb8(), width, height);
+    let mut out = Vec::new();
+    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, SCALED_FRAME_QUALITY).encode(
+        small.as_raw(),
+        width,
+        height,
+        image::ExtendedColorType::Rgb8,
+    )?;
+    Ok(Some(out))
+}
+
+/// A stored event frame at the size the page shows it. Frames are kept at the resolution they
+/// were captured at and scaled per request, because most are never looked at. One that cannot
+/// be scaled is served as stored: the picture matters more than its size.
+async fn sized_frame(state: &AppState, data: Vec<u8>, query: FrameSizeQuery) -> Vec<u8> {
+    if query.w.is_none() && query.h.is_none() {
+        return data;
+    }
+    let Ok(permit) = Arc::clone(&state.frame_scales).acquire_owned().await else {
+        return data;
+    };
+    let data = Arc::new(data);
+    let stored = Arc::clone(&data);
+    let scaled = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        scale_jpeg(&stored, &query)
+    })
+    .await;
+    match scaled {
+        Ok(Ok(Some(scaled))) => return scaled,
+        Ok(Ok(None)) => {}
+        Ok(Err(error)) => tracing::warn!(%error, "could not scale an event frame"),
+        Err(error) => tracing::warn!(%error, "event frame scaling failed"),
+    }
+    Arc::unwrap_or_clone(data)
+}
+
 fn jpeg_response(data: Vec<u8>) -> Response {
     (
         [
@@ -1283,6 +1366,7 @@ fn jpeg_response(data: Vec<u8>) -> Response {
 async fn warm_thumbnail_handler(
     State(state): State<AppState>,
     Path((id, event)): Path<(String, String)>,
+    Query(size): Query<FrameSizeQuery>,
 ) -> Response {
     let backend = match &state.storage {
         Some(b) => b,
@@ -1295,7 +1379,7 @@ async fn warm_thumbnail_handler(
     };
 
     match backend.read_thumbnail(&id, &entry).await {
-        Ok(data) => jpeg_response(data),
+        Ok(data) => jpeg_response(sized_frame(&state, data, size).await),
         Err(e) => thumbnail_error_response(e),
     }
 }
@@ -1388,6 +1472,7 @@ async fn detection_debug_full_frame_handler(
 async fn warm_filmstrip_handler(
     State(state): State<AppState>,
     Path((id, event, index)): Path<(String, String, u8)>,
+    Query(size): Query<FrameSizeQuery>,
 ) -> Response {
     let backend = match &state.storage {
         Some(b) => b,
@@ -1411,14 +1496,7 @@ async fn warm_filmstrip_handler(
     };
 
     match backend.read_filmstrip(&id, &entry, index).await {
-        Ok(data) => (
-            [
-                (header::CONTENT_TYPE, "image/jpeg"),
-                (header::CACHE_CONTROL, "public, max-age=86400"),
-            ],
-            data,
-        )
-            .into_response(),
+        Ok(data) => jpeg_response(sized_frame(&state, data, size).await),
         Err(error) => archive_read_error_response(&error, "filmstrip frame not found"),
     }
 }
@@ -3099,6 +3177,63 @@ mod tests {
     fn an_unexpected_archive_failure_is_a_bad_gateway() {
         let response = video_error_response(&std::io::Error::from(std::io::ErrorKind::Other));
         assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    fn size(w: u32, h: u32) -> FrameSizeQuery {
+        FrameSizeQuery {
+            w: Some(w),
+            h: Some(h),
+        }
+    }
+
+    #[test]
+    fn a_frame_is_scaled_to_cover_the_box_it_is_shown_in() {
+        assert_eq!(scaled_size(1920, 1080, &size(320, 180)), Some((320, 180)));
+        // A crop wider or taller than the box overhangs it rather than falling short of it.
+        assert_eq!(scaled_size(1920, 600, &size(320, 180)), Some((576, 180)));
+        assert_eq!(scaled_size(600, 1080, &size(320, 180)), Some((320, 576)));
+    }
+
+    #[test]
+    fn a_frame_is_never_scaled_up_or_without_being_asked() {
+        assert_eq!(scaled_size(640, 360, &size(1280, 720)), None);
+        assert_eq!(scaled_size(1920, 300, &size(320, 320)), None);
+        let as_stored = FrameSizeQuery { w: None, h: None };
+        assert_eq!(scaled_size(1920, 1080, &as_stored), None);
+    }
+
+    #[tokio::test]
+    async fn a_stored_frame_is_served_at_the_size_asked_for() {
+        let ids = vec!["cam".to_string()];
+        let state = AppState::new(
+            HashMap::new(),
+            HashMap::new(),
+            MotionStore::new(&ids),
+            DetectionStore::new(&ids),
+            DetectionDebugStore::new(&ids),
+            None,
+            None,
+        );
+        let mut stored = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new(&mut stored)
+            .encode(
+                &vec![128; 1920 * 1080 * 3],
+                1920,
+                1080,
+                image::ExtendedColorType::Rgb8,
+            )
+            .unwrap();
+
+        let served = sized_frame(&state, stored, size(320, 180)).await;
+        let served = image::load_from_memory(&served).unwrap();
+        assert_eq!((served.width(), served.height()), (320, 180));
+
+        let broken = b"not a jpeg".to_vec();
+        assert_eq!(
+            sized_frame(&state, broken.clone(), size(320, 180)).await,
+            broken,
+            "a frame that cannot be scaled was not served as stored"
+        );
     }
 
     #[test]

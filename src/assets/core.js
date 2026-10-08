@@ -40,6 +40,17 @@ function authHeaders(extra) {
     return headers;
 }
 
+// The size query for an event frame shown in a 16:9 box `cssWidth` wide: the server scales
+// the stored frame down to cover it. Widths go up in steps rather than following the layout
+// exactly, so a resized window or another view reuses what the browser already cached.
+const FRAME_WIDTH_STEP = 160;
+
+function frameSizeQuery(cssWidth) {
+    const pixels = cssWidth * (window.devicePixelRatio || 1);
+    const w = Math.max(1, Math.ceil(pixels / FRAME_WIDTH_STEP)) * FRAME_WIDTH_STEP;
+    return `w=${w}&h=${w * 9 / 16}`;
+}
+
 function authUrl(url) {
     if (!apiToken) return url;
     return `${url}${url.includes('?') ? '&' : '?'}token=${encodeURIComponent(apiToken)}`;
