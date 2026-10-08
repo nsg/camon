@@ -42,7 +42,6 @@ function showEventsView(cameraId) {
 }
 
 function renderEventList() {
-    disposeEventCards(eventList);
     eventList.innerHTML = '';
 
     const collapsed = collapseEventChains(warmEvents);

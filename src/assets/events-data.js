@@ -17,16 +17,14 @@ const INLINE_EVENT_PAGE_SIZE = 64;
 const INLINE_EVENT_MAX_PAGES = 4;
 const INLINE_EVENT_CARD_TARGET = 9;
 
-const FRAME_CYCLE_MS = 1000;
+// Slots in an event card's film: the most frames the server keeps per event.
+const EVENT_FILM_SLOTS = 4;
+
 const FRAME_PRELOAD_CONCURRENCY = 4;
-// One FIFO bounds filmstrip fan-out across cards; overlay loads use it too.
+// One FIFO bounds the live view's overlay image loads. Event card frames are
+// lazy <img>s the browser paces itself and do not go through it.
 const framePreloadQueue = [];
 const framePreloadsInFlight = new Set();
-const eventCardCycleSubscribers = new Set();
-const eventCardControllers = new WeakMap();
-const prefersReducedMotion = typeof window.matchMedia === 'function' &&
-    window.matchMedia('(prefers-reduced-motion: reduce)').matches;
-let eventCardCycleTimer = null;
 
 function createImagePreloadOwner() {
     return { cancelled: false, loads: new Set() };
@@ -87,80 +85,6 @@ function cancelImagePreloads(owner) {
     pumpImagePreloads();
 }
 
-function stopEventCardCycle() {
-    if (eventCardCycleTimer === null) return;
-    clearInterval(eventCardCycleTimer);
-    eventCardCycleTimer = null;
-}
-
-function startEventCardCycle() {
-    if (eventCardCycleTimer !== null || eventCardCycleSubscribers.size === 0 || document.hidden) {
-        return;
-    }
-    eventCardCycleTimer = setInterval(() => {
-        eventCardCycleSubscribers.forEach(controller => {
-            if (controller.card.isConnected) return;
-            disposeEventCard(controller);
-        });
-        if (eventCardCycleSubscribers.size === 0) {
-            stopEventCardCycle();
-            return;
-        }
-        eventCardCycleSubscribers.forEach(controller => controller.advanceFrame());
-    }, FRAME_CYCLE_MS);
-}
-
-function subscribeEventCard(controller) {
-    eventCardCycleSubscribers.add(controller);
-    startEventCardCycle();
-}
-
-function unsubscribeEventCard(controller) {
-    eventCardCycleSubscribers.delete(controller);
-    if (eventCardCycleSubscribers.size === 0) stopEventCardCycle();
-}
-
-function disposeEventCard(controller) {
-    if (!controller || controller.disposed) return;
-    controller.disposed = true;
-    unsubscribeEventCard(controller);
-    if (eventCardIntersectionObserver) eventCardIntersectionObserver.unobserve(controller.card);
-    cancelImagePreloads(controller.preloadOwner);
-    eventCardControllers.delete(controller.card);
-}
-
-function disposeEventCards(container) {
-    container.querySelectorAll('.event-card').forEach(card => {
-        disposeEventCard(eventCardControllers.get(card));
-    });
-}
-
-const eventCardIntersectionObserver = !prefersReducedMotion &&
-    typeof IntersectionObserver !== 'undefined'
-    ? new IntersectionObserver(entries => {
-        entries.forEach(entry => {
-            const controller = eventCardControllers.get(entry.target);
-            if (!controller) return;
-            if (!controller.card.isConnected) {
-                disposeEventCard(controller);
-            } else if (entry.isIntersecting) {
-                controller.preloadFrames();
-                subscribeEventCard(controller);
-            } else {
-                unsubscribeEventCard(controller);
-            }
-        });
-    }, { threshold: 0.25 })
-    : null;
-
-document.addEventListener('visibilitychange', () => {
-    if (document.hidden) {
-        stopEventCardCycle();
-    } else {
-        startEventCardCycle();
-    }
-});
-
 function mapWarmEvents(events) {
     return events.map(ev => ({
         ...ev,
@@ -215,8 +139,8 @@ function fetchWarmEvents(cameraId, { depth = 'inline' } = {}) {
             }
         }
         const mapped = mapWarmEvents(raw);
-        // Re-rendering identical data every poll would wipe in-progress
-        // filmstrip scrubbing, so unchanged results are dropped here.
+        // Re-rendering identical data every poll would rebuild every card and
+        // reload its frames, so unchanged results are dropped here.
         const signature = `${mayHaveMore}\n${mapped
             .map(ev => `${ev.key}:${ev.filmstrip_frames}:${ev.recovered}`)
             .join('\n')}`;
@@ -351,18 +275,18 @@ function eventObjectIcon(classes) {
 function buildEventCard(collapsed) {
     const ev = collapsed.event;
     const card = document.createElement('div');
-    const isHero = collapsed.eventType === 'object';
-    card.className = `event-card ${isHero ? 'event-card-hero' : 'event-card-tile'}`;
+    card.className = 'event-card';
     card.setAttribute('role', 'link');
     card.setAttribute('tabindex', '0');
 
     const cameraId = encodeURIComponent(currentDetailCameraId);
     const key = encodeURIComponent(ev.key);
-    const thumbnailUrl = authUrl(`api/cameras/${cameraId}/events/${key}/thumbnail`);
-    const frameCount = Math.max(0, Number(ev.filmstrip_frames) || 0);
-    const middleFrame = frameCount > 0 ? Math.floor(frameCount / 2) : -1;
-    const frameUrls = Array.from({ length: frameCount }, (_, i) =>
-        authUrl(`api/cameras/${cameraId}/events/${key}/filmstrip/${i}`));
+    const frameCount = Math.min(EVENT_FILM_SLOTS, Math.max(0, Number(ev.filmstrip_frames) || 0));
+    // An event with no filmstrip shows its thumbnail in the first slot.
+    const frameUrls = frameCount > 0
+        ? Array.from({ length: frameCount }, (_, i) =>
+            authUrl(`api/cameras/${cameraId}/events/${key}/filmstrip/${i}`))
+        : [authUrl(`api/cameras/${cameraId}/events/${key}/thumbnail`)];
     const timeStr = formatEventClock(ev.start_ms, true);
     const durationStr = formatEventDuration(collapsed.totalDurationMs) +
         (collapsed.members.length > 1 ? ' total' : '');
@@ -393,179 +317,34 @@ function buildEventCard(collapsed) {
             ${clipLabel}
         </div>`
         : '';
-    if (chainBadge) card.classList.add('has-chain-badge');
-    const frameDots = frameCount >= 2
-        ? `<div class="event-card-frames">${Array.from({ length: frameCount }, (_, i) =>
-            `<i${i === middleFrame ? ' class="active"' : ''}></i>`).join('')}</div>`
-        : '';
+    // Every card has the same slots, so a short filmstrip leaves the last ones empty.
+    const slots = Array.from({ length: EVENT_FILM_SLOTS }, (_, i) => i < frameUrls.length
+        ? '<div class="event-card-frame"><img loading="lazy" alt="" draggable="false"></div>'
+        : '<div class="event-card-frame empty"></div>').join('');
 
     card.innerHTML = `
-        <img class="event-card-image" loading="lazy" alt="" draggable="false">
-        <div class="event-card-fade"></div>
-        <div class="event-card-badge ${esc(typeClass)}">${typeIcon}<span class="event-card-badge-label">${esc(typeLabel)}${recoveredBadge}</span></div>
-        ${chainBadge}
-        ${frameDots}
-        <div class="event-card-meta">
+        <div class="event-card-head">
             <span class="event-card-time">${timeStr}</span>
+            <div class="event-card-badge ${esc(typeClass)}">${typeIcon}<span class="event-card-badge-label">${esc(typeLabel)}${recoveredBadge}</span></div>
+            ${chainBadge}
             <span class="event-card-duration">${durationStr}</span>
         </div>
+        <div class="event-card-film">${slots}</div>
     `;
 
-    const image = card.querySelector('.event-card-image');
-    const dots = [...card.querySelectorAll('.event-card-frames i')];
-    const frameStatus = Array(frameCount).fill(0);
-    const preloadOwner = createImagePreloadOwner();
-    let shownFrame = middleFrame;
-    let desiredFrame = middleFrame;
-    let lastGoodFrame = -1;
-    let lastGoodSrc = '';
-    let preloadingStarted = false;
-    let touchStart = null;
-    let suppressClick = false;
-    let interacting = false;
-    let controller = null;
-
-    function updateDots(index) {
-        dots.forEach((dot, i) => dot.classList.toggle('active', i === index));
-    }
-
-    function showFrame(index) {
-        if (frameStatus[index] !== 1) return;
-        shownFrame = index;
-        image.hidden = false;
-        image.src = frameUrls[index];
-        updateDots(index);
-    }
-
-    function preloadFrames() {
-        if (preloadingStarted) return;
-        preloadingStarted = true;
-        const indices = frameUrls.map((_, index) => index);
-        if (desiredFrame >= 0) {
-            indices.splice(indices.indexOf(desiredFrame), 1);
-            indices.unshift(desiredFrame);
-        }
-        indices.forEach(index => {
-            if (frameStatus[index] !== 0) return;
-            enqueueImagePreload(preloadOwner, frameUrls[index], () => {
-                if (!card.isConnected) {
-                    disposeEventCard(controller);
-                    return;
-                }
-                frameStatus[index] = 1;
-                if (desiredFrame === index) showFrame(index);
-            }, () => {
-                if (!card.isConnected) {
-                    disposeEventCard(controller);
-                    return;
-                }
-                frameStatus[index] = -1;
-            });
+    card.querySelectorAll('.event-card-frame img').forEach((image, i) => {
+        // A frame that cannot be loaded empties its slot instead of showing a broken image.
+        image.addEventListener('error', () => {
+            image.parentElement.classList.add('empty');
+            image.remove();
         });
-    }
-
-    function scrubTo(clientX) {
-        const rect = card.getBoundingClientRect();
-        const fraction = Math.max(0, Math.min(0.999999, (clientX - rect.left) / rect.width));
-        desiredFrame = Math.floor(fraction * frameCount);
-        showFrame(desiredFrame);
-    }
-
-    function advanceFrame() {
-        if (interacting || touchStart !== null) return;
-        const currentFrame = shownFrame >= 0 ? shownFrame : middleFrame;
-        for (let offset = 1; offset < frameCount; offset++) {
-            const index = (currentFrame + offset) % frameCount;
-            if (frameStatus[index] !== 1) continue;
-            showFrame(index);
-            desiredFrame = shownFrame;
-            return;
-        }
-        desiredFrame = shownFrame;
-    }
-
-    // Both handlers derive the frame index from the src that actually fired,
-    // so a stale error from a superseded request cannot poison another frame.
-    image.addEventListener('load', () => {
-        const src = image.getAttribute('src');
-        const index = frameUrls.indexOf(src);
-        if (index >= 0) frameStatus[index] = 1;
-        lastGoodFrame = index;
-        lastGoodSrc = src;
+        image.src = frameUrls[i];
     });
-    image.addEventListener('error', () => {
-        const src = image.getAttribute('src');
-        const index = frameUrls.indexOf(src);
-        if (index >= 0) frameStatus[index] = -1;
-        if (src === lastGoodSrc) lastGoodSrc = '';
-        if (!lastGoodSrc && src !== thumbnailUrl) {
-            shownFrame = -1;
-            updateDots(-1);
-            image.src = thumbnailUrl;
-        } else if (lastGoodSrc && src !== lastGoodSrc) {
-            shownFrame = lastGoodFrame;
-            updateDots(lastGoodFrame);
-            image.src = lastGoodSrc;
-        } else {
-            image.hidden = true;
-        }
-    });
-    image.src = middleFrame >= 0 ? frameUrls[middleFrame] : thumbnailUrl;
-
-    if (frameCount >= 2) {
-        card.addEventListener('pointerenter', () => {
-            interacting = true;
-            preloadFrames();
-        });
-        card.addEventListener('pointerdown', event => {
-            preloadFrames();
-            if (event.pointerType === 'touch') {
-                interacting = true;
-                touchStart = { x: event.clientX, y: event.clientY };
-            }
-        });
-        card.addEventListener('pointermove', event => {
-            scrubTo(event.clientX);
-        });
-        card.addEventListener('pointerleave', () => {
-            interacting = false;
-            desiredFrame = shownFrame;
-        });
-        card.addEventListener('pointerup', event => {
-            if (!touchStart || event.pointerType !== 'touch') return;
-            const dx = Math.abs(event.clientX - touchStart.x);
-            const dy = Math.abs(event.clientY - touchStart.y);
-            touchStart = null;
-            interacting = false;
-            desiredFrame = shownFrame;
-            if (dx >= 12 && dx > dy) {
-                suppressClick = true;
-                setTimeout(() => { suppressClick = false; }, 400);
-            }
-        });
-        card.addEventListener('pointercancel', () => {
-            touchStart = null;
-            interacting = false;
-            desiredFrame = shownFrame;
-        });
-
-        controller = { card, preloadFrames, advanceFrame, preloadOwner, disposed: false };
-        eventCardControllers.set(card, controller);
-        if (eventCardIntersectionObserver) {
-            eventCardIntersectionObserver.observe(card);
-        }
-    }
 
     const openEvent = () => {
         window.location.hash = `/camera/${encodeURIComponent(currentDetailCameraId)}/events/${ev.key}`;
     };
-    card.addEventListener('click', () => {
-        if (suppressClick) {
-            suppressClick = false;
-            return;
-        }
-        openEvent();
-    });
+    card.addEventListener('click', openEvent);
     card.addEventListener('keydown', event => {
         if (event.key !== 'Enter' && event.key !== ' ') return;
         event.preventDefault();
@@ -583,32 +362,18 @@ function formatQuietGap(durationMs) {
 }
 
 function appendEventCards(container, collapsedEvents, includeQuietGaps) {
-    let grid = null;
     collapsedEvents.forEach((collapsed, index) => {
         if (includeQuietGaps && index > 0) {
             const newer = collapsedEvents[index - 1];
             const quietMs = newer.event.start_ms -
                 (collapsed.event.start_ms + collapsed.totalDurationMs);
             if (quietMs >= 10 * 60 * 1000) {
-                grid = null;
                 const gap = document.createElement('div');
                 gap.className = 'event-quiet-gap';
                 gap.textContent = formatQuietGap(quietMs);
                 container.appendChild(gap);
             }
         }
-
-        const card = buildEventCard(collapsed);
-        if (collapsed.eventType === 'object') {
-            grid = null;
-            container.appendChild(card);
-            return;
-        }
-        if (!grid) {
-            grid = document.createElement('div');
-            grid.className = 'event-card-grid';
-            container.appendChild(grid);
-        }
-        grid.appendChild(card);
+        container.appendChild(buildEventCard(collapsed));
     });
 }
