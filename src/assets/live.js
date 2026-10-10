@@ -345,6 +345,7 @@ function cleanupLiveView() {
     tlTicks.innerHTML = '';
     lastTickKey = null;
     historyPanel.hidden = true;
+    disposeEventCards(historyDays);
     historyDays.innerHTML = '';
 }
 
@@ -1086,6 +1087,7 @@ function formatAgo(secs) {
 }
 
 function renderHistoryPanel() {
+    disposeEventCards(historyDays);
     if (warmEvents.length === 0) {
         historyPanel.hidden = true;
         historyDays.innerHTML = '';
