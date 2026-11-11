@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use tokio::sync::{mpsc, Notify};
 
 use crate::buffer::warm::{EventUpgrade, WriterMessage};
+use crate::mqtt::stamp::stamp_jpeg;
 use crate::mqtt::{send_event, MqttEvent, Sighting};
 use crate::storage::event_index::DetectionDetail;
 use crate::storage::{
@@ -39,6 +40,9 @@ pub struct DetectionJob {
     pub model_jpegs: Vec<Arc<Vec<u8>>>,
     /// The normalized full-frame region each frame shows, parallel to `crop_jpegs`.
     pub frame_crops: Vec<(f32, f32, f32, f32)>,
+    /// When each frame was captured — its segment's wall-clock start, in nanoseconds since the
+    /// epoch — parallel to `crop_jpegs`. Drawn on the MQTT sighting, nowhere else.
+    pub frame_times_ns: Vec<u64>,
     /// A full (uncropped) frame for the debug overlay, which is what reads it — so the
     /// analyzer encodes one only while somebody is watching that view, and this is `None` the
     /// rest of the time.
@@ -158,18 +162,38 @@ impl DetectionWorker {
         // Parsing already applied class and confidence filters, so this deduped set is the
         // complete verdict used by every consumer.
         if let Some(ref tx) = self.mqtt_tx {
-            send_event(
-                tx,
-                MqttEvent::Detections {
-                    camera_id: job.camera_id.clone(),
-                    sightings: build_sightings(
+            let sightings = {
+                let classes = classes.clone();
+                let per_frame = per_frame.clone();
+                let frames = frames.clone();
+                let full_frame = job.full_frame_jpeg.clone();
+                let times = job.frame_times_ns.clone();
+                // Stamping decodes and re-encodes each crop: milliseconds the runtime should not
+                // be spending.
+                tokio::task::spawn_blocking(move || {
+                    build_sightings(
                         &classes,
                         &per_frame,
                         &frames,
-                        job.full_frame_jpeg.as_ref().map(|f| f.as_slice()),
-                    ),
-                },
-            );
+                        full_frame.as_deref().map(Vec::as_slice),
+                        &times,
+                    )
+                })
+                .await
+            };
+            match sightings {
+                Ok(sightings) => {
+                    send_event(
+                        tx,
+                        MqttEvent::Detections {
+                            camera_id: job.camera_id.clone(),
+                            sightings,
+                        },
+                    );
+                }
+                Err(e) => tracing::warn!(camera = %job.camera_id, error = %e,
+                    "building mqtt sightings failed"),
+            }
         }
         self.store_detections(
             &job,
@@ -466,24 +490,32 @@ fn best_frame_per_class(per_frame: &[Vec<Detection>]) -> HashMap<&str, usize> {
 
 /// Pair every class of the verdict with the picture behind it, for the Home Assistant bridge to
 /// publish retained: the crop that evidences that class, the run's full
-/// frame when the crops are gone, and nothing at all when the job carried no frame.
+/// frame when the crops are gone, and nothing at all when the job carried no frame. The picture
+/// is stamped with its capture time when `frame_times_ns` knows it; the full frame is the run's
+/// first, so it takes the first time.
 fn build_sightings(
     classes: &[String],
     per_frame: &[Vec<Detection>],
     frames: &[Arc<Vec<u8>>],
     full_frame_jpeg: Option<&[u8]>,
+    frame_times_ns: &[u64],
 ) -> Vec<Sighting> {
     let best = best_frame_per_class(per_frame);
     classes
         .iter()
-        .map(|class| Sighting {
-            class: class.clone(),
-            frame_jpeg: best
+        .map(|class| {
+            let picture = best
                 .get(class.as_str())
-                .and_then(|&idx| frames.get(idx))
-                .map(|jpeg| jpeg.as_slice())
-                .or(full_frame_jpeg)
-                .map(<[u8]>::to_vec),
+                .and_then(|&idx| Some((frames.get(idx)?.as_slice(), frame_times_ns.get(idx))))
+                .or_else(|| full_frame_jpeg.map(|jpeg| (jpeg, frame_times_ns.first())));
+            Sighting {
+                class: class.clone(),
+                frame_jpeg: picture.map(|(jpeg, captured_ns)| {
+                    captured_ns
+                        .and_then(|&ns| stamp_jpeg(jpeg, ns, JPEG_QUALITY))
+                        .unwrap_or_else(|| jpeg.to_vec())
+                }),
+            }
         })
         .collect()
 }
@@ -636,6 +668,7 @@ mod tests {
             crop_jpegs: vec![Arc::new(vec![0xff])],
             model_jpegs: vec![Arc::new(vec![0xff])],
             frame_crops: vec![(0.0, 0.0, 1.0, 1.0)],
+            frame_times_ns: Vec::new(),
             full_frame_jpeg: None,
             motion_rects: Vec::new(),
             run_crop: None,
@@ -1474,6 +1507,7 @@ mod tests {
             &per_frame,
             &crops,
             Some(&[0xcc]),
+            &[],
         );
         assert_eq!(
             sightings,
@@ -1493,10 +1527,10 @@ mod tests {
     #[test]
     fn sighting_falls_back_to_the_full_frame_then_to_nothing() {
         let classes = ["person".to_string()];
-        let sightings = build_sightings(&classes, &[], &[], Some(&[0xcc]));
+        let sightings = build_sightings(&classes, &[], &[], Some(&[0xcc]), &[]);
         assert_eq!(sightings[0].frame_jpeg, Some(vec![0xcc]));
 
-        let sightings = build_sightings(&classes, &[], &[], None);
+        let sightings = build_sightings(&classes, &[], &[], None, &[]);
         assert_eq!(sightings[0].class, "person");
         assert_eq!(sightings[0].frame_jpeg, None);
     }

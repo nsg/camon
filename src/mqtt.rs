@@ -1380,11 +1380,11 @@ fn spawn_snapshot(
             let last = buf.last_sequence();
             last.checked_sub(1)
                 .and_then(|seq| buf.get_segment_by_sequence(seq))
-                .map(|segment| Arc::clone(&segment.data))
+                .map(|segment| (Arc::clone(&segment.data), segment.start_pts))
         }
         None => None,
     };
-    let Some(data) = data else {
+    let Some((data, captured_ns)) = data else {
         tracing::debug!(camera = %camera_id, "hot buffer empty, no snapshot");
         return;
     };
@@ -1396,7 +1396,7 @@ fn spawn_snapshot(
     let produced = Arc::clone(&decoded);
     let budget = link.images.clone();
     let handle = tokio::spawn(async move {
-        match snapshot_jpeg(&data).await {
+        match snapshot_jpeg(&data, captured_ns).await {
             Some(jpeg) => {
                 // A frame exists, which is what the cadence asked for; whether
                 // the queue then takes it is the queue's story, told by the
@@ -1423,8 +1423,9 @@ fn spawn_snapshot(
     );
 }
 
-/// Decode the first frame of an MPEG-TS segment and JPEG-encode it.
-async fn snapshot_jpeg(segment: &[u8]) -> Option<Vec<u8>> {
+/// Decode the first frame of an MPEG-TS segment, stamp it with `captured_ns` — the segment's
+/// wall-clock start, which is when its opening keyframe arrived — and JPEG-encode it.
+async fn snapshot_jpeg(segment: &[u8], captured_ns: u64) -> Option<Vec<u8>> {
     let expected = (SNAPSHOT_WIDTH * SNAPSHOT_HEIGHT * 3) as usize;
     let mut frame = piped_decode(
         snapshot_command(),
@@ -1441,10 +1442,18 @@ async fn snapshot_jpeg(segment: &[u8]) -> Option<Vec<u8>> {
     // Fixed-size CPU work that always terminates, so it needs no bound of its
     // own; off the runtime because a 720p encode is milliseconds the event loop
     // should not be spending.
-    tokio::task::spawn_blocking(move || encode_jpeg(&frame, SNAPSHOT_WIDTH, SNAPSHOT_HEIGHT))
-        .await
-        .map_err(|e| tracing::warn!(error = %e, "snapshot encode task failed"))
-        .ok()?
+    tokio::task::spawn_blocking(move || {
+        stamp::stamp_rgb(
+            &mut frame,
+            SNAPSHOT_WIDTH as usize,
+            SNAPSHOT_HEIGHT as usize,
+            captured_ns,
+        );
+        encode_jpeg(&frame, SNAPSHOT_WIDTH, SNAPSHOT_HEIGHT)
+    })
+    .await
+    .map_err(|e| tracing::warn!(error = %e, "snapshot encode task failed"))
+    .ok()?
 }
 
 fn snapshot_command() -> tokio::process::Command {
@@ -1604,3 +1613,5 @@ async fn abort_snapshots(snapshot_tasks: HashMap<String, SnapshotTask>) {
 
 #[cfg(test)]
 mod tests;
+
+pub(crate) mod stamp;

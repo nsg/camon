@@ -512,7 +512,7 @@ Camon can be installed as an ingress add-on from the separate [NSG Home Assistan
 
 See the [add-on documentation](https://github.com/nsg/ha-repo/blob/main/camon/DOCS.md) for install steps, ingress notes, the `camon.toml` configuration, and the amd64-only caveat.
 
-With the `[mqtt]` section enabled (automatic in the add-on when the Mosquitto broker add-on is installed), each camera also appears as native Home Assistant entities via MQTT discovery: a motion-gated snapshot camera, a motion sensor, per-class occupancy sensors, and a per-class snapshot camera showing the cropped frame from the last sighting of that class (retained, so it persists across restarts) — no custom integration required.
+With the `[mqtt]` section enabled (automatic in the add-on when the Mosquitto broker add-on is installed), each camera also appears as native Home Assistant entities via MQTT discovery: a motion-gated snapshot camera, a motion sensor, per-class occupancy sensors, and a per-class snapshot camera showing the cropped frame from the last sighting of that class (retained, so it persists across restarts) — no custom integration required. Both snapshot cameras carry the time the frame was captured, as local `HH:MM:SS` in the top-left corner; the time zone is the process's (`TZ`, which the add-on gets from Home Assistant).
 
 Because every state is published retained, a connection that drops mid-motion would otherwise leave Home Assistant showing movement that never ends. Every reconnect therefore restates *every* configured entity — the ones that are off just as loudly as the ones that are on — and only then marks the device available again, so nothing is trusted while the broker still holds a stale value.
 

@@ -345,6 +345,7 @@ fn a_batch_hands_the_crop_decoder_back_to_its_camera() {
         vec![MotionSegment {
             seq: 1,
             data: Arc::new(Vec::new()),
+            start_pts: 0,
             duration_ns: SEC,
         }],
         None,
@@ -595,6 +596,7 @@ async fn the_debug_overlay_frame_is_encoded_only_while_the_view_is_open() {
     let segment = |seq| MotionSegment {
         seq,
         data: Arc::new(Vec::new()),
+        start_pts: 0,
         duration_ns: 1,
     };
 
@@ -1037,6 +1039,7 @@ fn a_batch_arriving_inside_the_drain_forks_no_crop_decoder() {
         vec![MotionSegment {
             seq: 1,
             data: Arc::new(Vec::new()),
+            start_pts: 0,
             duration_ns: SEC,
         }],
         None,
@@ -1445,6 +1448,7 @@ fn two_motion_batches_are_extracted_through_one_crop_decoder() {
         vec![MotionSegment {
             seq,
             data: Arc::clone(&recorded[seq as usize]),
+            start_pts: 0,
             duration_ns: SEC,
         }]
     };
@@ -1505,6 +1509,7 @@ fn a_batch_leaves_frames_behind_and_the_next_pass_takes_them() {
             .map(|seq| MotionSegment {
                 seq,
                 data: Arc::clone(&recorded[seq as usize]),
+                start_pts: 0,
                 duration_ns: SEC,
             })
             .collect::<Vec<_>>()
@@ -2098,6 +2103,7 @@ async fn framed_job(framing: DetectionFramingConfig) -> (DetectionJob, Vec<Vec<u
     let segment = MotionSegment {
         seq: 7,
         data: Arc::new(Vec::new()),
+        start_pts: 0,
         duration_ns: 1,
     };
     analyzer.process_run_frames(vec![segment], frames);
@@ -2312,6 +2318,7 @@ fn run_selection(run_len: usize, frames: impl Fn(u64) -> usize) -> Vec<(u8, u8)>
         .map(|seq| MotionSegment {
             seq,
             data: Arc::new(vec![seq as u8]),
+            start_pts: 0,
             duration_ns: 1_000_000_000,
         })
         .collect();

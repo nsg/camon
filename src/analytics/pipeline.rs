@@ -62,6 +62,7 @@ use skips::{merge_skips, SkipReporter, SkippedSegments};
 struct MotionSegment {
     seq: u64,
     data: Arc<Vec<u8>>,
+    start_pts: u64,
     duration_ns: u64,
 }
 
@@ -801,6 +802,7 @@ impl MotionAnalyzer {
                     motion_segments.push(MotionSegment {
                         seq: seg.seq,
                         data: seg.data,
+                        start_pts: seg.start_pts,
                         duration_ns: seg.duration_ns,
                     });
                 }
@@ -1198,6 +1200,7 @@ impl MotionAnalyzer {
         let mut filmstrip_jpegs: Vec<Vec<u8>> = Vec::with_capacity(tagged_frames.len());
         let mut boxed_jpegs: Vec<Option<Vec<u8>>> = Vec::with_capacity(tagged_frames.len());
         let mut frame_crops: Vec<(f32, f32, f32, f32)> = Vec::with_capacity(tagged_frames.len());
+        let mut frame_times_ns: Vec<u64> = Vec::with_capacity(tagged_frames.len());
         for sampled in &tagged_frames {
             let region = sampled.crop.unwrap_or(FULL_FRAME);
             let (mut out, region, placement) = match crop_frame(&sampled.frame, &region) {
@@ -1227,6 +1230,11 @@ impl MotionAnalyzer {
             filmstrip_jpegs.push(display);
             boxed_jpegs.push(boxed);
             frame_crops.push((region.x, region.y, region.w, region.h));
+            frame_times_ns.push(
+                run.iter()
+                    .find(|seg| seg.seq == sampled.seq)
+                    .map_or(0, |seg| seg.start_pts),
+            );
         }
 
         for seg in &run {
@@ -1251,6 +1259,7 @@ impl MotionAnalyzer {
                 crop_jpegs,
                 model_jpegs,
                 frame_crops,
+                frame_times_ns,
                 detection_boxes,
                 full_frame_jpeg,
                 motion_rects: all_motion_rects,

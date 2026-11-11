@@ -33,13 +33,15 @@ FROM debian:bookworm-slim
 # ffmpeg/ffprobe are spawned by Camon; ca-certificates for HTTPS (Ollama, tpue,
 # stathost, update checks); curl + jq for run.sh to query and parse the
 # Supervisor's /services/mqtt response (MQTT auto-configuration) — the slim
-# base image ships neither.
+# base image ships neither; tzdata so the Supervisor's TZ resolves and the time
+# stamped on MQTT snapshots is local rather than UTC.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         ffmpeg \
         ca-certificates \
         curl \
         jq \
+        tzdata \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /src/target/release/camon /usr/local/bin/camon
